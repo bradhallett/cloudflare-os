@@ -8,7 +8,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  gatekeeperShortName, isGatekeeperPackage, readDeployablePackages, type BindingDecl,
+  gatekeeperBindingName, isGatekeeperPackage, readDeployablePackages, releaseShortName,
+  type BindingDecl,
 } from "../release/manifest-lib.ts";
 import {
   MAX_PREVIEW_NAME_LENGTH,
@@ -16,7 +17,6 @@ import {
   R2_MAX_BUCKET_NAME_LENGTH,
   backendSecrets,
   buildPreviewConfigs,
-  gatekeeperBindingName,
   previewPullRequestNumber,
   resolveAccess,
   resolveAiGateway,
@@ -390,7 +390,7 @@ test("every gatekeeper is bound to the backend by RPC and to the router by HTTP"
   assert.ok(gatekeepers.length >= 16, `only found ${gatekeepers.length} gatekeepers`);
 
   // A service binding names a worker, which is the package name; the binding name — what the
-  // router and the backend actually scan for — is the uppercased form.
+  // router and the backend actually scan for — is the folded, uppercased release slug.
   const backend = previewsOf(configs, "workshop-backend").services;
   assert.ok(backend, "the backend preview declares no service bindings");
   assert.deepEqual(backend.map((service) => service.service),
@@ -412,17 +412,25 @@ test("every gatekeeper is bound to the backend by RPC and to the router by HTTP"
   }
 });
 
-test("every gatekeeper is mounted under the router's origin", () => {
+test("every gatekeeper is mounted under the router's origin at its production path", () => {
   const { packages, configs } = buildAll();
 
   for (const { name } of packages.filter((pkg) => isGatekeeperPackage(pkg.name))) {
     assert.equal(previewsOf(configs, name).vars?.BASE_URL,
-        `${BASE_URL}/gatekeeper/${gatekeeperShortName(name)}`);
+        `${BASE_URL}/gatekeeper/${releaseShortName(name)}`);
   }
-  // The router discovers gatekeepers by lowercasing its GATEKEEPER_* bindings, so the path each
-  // gatekeeper is told to serve has to be the one the router will route to it.
-  assert.equal(gatekeeperBindingName("gatekeeper-mcp-portal"), "GATEKEEPER_MCP_PORTAL");
-  assert.equal(gatekeeperShortName("gatekeeper-mcp-portal"), "mcp-portal");
+  // The router derives each gatekeeper's path from its GATEKEEPER_* binding name
+  // (router/src/index.ts: suffix lowercased, underscores -> hyphens), so the path BASE_URL
+  // claims has to be the one that derivation yields. Restated here rather than imported, so a
+  // change to either side fails this test instead of silently re-diverging.
+  const routerPath = (binding: string) =>
+    `/gatekeeper/${binding.slice("GATEKEEPER_".length).toLowerCase().replaceAll("_", "-")}`;
+  // The spelling matches production exactly, including the fold: customer deployments bound
+  // GATEKEEPER_MCPPORTAL and registered their OAuth redirect URIs at /gatekeeper/mcpportal, so
+  // dev and previews must not spell the multi-word gatekeeper's path "mcp-portal".
+  assert.equal(gatekeeperBindingName("gatekeeper-mcp-portal"), "GATEKEEPER_MCPPORTAL");
+  assert.equal(routerPath(gatekeeperBindingName("gatekeeper-mcp-portal")), "/gatekeeper/mcpportal");
+  assert.equal(releaseShortName("gatekeeper-mcp-portal"), "mcpportal");
 });
 
 test("each preview's context collections are namespaced to that preview", () => {

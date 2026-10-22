@@ -30,7 +30,7 @@ import { createHash } from "node:crypto";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
-  gatekeeperShortName, isGatekeeperPackage, readDeployablePackages,
+  gatekeeperBindingName, isGatekeeperPackage, readDeployablePackages, releaseShortName,
   type BindingDecl, type DeployablePackage, type ObservabilityConfig, type ServiceBinding,
   type WranglerConfig,
 } from "../release/manifest-lib.ts";
@@ -127,16 +127,6 @@ export const R2_MAX_BUCKET_NAME_LENGTH = 63;
 export const MAX_PREVIEW_NAME_LENGTH = 28;
 const PREVIEW_NAME_HASH_LENGTH = 8;
 
-
-/**
- * The service binding name a gatekeeper is bound as: `gatekeeper-mcp-portal` ->
- * `GATEKEEPER_MCP_PORTAL`. Both the router (router/src/index.ts) and the backend
- * (buildGatekeeperVendorMap) discover gatekeepers by scanning for this prefix, so the name is
- * the wiring — nothing references a specific gatekeeper.
- */
-export function gatekeeperBindingName(pkgName: string): string {
-  return pkgName.toUpperCase().replaceAll("-", "_");
-}
 
 /**
  * A worker's preview URL, in Cloudflare's fixed `<preview>-<worker>.<subdomain>.workers.dev`
@@ -317,9 +307,12 @@ function applyGatekeeper(
 ): void {
   config.vars = {
     ...config.vars,
-    // Every gatekeeper is mounted under the router's origin, exactly as manifest-lib.ts
-    // templates it for real instances ($PUBLIC_BASE_URL/gatekeeper/<short>).
-    BASE_URL: `${baseUrl}/gatekeeper/${gatekeeperShortName(pkgName)}`,
+    // Every gatekeeper is mounted under the router's origin at the folded release shortName —
+    // the same URL manifest-lib.ts templates for real instances
+    // ($PUBLIC_BASE_URL/gatekeeper/<short>) and the one customer deployments registered their
+    // OAuth redirect URIs against, so a preview exercises the URLs production actually serves
+    // (gatekeeper-mcp-portal is "mcpportal").
+    BASE_URL: `${baseUrl}/gatekeeper/${releaseShortName(pkgName)}`,
   };
   config.previews = {
     observability: previewObservability(config),

@@ -37,7 +37,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
 import {
-  gatekeeperShortName, isGatekeeperPackage, type DeployablePackage,
+  isGatekeeperPackage, releaseShortName, type DeployablePackage,
 } from "../release/manifest-lib.ts";
 import {
   ROOT,
@@ -603,7 +603,7 @@ async function deploy({ dryRun }: { dryRun: boolean }): Promise<void> {
     for (const pkg of gatekeepers) {
       const oauth = oauthApps.get(pkg.name);
       console.log(`    ${pkg.name} ` +
-          `(no hostname; served at ${baseUrl}/gatekeeper/${gatekeeperShortName(pkg.name)})` +
+          `(no hostname; served at ${baseUrl}/gatekeeper/${releaseShortName(pkg.name)})` +
           (oauth ? `, holding the ${Object.keys(oauth).join(", ")} secrets` : ""));
     }
     console.log(`  tier 2: ${backend.name} (no hostname; served at ` +
