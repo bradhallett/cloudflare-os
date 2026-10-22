@@ -1,8 +1,9 @@
 // The cursor every listing returns. It keeps the kit cursors' contract -- each page is authorized
 // before it leaves, a refused page is held and re-offered exactly, a walk ends at `null` -- but
 // makes exactly one X request per `next()`. The kit's `TokenCursor` fills a whole local page,
-// fetching again (up to ten times) whenever X returns fewer rows than asked; on X every row fetched
-// is billed, so a cursor must never read rows the caller did not ask for.
+// fetching again whenever X returns fewer rows than asked (twice per call by default, and a
+// constructor may opt in to more); on X every row fetched is billed, so a cursor must never read
+// rows the caller did not ask for.
 
 import { RpcTarget } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
