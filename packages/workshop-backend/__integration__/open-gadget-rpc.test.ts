@@ -83,8 +83,7 @@ async function openRejection(
   return await rejection(workspace.getMetadata());
 }
 
-// TODO: This test suite keeps timing out in CI, skipping for now.
-describe.skip("openGadget errors across native RPC and Cap'n Web", () => {
+describe("openGadget errors across native RPC and Cap'n Web", () => {
   it("retains enumerable Error.code at the native Durable Object boundary", async () => {
     const code = OPEN_GADGET_ERROR_CODES.workspaceNotFound;
     const local = createOpenGadgetError(code);
