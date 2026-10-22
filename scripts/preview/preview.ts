@@ -138,13 +138,19 @@ const API_CONCURRENCY = 8;
 // `namespace_id: undefined`, and both silently drop `preview_id` from a service binding — which
 // would leave the whole instance wired to the baselines, and which the Previews documentation
 // lists as a limitation. So the deploy runs on the draft build from
-// https://github.com/cloudflare/workers-sdk/pull/14416 instead, installed into a tmpdir. It pulls
-// matching workers-sdk workspace packages from pkg.pr.new, hence the exotic-subdeps opt-out.
+// https://github.com/cloudflare/workers-sdk/pull/14416 instead, installed into a tmpdir.
+//
+// Pinned to the PR's head commit, not its number: pkg.pr.new's `@14416` form floats to whatever
+// the branch head is on any given day (and stops resolving if the PR closes or is merged), while
+// `@<commit>` addresses the tarball built from that exact commit — whose workers-sdk workspace
+// siblings (miniflare, @cloudflare/kv-asset-handler, ...) pkg.pr.new rewrites to URLs pinned at
+// the same commit, so the whole dependency closure is fixed bytes. A new head is a deliberate
+// re-pin: read the PR, then replace the commit here.
 //
 // Drop all of this — and set PREVIEW_WRANGLER=pnpm-exec-wrangler in the meantime to check — once
 // both features ship: `preview_id` appearing in a released `config-schema.json` under
 // `PreviewsConfig.properties.services.items.properties` is the signal.
-const WRANGLER_PACKAGE = "https://pkg.pr.new/wrangler@14416";
+const WRANGLER_PACKAGE = "https://pkg.pr.new/wrangler@cf6cd82520e3e4b551ab802a336ede61b1f87bc8";
 
 // The one command the draft build cannot run. A worker's Preview base config is the
 // `previews_base_config` field of the Workers API, and the draft writes it under a name the API
@@ -249,6 +255,10 @@ function preparePreviewWrangler(): PreviewWrangler {
 
   return {
     command: join(installDir, "node_modules", ".bin", "wrangler"),
+    // --config.blockExoticSubdeps=false is required, not relaxed hygiene: pkg.pr.new rewrites the
+    // draft's workers-sdk workspace siblings (miniflare, @cloudflare/kv-asset-handler, ...) into
+    // URL dependencies, and pnpm refuses exotic (URL) *sub*dependencies by default — without the
+    // opt-out the install fails rather than substituting registry versions.
     ready: runAsync("pnpm",
         ["--config.blockExoticSubdeps=false", "--dir", installDir, "install"]),
     cleanup: () => rmSync(installDir, { recursive: true, force: true }),
