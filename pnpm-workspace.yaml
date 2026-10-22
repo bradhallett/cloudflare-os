@@ -39,7 +39,13 @@ catalog:
   # drives. Playwright's browsers are not dependencies: `playwright install chromium` fetches them.
   '@vitest/browser-playwright': ^5.0.5
   playwright: ^1.64.0
-  wrangler: ^4.147.0
+  # Exact, not ranged: build-release.ts bundles every deployable worker with this wrangler and
+  # records the version in the release manifest, so the "byte-identical builds" guarantee lasts
+  # only as long as the version cannot move. A range here would let a routine lockfile bump swap
+  # in a newer wrangler and re-bundle every worker (hash churn, R2 dedup loss) with no code
+  # change to review. Bumping wrangler is now a deliberate edit on this line, like miniflare and
+  # typescript above.
+  wrangler: 4.147.0
   zod: ^4.6.5
 
 overrides:
