@@ -16,6 +16,7 @@ import { useSiteName } from '../../ServerConfigContext'
 import SiteLogo from '../SiteLogo'
 import { useGatekeeperApps } from '../../useGatekeeperApps'
 import { openCommandPalette } from './commandPaletteBus'
+import { formatHotkey, useIsApple } from '@gadgets/ui/hotkey'
 import SidebarItem from './SidebarItem'
 import {
   SidebarWorkspacesProvider,
@@ -45,6 +46,7 @@ export default function Sidebar({
   onToggleCollapsed: () => void
 }) {
   const siteName = useSiteName()
+  const isApple = useIsApple()
   // Gatekeeper-served management apps the user can reach now (one per gatekeeper that provides a UI
   // and is connected / enabled for everyone). Disabled or not-yet-connected ones aren't returned, so
   // they simply don't appear. The set is fully dynamic — no gatekeeper is hardcoded.
@@ -84,7 +86,7 @@ export default function Sidebar({
               type="button"
               onClick={() => openCommandPalette()}
               aria-label="Search"
-              title="Search (⌘K)"
+              title={`Search (${formatHotkey('mod+k', isApple)})`}
               className="press flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-kumo-inactive transition-colors hover:bg-kumo-tint hover:text-kumo-default"
             >
               <MagnifyingGlass size={15} />

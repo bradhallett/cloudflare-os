@@ -8,6 +8,10 @@
       "types": "./src/index.ts",
       "import": "./src/index.ts"
     },
+    "./hotkey": {
+      "types": "./src/hotkey.ts",
+      "import": "./src/hotkey.ts"
+    },
     "./hierarchical-list": {
       "types": "./src/HierarchicalList/index.ts",
       "import": "./src/HierarchicalList/index.ts"
