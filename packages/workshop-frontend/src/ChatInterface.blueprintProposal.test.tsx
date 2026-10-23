@@ -47,7 +47,7 @@ vi.mock('@cloudflare/kumo', async (importOriginal) => {
 
 vi.mock('./AuthContext', () => {
   const context = {
-    authenticatedApi: { listGatekeeperVendors: async () => [] },
+    authenticatedApi: { listGatekeeperVendors: async () => [], listBots: async () => [] },
     currentUser: null,
   }
   return {
@@ -138,12 +138,14 @@ async function renderProposalChat(options: {
     getChatMessage: async () => null,
     getChatHistory: async () => ({ messages: options.history }),
     listChats: async () => [options.metadata ?? chatMetadata()],
+    listBots: async () => [],
     listModels: async () => [],
     onRpcBroken: () => {},
     subscribeToChat: (next: AiChatSubscriber) => {
       subscriber = next
       return { [Symbol.dispose]: () => {} }
     },
+    viewChat: () => ({ [Symbol.dispose]: () => {} }),
     readFilesAtCommit: async (commitId: string, paths: string[]) =>
       paths.map((path): [string, FileAtCommit] => {
         const text = options.commits?.[commitId]?.[path]

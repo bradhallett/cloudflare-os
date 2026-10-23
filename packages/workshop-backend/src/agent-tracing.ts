@@ -13,8 +13,15 @@ import { obsContext } from "./observability";
 
 type Attributes = Record<string, string | number | boolean | undefined>;
 
-// A spawned chat runs as a separate subagent.
+// A spawned chat runs as a separate subagent; a chat running as a declared bot names the bot,
+// sanitized (lowercased, non-alphanumerics collapsed) the way the Agents dashboard likes its
+// agent names. Never the raw name: tracing attributes are not a place for free text.
 function agentName(context: AiChatAgentContext): string {
+  if (context.botConfig) {
+    let sanitized = context.botConfig.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "").slice(0, 40);
+    return `workshop-bot-${sanitized || "bot"}`;
+  }
   return context.spawnerConfig ? "workshop-subagent" : "workshop-agent";
 }
 

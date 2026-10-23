@@ -44,7 +44,7 @@ vi.mock('@cloudflare/kumo', async (importOriginal) => {
 
 vi.mock('./AuthContext', () => {
   const context = {
-    authenticatedApi: { listGatekeeperVendors: async () => [] },
+    authenticatedApi: { listGatekeeperVendors: async () => [], listBots: async () => [] },
     currentUser: null,
   }
   return {
@@ -116,12 +116,14 @@ async function openChat(
     getChatMessage: async () => null,
     getChatHistory,
     listChats: async () => [metadata(0)],
+    listBots: async () => [],
     listModels: async () => [],
     onRpcBroken: () => {},
     subscribeToChat: (next: AiChatSubscriber) => {
       subscriber = next
       return { [Symbol.dispose]: () => {} }
     },
+    viewChat: () => ({ [Symbol.dispose]: () => {} }),
   })
   await testRoot.render(
     <ChatInterface

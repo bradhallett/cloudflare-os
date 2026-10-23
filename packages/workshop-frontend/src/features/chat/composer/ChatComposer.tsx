@@ -13,6 +13,8 @@ import { Brain, DotsThree, File as FileIcon } from "@phosphor-icons/react";
 import { RpcStub } from "capnweb";
 import type {
   AiChatAuthorInfo,
+  BotInfo,
+  BotSelection,
   CapsuleSpecifier,
   ChatAttachmentHandle,
   GatekeeperClient,
@@ -85,6 +87,11 @@ export const ChatComposer = ({
   models,
   selectedModel,
   onModelChange,
+  bots,
+  selectedBot,
+  onBotChange,
+  showModels,
+  staleBotName,
   pendingConsoleLogCount = 0,
   consoleLogPreview = "",
   consoleLogSeverity = "info",
@@ -120,11 +127,30 @@ export const ChatComposer = ({
     capsules?: CapsuleSpecifier[],
     attachments?: ChatAttachmentHandle[],
     formats?: MessageFormatRef[],
+    /**
+     * The agent-pick the send rides on: a BotSelection switches the chat to that bot, "none"
+     * runs it as a bare model, and undefined leaves the chat's agent as is. Absent on steers —
+     * a running turn cannot switch agents.
+     */
+    bot?: BotSelection | "none",
   ) => Promise<void> | void;
   isAgentActive: boolean;
   models: AiChatAuthorInfo[];
   selectedModel: SelectedModel;
   onModelChange: (modelId: string | null) => void;
+  /** Bots offered in the composer's agent picker (see ComposerModelSelector). */
+  bots?: BotInfo[];
+  /** The bot the picker selects, or null when a model or "No agent" answers the chat. */
+  selectedBot?: BotSelection | null;
+  /** Chooses a bot in the agent picker; null returns to a bare model. */
+  onBotChange?: (bot: BotSelection | null) => void;
+  /**
+   * Whether the picker offers the raw model list (in-chat composers only). Intake composers offer
+   * the default model as "Default agent" instead.
+   */
+  showModels?: boolean;
+  /** The chat's own bot name when that bot no longer resolves; shown as a disabled picker row. */
+  staleBotName?: string;
   pendingConsoleLogCount?: number;
   consoleLogPreview?: string;
   consoleLogSeverity?: "error" | "warn" | "info";
@@ -523,10 +549,22 @@ export const ChatComposer = ({
       const { message, capsules: capsuleSpecifiers, formats: formatRefs } =
         submissionResult.submission;
 
+      // The picker's single choice of who answers. Intake names the bot for the chat being
+      // created; in-chat, an idle chat gets the explicit pick ("none" clears the bot) while a
+      // running turn keeps its agent — steers pass no bot.
+      const sendBot = onBotChange == null
+        ? undefined
+        : newChat
+          ? selectedBot ?? undefined
+          : isAgentActive
+            ? undefined
+            : selectedBot ?? "none";
+
       await onSend(message, selectedModel?.id ?? null,
           capsuleSpecifiers,
           readyAttachments.length ? readyAttachments : undefined,
-          formatRefs);
+          formatRefs,
+          sendBot);
       clearSentAttachments(attachmentsSnapshot);
       if (!completeDraftSend(draftSend)) return;
       replaceComposerDocument({ text: "", capsules: [], formats: [], command: null });
@@ -764,7 +802,7 @@ export const ChatComposer = ({
           onRemove={removeAttachment}
         />
         {/* Textarea */}
-        <div className="relative px-4 pb-1 pt-3">
+        <div className="relative px-4 pb-2.5 pt-3">
           {slashCommandPicker.popup}
           {/* The resolved command is marked by color alone, so announce it for screen readers. */}
           <div className="sr-only" aria-live="polite">
@@ -1008,6 +1046,11 @@ export const ChatComposer = ({
                 models={models}
                 selectedModel={selectedModel}
                 onModelChange={onModelChange}
+                bots={bots}
+                selectedBot={selectedBot ?? null}
+                onBotChange={onBotChange}
+                showModels={showModels}
+                staleBotName={staleBotName}
               />
               {isAgentActive && onStop && (
                 // A steer still being sent can't be handed back to the draft yet.

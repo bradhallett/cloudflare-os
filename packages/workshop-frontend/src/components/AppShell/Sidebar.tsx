@@ -7,6 +7,7 @@ import {
   Hexagon,
   House,
   MagnifyingGlass,
+  Robot,
   SidebarSimple,
   SquaresFour,
   Stack,
@@ -135,6 +136,12 @@ export default function Sidebar({
               to="/blueprints"
               label="Blueprints"
               icon={<Blueprint size={14} weight="regular" />}
+              collapsed={collapsed}
+            />
+            <SidebarItem
+              to="/bots"
+              label="Bots"
+              icon={<Robot size={14} weight="regular" />}
               collapsed={collapsed}
             />
             <SidebarItem

@@ -119,6 +119,8 @@ export interface WranglerConfig {
   services?: ServiceBinding[];
   /** Browser Rendering binding (Gadget PDF exports). */
   browser?: BindingDecl;
+  /** This Worker version's metadata (the backend's, so a session can tell it is out of date). */
+  version_metadata?: BindingDecl;
   /**
    * Workers AI binding of a worker that declares its own (gatekeeper-websearch, gatekeeper-google).
    * The backend's `WORKERS_AI` is hardcoded in buildWorkerEntry instead, which refuses one in its
@@ -260,6 +262,8 @@ const HANDLED_CONFIG_KEYS = new Set([
   // Workers AI, for a gatekeeper that calls it itself (gatekeeper-websearch's searches,
   // gatekeeper-google's Drive PDF reading). Placeholder-free, like browser.
   "ai",
+  // The Worker version's metadata. Placeholder-free, like browser.
+  "version_metadata",
   // gatekeeper-context's Artifacts binding is closed-beta and cannot be provisioned in arbitrary
   // user accounts; it is dropped from customer manifests (the gatekeeper degrades gracefully).
   "artifacts",
@@ -462,6 +466,9 @@ export function buildWorkerEntry(
   if (config.ai) {
     // Like browser: `remote` is dev-only.
     bindings.push({ type: "ai", name: config.ai.binding });
+  }
+  if (config.version_metadata) {
+    bindings.push({ type: "version_metadata", name: config.version_metadata.binding });
   }
   for (const loader of config.worker_loaders ?? []) {
     bindings.push({ type: "worker_loader", name: loader.binding });

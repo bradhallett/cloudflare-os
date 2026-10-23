@@ -1,7 +1,8 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, type DeviceSessionHandoffStart } from '@gadgets/workshop-shared/api';
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, type DeviceSessionHandoffStart, type BotDefinition, type BotInfo, type BotSelection, type BotSkillChoice, type BotSkillRef } from '@gadgets/workshop-shared/api';
 import { ActionDescription, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperUserSelection, GatekeeperUserSelectionExchange, RedeemedGatekeeperUserSelection } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
+import { botKey, normalizeBotDefinition } from "./bot-config.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
@@ -65,6 +66,13 @@ type ResourceCreatorStub = Required<Pick<GatekeeperVendor, "createResource">>;
 type SingletonAccountStub = Required<Pick<GatekeeperUser, "getSingletonGatekeeperClass" | "startAppUi">>;
 type CreationConfiguratorStub = Required<Pick<GatekeeperUser, "startCreationConfigurator">>;
 
+// getSlashCommandProvider is optional on Gatekeeper (present exactly when the gatekeeper offers
+// slash commands), so a facet that offers them is viewed through the required-method shape, the
+// same derived Pick+Required view slash-commands.ts uses.
+type SlashCommandGatekeeperStub = Fetcher<Gatekeeper<any> & Required<
+  Pick<Gatekeeper<any>, "getSlashCommandProvider">
+>>;
+
 function areCredentialsValid(record: ConnectedAccountRecord): boolean {
   if (record.credentialsExpired) return false;
   if (record.credentialExpiresAt && record.credentialExpiresAt.valueOf() < Date.now()) return false;
@@ -124,10 +132,27 @@ function resolveWithheldSecrets(
   };
 }
 
+/**
+ * A declared bot as resolved for a chat: its selection plus its definition, which is normalized
+ * where it is stored (the user's bots at create/update, deployment bots in admin config). This is
+ * the identity a chat snapshots at start; it is not re-resolved per turn, so a later edit or
+ * deletion never rewrites a running chat.
+ */
+export type ResolvedUserBot = {
+  selection: BotSelection;
+  name: string;
+  description?: string;
+  instructions: string;
+  modelId: string;
+  skills: BotSkillRef[];
+};
+
 export type UserChatContext = {
   profile: AiChatAuthorInfo;
   aiModel?: UserAiModelRecord;
   quickModel?: AiModelConfig;
+  /** The bot the chat runs as, when one was selected at intake; `aiModel` is then its model. */
+  bot?: ResolvedUserBot;
 }
 
 function isFullyCreated(g: GadgetRecord): g is GadgetMetadataWithTimestamps {
@@ -848,9 +873,19 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /** DO NOT MAKE PUBLIC -- returns API keys. Pure read: call sites replay it across DO resets
-   * via retryOnDoReset, so it must stay free of writes and side effects. */
-  async getChatContext(modelId: string | null): Promise<UserChatContext> {
-    return this.#getChatContext(modelId, await getGatewayModels(this.env));
+   * via retryOnDoReset, so it must stay free of writes and side effects.
+   *
+   * `bot` names a declared bot to run the chat as (see listBots) and wins over `modelId`: the
+   * chat runs on the bot's declared model. A bot or model that no longer resolves throws visibly
+   * here, never a silent fallback to another model. */
+  async getChatContext(modelId: string | null, bot?: BotSelection): Promise<UserChatContext> {
+    let models = await getGatewayModels(this.env);
+    let result = this.#getChatContext(bot === undefined ? modelId : null, models);
+    if (bot !== undefined) {
+      result.bot = await this.#resolveBot(bot);
+      result.aiModel = this.#requireModel(result.bot.modelId, models);
+    }
+    return result;
   }
 
   #getChatContext(modelId: string | null, models: GatewayModels | null): UserChatContext {
@@ -858,15 +893,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       profile: this.storage.profile.get()
     };
     if (modelId) {
-      result.aiModel = this.#resolveModel(modelId, models);
-      if (!result.aiModel) {
-        models?.refuseDisabled(modelId);
-        // No gateway model has the ID, so a stored model with it is one the deployment keeps
-        // users from running.
-        let stored = this.storage.aiModels.get(modelId);
-        if (stored) models?.refuseUserModel(stored.profile.name);
-        throw new Error(`No such model: ${modelId}`);
-      }
+      result.aiModel = this.#requireModel(modelId, models);
     }
 
     // Resolve the quick model (used for lightweight tasks like title generation).
@@ -883,6 +910,36 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       }
     }
     return result;
+  }
+
+  // Resolve a model ID the way chats do (see #resolveModel), refusing visibly -- with the most
+  // specific reason the ID doesn't resolve -- when it doesn't. Shared by the plain-model and bot
+  // paths of getChatContext, so a bot's model refuses exactly like a hand-picked one.
+  #requireModel(id: string, models: GatewayModels | null): UserAiModelRecord {
+    let record = this.#resolveModel(id, models);
+    if (record) return record;
+    models?.refuseDisabled(id);
+    // No gateway model has the ID, so a stored model with it is one the deployment keeps
+    // users from running.
+    let stored = this.storage.aiModels.get(id);
+    if (stored) models?.refuseUserModel(stored.profile.name);
+    throw new Error(`No such model: ${id}`);
+  }
+
+  // The declaration a BotSelection names: the user's own bots from storage, the deployment's
+  // from the admin config's KV mirror (normalized where it is stored). A bot that no longer
+  // exists throws visibly (`No such bot: <key>`) rather than degrading to a bare-model chat,
+  // which would silently run a different agent than the one picked.
+  async #resolveBot(selection: BotSelection): Promise<ResolvedUserBot> {
+    if (selection.scope === "user") {
+      let record = this.storage.bots.get(selection.id);
+      if (!record) throw new Error(`No such bot: ${botKey(selection)}`);
+      return {selection, ...record.def};
+    }
+    let deployment = (await readAdminConfig(this.env)).deploymentBots
+        .find(bot => bot.id === selection.id);
+    if (!deployment) throw new Error(`No such bot: ${botKey(selection)}`);
+    return {selection, ...deployment.def};
   }
 
   async getExternalMessageChatContext(existingChatModelId: string | null): Promise<UserChatContext> {
@@ -908,6 +965,138 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   #resolveModel(id: string, models: GatewayModels | null): UserAiModelRecord | undefined {
     if (models?.get(id)) return models.resolve(id);
     return models && !models.userModels ? undefined : this.storage.aiModels.get(id);
+  }
+
+  // --- Declared bots (see the Bot* types in @gadgets/workshop-shared/api) ---
+
+  /**
+   * List the bots offered to this user: their own plus the deployment's, merged. A bot whose
+   * model no longer resolves for this user is listed `available: false` (with the reason) rather
+   * than dropped, so it stays visible wherever it was picked and its chats refuse visibly at
+   * start instead of mysteriously changing agent.
+   */
+  async listBots(): Promise<BotInfo[]> {
+    let models = await getGatewayModels(this.env);
+    let result: BotInfo[] = [];
+    for (let record of this.storage.bots.list()) {
+      result.push(this.#botInfo({scope: "user", id: record.id}, record.def, models));
+    }
+    for (let {id, def} of (await readAdminConfig(this.env)).deploymentBots) {
+      result.push(this.#botInfo({scope: "deployment", id}, def, models));
+    }
+    return result;
+  }
+
+  #botInfo(selection: BotSelection, def: BotDefinition, models: GatewayModels | null): BotInfo {
+    let model = this.#resolveModel(def.modelId, models);
+    return {
+      selection,
+      name: def.name,
+      ...(def.description ? {description: def.description} : {}),
+      modelId: def.modelId,
+      ...(model ? {modelName: model.profile.name} : {}),
+      available: model !== undefined,
+      ...(model ? {} : {unavailableReason: "Model not available to you"}),
+    };
+  }
+
+  /** One of this user's own bots' definitions, as stored (deployment bots are listBots' metadata). */
+  async getBot(id: string): Promise<BotDefinition> {
+    let record = this.storage.bots.get(id);
+    if (!record) throw new Error(`No such bot: ${botKey({scope: "user", id})}`);
+    return record.def;
+  }
+
+  /** Create a bot owned by this user, returning its id. The name must be unique among the user's
+   * own bots; the definition is capped and trimmed by normalizeBotDefinition. */
+  async createBot(def: BotDefinition): Promise<string> {
+    let normalized = normalizeBotDefinition(def);
+    this.#assertBotNameFree(normalized.name);
+    let next = this.storage.nextBotId.get();
+    this.storage.nextBotId.put(next + 1);
+    this.storage.bots.put({id: String(next), def: normalized, created: new Date()});
+    return String(next);
+  }
+
+  /** Replace one of this user's own bots' definitions, keeping its id (and so every chat's
+   * selection of it) stable. */
+  async updateBot(id: string, def: BotDefinition): Promise<void> {
+    let record = this.storage.bots.get(id);
+    if (!record) throw new Error(`No such bot: ${botKey({scope: "user", id})}`);
+    let normalized = normalizeBotDefinition(def);
+    this.#assertBotNameFree(normalized.name, id);
+    record.def = normalized;
+    this.storage.bots.put(record);
+  }
+
+  /** Delete one of this user's own bots. Chats that used it keep their frozen snapshot, so this
+   * is a no-op on an already-deleted bot. */
+  async deleteBot(id: string): Promise<void> {
+    this.storage.bots.delete(id);
+  }
+
+  // Bot names are unique among the user's own bots (deployment bots are a separate namespace;
+  // cross-scope collisions are disambiguated by the bot key, never by refusing the name).
+  // `exceptId` keeps an updated bot's own record out of the check.
+  #assertBotNameFree(name: string, exceptId?: string): void {
+    for (let other of this.storage.bots.list()) {
+      if (other.id !== exceptId && other.def.name === name) {
+        throw new Error(`You already have a bot named "${name}".`);
+      }
+    }
+  }
+
+  /**
+   * List the skills this user can declare on a bot: the slash commands offered by their
+   * connected accounts' agent singletons (e.g. the Context Library), each carrying the vendor id
+   * a BotSkillRef stores. A vendor whose singleton can't be reached -- its class won't mint, its
+   * provider won't load -- is skipped, not fatal, exactly like the slash-command catalog.
+   */
+  async listBotSkills(): Promise<BotSkillChoice[]> {
+    // Self-sufficient like listGatekeeperApps: ambient singletons (Context) are provisioned
+    // first (idempotent), so the list works even before the user has opened a workspace.
+    await this.#ensureAutoProvisionedAccounts();
+    let config = await readAdminConfig(this.env);
+
+    let perAccount = await Promise.all([...this.#connectedAccountRecords()].map(async record => {
+      if (!record.description.singleton) return [];
+      // A "disabled" ambient gatekeeper's account stays dormant (the same test
+      // listProvidedAccounts applies): its skills are not offerable while disabled.
+      if (record.autoProvisioned && ambientGatekeeperMode(config, record.vendorId) === "disabled") {
+        return [];
+      }
+      try {
+        let cls = await this.getSingletonGatekeeperClass(record.id);
+        if (!cls) return [];
+        // The singleton runs as a facet of this DO, in the gatekeeper's own worker, exactly as
+        // the overseer installs it -- only the class reference crosses over.
+        let facet = this.ctx.facets.get<Gatekeeper<any>>(`botSkills${record.id}`, () => ({class: cls}));
+        using provider =
+            await (facet as unknown as SlashCommandGatekeeperStub).getSlashCommandProvider();
+        let providerLabel = record.description.displayName
+            ?? record.description.uniqueName ?? record.vendorId;
+        let commands = await provider.list();
+        return commands.map(command => ({
+          vendorId: record.vendorId,
+          commandId: command.id,
+          name: command.name,
+          description: command.description,
+          providerLabel,
+        }));
+      } catch (err) {
+        // "Does not implement the method" is how a singleton without slash commands answers
+        // (most do not offer any); that absence is expected, so it is not worth a warning.
+        let absent = err instanceof TypeError && /does not implement/.test(err.message);
+        logger[absent ? "debug" : "warn"]("skipping bot-skill provider", {
+          event: "bot.skill.provider.skipped", vendorId: record.vendorId,
+          accountId: record.id, error: absent ? undefined : err,
+        });
+        return [];
+      }
+    }));
+
+    return perAccount.flat().toSorted((left, right) =>
+      left.name.localeCompare(right.name) || left.commandId.localeCompare(right.commandId));
   }
 
   async listGadgets(): Promise<GadgetMetadataWithTimestamps[]> {

@@ -1,4 +1,4 @@
-import { AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AiChatStreamEvent, AlwaysAvailableResource, BlueprintBinding, BlueprintMerge, BlueprintOutput, ChatGadgetPin, ChatGadgetPinRecord, MainlineMergeGadget, WorkpieceId, type AiModelConfig, validateBindingName } from '@gadgets/workshop-shared/api';
+import { AGENT_SPAWNER_CONNECTION_ID, AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AiChatStreamEvent, AlwaysAvailableResource, BlueprintBinding, BlueprintMerge, BlueprintOutput, ChatGadgetPin, ChatGadgetPinRecord, MainlineMergeGadget, WorkpieceId, type AiModelConfig, validateBindingName } from '@gadgets/workshop-shared/api';
 import { applyCodeChange, codeChangeSerializedSize, MAX_CODE_CHANGE_SIZE, replaceSpanChange, validateCodeChangeSchema,
   type FileContent, type CodeContent, type CodeChange,
   type FileChange } from '@gadgets/workshop-shared/code-change';
@@ -28,8 +28,9 @@ import { formatInstanceInstructions } from "./admin-config";
 import type { AiGatewayLogRoute } from "./ai-gateway";
 import type { SpawnCallableOptions } from "./agent-spawner-binding";
 import { traceRejectedToolCall, traceTool } from "./agent-tracing";
+import { dedupCatalogsForBot } from "./bot-config";
 import { AgentTurnError, completeText, httpStatusFromError, zeroUsage } from "./ai-invoke";
-import type { ModelHandle } from "./ai-models";
+import type { CachedRequest, ModelHandle } from "./ai-models";
 import { blobOid } from "./git-store";
 import type {
   AiChatAgentContext, ChatBindingEntry, CompactionCheckpoint, StoredAssistantMessage,
@@ -191,11 +192,12 @@ export type ChatHistory = {
   measuredTokens: number;
 };
 
-// Why one pass of the agent returned to runAgent's loop: the turn ran to a stop; a persisted tool
-// step left the next request over the compaction trigger, so the pass ended for a reload; or the
-// pass summarized instead of prompting the model and this is the checkpoint to publish.
+// Why one pass of the agent returned to runAgent's loop: the turn ran to a stop, leaving its last
+// model request if the chat's next request will start with it; a persisted tool step left the
+// next request over the compaction trigger, so the pass ended for a reload; or the pass
+// summarized instead of prompting the model and this is the checkpoint to publish.
 type AgentPassOutcome =
-  | {type: "finished"}
+  | {type: "finished"; lastRequest?: CachedRequest}
   | {type: "reloadForCompaction"}
   | {type: "compacted"; checkpoint: CompactionCheckpoint}
   | {type: "transientFailure"; error: AgentTurnError};
@@ -244,7 +246,7 @@ async function describeBinding(
     if (!entry) throw new Error(`There is no binding named "${name}" in your env.`);
     switch (entry.type) {
       case "workpiece":
-        return hooks.describeBinding(envName, entry.id);
+        return hooks.describeBinding(envName, entry.id, chatId);
       case "value":
         return `${envName} is the arguments array of a call delivered to this agent (one ` +
             `element per parameter of the call). Any RPC stubs among them may be called directly.`;
@@ -261,7 +263,7 @@ async function describeBinding(
   if (!info) throw new Error(`There is no gadget named "${gadget}" in your env.`);
   // Mirrors the env getEnvForLoader builds: the gadget's own edges shadow GIT and GADGET.
   let edge = info.bindings.find(binding => binding.name === name);
-  if (edge) return hooks.describeBinding(envName, edge.target);
+  if (edge) return hooks.describeBinding(envName, edge.target, chatId);
   if (name === GIT_BINDING_NAME) return hooks.describeGitBinding(envName);
   if (name === "GADGET") {
     // Unlike the gadget bindings in the agent's env, a gadget's env.GADGET is
@@ -497,19 +499,20 @@ export interface AgentHooks {
                 path?: string): Promise<GrepScan>;
 
   /**
-   * Describe a workpiece (a gadget or a gatekeeper) reachable as `envName` in the chat's env,
-   * for the agent's describeBinding tool. (`envName` is provided here only so that it can be
-   * incorporated into the returned description.)
+   * Describe a workpiece (a gadget or a gatekeeper) reachable as `envName` in chat `chatId`'s
+   * env, for the agent's describeBinding tool. (`envName` is provided here only so that it can
+   * be incorporated into the returned description.)
    */
-  describeBinding(envName: string, id: WorkpieceId): Promise<string>;
+  describeBinding(envName: string, id: WorkpieceId, chatId: number): Promise<string>;
 
   /** Describe the env.GIT binding (see GIT_BINDING_NAME), for the describeBinding tool. */
   describeGitBinding(envName: string): string;
 
   /**
-   * Add a binding to the given gadget, pointing at the given workpiece. The binding is provisional
-   * to the chat. The caller is responsible for getting the addition recorded in the chat log (see
-   * `addedBindings` on the "changes" message) so the pending edge gets sequence-stamped.
+   * Add a binding to the given gadget or agent spawner, pointing at the given workpiece. The
+   * binding is provisional to the chat. The caller is responsible for getting the addition
+   * recorded in the chat log (see `addedBindings` on the "changes" message) so the pending edge
+   * gets sequence-stamped.
    */
   addGadgetBinding(gadgetId: WorkpieceId, name: string, target: WorkpieceId, chatId: number): void;
 
@@ -653,6 +656,37 @@ export interface AgentHooks {
     files: Record<string, string>, notes: string, output?: BlueprintOutput,
     merge: Omit<BlueprintMerge, "gadgetId">,
   }>;
+
+  /**
+   * Activate one of this chat's bot skills (agentContext.botSkills) by commandId or unique
+   * title, invoking it against the workspace and returning its agent-visible result text.
+   * Throws an agent-readable error when the skill is unknown, ambiguous, or no longer usable.
+   */
+  invokeBotSkill(chatId: number, skill: string): Promise<string>;
+
+  /**
+   * The bots the turn's initiator may delegate to or message (merged user + deployment bots,
+   * only the available ones), as the bot tools' descriptions list them. Empty -- and the
+   * delegateToBot/messageBot tools are omitted -- when there are none (or no initiator).
+   */
+  listDelegatableBots(chatId: number): Promise<{key: string, name: string, description?: string}[]>;
+
+  /**
+   * Run (or continue) a bot's thread as this chat's subagent and await its reply: idempotent by
+   * `toolCallId` (a re-executed tool call returns the existing child, never a duplicate), and
+   * returning the child's last reply or an honest status string when it ended without one.
+   * Refuses cycles, self-delegation, and over-deep chains with agent-readable errors.
+   */
+  runBotSubagent(chatId: number, bot: string, message: string, threadId: number | undefined,
+      toolCallId: string, signal: AbortSignal): Promise<{threadId: number, response: string}>;
+
+  /**
+   * Deliver a direct message to another bot's thread in this chat's delegation tree (waking an
+   * idle one, auto-spawning a missing one, steering a mid-turn one) or to "orchestrator" (the
+   * chat's parent). Returns confirmation text for the sender; throws an agent-readable error
+   * when the target can't be resolved or the tree's DM budget is exhausted.
+   */
+  deliverBotMessage(chatId: number, to: string, text: string): Promise<string>;
 }
 
 // =======================================================================================
@@ -945,9 +979,13 @@ export function formatMissingBlueprintBindings(
       `The blueprint's code expects the following bindings, which ${gadget} does not ` +
       `have yet. Wire up each one under the exact binding name given. For external ` +
       `resources, use setGadgetBinding on ${gadget} (first requesting a connection via ` +
-      `requestConnection if your env doesn't already hold a suitable resource). AI-model ` +
-      `and agent-spawner bindings cannot be created from chat; ask the user to add those ` +
-      `from the gadget's Connections panel.`];
+      `requestConnection if your env doesn't already hold a suitable resource). For an ` +
+      `agent-spawner binding, request a spawner via requestConnection with vendorId ` +
+      `"${AGENT_SPAWNER_CONNECTION_ID}", give it each binding its agents get with ` +
+      `setGadgetBinding on the spawner, under the name left of the \`=\`, then bind the spawner ` +
+      `into ${gadget}; a binding marked "for agent spawners only" goes only into a spawner. ` +
+      `AI-model bindings cannot be created from chat; ask the user to add those from the ` +
+      `gadget's Connections panel.`];
   for (let [name, binding] of Object.entries(bindings)) {
     let details: string;
     switch (binding.type) {
@@ -962,15 +1000,19 @@ export function formatMissingBlueprintBindings(
         details = binding.modelKind === "decision"
             ? `an AI decision model binding` : `an AI model binding`;
         break;
-      case "agentSpawner":
-        details = `an agent-spawner binding`;
+      case "agentSpawner": {
+        let env = Object.entries(binding.env).map(([envName, target]) =>
+            `${envName} = ${target.type === "gadget" ? gadget : `binding ${target.name}`}`);
+        details = `an agent-spawner binding whose agents get ${env.join(", ") || "no bindings"}`;
         break;
+      }
       default:
         binding satisfies never;
         details = `unknown`;
         break;
     }
-    lines.push(`* ${name} — ${JSON.stringify(binding.title)} (${details})` +
+    lines.push(`* ${name} — ${JSON.stringify(binding.title)} (${details}` +
+        `${binding.spawnerOnly ? `; for agent spawners only` : ``})` +
         (binding.description ? `: ${binding.description}` : ``));
   }
   return lines.join("\n");
@@ -1252,7 +1294,9 @@ The bindings in your \`env\` belong to this chat; a Gadget's code sees only the 
 
 The addition is part of your proposed changes: like code edits, it takes permanent effect when the user accepts your changes.
 
-NOTE: You do NOT need this tool to use a resource yourself with \`executeCode\` — your own bindings are already available there. ONLY use it when a Gadget's code needs the resource.
+\`gadget\` may also name an agent spawner. The binding then goes to each agent the spawner starts, and \`source\` may also be a Gadget. Spawned agents get it only once the user accepts your changes.
+
+NOTE: You do NOT need this tool to use a resource yourself with \`executeCode\` — your own bindings are already available there. ONLY use it when a Gadget's code, or a spawner's agents, need the resource.
 `.trim();
 
 let EXECUTE_CODE_INTRO = `
@@ -1296,6 +1340,8 @@ List the resource types a gatekeeper vendor offers, so you can construct a resou
 
 let REQUEST_CONNECTION_TOOL_DESCRIPTION = `
 Ask the user to connect a gatekeeper resource (e.g. a ClickHouse cluster, a GitHub repo). Pre-configure as much as you can: always pass vendorId, and pass resourceUrl when you can infer it (use listConnectableResources to learn the URL patterns). The request must resolve to a specific resource: if you pass a resourceUrl it must match one of the vendor's patterns, and if the vendor offers multiple resource types with no whole-instance option you MUST pass a matching resourceUrl. Otherwise the call is rejected with guidance and no card is shown — fix the request and try again. You also choose \`bindingName\`: the name the resource will have in your env once connected (you know why you want the resource, so pick a name that reflects its role). On success this shows the user an accept/deny card in the chat. It does NOT block: your turn ends after a successful call, and you will be resumed once the user accepts (the resource becomes available as \`env.<bindingName>\`, which you can describeBinding and use from executeCode; wire it into a Gadget with setGadgetBinding only if the Gadget's code needs it) or denies (your turn simply ends; wait for the user's next message).
+
+For a Gadget that needs AI agents of its own, rather than calling back into this chat through \`self\`, request an agent spawner: pass vendorId "${AGENT_SPAWNER_CONNECTION_ID}" and no resourceUrl. Once it is accepted, give the spawner's agents the bindings they need with setGadgetBinding on the spawner.
 `.trim();
 
 let CREATE_EXTERNAL_RESOURCE_TOOL_DESCRIPTION = `
@@ -1491,7 +1537,8 @@ const TRANSIENT_FAILURE_RETRIES = 2;
  * which the next pass compacts first, and goes again. Each compaction moves the boundary strictly
  * forward and can never pass the newest turn start, so the loop is bounded. `/compact` is done once
  * it has compacted; the model is never prompted. A pass whose model request failed transiently is
- * also run again, a bounded number of times.
+ * also run again, a bounded number of times. Resolves with the turn's last model request if the
+ * chat's next request will start with it, so keeping that request cached pays off.
  */
 export async function runAgent(
     hooks: AgentHooks,
@@ -1500,7 +1547,7 @@ export async function runAgent(
     author: AiChatAuthorInfo,
     abortSignal: AbortSignal,
     initiator: AiChatAuthorInfo,
-    modelConfig: AiModelConfig): Promise<void> {
+    modelConfig: AiModelConfig): Promise<CachedRequest | undefined> {
   // Provider retries and compaction reloads are passes of this execution, not new executions.
   const progress: AgentProgress = {
     executionId: crypto.randomUUID(),
@@ -1519,7 +1566,8 @@ export async function runAgent(
       await scheduler.wait(1000 * retries);
     }
     if (outcome.type === "compacted") hooks.commitChatCompaction(chatId, outcome.checkpoint);
-    if (outcome.type === "finished" || isCompactionTurn(history.chatMessages)) return;
+    if (outcome.type === "finished") return outcome.lastRequest;
+    if (isCompactionTurn(history.chatMessages)) return undefined;
     abortSignal.throwIfAborted();
   }
 }
@@ -2109,9 +2157,19 @@ async function runAgentPass(
   // so it stays the same when a catalog changes or the chat gains a resource; the model is told
   // instead (see AiChatAgentContext.alwaysAvailableResources). One the chat can no longer reach
   // drops out.
-  let currentResources = alwaysAvailableResources(seedBindings);
-  let listedResources = checkpoint?.alwaysAvailableResources ??
-      agentContext.alwaysAvailableResources ?? currentResources;
+  // A bot chat's declared skills appear only in its bot section (agentContext.botSection),
+  // never duplicated by the ambient catalogs: every resource stream below is filtered through
+  // the chat's resolved botSkills (an empty list passes everything through unchanged). A
+  // per-turn derived filter, never persisted, so switching bots mid-chat cannot serve a stale
+  // filtered snapshot -- the stored and checkpointed lists stay untouched, and a bot-less turn
+  // reads them unchanged.
+  let seedTargets = new Map(seedBindings.map(seed => [seed.name, seed.target]));
+  let currentResources = dedupCatalogsForBot(
+      alwaysAvailableResources(seedBindings), seedTargets, agentContext.botSkills ?? []);
+  let listedResources = dedupCatalogsForBot(
+      checkpoint?.alwaysAvailableResources ?? agentContext.alwaysAvailableResources
+          ?? currentResources,
+      seedTargets, agentContext.botSkills ?? []);
   let alwaysAvailable = listedResources.filter(listed =>
       currentResources.some(current => current.name === listed.name));
   let alwaysAvailableResourcesPrompt = alwaysAvailable.length > 0
@@ -2530,6 +2588,11 @@ async function runAgentPass(
                 case "listBlueprints":
                 case "listConnectableResources":
                 case "requestConnection":
+                  toolOutput = {text: toolCall.output ?? ""};
+                  break;
+                case "activateSkill":
+                case "delegateToBot":
+                case "messageBot":
                   toolOutput = {text: toolCall.output ?? ""};
                   break;
                 case "createExternalResource":
@@ -3158,7 +3221,12 @@ async function runAgentPass(
       SYSTEM_PROMPT,
       (standardFormats ? `${standardFormats}\n\n` : "") +
           `${savedWorkspace ?? systemPromptWorkspace}${systemPromptConnections}` +
-          (alwaysAvailableResourcesPrompt ? `\n\n${alwaysAvailableResourcesPrompt}` : ""),
+          (alwaysAvailableResourcesPrompt ? `\n\n${alwaysAvailableResourcesPrompt}` : "") +
+          // The bot section is part of the chat's identity, so it lives in the dynamic slot
+          // (slot 1): slot 0 stays byte-stable, preserving the cross-chat cache prefix, and a
+          // mid-chat bot switch costs exactly one cache miss. Only regular chats run as bots --
+          // gadget-spawned agents never do -- so the spawner branch above needs nothing.
+          (agentContext.botSection ? `\n\n${agentContext.botSection}` : ""),
     ];
   }
 
@@ -3217,6 +3285,18 @@ async function runAgentPass(
         "in the system prompt or chosen when creating it.",
   });
 
+  // Bot tools. activateSkill exists only in a bot chat; delegateToBot/messageBot exist only
+  // when the initiator has bots to talk to. None is offered to gadget-spawned agents (they are
+  // excluded by SPAWNED_AGENT_TOOLS below): no user is present to review what a bot-driven
+  // turn might do. Bot tools are for interactive chats, where the human watches the threads.
+  // The bot list is tool-advertising, not turn-critical: a user-DO or KV hiccup must not fail
+  // the pass, so it degrades to an empty list (the tools are simply omitted this turn).
+  let delegatableBots = agentContext.spawnerConfig ? []
+      : await hooks.listDelegatableBots(chatId).catch(() => []);
+  let delegatableBotsList = delegatableBots.length === 0 ? ""
+      : delegatableBots.map(bot =>
+            `- ${bot.name} (${bot.key})${bot.description ? `: ${bot.description}` : ""}`)
+          .join("\n");
   let tools: Record<string, AgentTool> = {
     readFile: defineTool({
       name: "readFile",
@@ -3552,7 +3632,7 @@ async function runAgentPass(
       description: SET_GADGET_BINDING_TOOL_DESCRIPTION,
       parameters: Type.Object({
         gadget: Type.String({
-          description: "Env binding name of the gadget whose bindings to modify.",
+          description: "Env binding name of the gadget (or agent spawner) whose bindings to modify.",
         }),
         source: Type.String({
           description: "Env binding name of the resource to wire into the gadget.",
@@ -3862,7 +3942,8 @@ async function runAgentPass(
       description: REQUEST_CONNECTION_TOOL_DESCRIPTION,
       parameters: Type.Object({
         vendorId: Type.String({
-          description: "Vendor id, as listed in the system prompt (e.g. 'github').",
+          description: "Vendor id, as listed in the system prompt (e.g. 'github'), or " +
+              `'${AGENT_SPAWNER_CONNECTION_ID}' for an agent spawner.`,
         }),
         resourceUrl: Type.Optional(Type.String({
           description:
@@ -3956,6 +4037,94 @@ async function runAgentPass(
     }),
   };
 
+  if (agentContext.botConfig) {
+    tools.activateSkill = defineTool({
+      name: "activateSkill",
+      label: "Activate skill",
+      description:
+          "Activate one of this bot's skills on demand (see the Skills section of the system " +
+          "prompt). Pass the skill's command id, or its title when unambiguous. Returns the " +
+          "skill's agent-visible result text.",
+      parameters: Type.Object({
+        skill: Type.String({
+          description: 'The skill to activate: its command id (e.g. "search") or its title.',
+        }),
+      }),
+      execute: async (toolCallId, input) => {
+        try {
+          let output = await hooks.invokeBotSkill(chatId, input.skill);
+          return toolResult(output, {output});
+        } catch (error) {
+          toolCallNotes.set(toolCallId, {error: toolErrorText(error)});
+          throw error;
+        }
+      }
+    });
+  }
+
+  if (delegatableBots.length > 0) {
+    tools.delegateToBot = defineTool({
+      name: "delegateToBot",
+      label: "Delegate to bot",
+      description:
+          "Run another bot as a subagent of this chat: it starts (or continues) its own " +
+          "visible thread, works on the task, and this chat waits for its reply. Pass " +
+          "threadId from a earlier call to send the same bot a follow-up on its thread. " +
+          "Bots available to the initiator of this chat:\n" + delegatableBotsList,
+      parameters: Type.Object({
+        bot: Type.String({
+          description: 'The bot to run, by key (e.g. "u:3" or "d:slug").',
+        }),
+        message: Type.String({
+          description: "The task for the bot, stated completely: it sees no other context " +
+              "from this chat.",
+        }),
+        threadId: Type.Optional(Type.Number({
+          description: "threadId returned by an earlier delegateToBot call, to continue that " +
+              "thread instead of starting a new one.",
+        })),
+      }),
+      execute: async (toolCallId, input) => {
+        try {
+          let result = await hooks.runBotSubagent(
+              chatId, input.bot, input.message, input.threadId, toolCallId, abortSignal);
+          let output = JSON.stringify(result);
+          return toolResult(output, {output});
+        } catch (error) {
+          toolCallNotes.set(toolCallId, {error: toolErrorText(error)});
+          throw error;
+        }
+      }
+    });
+
+    tools.messageBot = defineTool({
+      name: "messageBot",
+      label: "Message bot",
+      description:
+          'Send a direct message to another bot (or to "orchestrator", the chat that ' +
+          'delegated to this one) without waiting for a reply: an idle bot starts a turn and ' +
+          'answers in its own thread; a mid-turn bot receives it as a steer. Use ' +
+          'delegateToBot for blocking Q&A; use this to hand off, notify, or coordinate ' +
+          'asynchronously. Targets are bot keys (e.g. "u:3", "d:slug"), bot names, or ' +
+          '"orchestrator".',
+      parameters: Type.Object({
+        to: Type.String({
+          description: 'The recipient: a bot key, a bot name, or "orchestrator".',
+        }),
+        text: Type.String({description: "The message body."}),
+      }),
+      execute: async (toolCallId, input) => {
+        try {
+          let output = await hooks.deliverBotMessage(chatId, input.to, input.text);
+          return toolResult(output, {output});
+        } catch (error) {
+          toolCallNotes.set(toolCallId, {error: toolErrorText(error)});
+          throw error;
+        }
+      }
+    });
+  }
+
   if (agentContext.spawnerConfig) {
     // Restrict sub-agents to a narrower set of tools. No user is present to approve changes, so
     // they get nothing that modifies gadgets or requests connections; they can inspect and call
@@ -3977,6 +4146,10 @@ async function runAgentPass(
   // Set when the next provider request would cross the preferred compaction budget. The
   // turn_end barrier persists this step before the caller reloads durable history.
   let reloadForCompaction = false;
+
+  // Whether the request after the latest step fits under the compaction trigger, so it will start
+  // with that step's request.
+  let nextRequestFits = false;
 
   // pi 0.87 calls finishTurn before turn_end. Capture actions there so the stop decision can
   // see them; the awaited turn_end barrier then persists this same snapshot before another
@@ -4312,6 +4485,12 @@ async function runAgentPass(
       if (message.stopReason === "error" || message.stopReason === "aborted") return;
       capturedActionsForStep = hooks.consumeCapturedActions(chatId);
       if (capturedActionsForStep?.awaitDecision) awaitingActionDecision = true;
+      // The next request is this step's measured prompt plus the tool results just produced,
+      // weighed as the model will see them (pi's `details` can carry a second copy of a large
+      // output). Without usage there is nothing to measure against.
+      let measured = message.usage.totalTokens;
+      nextRequestFits = measured > 0 && !shouldCompactChat(measured + estimateProjectionTokens(
+          toolResults.map(({details: _, ...message}) => ({message}))), inputBudget);
       // The stop reasons that end the turn come first: a compaction reload must not resume work
       // that one of them ended.
       if (
@@ -4330,14 +4509,9 @@ async function runAgentPass(
       }
       // The model stopped on its own; there is no next request to make room for.
       if (toolResults.length === 0) return;
-      // Otherwise the next request is this step's measured prompt plus the tool results just
-      // produced, weighed as the model will see them (pi's `details` can carry a second copy of a
-      // large output). Without usage there is nothing to measure against, so reload: the
-      // turn-start check estimates the whole prompt, as it does for that case there.
-      let measured = message.usage.totalTokens;
-      let next = measured + estimateProjectionTokens(
-          toolResults.map(({details: _, ...message}) => ({message})));
-      if (measured <= 0 || shouldCompactChat(next, inputBudget)) {
+      // Otherwise reload when that request won't fit, or can't be measured: the turn-start check
+      // then estimates the whole prompt, as it does for that case there.
+      if (!nextRequestFits) {
         reloadForCompaction = true;
         // The rerun's fresh preview manager knows of no active file; end this one's marker here,
         // as a non-edit tool start would, so it doesn't outlive the run on the client.
@@ -4366,7 +4540,8 @@ async function runAgentPass(
     throw error;
   }
 
-  return {type: reloadForCompaction ? "reloadForCompaction" : "finished"};
+  if (reloadForCompaction) return {type: "reloadForCompaction"};
+  return {type: "finished", lastRequest: nextRequestFits ? handle.lastRequest : undefined};
 }
 
 /**

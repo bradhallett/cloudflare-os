@@ -153,15 +153,14 @@ function relaxedHeader(instance: { raw: string }): string {
 /**
  * Canonicalizes the body per RFC 6376 section 3.4: simple keeps bytes as-is; relaxed collapses
  * WSP runs and strips line-trailing WSP. Both drop trailing empty lines and ensure a final CRLF
- * on a non-empty body. `limit` implements the l= tag (bytes of canonical body to hash).
+ * on a non-empty body.
  */
-function canonicalizeBody(body: string, mode: "simple" | "relaxed", limit: number | null): string {
+function canonicalizeBody(body: string, mode: "simple" | "relaxed"): string {
   let canonical = mode === "relaxed"
       ? body.split("\r\n").map(line => line.replace(/[ \t]+/g, " ").replace(/[ \t]+$/g, "")).join("\r\n")
       : body;
   canonical = canonical.replace(/(?:\r\n)*$/, "");
   if (canonical.length > 0) canonical += "\r\n";
-  if (limit != null && limit < canonical.length) canonical = canonical.slice(0, limit);
   return canonical;
 }
 
@@ -237,6 +236,11 @@ async function verifySignature(signature: HeaderInstance, message: ParsedMessage
   let headerNames = headerList.split(":").map(name => name.trim().toLowerCase()).filter(Boolean);
   if (!headerNames.includes("from")) return null;  // RFC 6376 5.4: From MUST be signed
 
+  // RFC 5322 allows exactly one From field. With several, the instance a mail client displays
+  // need not be the one this signature verified (h= selection is bottom-up); with none, there
+  // is no sender to vouch for at all. Fail the signature rather than guess which one counts.
+  if (message.instances.filter(instance => instance.lower === "from").length !== 1) return null;
+
   let canon = tags.get("c") ?? "simple/simple";
   let [headerMode, bodyMode = "simple"] = canon.split("/");
   if (headerMode !== "simple" && headerMode !== "relaxed") return null;
@@ -251,10 +255,12 @@ async function verifySignature(signature: HeaderInstance, message: ParsedMessage
   let expires = tags.get("x");
   if (expires != null && (!/^\d+$/.test(expires) || Number(expires) * 1000 < now)) return null;
 
+  let canonicalBody = canonicalizeBody(message.body, bodyMode);
+  // RFC 6376's l= tag signs only a prefix of the body, so content appended after the signed
+  // prefix would still verify. Accept l= only when it covers the canonical body exactly; a
+  // partial, over-long, or non-numeric l= fails the signature outright.
   let limit = tags.get("l");
-  let bodyLimit = limit != null && /^\d+$/.test(limit) ? Number(limit) : null;
-
-  let canonicalBody = canonicalizeBody(message.body, bodyMode, bodyLimit);
+  if (limit != null && (!/^\d+$/.test(limit) || Number(limit) !== canonicalBody.length)) return null;
   let computedBodyHash = new Uint8Array(
       await crypto.subtle.digest("SHA-256", latin1Encode(canonicalBody)));
   if (b64encode(computedBodyHash) !== bodyHash.replace(/[ \t]/g, "")) return null;
@@ -279,12 +285,18 @@ async function verifySignature(signature: HeaderInstance, message: ParsedMessage
   let stripped = stripBTag(signature.raw);
   input += headerMode === "simple" ? stripped : relaxedHeader({ raw: stripped });
 
-  let verified = algorithm === "rsa-sha256"
-      ? await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, b64decode(signatureValue),
-            latin1Encode(input))
-      : await crypto.subtle.verify({ name: "Ed25519" }, key, b64decode(signatureValue),
-            latin1Encode(input));
-  return verified ? domain : null;
+  // b64decode throws on a malformed b=; contain that (and any crypto-provider rejection) to
+  // this signature, as the key-record path does, so a later DKIM-Signature still gets a chance.
+  try {
+    let verified = algorithm === "rsa-sha256"
+        ? await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, b64decode(signatureValue),
+              latin1Encode(input))
+        : await crypto.subtle.verify({ name: "Ed25519" }, key, b64decode(signatureValue),
+              latin1Encode(input));
+    return verified ? domain : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

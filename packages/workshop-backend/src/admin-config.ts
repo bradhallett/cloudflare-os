@@ -9,8 +9,9 @@
 // changed by a compromised admin session. Everything here is enabled by default; the admin UI opts
 // things *out*.
 
-import { AiModelProvider, AmbientGatekeeperMode, BlueprintBinding, BlueprintMetadata, BlueprintOutput, DEFAULT_BANNER_COLOR, GatewayModel, GatewayModelCapabilities, GatewayModelMode, GatewayModelSettings, MAX_UPDATE_CHECK_INTERVAL_MINUTES, MAX_UPDATE_HOURS, OutputFormatOffer, REASONING_LEVELS, SUGGESTED_MODELS, isAmbientGatekeeperMode, isBannerColor, isGatewayModelMode, isOutputIcon, isReasoningLevel } from "@gadgets/workshop-shared/api";
+import { AiModelProvider, AmbientGatekeeperMode, BlueprintBinding, BlueprintMetadata, BlueprintOutput, BotDefinition, DEFAULT_BANNER_COLOR, GatewayModel, GatewayModelCapabilities, GatewayModelMode, GatewayModelSettings, MAX_UPDATE_CHECK_INTERVAL_MINUTES, MAX_UPDATE_HOURS, OutputFormatOffer, REASONING_LEVELS, SUGGESTED_MODELS, isAmbientGatekeeperMode, isBannerColor, isGatewayModelMode, isOutputIcon, isReasoningLevel } from "@gadgets/workshop-shared/api";
 import { SupportedResource } from "@gadgets/workshop-shared/gatekeeper";
+import { normalizeBotDefinition } from "./bot-config.js";
 import { sanitizeBlueprintOutput } from "./blueprint-archive.js";
 import { DEFAULT_ADMIN_CONFIG, type AdminConfig, type FormatCuration } from "./storage-schema/admin-settings-storage.js";
 import { ADMIN_CONFIG_KEY, BlueprintKvEnv, readBlueprintKvRecord } from "./storage-schema/blueprints-kv.js";
@@ -281,6 +282,32 @@ function parseAddedModels(value: unknown): GatewayModel[] {
 }
 
 /**
+ * Accept a stored deployment bot only if it is well-formed: a lowercase slug id and a
+ * normalizable definition (normalizeBotDefinition throws on unusable input, so a malformed
+ * stored entry is dropped, like parseFormats drops one). Only the first entry under each id
+ * counts.
+ */
+export function parseDeploymentBots(value: unknown): {id: string; def: BotDefinition}[] {
+  if (!Array.isArray(value)) return [];
+  let bots: {id: string; def: BotDefinition}[] = [];
+  let seen = new Set<string>();
+  for (let entry of value) {
+    if (typeof entry !== "object" || entry === null || !("id" in entry) || !("def" in entry)) continue;
+    let {id, def} = entry;
+    if (typeof id !== "string" || !/^[a-z0-9][a-z0-9-]*$/.test(id) || seen.has(id)) continue;
+    if (typeof def !== "object" || def === null || !("name" in def)) continue;
+    try {
+      let normalized = normalizeBotDefinition(def);
+      seen.add(id);
+      bots.push({id, def: normalized});
+    } catch {
+      // A malformed stored entry is one not made.
+    }
+  }
+  return bots;
+}
+
+/**
  * Whether `value` may be the minimum age or the notice snooze of the update notice: a whole number
  * of hours from 0 to MAX_UPDATE_HOURS.
  */
@@ -353,6 +380,7 @@ export function normalizeAdminConfig(p: Partial<AdminConfig>): AdminConfig {
     disabledGatekeepers: strings(p.disabledGatekeepers).map(v => v.toLowerCase()),
     ambientGatekeeperModes,
     formats: parseFormats(p.formats),
+    deploymentBots: parseDeploymentBots(p.deploymentBots),
     modelModes,
     addedProviders: Array.isArray(p.addedProviders)
       ? [...new Set(p.addedProviders.filter(isProvider))]

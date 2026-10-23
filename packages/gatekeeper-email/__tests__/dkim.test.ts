@@ -13,7 +13,7 @@ function toBase64(bytes: Uint8Array): string {
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
   return btoa(binary);
 }
-function toBytes(text: string): Uint8Array {
+function toBytes(text: string): Uint8Array<ArrayBuffer> {
   let out = new Uint8Array(text.length);
   for (let i = 0; i < text.length; i++) out[i] = text.charCodeAt(i) & 0xff;
   return out;
@@ -282,14 +282,63 @@ describe("verifyDkim", () => {
         { status: "aligned", domain: "example.org" });
   });
 
-  it("hashes only the l= prefixed body bytes when l= is present", async () => {
-    // sign over the first body line only, then append unsigned content after it
-    let body = "Hi.\r\n\r\nAre you hungry yet?\r\n";
+  it("fails a signature whose l= covers only part of the canonical body", async () => {
+    // l= signs a body prefix, so content appended after the signed prefix used to verify too;
+    // the appended attack below must fail the signature instead of aligning it.
     let limit = "Hi.\r\n".length;
     let fixture = await signedFixture({ bodyLimit: limit, appendToBody: "APPENDED ATTACK\r\n" });
     let dns = dnsWith({ [fixture.keyName]: [fixture.keyRecord] });
-    expect(body.length).toBeGreaterThan(limit);
+    expect(CANONICAL_BODY.length).toBeGreaterThan(limit);
     await expect(verifyDkim(fixture.message, dns)).resolves.toEqual(
+        { status: "fail", domain: null });
+  });
+
+  it("fails a signature whose l= exceeds the canonical body length", async () => {
+    let fixture = await signedFixture({ bodyLimit: CANONICAL_BODY.length + 10 });
+    let dns = dnsWith({ [fixture.keyName]: [fixture.keyRecord] });
+    await expect(verifyDkim(fixture.message, dns)).resolves.toEqual(
+        { status: "fail", domain: null });
+  });
+
+  it("accepts an l= that covers the canonical body exactly", async () => {
+    let fixture = await signedFixture({ bodyLimit: CANONICAL_BODY.length });
+    let dns = dnsWith({ [fixture.keyName]: [fixture.keyRecord] });
+    await expect(verifyDkim(fixture.message, dns)).resolves.toEqual(
+        { status: "aligned", domain: "example.org" });
+  });
+
+  it("fails a message with two From headers, even though the signed one is intact", async () => {
+    // The signature covers the lower (original) From instance, but header-order readers like
+    // PostalMime may display the first one; the ambiguity fails the signature outright.
+    let fixture = await signedFixture();
+    let withDuplicate = fromBytes(fixture.message).replace(
+        "From:   Joe   <joe@example.org>",
+        "From: mallory@evil.test\r\nFrom:   Joe   <joe@example.org>");
+    let dns = dnsWith({ [fixture.keyName]: [fixture.keyRecord] });
+    await expect(verifyDkim(toBytes(withDuplicate), dns)).resolves.toEqual(
+        { status: "fail", domain: null });
+  });
+
+  it("reads a message without any From header as a verification failure", async () => {
+    let fixture = await signedFixture();
+    let withoutFrom = fromBytes(fixture.message).replace(
+        "From:   Joe   <joe@example.org>\r\n", "");
+    let dns = dnsWith({ [fixture.keyName]: [fixture.keyRecord] });
+    await expect(verifyDkim(toBytes(withoutFrom), dns)).resolves.toEqual(
+        { status: "fail", domain: null });
+  });
+
+  it("fails only the signature with a malformed b=, letting a later signature verify", async () => {
+    // The first signature passes every check up to b= (resolvable selector, matching bh) but
+    // its b= is not base64; without per-signature containment the decode throw failed the
+    // whole message instead of falling through to the valid signature below it.
+    let fixture = await signedFixture();
+    let withMalformed = fromBytes(fixture.message).replace(
+        "DKIM-Signature: ",
+        "DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.org; s=tsubi;" +
+        ` h=from; bh=${fixture.bodyHash}; b=!!!!\r\nDKIM-Signature: `);
+    let dns = dnsWith({ [fixture.keyName]: [fixture.keyRecord] });
+    await expect(verifyDkim(toBytes(withMalformed), dns)).resolves.toEqual(
         { status: "aligned", domain: "example.org" });
   });
 
