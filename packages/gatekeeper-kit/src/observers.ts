@@ -1,10 +1,11 @@
 /** Observer-policy strategies and per-read authorization. */
 
 import type { RpcStub } from "cloudflare:workers";
-import type {
-  GatekeeperUserVerifier,
-  ObservationAuthorizer,
-  ObservationDescription,
+import {
+  isObservationRefused,
+  type GatekeeperUserVerifier,
+  type ObservationAuthorizer,
+  type ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import {
   asVerifier,
@@ -25,27 +26,6 @@ export {
   type ObserverKv,
   type ObserverTrackerOptions,
 } from "./observer-tracker";
-
-/**
- * The mark an overseer refusal of an observation carries, on `name` or a transport-stable `code`.
- * A failure carrying it proves the observation was refused by policy *before* it was recorded, so
- * prepared observer state may be reclaimed; any other failure leaves the outcome unknown, and
- * durable fences must be retained.
- */
-export const OBSERVATION_REFUSED_CODE = "ObservationRefusedError";
-
-/**
- * Matches an overseer observation refusal by `name` or `code`: capnweb rebuilds errors, keeping
- * enumerable own props but not the name. Until the overseer marks its refusals nothing matches, so
- * every failure takes the unknown-outcome path.
- * @param error Caught error.
- * @returns Whether the overseer refused the observation before recording it.
- */
-export function isObservationRefused(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  return error.name === OBSERVATION_REFUSED_CODE
-    || ("code" in error && error.code === OBSERVATION_REFUSED_CODE);
-}
 
 /**
  * How thoroughly a strategy checks observer access to the provider groupings a read discloses.

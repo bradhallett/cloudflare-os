@@ -47,7 +47,6 @@ function WorkspaceProbe({ authenticatedApi }: { authenticatedApi: RpcStub<Authen
   const state = useWorkspaceOpen({
     id: 'workspace-1',
     authenticatedApi,
-    onInvalidShareKey: () => {},
     onMetadata: () => {},
     onShareKeyConsumed: () => {},
   })
@@ -89,7 +88,6 @@ describe('useWorkspaceOpen', () => {
       useWorkspaceOpen({
         id: 'workspace-1',
         authenticatedApi,
-        onInvalidShareKey: () => {},
         onMetadata: () => {},
         onShareKeyConsumed: () => {},
       })

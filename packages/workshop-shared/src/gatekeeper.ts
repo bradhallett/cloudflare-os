@@ -1239,6 +1239,38 @@ export interface ObservationAuthorizer extends RpcTarget {
 }
 
 /**
+ * The mark the overseer puts on a refusal from `authorizeObservation`: the error carries it as an
+ * own enumerable `code`. A failure carrying it proves the observation was refused by policy
+ * *before* anything was recorded, so prepared observer state may be reclaimed; any other failure
+ * leaves the outcome unknown, and durable fences must be retained.
+ *
+ * The mark rides `code` because both observation RPC transports preserve own enumerable Error
+ * props where they drop the thrown class: Cap'n Web rebuilds errors client-side, and workerd RPC
+ * serializes `code` the same way the openGadget error codes rely on. A refusal from an overseer
+ * deployment too old to mark it therefore reads as an unknown outcome, which is the safe
+ * direction.
+ */
+export const OBSERVATION_REFUSED_CODE = "ObservationRefusedError";
+
+/** Creates the refusal `authorizeObservation` throws when policy blocks an observation. */
+export function createObservationRefusedError(): Error & {code: typeof OBSERVATION_REFUSED_CODE} {
+  return Object.assign(
+      new Error(
+          "This observation was blocked because it contains data that a current collaborator " +
+          "is not permitted to see."),
+      {code: OBSERVATION_REFUSED_CODE} as const);
+}
+
+/**
+ * Reads whether a failure from `authorizeObservation` is a marked observation refusal.
+ * @param error Caught failure.
+ * @returns Whether the overseer refused the observation before recording it.
+ */
+export function isObservationRefused(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === OBSERVATION_REFUSED_CODE;
+}
+
+/**
  * Macro expansion produced by a slash command. An absent message suppresses the generated
  * agent-visible message and agent turn; the visible command event remains in chat history.
  */

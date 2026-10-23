@@ -512,9 +512,6 @@ export default function GadgetEditor() {
     onShareKeyConsumed: () => {
       if (id) navigate({ to: '/workspace/$id', params: { id }, search: {}, replace: true })
     },
-    onInvalidShareKey: () => {
-      toasts.add({ title: 'Invalid or expired share link.', variant: 'error' })
-    },
   })
   const [userInfo, setUserInfo] = useState<AiChatAuthorInfo | null>(null)
 

@@ -1,5 +1,6 @@
-import { isObservationRefused } from "@gadgets/gatekeeper-kit/observers";
-import type { ObservationDescription } from "@gadgets/workshop-shared/gatekeeper";
+import {
+  isObservationRefused, type ObservationDescription,
+} from "@gadgets/workshop-shared/gatekeeper";
 import { CursorPager, type Pager } from "./cursor";
 import {
   FOLDER_MIME_TYPE, MAX_QUERY_PARENTS, SHORTCUT_MIME_TYPE,

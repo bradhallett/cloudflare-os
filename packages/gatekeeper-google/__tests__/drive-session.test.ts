@@ -1,6 +1,7 @@
-import { OBSERVATION_REFUSED_CODE } from "@gadgets/gatekeeper-kit/observers";
 import { describe, expect, it, vi } from "vitest";
-import type { ObservationDescription } from "@gadgets/workshop-shared/gatekeeper";
+import {
+  OBSERVATION_REFUSED_CODE, type ObservationDescription,
+} from "@gadgets/workshop-shared/gatekeeper";
 import type { DriveObservation } from "../src/drive-observers";
 import {
   DriveFolderSessionCore, DriveSessionCore, driveFileToEntry, requireDriveBindingScope,
