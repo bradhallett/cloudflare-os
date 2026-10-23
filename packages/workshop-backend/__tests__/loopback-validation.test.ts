@@ -15,6 +15,7 @@
 // and unlike the old all-Proxy surfaces, the declared methods are resolvable on the prototype, so
 // the classes stay exercisable even where the pool emulates RPC by prototype lookup.
 
+// oxlint-disable-next-line typescript/triple-slash-reference -- Wrangler declarations are globals.
 /// <reference path="../worker-configuration.d.ts" />
 
 import { describe, expect, it } from "vitest";
@@ -73,8 +74,8 @@ describe("GatekeeperLoopback", () => {
   function make(target = { type: "git" }, caller = { from: "agent", chatId: 7 }) {
     let sessionCalls: Call[] = [];
     let session = {
-      postMessage: (text: string) => {
-        sessionCalls.push({ method: "postMessage", args: [text] });
+      send: (text: string) => {
+        sessionCalls.push({ method: "send", args: [text] });
         return `sent:${text}`;
       },
       ready: false,
@@ -91,9 +92,10 @@ describe("GatekeeperLoopback", () => {
     let { loopback, sessionCalls } = make();
 
     // The public wire protocol: any session method name, invoked directly on the binding.
-    expect((loopback as unknown as { postMessage(text: string): string }).postMessage("hi"))
-        .toBe("sent:hi");
-    expect(sessionCalls).toEqual([{ method: "postMessage", args: ["hi"] }]);
+    // The proxy's methods are dynamic; the cast names the one under test.
+    const binding = loopback as unknown as { send(text: string): string };
+    expect(binding.send("hi")).toBe("sent:hi");
+    expect(sessionCalls).toEqual([{ method: "send", args: ["hi"] }]);
 
     // Non-function session members (property reads) pass through untouched.
     expect((loopback as unknown as { ready: boolean }).ready).toBe(false);
