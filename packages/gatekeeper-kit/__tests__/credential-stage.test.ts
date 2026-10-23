@@ -1,9 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
+  clearConnectionSubject,
+  commitReconnect,
   commitStagedCredentials,
+  CONNECTION_SUBJECT_KEY,
+  ConnectionSubject,
   discardStagedCredentials,
   peekStagedCredentials,
+  pinnedConnectionSubject,
+  pinConnectionSubject,
   stageCredentials,
+  stageReconnect,
   STAGED_CREDENTIALS_KEY,
 } from "../src/credential-stage";
 import { OAUTH_NONCE_LIFETIME_MS } from "../src/connect-nonce";
@@ -124,3 +131,98 @@ describe("credential stage", () => {
     expect(kv.keys()).toEqual(["tokens"]);
   });
 });
+
+type User = ConnectionSubject & { login: string };
+const ALICE: User = { id: "1", login: "alice" };
+const BOB: User = { id: "2", login: "bob" };
+
+describe("connection subject pin", () => {
+  it("pins the durable key", () => {
+    expect(CONNECTION_SUBJECT_KEY).toBe("connectionSubject");
+  });
+
+  it("refuses a reconnect verified as a different subject than the pin, staging nothing", () => {
+    const kv = fakeKv();
+    pinConnectionSubject(kv, ALICE);
+    // An overlapping flow's stage: the refusal must leave it for its own ticket to commit.
+    const earlier = stageCredentials(kv, GRANT, 1_000);
+
+    const outcome = stageReconnect(kv, { ...GRANT, accessToken: "bob-token" }, BOB, 1_200,
+      (pinned, granted) => ({
+        title: "That's a different account",
+        detail: `for @${pinned.login}, not @${granted.login}`,
+      }));
+
+    expect(outcome).toEqual({
+      refused: { title: "That's a different account", detail: "for @alice, not @bob" },
+    });
+    expect(peekStagedCredentials<Grant>(kv, 1_200)).toEqual({ creds: GRANT, stageId: earlier });
+  });
+
+  it("stages the pinned subject's own reconnect, and one for a connection nothing pins", () => {
+    const kv = fakeKv();
+    let outcome = stageReconnect(kv, GRANT, ALICE, 1_000, () => ({ title: "", detail: "" }));
+    expect("stageId" in outcome).toBe(true);
+    expect("stageId" in outcome && commitReconnect<Grant>(kv, 1_100, outcome.stageId)).toEqual(GRANT);
+
+    // The commit above pinned ALICE; her own reconnect — renamed — stages again.
+    const renamed: User = { id: "1", login: "alice-new" };
+    outcome = stageReconnect(kv, { ...GRANT, accessToken: "renamed" }, renamed, 1_200,
+      () => ({ title: "", detail: "" }));
+    expect("refused" in outcome).toBe(false);
+  });
+
+  it("re-pins at commit: adopting a connection made before any pin, and following a rename", () => {
+    const kv = fakeKv();
+    const adopted = stageReconnect(kv, GRANT, ALICE, 1_000, () => ({ title: "", detail: "" }));
+    expect("stageId" in adopted
+      && commitReconnect<Grant>(kv, 1_100, adopted.stageId)).toEqual(GRANT);
+    expect(pinnedConnectionSubject<User>(kv)).toEqual(ALICE);
+
+    const renamed: User = { id: "1", login: "alice-new" };
+    const followed = stageReconnect(kv, GRANT, renamed, 1_200, () => ({ title: "", detail: "" }));
+    if ("stageId" in followed) commitReconnect<Grant>(kv, 1_300, followed.stageId);
+    expect(pinnedConnectionSubject<User>(kv)).toEqual(renamed);
+    clearConnectionSubject(kv);
+    expect(kv.keys()).toEqual([]);
+  });
+
+  it("drops at commit a stage whose subject contradicts the pin", () => {
+    const kv = fakeKv();
+    pinConnectionSubject(kv, ALICE);
+    // A stage slipped past the pin — say, hand-written while a rename raced — must not commit.
+    const stageId = stageCredentials(kv, GRANT, 1_000);
+    const record = kv.get<{ creds: Grant; stageId: string; expiresAt: number }>(STAGED_CREDENTIALS_KEY);
+    kv.put(STAGED_CREDENTIALS_KEY, { ...record, subject: BOB });
+
+    expect(commitReconnect<Grant>(kv, 1_100, stageId)).toBeNull();
+    expect(kv.keys()).toEqual([CONNECTION_SUBJECT_KEY]);
+    expect(pinnedConnectionSubject<User>(kv)).toEqual(ALICE);
+  });
+
+  it("commits a subjectless stage without touching the pin", () => {
+    const kv = fakeKv();
+    pinConnectionSubject(kv, ALICE);
+    const stageId = stageCredentials(kv, GRANT, 1_000);
+
+    expect(commitReconnect<Grant>(kv, 1_100, stageId)).toEqual(GRANT);
+    expect(pinnedConnectionSubject<User>(kv)).toEqual(ALICE);
+  });
+
+  it("drops a corrupt pin rather than pinning to garbage", () => {
+    const kv = fakeKv();
+    kv.put(CONNECTION_SUBJECT_KEY, { login: "no-id" });
+    expect(pinnedConnectionSubject<User>(kv)).toBeUndefined();
+    expect(kv.keys()).toEqual([]);
+
+    const outcome = stageReconnect(kv, GRANT, BOB, 1_000, () => ({ title: "", detail: "" }));
+    expect("refused" in outcome).toBe(false);
+  });
+
+  it("reads the connector's own subject shape back", () => {
+    const kv = fakeKv();
+    pinConnectionSubject(kv, ALICE);
+    expect(pinnedConnectionSubject<User>(kv)?.login).toBe("alice");
+  });
+});
+

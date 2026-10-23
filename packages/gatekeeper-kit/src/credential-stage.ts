@@ -14,6 +14,11 @@
  * Workshop's ticket names the exact credentials whose completion minted it. Two reconnects can
  * overlap — the owner's and one a phished victim finished — and a commit that took "whatever is
  * staged" would let the ticket from the first activate the second's credentials.
+ *
+ * A second fence sits in front of the escrow: the connection is pinned to the subject — the
+ * provider-stable account identity — its first connect was verified as, and only that subject's
+ * grant may be staged or committed (`stageReconnect` / `commitReconnect`). Whoever holds the
+ * reconnect URL, then, can only ever reconnect the account the connection already belongs to.
  */
 
 import { generateNonce, OAUTH_NONCE_LIFETIME_MS } from "./connect-nonce";
@@ -22,11 +27,22 @@ import type { KvMutable } from "./kv";
 /** KV key holding the staged credentials. */
 export const STAGED_CREDENTIALS_KEY = "stagedCredentials";
 
-/** The stored record: the consumer's credentials, plus the stage's own id and expiry. */
-type StagedCredentials<T> = { creds: T; stageId: string; expiresAt: number };
+/** The stored record: the consumer's credentials, the subject the flow verified them as, and the stage's own id and expiry. */
+type StagedCredentials<T> = { creds: T; subject?: ConnectionSubject; stageId: string; expiresAt: number };
 
 /** A stage's credentials together with the id a commit must name to take them. */
 export type StagedCredentialsView<T> = { creds: T; stageId: string };
+
+/**
+ * The stable identity of the account a connection belongs to, as its provider spells it: a
+ * GitHub user id, a Google `sub` claim, an Atlassian account id. Only `id` is compared, so a
+ * connector widens this with the fields its user-facing refusal wording needs — a login, a
+ * workspace name — and those ride along in storage untouched.
+ */
+export type ConnectionSubject = { id: string };
+
+/** KV key holding the connection's pinned subject. */
+export const CONNECTION_SUBJECT_KEY = "connectionSubject";
 
 /**
  * Stages credentials for a later `commitStagedCredentials`, replacing any earlier stage. A caller
@@ -65,9 +81,15 @@ function storedStage<T>(kv: KvMutable): StagedCredentials<T> | undefined {
   const staged = kv.get<StagedCredentials<T>>(STAGED_CREDENTIALS_KEY);
   if (staged === undefined) return undefined;
   if (typeof staged?.stageId === "string" && Number.isFinite(staged.expiresAt)
-      && staged.creds !== undefined) return staged;
+      && staged.creds !== undefined && isSubject(staged.subject)) return staged;
   kv.delete(STAGED_CREDENTIALS_KEY);
   return undefined;
+}
+
+/** A stage's `subject` slot holds a subject or nothing; anything else is corruption, not data. */
+function isSubject(value: ConnectionSubject | undefined): boolean {
+  return value === undefined
+    || (typeof value === "object" && typeof value?.id === "string");
 }
 
 /**
@@ -144,6 +166,122 @@ export function commitStagedCredentials<T>(kv: KvMutable, now: number, stageId: 
 export function discardStagedCredentials<T>(kv: KvMutable, stageId?: string): T | null {
   const staged = storedStage<T>(kv);
   if (staged === undefined || (stageId !== undefined && staged.stageId !== stageId)) return null;
+  kv.delete(STAGED_CREDENTIALS_KEY);
+  return staged.creds;
+}
+
+/**
+ * Reads the subject this connection is pinned to. `S` is the connector's own subject shape, so a
+ * record staged with display fields reads back with them.
+ * @param kv Durable Object storage.
+ * @returns The pinned subject, or `undefined` when none is pinned (or a corrupt record was dropped).
+ */
+export function pinnedConnectionSubject<S extends ConnectionSubject>(kv: KvMutable): S | undefined {
+  const pinned = kv.get<S>(CONNECTION_SUBJECT_KEY);
+  if (pinned === undefined) return undefined;
+  if (typeof pinned?.id === "string") return pinned;
+  kv.delete(CONNECTION_SUBJECT_KEY);
+  return undefined;
+}
+
+/**
+ * Pins the connection to the subject its first connect was verified as. Committing a reconnect
+ * re-pins on its own, so this is for the first connect alone; clear it again if that connect is
+ * unwound, so an abandoned attempt pins nothing.
+ * @param kv Durable Object storage.
+ * @param subject The subject the connect flow verified the grant as.
+ */
+export function pinConnectionSubject<S extends ConnectionSubject>(kv: KvMutable, subject: S): void {
+  kv.put<S>(CONNECTION_SUBJECT_KEY, subject);
+}
+
+/**
+ * Drops the pin, for a connector clearing the credentials the pin fenced.
+ * @param kv Durable Object storage.
+ */
+export function clearConnectionSubject(kv: KvMutable): void {
+  kv.delete(CONNECTION_SUBJECT_KEY);
+}
+
+/**
+ * Stages a reconnect's credentials together with the subject the flow verified them as, refusing
+ * (and staging nothing) when the connection is pinned to a different subject: a reconnect URL is a
+ * bearer capability, so anyone can finish one, and only the pinned account's grant may take the
+ * stage a Workshop ticket could commit. An unpinned connection — one made before its gatekeeper
+ * pinned — stages anything, and its commit adopts the subject it came with.
+ *
+ * The refusal's words are the connector's: `refused` receives both subjects and returns the page
+ * to show. The caller keeps ownership of disposing the refused grant, since whether a provider can
+ * revoke one varies.
+ * @param kv Durable Object storage.
+ * @param creds Whatever the connector needs to write its live keys on commit.
+ * @param subject The subject the flow verified the new grant as.
+ * @param now Current Unix time in milliseconds.
+ * @param refused Words the refusal page shows, given the pinned and the granted subjects.
+ * @param ttlMs How long the stage stays committable; the Workshop redeems well within the default.
+ * @returns The new stage's id, or the refusal to render in its place. A refusal leaves any earlier
+ * stage untouched — it belongs to a flow whose own ticket may still commit it.
+ *
+ * @example
+ * ```ts
+ * const staged = stageReconnect(kv, grant, subject, Date.now(), (pinned, granted) => ({
+ *   title: "That's a different account",
+ *   detail: `This connection is for ${pinned.name}, but the provider authorized ${granted.name}.`,
+ * }));
+ * if ("refused" in staged) return staged;
+ * return callback.reconnectComplete(staged.stageId);
+ * ```
+ */
+export function stageReconnect<T, S extends ConnectionSubject>(
+  kv: KvMutable,
+  creds: T,
+  subject: S,
+  now: number,
+  refused: (pinned: S, granted: S) => { title: string; detail: string },
+  ttlMs: number = OAUTH_NONCE_LIFETIME_MS,
+): { stageId: string } | { refused: { title: string; detail: string } } {
+  const pinned = pinnedConnectionSubject<S>(kv);
+  if (pinned !== undefined && pinned.id !== subject.id) {
+    return { refused: refused(pinned, subject) };
+  }
+  const stageId = generateNonce();
+  kv.put<StagedCredentials<T>>(STAGED_CREDENTIALS_KEY,
+    { creds, subject, stageId, expiresAt: now + ttlMs });
+  return { stageId };
+}
+
+/**
+ * Commits a reconnect staged by `stageReconnect`, fenced on the connection's pinned subject: the
+ * stage's subject must be the pinned one — or absent, for a connection nothing pins yet — or the
+ * stage is dropped and `null` returned, the same answer as no stage at all. A stage that passes
+ * re-pins the connection to the subject it was verified as, adopting a connection made before its
+ * gatekeeper pinned and following a rename. A stage without a subject (a connector that could not
+ * read one, or a record from before subjects) commits without touching the pin.
+ *
+ * Otherwise this is `commitStagedCredentials`: the stage named by `stageId` is taken at most once,
+ * an expired stage is dropped, and a stage with a different id is left for its own flow.
+ * @param kv Durable Object storage.
+ * @param now Current Unix time in milliseconds.
+ * @param stageId The id `stageReconnect` returned for the stage being committed.
+ * @returns The staged credentials, or `null` when that stage is not committable.
+ */
+export function commitReconnect<T>(kv: KvMutable, now: number, stageId: string): T | null {
+  const staged = liveStage<T>(kv, now);
+  if (staged === undefined) {
+    kv.delete(STAGED_CREDENTIALS_KEY);
+    return null;
+  }
+  // Plain comparison: the id is an identity, not a secret. Only the Workshop can reach
+  // `commitReconnect`, and it names the id its own record carries.
+  if (staged.stageId !== stageId) return null;
+  if (staged.subject !== undefined) {
+    const pinned = pinnedConnectionSubject<ConnectionSubject>(kv);
+    if (pinned !== undefined && pinned.id !== staged.subject.id) {
+      kv.delete(STAGED_CREDENTIALS_KEY);
+      return null;
+    }
+    pinConnectionSubject(kv, staged.subject);
+  }
   kv.delete(STAGED_CREDENTIALS_KEY);
   return staged.creds;
 }
