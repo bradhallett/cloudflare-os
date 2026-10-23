@@ -13,12 +13,16 @@ import {
   type ActionDescriptionBuilder,
   buildDescription,
 } from "@gadgets/gatekeeper-kit/action-description";
+import {
+  APPLY_OUTCOME_UNKNOWN_MESSAGE, ActionOutcomeUnknownError,
+} from "@gadgets/gatekeeper-kit/actions";
 import { ActionFileStore, type ActionFileReference } from "@gadgets/gatekeeper-kit/action-files";
 import type { ActionDescription, ApprovalQueue, ObservationDescription } from "@gadgets/workshop-shared/gatekeeper";
 import {
   ConfluenceApi,
   contentBodyMarkdown,
   contentToSummary,
+  isConfluenceOutcomeUnknown,
   type ContentResponse,
 } from "./confluence-api";
 import { markdownToStorage, storageToMarkdown } from "./confluence-markdown";
@@ -68,12 +72,20 @@ export type UploadAttachmentAction = {
 export type StoredActionRecord = {
   id: number;
   action: ConfluenceAction;
-  state: "pending" | "applied" | "reverted";
+  /**
+   * Lifecycle of a stored action. `claimed` marks the window where the Confluence call is in
+   * flight: the claim is written before the call, so any later attempt that finds it knows a
+   * previous dispatch may have applied and refuses to run again. `failed` is terminal — its
+   * `failure` explains itself — and is cleared by a rejection.
+   */
+  state: "pending" | "claimed" | "applied" | "failed" | "reverted";
   submittedAt: number;
   /** For createContent / addComment: the real content ID assigned on apply. */
   createdContentId?: string;
   /** For uploadAttachment: the attachment ID assigned on apply. */
   createdAttachmentId?: string;
+  /** For state "failed": why, and what to answer later attempts with. */
+  failure?: string;
 };
 
 /** The content (provisional or real) an action targets, or null if it targets none. */
@@ -151,7 +163,7 @@ export class ConfluenceStore {
   }
 
   pendingActions(): StoredActionRecord[] {
-    return this.allActions().filter(r => r.state === "pending");
+    return this.allActions().filter(r => r.state === "pending" || r.state === "claimed");
   }
 
   /** Pending actions targeting a piece of content (addressed by either provisional or real ID). */
@@ -656,17 +668,54 @@ async function applyAction(store: ConfluenceStore, record: StoredActionRecord): 
 export async function applyStoredAction(store: ConfluenceStore, id: number): Promise<void> {
   const record = store.getAction(id);
   if (!record) throw new Error(`Unknown action: ${id}`);
-  // The Workshop marks its side approved only after this RPC returns, so a restart in between
-  // re-applies an action whose work (and attachment file) is already done and gone.
-  if (record.state === "applied") return;
-  await applyAction(store, record);
+  // The Workshop marks its side approved only after this RPC returns, so a replayed apply
+  // (restart, retry, duplicate click) settles here instead of dispatching again.
+  if (record.state === "applied" || record.state === "reverted") return;
+  // A terminal failure answers every later attempt with the same message, no Confluence call.
+  if (record.state === "failed") throw new Error(record.failure ?? "This action previously failed.");
+  // A claim left behind means a previous dispatch's outcome is unknown: the call may have
+  // reached Confluence. Record it terminally and surface it — never silently re-run a write.
+  if (record.state === "claimed") throw failUnknownOutcome(store, record);
+
+  // Claim before the first Confluence call: the record durably says a dispatch began, so an
+  // interrupted apply can never be mistaken for never-run.
+  store.putAction({ ...record, state: "claimed" });
+  try {
+    await applyAction(store, record);
+  } catch (error) {
+    if (isConfluenceOutcomeUnknown(error)) {
+      // No definitive answer arrived, so the write may have landed. Record the action terminally
+      // with the reason and surface it; a rejection clears the record after the user checks.
+      const message = `${APPLY_OUTCOME_UNKNOWN_MESSAGE} (${error instanceof Error ? error.message : String(error)})`;
+      store.putAction({ ...record, state: "failed", failure: message });
+      throw new ActionOutcomeUnknownError(message);
+    }
+    // Atlassian answered with a refusal (or the failure is internal): the write did not land, so
+    // the record goes back to pending and the failure stays retryable, as before.
+    store.putAction(record);
+    throw error;
+  }
+}
+
+/**
+ * Records that the outcome of a dispatched action cannot be known, and returns the error that
+ * surfaces it. Terminal: only a rejection clears the record.
+ */
+function failUnknownOutcome(store: ConfluenceStore, record: StoredActionRecord): ActionOutcomeUnknownError {
+  store.putAction({ ...record, state: "failed", failure: APPLY_OUTCOME_UNKNOWN_MESSAGE });
+  return new ActionOutcomeUnknownError(APPLY_OUTCOME_UNKNOWN_MESSAGE);
 }
 
 export function rejectStoredAction(store: ConfluenceStore, id: number): void | { restart?: boolean } {
   const record = store.getAction(id);
   if (!record) return;
+  if (record.state === "claimed") {
+    // The Confluence call may already have run; deleting the record would discard the only trace
+    // that it might have. The user checks Confluence, then rejects again to clear the failure
+    // this records.
+    throw failUnknownOutcome(store, record);
+  }
   store.deleteAction(id);
-
   // Rejecting a creation invalidates any pending actions on that (now-nonexistent) content,
   // including child pages created under it, transitively. Cascade-delete and request a restart.
   if (record.action.type === "createContent") {

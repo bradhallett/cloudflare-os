@@ -8,6 +8,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { vi } from "vitest";
 import { generateNonce } from "@gadgets/gatekeeper-kit/connect-nonce";
 import type { ConnectionSubject } from "@gadgets/gatekeeper-kit/credential-stage";
+import type { LinearGatekeeperImplProps } from "../../src/linear";
 
 const API = "https://api.linear.app";
 
@@ -113,6 +114,16 @@ export function failure(outcome: Outcome<unknown>): string {
 export type HooksApi = {
   installCallback(userObjectId: string, initiationNonce: string): Promise<void>;
   account(userObjectId: string, method: string, ...args: unknown[]): Promise<Outcome<unknown>>;
+  applyGatekeeperAction(
+    facetName: string, props: LinearGatekeeperImplProps, actionId: number,
+  ): Promise<Outcome<void>>;
+  rejectGatekeeperAction(
+    facetName: string, props: LinearGatekeeperImplProps, actionId: number,
+  ): Promise<Outcome<void | { restart?: boolean }>>;
+  seedGatekeeper(
+    facetName: string, props: LinearGatekeeperImplProps, entries: Record<string, unknown>,
+  ): Promise<void>;
+  gatekeeperEntry(facetName: string, props: LinearGatekeeperImplProps, key: string): Promise<unknown>;
 };
 
 export function hooks(): HooksApi {
