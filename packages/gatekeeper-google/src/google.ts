@@ -3,7 +3,9 @@ import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import { GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, ResourceDescription, ApprovalQueue, ObservationDescription, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions, AccountDescription, SupportedResource, ResourceConfiguratorFrame, Cursor, ActionKind, GitCache, workerVersionTag, type ActionDescription, type ConnectHandoff } from '@gadgets/workshop-shared/gatekeeper';
 import { buildDescription, codeSpan, plainInline } from "@gadgets/gatekeeper-kit/action-description";
 import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
-import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import {
+  clearConnectionSubject, commitReconnect, pinConnectionSubject, stageReconnect,
+} from "@gadgets/gatekeeper-kit/credential-stage";
 import {
   PreviewOAuth,
   PreviewOAuthConfigurationError,
@@ -449,16 +451,15 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
 export type HookDriverRef = { kind: "gmail" | "chat"; name: string };
 
 /**
- * What a reconnect flow obtains, held in escrow until commitReconnect() writes it live. `subject`
- * is the Google account (`sub`) the new grant was verified as, so committing pins the connection.
+ * What a reconnect flow obtains, held in escrow until commitReconnect() writes it live. The Google
+ * account (`sub`) the new grant was verified as travels with the stage as its connection subject,
+ * which is what the kit's fence checks and what committing re-pins.
  */
 type StagedGoogleCredentials = {
   refreshToken: string;
   accessToken: GoogleAccessToken;
   grantedScopes: string[];
   requestedResources: string[];
-  /** Absent on stages written before the pin existed; commitReconnect keeps the pin it finds. */
-  subject?: string;
 };
 
 /** What the locked section of acceptAuthCode() worked out, once it releases the mutex. */
@@ -583,31 +584,25 @@ export class UserAccount extends DurableObject<Env> {
       }
 
       if (flow.mode === "reconnect") {
-        let pinned = this.ctx.storage.kv.get<string>("accountSubject");
-        if (pinned !== undefined && pinned !== subject) {
-          // Another account's grant, which can never share an authorization with the live one.
-          await this.#revokeRefreshToken(response.refreshToken);
-          return {
-            callback,
-            mode: flow.mode,
-            refused: {
-              title: "That's a different Google account",
-              detail: "This connection was made for another Google account than the one that just " +
-                "authorized it. Sign in as that account and reconnect, or connect the other " +
-                "account as a separate connection.",
-            },
-          };
-        }
         // The reconnect URL is a bearer capability, so the new grant is only staged until the
         // Workshop has confirmed the browser that finished the flow is the owner's (see
-        // commitReconnect). Bound gadgets keep reading the current token meanwhile.
-        let staged: StagedGoogleCredentials = {
+        // commitReconnect). The kit refuses a grant for anyone but the pinned account. Bound
+        // gadgets keep reading the current token meanwhile.
+        let staged = stageReconnect(this.ctx.storage.kv, {
           refreshToken: response.refreshToken, accessToken: response.accessToken,
           grantedScopes: response.grantedScopes, requestedResources: flow.requestedResources,
-          subject,
-        };
-        let stageId = stageCredentials(this.ctx.storage.kv, staged, Date.now());
-        return { callback, mode: flow.mode, stageId };
+        }, { id: subject }, Date.now(), () => ({
+          title: "That's a different Google account",
+          detail: "This connection was made for another Google account than the one that just " +
+            "authorized it. Sign in as that account and reconnect, or connect the other " +
+            "account as a separate connection.",
+        }));
+        if ("refused" in staged) {
+          // Another account's grant, which can never share an authorization with the live one.
+          await this.#revokeRefreshToken(response.refreshToken);
+          return { callback, mode: flow.mode, refused: staged.refused };
+        }
+        return { callback, mode: flow.mode, stageId: staged.stageId };
       }
 
       this.ctx.storage.kv.put<string>("refreshToken", response.refreshToken);
@@ -616,7 +611,7 @@ export class UserAccount extends DurableObject<Env> {
       this.#mintFailure = undefined;
       this.ctx.storage.kv.put<string[]>("grantedScopes", response.grantedScopes);
       mergeGrantedResources(this.ctx.storage.kv, flow.requestedResources);
-      this.ctx.storage.kv.put<string>("accountSubject", subject);
+      pinConnectionSubject(this.ctx.storage.kv, { id: subject });
       return { callback, mode: flow.mode, stageId: undefined };
     });
 
@@ -632,7 +627,7 @@ export class UserAccount extends DurableObject<Env> {
         handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({props}));
       } catch (err) {
         this.ctx.storage.kv.delete("refreshToken");
-        this.ctx.storage.kv.delete("accountSubject");
+        clearConnectionSubject(this.ctx.storage.kv);
         throw err;
       }
 
@@ -655,13 +650,13 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   /**
-   * Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. The
-   * connection stays pinned to the account the grant was verified as: writing the staged subject
-   * back pins a connection made before the pin existed, and never moves an established one.
+   * Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. The kit keeps
+   * the connection pinned to the account the grant was verified as: re-pinning the staged subject
+   * adopts a connection made before the pin existed, and never moves an established one.
    */
   async commitReconnect(stageId: string): Promise<void> {
     await this.#credentials.run(async () => {
-      let staged = commitStagedCredentials<StagedGoogleCredentials>(
+      let staged = commitReconnect<StagedGoogleCredentials>(
           this.ctx.storage.kv, Date.now(), stageId);
       if (!staged) throw new Error("No reconnect is awaiting confirmation. Please try again.");
       this.ctx.storage.kv.put<string>("refreshToken", staged.refreshToken);
@@ -670,8 +665,6 @@ export class UserAccount extends DurableObject<Env> {
       this.#mintFailure = undefined;
       this.ctx.storage.kv.put<string[]>("grantedScopes", staged.grantedScopes);
       mergeGrantedResources(this.ctx.storage.kv, staged.requestedResources);
-      // A stage from before the pin carried no subject; keep whatever pin the account already has.
-      if (staged.subject !== undefined) this.ctx.storage.kv.put<string>("accountSubject", staged.subject);
     });
   }
 

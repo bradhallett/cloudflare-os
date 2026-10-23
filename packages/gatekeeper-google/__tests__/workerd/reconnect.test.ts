@@ -79,7 +79,7 @@ async function storedConnection(userObjectId: string) {
     env.UserAccount.get(env.UserAccount.idFromString(userObjectId)),
     async (_instance, state) => ({
       refreshToken: await state.storage.kv.get<string>("refreshToken"),
-      accountSubject: await state.storage.kv.get<string>("accountSubject"),
+      pinnedSubject: await state.storage.kv.get<{ id: string }>("connectionSubject"),
     }));
 }
 
@@ -104,7 +104,7 @@ describe("reconnecting", () => {
       const google = new FakeGoogle();
       const { account, id, events } = await connect(google);
       const before = await storedConnection(id.toString());
-      expect(before).toEqual({ refreshToken: "rt-1", accountSubject: "alice-subject" });
+    expect(before).toEqual({ refreshToken: "rt-1", pinnedSubject: { id: "alice-subject" } });
 
       const result = await reconnectAs(google, account, "bob-subject");
 
@@ -134,7 +134,7 @@ describe("reconnecting", () => {
     await account.commitReconnect(stageId);
 
     expect(await storedConnection(id.toString()))
-      .toEqual({ refreshToken: "rt-2", accountSubject: "alice-subject" });
+      .toEqual({ refreshToken: "rt-2", pinnedSubject: { id: "alice-subject" } });
     expect(google.revoked).toEqual([]);
     const failure = await runInDurableObject(account, async instance => {
       try {
@@ -153,7 +153,7 @@ describe("reconnecting", () => {
     // The account predates pinning: nothing recorded which Google account it belongs to.
     await runInDurableObject(env.UserAccount.get(env.UserAccount.idFromString(id.toString())),
       (_instance, state) => {
-        state.storage.kv.delete("accountSubject");
+        state.storage.kv.delete("connectionSubject");
       });
 
     const result = await reconnectAs(google, account, "bob-subject");
@@ -163,7 +163,7 @@ describe("reconnecting", () => {
       .at(-1)!.slice("reconnectComplete:".length);
     await account.commitReconnect(stageId);
     expect(await storedConnection(id.toString()))
-      .toEqual({ refreshToken: "rt-2", accountSubject: "bob-subject" });
+      .toEqual({ refreshToken: "rt-2", pinnedSubject: { id: "bob-subject" } });
   });
 
   it("refuses to finish a connect when Google will not say which account authorized", async () => {
@@ -180,7 +180,7 @@ describe("reconnecting", () => {
       await expect(instance.acceptAuthCode("code", begun!.oauthNonce))
         .rejects.toThrow(/Could not read which Google account/);
       expect(state.storage.kv.get("refreshToken")).toBeUndefined();
-      expect(state.storage.kv.get("accountSubject")).toBeUndefined();
+      expect(state.storage.kv.get("connectionSubject")).toBeUndefined();
     });
     // The grant Google issued was revoked rather than left dangling.
     expect(google.revoked).toEqual(["rt-1"]);
