@@ -94,6 +94,12 @@ The Workshop admission check runs before every attempt. If the hook, gatekeeper,
 longer allowed, the occurrence is skipped without consuming a callback attempt. Recurring schedules
 advance to their next future occurrence; a due one-shot expires.
 
+Every in-flight delivery also races its five-minute recovery lease. A delivery whose hook RPC never
+settles is timed out at the lease deadline and settled like a callback failure — retried, then
+**Needs attention** once the budget is gone — while an admission that never settles skips the
+occurrence without consuming an attempt, like an admission refusal. In both cases the account's
+alarm keeps processing its other schedules.
+
 ## Cadence behavior
 
 - Recurrences preserve the phase established at registration.
@@ -151,9 +157,10 @@ pass with four concurrent deliveries, then arms an immediate continuation when a
 Stable `runId` fencing prevents late completion or retry continuations from mutating a disabled,
 re-enabled, or revoked schedule.
 
-One account-wide driver keeps management and revocation simple, but it is also a shared failure domain:
-a user callback that never settles can delay other schedules in that account until the runtime aborts
-the alarm. Bounded batches limit ordinary load; they do not eliminate that tradeoff.
+One account-wide driver keeps management and revocation simple. Each in-flight delivery races its
+five-minute recovery lease, so a hook RPC that never settles is timed out and settled like a
+failure instead of stalling the account's alarm; bounded batches and immediate continuations cover
+ordinary load.
 
 The Scheduler is capability-authorized. It does not receive Workshop user identity, assert its own
 ambient policy, expose external network authority, or implement actions. The Workshop's existing hook
@@ -166,6 +173,7 @@ admission and observation authorization remain the security boundaries.
 - 100 rows per management page.
 - 20 due schedules per alarm pass and four concurrent deliveries.
 - Eight callback attempts per logical occurrence.
+- Five-minute lease per in-flight delivery attempt.
 - Schedule titles: 200 characters; descriptions: 2,000 characters.
 
 These are fixed policy limits rather than deployment settings.
