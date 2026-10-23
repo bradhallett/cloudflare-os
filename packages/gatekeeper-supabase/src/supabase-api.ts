@@ -42,6 +42,40 @@ export class SupabaseApiError extends Error {
   }
 }
 
+/** The connected Supabase account, read from `/v1/profile` with the OAuth access token. */
+export type SupabaseProfile = {
+  /** The GoTrue user id: the stable property a reconnect pins against. */
+  gotrueId: string;
+  primaryEmail?: string;
+  username?: string;
+};
+
+/**
+ * Reads the profile of the account an OAuth access token belongs to, immediately after the token
+ * exchange. Unlike every other call here, it is a module function over a raw token: it identifies
+ * a *newly exchanged* grant before any `SupabaseApi` exists to refresh it.
+ * @throws SupabaseApiError when the profile cannot be read.
+ */
+export async function fetchProfile(accessToken: string): Promise<SupabaseProfile> {
+  const response = await fetch(`${API_BASE_URL}/v1/profile`, {
+    headers: { Authorization: `Bearer ${accessToken}`, "User-Agent": USER_AGENT },
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  const parsed = await parseBody(response);
+  if (!response.ok) {
+    throw new SupabaseApiError(
+      response.status, errorMessage(response.status, response.statusText, parsed), parsed);
+  }
+  const profile = parsed as { gotrue_id?: unknown; primary_email?: unknown; username?: unknown };
+  if (typeof profile.gotrue_id !== "string" || profile.gotrue_id === "") {
+    throw new SupabaseApiError(502, "Supabase profile response was missing a gotrue_id.", parsed);
+  }
+  return {
+    gotrueId: profile.gotrue_id,
+    primaryEmail: typeof profile.primary_email === "string" ? profile.primary_email : undefined,
+    username: typeof profile.username === "string" ? profile.username : undefined,
+  };
+}
 // ---------------------------------------------------------------------------
 // Raw Management API response shapes (only the fields we consume).
 

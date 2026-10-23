@@ -59,6 +59,10 @@ Optional overrides read by the Worker:
 - `BASE_URL` — the gatekeeper's public base (default `http://localhost:8787/gatekeeper/zoominfo`);
   the OAuth redirect is `${BASE_URL}/oauth`.
 - `ZOOMINFO_API_BASE_URL` — the ZoomInfo API root (default `https://api.zoominfo.com/gtm`).
+- `ZOOMINFO_DAILY_READ_LIMIT` — the API requests one connection may make per UTC day, across every
+  binding and gadget using it (default 1,000; `0` removes the limit). A read past it fails with a
+  message naming when it resets; a read whose answer is lost still counts, because it may have been
+  spent.
 
 ## Notes & limitations
 
@@ -72,6 +76,10 @@ Optional overrides read by the Worker:
   `getEnrichmentResult(ticket)`. Enrichments are **not** simulated — the action carries
   `awaitDecision`, so the agent turn suspends until the decision rather than reading back
   un-enriched state.
+- **Reconnect pinning.** A connection is pinned to the ZoomInfo account that created it (the OIDC
+  `sub` of its grant). A reconnect authorized as a different account is refused — its grant is not
+  usable by this connection, and ZoomInfo offers no revocation endpoint, so the refused page says so
+  rather than claiming a revocation happened.
 - **Intent/scoop company targeting.** Intent and scoop *search* filter by firmographics only —
   ZoomInfo has no company-identity inputs there. To pull intent or scoops for a specific known
   company, use `enrichIntent` / `enrichScoops` (which take a company identifier). The API surface and
