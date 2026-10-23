@@ -12,7 +12,7 @@ import { Toasty, TooltipProvider } from '@cloudflare/kumo'
 import type { AiChatMessage, BoundHookInfo } from '@gadgets/workshop-shared/api'
 
 vi.mock('./AuthContext', () => {
-  const context = { authenticatedApi: { listGatekeeperVendors: async () => [] }, currentUser: null }
+  const context = { authenticatedApi: { listBots: async () => [], listGatekeeperVendors: async () => [] }, currentUser: null }
   return { useAuthenticatedApi: () => context, useOptionalAuthenticatedApi: () => context }
 })
 vi.mock('./useAlwaysApproveTag', () => ({
