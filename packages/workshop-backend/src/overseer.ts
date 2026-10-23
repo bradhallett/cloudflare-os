@@ -10809,10 +10809,25 @@ type BindingLoopbackTarget = {
  * props identify the overseer and target workpiece, so that on each method call it can resolve the
  * target session.
  *
+ * The wire protocol this class must keep is dynamic dispatch: gadget and agent code calls
+ * `env.<BINDING>.<session method>(...)`, where the session's surface is defined by the target
+ * (a vendor session, a gadget facet, or one of the typed session classes) and so is not knowable
+ * here. The constructor therefore installs a Proxy whose only job is translating that protocol:
+ * every method name maps onto the one declared, @validateRpc()-validated method below, forward(),
+ * which is the entire forwarding implementation -- statically visible, directly callable in tests,
+ * and the one place a crossing call is checked. Argument types that mean anything (the session's
+ * own signatures) are validated at the terminal session, which is reached only through this hop.
+ *
  * TODO(multi-gadget): Rename to BindingLoopback. Stubs to this entrypoint aren't stored anywhere,
  * so a rename should be safe.
  */
+@validateRpc()
 export class GatekeeperLoopback extends WorkerEntrypoint<Cloudflare.Env, GatekeeperLoopbackProps> {
+  // The pipelined session RPC every call forwards to, opened once per instance. Property access
+  // on the un-awaited promise pipelines (see AGENTS.md): forward() resolves each method stub off
+  // it without waiting for the session to open.
+  #session: Promise<any>;
+
   constructor(ctx: ExecutionContext<GatekeeperLoopbackProps>, env: Cloudflare.Env) {
     super(ctx, env);
 
@@ -10821,14 +10836,23 @@ export class GatekeeperLoopback extends WorkerEntrypoint<Cloudflare.Env, Gatekee
         ns.get(ns.idFromString(ctx.props.overseerId));
 
     // @ts-ignore: LSP-only RPC types bug, "type instantiation is excessively deep"
-    let session = stub.startGatekeeperSession(
+    this.#session = stub.startGatekeeperSession(
         this.ctx.props.target, this.ctx.props.caller);
 
-    return new Proxy(session, {
+    let session = this.#session;
+    return new Proxy(this, {
       get(target, prop, receiver) {
-        // Note: We need `target` to be used as the receiver. If we use `receiver` as the receiver,
-        //   we'll get an illegal invocation, as `receiver` points to our Proxy.
-        return Reflect.get(target, prop, target);
+        // The declared RPC method and symbol probes resolve on the instance; everything else is
+        // a session member. Note: We need `target`/`session` to be used as the receiver. If we
+        // use `receiver`, we'll get an illegal invocation, as `receiver` points to our Proxy.
+        // `forward` is consequently an unforwardable name: a session method literally named
+        // "forward" would be shadowed (none exists today).
+        if (typeof prop === "symbol" || prop === "forward") {
+          return Reflect.get(target, prop, target);
+        }
+        let member = Reflect.get(session, prop, session);
+        if (typeof member !== "function") return member;
+        return (...args: unknown[]) => target.forward(String(prop), args);
       },
       getPrototypeOf(target) {
         return WorkerEntrypoint.prototype;
@@ -10837,10 +10861,16 @@ export class GatekeeperLoopback extends WorkerEntrypoint<Cloudflare.Env, Gatekee
   }
 
   /**
-   * We need to declare a method otherwise the validator won't even report this class as existing
-   * and so the loopback binding won't be created.
+   * Forwards one dynamically-dispatched call to the session, preserving pipelining by returning
+   * the pipelined call's result without awaiting it. The arguments cross from gadget/agent code
+   * (a separate trust domain from the session), so the surface is validated here for shape and
+   * at the terminal session for meaning.
    */
-  dummyMethodToWorkAroundValidatorBug() {}
+  forward(methodName: string, args: unknown[]): unknown {
+    let method: (...args: unknown[]) => unknown =
+        Reflect.get(this.#session, methodName, this.#session);
+    return method(...args);
+  }
 }
 
 type GatekeeperHookLoopbackProps = {
@@ -10854,6 +10884,7 @@ type GatekeeperHookLoopbackProps = {
  * startHook(), which returns both the actual hook RpcStub and an ApprovalQueue for logging
  * observations and actions.
  */
+@validateRpc()
 export class GatekeeperHookLoopback
     extends WorkerEntrypoint<Cloudflare.Env, GatekeeperHookLoopbackProps>
     implements HookInitiator<RpcTarget> {
@@ -10884,27 +10915,33 @@ type AgentSelfLoopbackProps = {
  * arguments must be storable (any RPC stubs among them must be persistent stubs). This is a
  * WorkerEntrypoint so it produces a Fetcher that can be passed over RPC and stored in Durable
  * Object KV storage.
+ *
+ * The wire protocol is dynamic dispatch -- callers name any method -- so the constructor installs
+ * a Proxy whose only job is translating `stub.<methodName>(...args)` onto the one declared,
+ * @validateRpc()-validated method below, deliverCallback(), which is the entire forwarding
+ * implementation. `deliverCallback` is therefore a reserved name: a callback literally named
+ * "deliverCallback" would reach the method instead of being recorded.
  * TODO: Would be awesome if the agent could pass a sub-object like `self.foo`, and then be told
  *   later e.g. "foo.callback() was called". This requires that we implement RpcPromise
  *   serializability in the built-in RPC system, matching Cap'n Web.
  */
+@validateRpc()
 export class AgentSelfLoopback
     extends WorkerEntrypoint<Cloudflare.Env, AgentSelfLoopbackProps> {
+  #overseer: DurableObjectStub<OverseerDurableObject>;
+
   constructor(ctx: ExecutionContext<AgentSelfLoopbackProps>, env: Cloudflare.Env) {
     super(ctx, env);
 
     let ns = ctx.exports.OverseerDurableObject;
-    let stub: DurableObjectStub<OverseerDurableObject> =
-        ns.get(ns.idFromString(ctx.props.overseerId));
-    let { chatId, initiatorUserId, initiatorModelId } = ctx.props;
+    this.#overseer = ns.get(ns.idFromString(ctx.props.overseerId));
 
     return new Proxy<AgentSelfLoopback>(<any>this, {
       get(target, prop, receiver) {
-        if (typeof prop === 'symbol') return Reflect.get(target, prop, target);
-        return (...args: unknown[]) => {
-          return stub.deliverAgentCallback(
-              chatId, String(prop), args, initiatorUserId, initiatorModelId);
-        };
+        if (typeof prop === 'symbol' || prop === 'deliverCallback') {
+          return Reflect.get(target, prop, target);
+        }
+        return (...args: unknown[]) => target.deliverCallback(String(prop), args);
       },
       getPrototypeOf(target) {
         return WorkerEntrypoint.prototype;
@@ -10912,11 +10949,12 @@ export class AgentSelfLoopback
     });
   }
 
-  /**
-   * We need to declare a method otherwise the validator won't even report this class as existing
-   * and so the loopback binding won't be created.
-   */
-  dummyMethodToWorkAroundValidatorBug() {}
+  /** Delivers one `self.<methodName>(...args)` call to the chat thread (see class docs). */
+  deliverCallback(methodName: string, args: unknown[]): Promise<void> {
+    let { chatId, initiatorUserId, initiatorModelId } = this.ctx.props;
+    return this.#overseer.deliverAgentCallback(
+        chatId, methodName, args, initiatorUserId, initiatorModelId);
+  }
 }
 
 type GadgetTailLoopbackProps = {
@@ -10928,6 +10966,12 @@ type GadgetTailLoopbackProps = {
   overseerId: string;
 };
 
+/**
+ * What a loaded gadget's tail worker (old-style `tail` or streaming `tailStream`) delivers to.
+ * The workerd runtime invokes these lifecycle entrypoints, which capnweb-validate deliberately
+ * passes through unvalidated; the decorator still covers any other method this class ever grows.
+ */
+@validateRpc()
 export class GadgetTailLoopback extends WorkerEntrypoint<Cloudflare.Env, GadgetTailLoopbackProps> {
   async #deliver(logs: ConsoleLogEvent[]) {
     let ns = this.ctx.exports.OverseerDurableObject;
@@ -11011,6 +11055,12 @@ type CodeModeLoopbackProps = {
   overseerId: string;
 };
 
+/**
+ * What an executeCode run's tail worker delivers its trace to. As with GadgetTailLoopback, the
+ * runtime-invoked `tail` here is a capnweb-validate passthrough; the decorator covers any other
+ * method this class ever grows.
+ */
+@validateRpc()
 export class CodeModeTailLoopback extends WorkerEntrypoint<Cloudflare.Env, CodeModeLoopbackProps> {
   // TODO: Use tailStream here, but see comment in GadgetTailLoopback about excessive log spam
   //   on workerd console, need to fix that first.
