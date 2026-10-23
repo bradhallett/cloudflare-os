@@ -957,13 +957,13 @@ export function ChatTranscript({
                       return (
                         <div className={`group/agent min-w-0 w-full max-w-[860px] space-y-2 ${provisionalTopClass}`}>
                           {isCompacting && (
-                            <div className={`inline-flex px-1.5 py-1 text-[14px] leading-5 tracking-[-0.25px] ${styles.thinkingShimmer}`}>
+                            <div className="inline-flex shimmer px-1.5 py-1 text-[14px] leading-5 tracking-[-0.25px] text-kumo-inactive shimmer-duration-1800">
                               Compacting…
                             </div>
                           )}
 
                           {showThinking && (
-                            <div className={`inline-flex px-1.5 py-1 text-[14px] leading-5 tracking-[-0.25px] ${styles.thinkingShimmer}`}>
+                            <div className="inline-flex shimmer px-1.5 py-1 text-[14px] leading-5 tracking-[-0.25px] text-kumo-inactive shimmer-duration-1800">
                               Thinking
                             </div>
                           )}
