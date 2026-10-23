@@ -25,7 +25,7 @@ export default defineConfig({
           GmailHookDriver: {className: "GmailHookDriver", useSQLite: true},
           GoogleChatGatekeeperImpl: {className: "GoogleChatGatekeeperImpl", useSQLite: true},
           TestHooks: {className: "TestHooks", useSQLite: true},
-          USER_ACCOUNT: {className: "UserAccount", useSQLite: true},
+          UserAccount: {className: "UserAccount", useSQLite: true},
         },
       },
     }),

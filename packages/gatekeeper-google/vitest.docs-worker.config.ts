@@ -23,7 +23,7 @@ export default defineConfig({
           GOOGLE_SHEETS_GATEKEEPER: { className: "GoogleSheetsGatekeeperImpl", useSQLite: true },
           GOOGLE_SLIDES_GATEKEEPER: { className: "GoogleSlidesGatekeeperImpl", useSQLite: true },
           TEST_HOOKS: { className: "TestHooks", useSQLite: true },
-          USER_ACCOUNT: { className: "UserAccount", useSQLite: true },
+          UserAccount: { className: "UserAccount", useSQLite: true },
         },
       },
     }),
