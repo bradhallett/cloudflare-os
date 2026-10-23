@@ -252,7 +252,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   getCloudflareUsage(): Promise<CloudflareUsageInfo> {
-    return getUsageInfo(this.env, this.#user);
+    return getUsageInfo(this.env, this.#user, this.#userId.toString());
   }
 
   listCloudflareAccounts(): Promise<CloudflareAccountOption[]> {
