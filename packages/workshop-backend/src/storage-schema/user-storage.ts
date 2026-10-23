@@ -7,7 +7,7 @@
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
 import type {
   AiChatAuthorInfo, AiModelConfig, BlueprintMetadata, BlueprintOutput,
-  BotDefinition, GadgetMetadata, WorkpieceId,
+  BotDefinition, GadgetMetadata, OrgMemberStatus, OrgRole, WorkpieceId,
 } from "@gadgets/workshop-shared/api";
 import type { AccountDescription, GatekeeperUser } from "@gadgets/workshop-shared/gatekeeper";
 import type { DeviceSessionHandoff } from "../auth/device-session-handoff.js";
@@ -167,6 +167,17 @@ export type CloudflareBilling = {
   creditsUpdatedAt?: number;
 };
 
+/**
+ * One of the user's organization memberships, mirrored here by the org's Durable Object
+ * (OrgDurableObject.#mirror) whenever it changes. Discovery only: the org's own members
+ * collection is the authority, and listMyOrgs re-checks each entry against its org live.
+ */
+export type OrgMembershipRecord = {
+  orgId: string;
+  role: OrgRole;
+  status: OrgMemberStatus;
+};
+
 export function makeUserStorage(storage: DurableObjectStorage) {
   return createTypedStorage(storage, {
     collections: {
@@ -212,6 +223,11 @@ export function makeUserStorage(storage: DurableObjectStorage) {
         nonUniqueIndexes: {
           byWorkspace(record: OutputRecord) { return record.workspaceId; },
         },
+      }),
+      // The user's org memberships (see OrgMembershipRecord), mirrored by each org's Durable
+      // Object; listMyOrgs reads this index and re-checks every entry against its org.
+      orgMemberships: collection<OrgMembershipRecord>()({
+        primaryKey: "orgId",
       }),
     },
     singletons: {

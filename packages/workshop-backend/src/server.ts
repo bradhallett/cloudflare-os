@@ -1,7 +1,7 @@
 import { RpcStub, RpcTarget, newHttpBatchRpcResponse, newWebSocketRpcSession, RpcSessionOptions } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type { JWTPayload } from "jose";
-import { PublicApi, ROUTER_TAG_PROBE_PATH, VERSION_PATH, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, RedactedAiModelConfig, AiGatewayInfo, AiModelProvider, ModelKind, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, UserDirectoryRecord, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, NotificationSubscriber, NotificationMute, type BotDefinition, type BotInfo, type BotSkillChoice } from '@gadgets/workshop-shared/api';
+import { PublicApi, ROUTER_TAG_PROBE_PATH, VERSION_PATH, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, RedactedAiModelConfig, AiGatewayInfo, AiModelProvider, ModelKind, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, UserDirectoryRecord, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, NotificationSubscriber, NotificationMute, type BotDefinition, type BotInfo, type BotSkillChoice, type OrgInvitePolicy, type OrgMember, type OrgRole, type OrgSummary } from '@gadgets/workshop-shared/api';
 import type { UiFeatureFlags } from "@gadgets/workshop-shared/feature-flags";
 import { backendVersion, getServerConfig } from "./deployment-config.js";
 import { isPasswordAuthEnabled, getAuthGatekeeperAllowlist } from "./auth/config.js";
@@ -23,6 +23,7 @@ import { BlueprintKvRecord, listFeaturedBlueprintsFromKv, readBlueprintKvRecord 
 import { GatekeeperConnectCallbackImpl, GatekeeperUserSelectionExchangeImpl, normalizeUsername, UserDurableObject, CLOUDFLARE_VENDOR_ID } from "./user";
 import { OverseerDurableObject, GatekeeperLoopback, CodeModeTailLoopback, AgentSpawnerGatekeeper, GatekeeperHookLoopback, GadgetTailLoopback, AgentSelfLoopback } from "./overseer";
 import { UserDirectoryDurableObject } from "./user-directory.js";
+import { OrgDurableObject, randomOrgId } from "./org.js";
 import { ExternalMessageGateway } from "./external-message-gateway";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { recordAnalytics } from "./analytics";
@@ -67,6 +68,9 @@ export { AdminSettings };
 
 // Re-export the deployment-wide user directory Durable Object.
 export { UserDirectoryDurableObject };
+
+// Re-export the organization Durable Object.
+export { OrgDurableObject };
 
 // Re-export entrypoint types from user.ts.
 export { UserDurableObject, GatekeeperConnectCallbackImpl, GatekeeperUserSelectionExchangeImpl };
@@ -204,6 +208,58 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
   listBotSkills(): Promise<BotSkillChoice[]> {
     return retryOnDoReset(() => this.#user.listBotSkills());
+  }
+
+  // --- Organizations (see the Org* types in @gadgets/workshop-shared/api) ---
+
+  // The caller's canonical user id (the user DO's name): what org memberships are keyed by.
+  get #ownId(): string {
+    return this.#userId.name!;
+  }
+
+  // A stub for one org's Durable Object, named by the org's random id.
+  #org(orgId: string): DurableObjectStub<OrgDurableObject> {
+    return wrapDoStubForTelemetry(this.ctx.exports.OrgDurableObject.getByName(orgId));
+  }
+
+  // Writes never retry across an org-DO reset (see whoami for the user DO's version of this).
+  createOrg(name: string): Promise<OrgSummary> {
+    return this.#org(randomOrgId()).initializeOrg(name, this.#ownId);
+  }
+  async listMyOrgs(): Promise<OrgSummary[]> {
+    // The user DO's index is discovery only; each org re-checks the membership live, which also
+    // drops stale entries.
+    let entries = await retryOnDoReset(() => this.#user.listOrgMemberships());
+    let me = this.#ownId;
+    let seen = await Promise.all(entries.map(
+        entry => this.#org(entry.orgId).describeForMember(me)));
+    // Inferred null-filter (TS 5.5) keeps the stub-added Disposable in the element type, which
+    // stays assignable to OrgSummary.
+    return seen
+        .filter(org => org !== null)
+        .toSorted((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : a.id < b.id ? -1 : 1);
+  }
+  getOrgMembers(orgId: string): Promise<OrgMember[]> {
+    return retryOnDoReset(() => this.#org(orgId).listMembersFor(this.#ownId));
+  }
+  inviteOrgMember(orgId: string, userId: string, role?: OrgRole): Promise<OrgMember> {
+    return this.#org(orgId).inviteMember(this.#ownId, userId, role ?? "member");
+  }
+  acceptOrgInvitation(orgId: string): Promise<OrgSummary> {
+    return this.#org(orgId).acceptInvitation(this.#ownId);
+  }
+  changeOrgMemberRole(orgId: string, userId: string, role: OrgRole): Promise<OrgMember> {
+    return this.#org(orgId).changeMemberRole(this.#ownId, userId, role);
+  }
+  removeOrgMember(orgId: string, userId: string): Promise<void> {
+    return this.#org(orgId).removeMember(this.#ownId, userId);
+  }
+  leaveOrg(orgId: string): Promise<void> {
+    return this.#org(orgId).memberLeave(this.#ownId);
+  }
+  updateOrgSettings(
+      orgId: string, settings: { invitePolicy: OrgInvitePolicy }): Promise<OrgSummary> {
+    return this.#org(orgId).updateOrgSettings(this.#ownId, settings);
   }
   addModel(profile: AiChatAuthorInfo, config: RedactedAiModelConfig,
            copySecretsFrom?: string): Promise<void> {
