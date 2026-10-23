@@ -2,11 +2,9 @@ import gatekeeperConfiguratorConfig from "@gadgets/scripts/gatekeeper-configurat
 import { vitestTask } from "@gadgets/scripts/vitest-task";
 
 /**
- * Vite+ per-package settings: the shared configurator `build`/`build:configurator` tasks plus a
- * two-pass `test` task — pure logic in Node, RpcTarget/Durable Object behaviour in workerd. The
- * passes stay separate commands so one can replay from the task cache when only the other's
- * inputs moved. The workerd suite imports the generated configurator modules, so `test` generates
- * them first rather than rely on an earlier build having left them.
+ * Vite+ per-package settings: the shared configurator `build`/`build:configurator` tasks plus the
+ * package's `test` task. Every test here exercises RpcTarget/Durable Object behaviour in workerd,
+ * so the task is the single workerd pass (there is no Node suite to keep a separate command for).
  */
 export default {
   ...gatekeeperConfiguratorConfig,
@@ -14,10 +12,7 @@ export default {
     ...gatekeeperConfiguratorConfig.run,
     tasks: {
       ...gatekeeperConfiguratorConfig.run.tasks,
-      test: {
-        ...vitestTask(["vitest run", "vitest run -c vitest.worker.config.ts"]),
-        dependsOn: ["build:configurator"],
-      },
+      test: vitestTask(["vitest run -c vitest.worker.config.ts"]),
     },
   },
 };
