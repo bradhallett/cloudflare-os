@@ -53,6 +53,7 @@ import {
 } from "./transcript/CreatedWorkpieceChatCard";
 import { ThinkingTraceRow } from "./transcript/ThinkingTraceRow";
 import { ToolGroupRow } from "./transcript/ToolGroupRow";
+import { ToolRunningIndicator } from "./transcript/ToolRunningIndicator";
 import { SlashCommandMention } from "./transcript/SlashCommandMention";
 import { WorkIcon } from "./transcript/WorkIcon";
 import {
@@ -980,7 +981,7 @@ export function ChatTranscript({
 
                           {provisionalToolCalls.length > 0 && (() => {
                             const first = provisionalToolCalls[0];
-                            const { label, detailLines } =
+                            const { label, detailLines, running } =
                               buildProvisionalToolSummary(provisionalToolCalls);
                             const expansionKey = `group-${first.toolCallId}`;
                             const isExpanded = expandedToolCalls.has(expansionKey);
@@ -1002,6 +1003,7 @@ export function ChatTranscript({
                                     <span className="min-w-0 flex-1">
                                       <span className="flex min-w-0 items-center gap-2 text-[14px] leading-5 tracking-[-0.25px]">
                                         <span className="min-w-0 truncate">{label}</span>
+                                        {running && <ToolRunningIndicator />}
                                         <CaretRight
                                           size={13}
                                           weight="bold"
