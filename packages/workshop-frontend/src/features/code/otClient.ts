@@ -28,11 +28,12 @@ import {
 // Inputs arrive through three paths, each safe to deliver redundantly or out of order across
 // paths (the client holds rows it cannot apply yet and drains them as knowledge arrives):
 //  - setDurableState(): the chat's ChatCodeBase plus the composed change of the current epoch's
-//    "changes" messages (see ChatCodeChanges in ChatInterface). Also how generation bumps are
-//    learned: a content-preserving bump (a merge's epoch reset, `prior` present) hands the
-//    local buffers across the boundary, so typing straight through someone's accept is
-//    seamless; a destructive bump (revert / draft discard / turn abort) discards local edits
-//    and rebuilds, per ChatCodeBase.generation's contract.
+//    "changes" messages (see ChatCodeChanges in ChatInterface); a delivery older than what is
+//    already folded is ignored. Also how generation bumps are learned: a content-preserving
+//    bump (a merge's epoch reset, `prior` present) hands the local buffers across the
+//    boundary, so typing straight through someone's accept is seamless; a destructive bump
+//    (revert / draft discard / turn abort) discards local edits and rebuilds, per
+//    ChatCodeBase.generation's contract.
 //  - pushRow(): one AiChatSubscriber.changeApplied() row. Deduped by (generation, revision), so
 //    subscribe-replay after a reconnect is harmless.
 //  - applyLocalChange() (with ensureFileEditable() first for a path the content doesn't hold):
@@ -124,7 +125,10 @@ export interface ChatOtClientDelegate {
    * client wholesale. Notifications that would change nothing an editor displays -- our own
    * submission's echo, a doubly-transformed no-op remote row -- are not delivered at all, so
    * empty never means "no-op" (a spurious coarse signal would needlessly rebuild editors,
-   * dropping focus and selection).
+   * dropping focus and selection). Deltas can follow a coarse call within the same tick (the
+   * reset's drain applies held rows immediately), so implementors must route them to
+   * subscriptions the coarse call retires (see RemoteFileListeners), never into sessions the
+   * reload has just doomed.
    */
   onRemoteChange(events: RemoteFileEvent[]): void
   /** Queued local edits were discarded (hard rejection or destructive generation bump). */
@@ -387,13 +391,28 @@ export class ChatOtClient {
 
   /**
    * Fold a fresh durable snapshot (metadata + message log). Called on every recomputation;
-   * internally decides whether it means a rebuild, a generation handoff, or nothing.
+   * internally decides whether it means a rebuild, a generation handoff, or nothing. A
+   * delivery older than what is already folded -- a lower generation, or the same generation
+   * with a lower watermark -- is ignored: #latestDurable is read as the newest knowledge
+   * everywhere (pin resolution for rows, watermark-gap detection, rebuilds), so it only ever
+   * moves forward.
    */
   setDurableState(durable: ChatDurableCode): void {
     this.#enqueue(async () => {
       const codeBase = durable.codeBase ?? { pins: [], generation: 0, revision: 0 }
       // Messages can arrive before the metadata that covers their materialization watermark.
       if (durable.rowsThrough > codeBase.revision) return
+      // A delivery older than the folded snapshot must not displace it: every consumer of
+      // #latestDurable (row pin resolution, watermark-gap detection, #rebuild and its
+      // superseded check) reads it as the newest knowledge. #generation never runs ahead of
+      // the folded generation, so this also covers the stale deliveries the per-generation
+      // check used to catch -- and, unlike it, before anything could read the regression.
+      const foldedGeneration = this.#latestDurable.codeBase?.generation ?? 0
+      if (codeBase.generation < foldedGeneration ||
+          (codeBase.generation === foldedGeneration &&
+           durable.rowsThrough < this.#latestDurable.rowsThrough)) {
+        return
+      }
       const previousPins = this.#latestDurable.codeBase?.pins ?? []
       this.#latestDurable = durable
 
@@ -403,7 +422,6 @@ export class ChatOtClient {
       }
 
       if (codeBase.generation !== this.#generation) {
-        if (codeBase.generation < this.#generation) return  // stale delivery
         if (codeBase.prior?.generation === this.#generation) {
           // Content-preserving epoch reset: finish the closed generation's tail, then hand the
           // local buffers across (see #trySwitchGeneration, called from the drain). The first
