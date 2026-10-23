@@ -82,6 +82,11 @@ declare global {
       // Enables the Cloudflare free-tier limits + top-up flow when set to "true".
       ENABLE_CLOUDFLARE_LIMITS?: string;
 
+      // Marks a hosted SaaS deployment ("true"): surfaced to the frontend through ServerConfig
+      // so SaaS builds can learn the deployment's mode at runtime. Purely informational for the
+      // OSS core — no behavior keys off it here.
+      SAAS_MODE?: string;
+
       // Public base URL of the deployment.
       PUBLIC_BASE_URL?: string;
 
