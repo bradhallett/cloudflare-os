@@ -10,12 +10,10 @@ import {
 } from "react";
 import {
   Dialog,
-  Tooltip,
   useKumoToastManager,
 } from "@cloudflare/kumo";
 
 import {
-  Check,
   X,
 } from "@phosphor-icons/react";
 import { RpcStub } from "capnweb";
@@ -40,6 +38,7 @@ import {
 import { ChatListPanel, type ChatListScope } from "./features/chat/ChatListPanel";
 import { ChatTranscript } from "./features/chat/ChatTranscript";
 import { ChatHeaderBar } from "./features/chat/ChatHeaderBar";
+import { ChatComposerBar } from "./features/chat/ChatComposerBar";
 import type { ChatContentReader } from "./features/code/otClient";
 import { commitFileStore, type CommitFileReader } from "./features/code/commitFileStore";
 import GatekeeperModal from "./GatekeeperModal";
@@ -52,8 +51,6 @@ import { useResolveAction } from "./useResolveAction";
 import { useAuthenticatedApi } from "./AuthContext";
 import OutOfCreditsModal from "./components/billing/OutOfCreditsModal";
 import { copyToClipboard } from "./clipboard";
-import { ChatComposer } from "./features/chat/composer/ChatComposer";
-import { composerDraftStorageKey } from "./features/chat/composer/draft/composerDraft";
 import {
   findUnresolvedConflicts, listConflictedFiles, type UnresolvedConflict,
 } from "./features/chat/mergeConflicts";
@@ -68,7 +65,6 @@ import {
   getStoredShowThinkingTraces,
   persistShowThinkingTraces,
 } from "./features/chat/thinkingTracesPreference";
-import { chatHasProposedChanges } from "./features/chat/chatHasProposedChanges";
 import { resolveToolCallOutput } from "./features/chat/transcript/toolCalls";
 import {
   buildChatDisplayEntries,
@@ -78,7 +74,6 @@ import {
   rhythmTopClass,
 } from "./features/chat/transcript/chatDisplayEntries";
 import { usePendingTurnChanges } from "./features/chat/transcript/usePendingTurnChanges";
-import { DiscardPendingChangesPopover } from "./features/chat/transcript/DiscardPendingChangesPopover";
 import { type AutoApproveTarget } from "./features/chat/transcript/ActionCard";
 import { useChatSubscription } from "./features/chat/useChatSubscription";
 
@@ -1446,111 +1441,39 @@ function ChatInterface({
                 />
               </div>
 
-              {/* ── Bottom: input, update state, and cost ──────────────── */}
-              <div className={`flex-shrink-0 bg-kumo-base ${sidebarMode ? "" : "border-t border-kumo-line"}`}>
-                <div className={useConstrainedChatWidth ? "mx-auto w-full max-w-[920px]" : ""}>
-                  {/* Remount all transient composer state when the conversation changes. */}
-                  <ChatComposer
-                    key={`${workspaceId}:${selectedChatId}`}
-                    chatKey={selectedChatId}
-                    createCapsuleGatekeeper={(accountId, url) =>
-                      overseer.newGatekeeper(accountId, url)
-                    }
-                    getOverseer={getOverseer}
-                    onSend={handleSend}
-                    isAgentActive={isAgentActive}
-                    models={availableModels}
-                    selectedModel={selectedModel === null ? null : {
-                      id: selectedModel,
-                      name: chatAgent?.id === selectedModel ? chatAgent.name : undefined,
-                    }}
-                    onModelChange={handleModelChange}
-                    pendingConsoleLogCount={pendingConsoleLogCount}
-                    consoleLogPreview={consoleLogPreview}
-                    consoleLogSeverity={consoleLogSeverity}
-                    onConsumeConsoleLogs={onConsumeConsoleLogs}
-                    onDiscardConsoleLogs={onDiscardConsoleLogs}
-                    onStop={handleStop}
-                    queuedSteers={queuedSteers?.map((steer) => steer.text)}
-                    showThinkingTraces={showThinkingTraces}
-                    onToggleThinkingTraces={toggleShowThinkingTraces}
-                    draftStorageKey={currentUser && workspaceId && selectedChatId !== null
-                      ? composerDraftStorageKey(
-                          currentUser.id,
-                          `workspace:${workspaceId}:chat:${selectedChatId}`,
-                        )
-                      : undefined}
-                    blockedReason={
-                      hasPendingConnectionRequest
-                        ? "Set up or deny the connection request above to continue."
-                        : hasPendingAwaitedAction
-                          ? "Approve or reject the pending action above to continue."
-                          : undefined
-                    }
-                    draftUpdateBanner={(() => {
-                      if (!currentChatMetadata ||
-                          !(chatHasProposedChanges(currentChatMetadata) ||
-                            hasPendingBlueprintProposal)) return null;
-
-                      // Accepting always merges everything the chat proposes (drafts swept in,
-                      // no partial accepts -- see Overseer.mergeChanges()), so the banner needs
-                      // no accept cut of its own. Discard-all still uses sequence zero, which
-                      // covers every batch including the compacted prefix's.
-                      const isDiscardingChanges = discardingChangesChatIds.has(
-                        currentChatMetadata.id,
-                      );
-                      const changesActionsDisabled = isAgentActive || isDiscardingChanges;
-                      return (
-                        <div className="themed-surface-inset relative flex items-center gap-2 overflow-hidden rounded-t-[calc(1rem-1px)] border-b border-kumo-line bg-kumo-elevated px-3.5 py-2">
-                          <span className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-kumo-brand/40 to-transparent" aria-hidden="true" />
-                          <span className="min-w-0 flex-1 truncate text-[12px] font-medium leading-4 tracking-[-0.2px] text-kumo-default">
-                            Pending changes
-                          </span>
-                          <DiscardPendingChangesPopover
-                            open={discardChangesTarget?.chatId === currentChatMetadata.id}
-                            disabled={changesActionsDisabled}
-                            isDiscarding={isDiscardingChanges}
-                            onOpenChange={(open) => {
-                              if (isDiscardingChanges) return;
-                              setDiscardChangesTarget(open ? {
-                                chatId: currentChatMetadata.id,
-                              } : null);
-                            }}
-                            onConfirm={handleDiscardPendingChanges}
-                          />
-                          <Tooltip content={isAgentActive
-                            ? "Wait for the agent to finish before accepting changes."
-                            : isDiscardingChanges
-                              ? "Wait for pending changes to finish discarding."
-                              : "Keep this draft and make it the gadget's current version."} asChild>
-                            <WorkshopButton
-                              disabled={changesActionsDisabled}
-                              onClick={() => { void handleAcceptChanges(); }}
-                              tone="primary"
-                              className="!h-7 !cursor-pointer !rounded-md !border-transparent !shadow-none gap-1 text-[12px]"
-                            >
-                              <Check size={11} weight="bold" />
-                              Accept changes
-                            </WorkshopButton>
-                          </Tooltip>
-                        </div>
-                      );
-                    })()}
-                  />
-
-                  {/* Token / cost summary. */}
-                  <div className="-mt-1 flex min-h-[1.25rem] items-start justify-end gap-4 px-4 pb-1 font-mono text-[11px] leading-4 text-kumo-inactive">
-                    {currentChatMetadata?.totalTokens != null && (
-                      <span>
-                        {currentChatMetadata.totalTokens.toLocaleString()} tokens
-                      </span>
-                    )}
-                    {currentChatMetadata?.totalCost != null && (
-                      <span>${currentChatMetadata.totalCost.toFixed(4)}</span>
-                    )}
-                  </div>
-                </div>
-              </div>
+              <ChatComposerBar
+                sidebarMode={sidebarMode}
+                useConstrainedChatWidth={useConstrainedChatWidth}
+                workspaceId={workspaceId}
+                selectedChatId={selectedChatId}
+                overseer={overseer}
+                getOverseer={getOverseer}
+                handleSend={handleSend}
+                isAgentActive={isAgentActive}
+                availableModels={availableModels}
+                selectedModel={selectedModel}
+                chatAgent={chatAgent}
+                handleModelChange={handleModelChange}
+                pendingConsoleLogCount={pendingConsoleLogCount}
+                consoleLogPreview={consoleLogPreview}
+                consoleLogSeverity={consoleLogSeverity}
+                onConsumeConsoleLogs={onConsumeConsoleLogs}
+                onDiscardConsoleLogs={onDiscardConsoleLogs}
+                handleStop={handleStop}
+                queuedSteers={queuedSteers}
+                showThinkingTraces={showThinkingTraces}
+                toggleShowThinkingTraces={toggleShowThinkingTraces}
+                currentUser={currentUser}
+                hasPendingConnectionRequest={hasPendingConnectionRequest}
+                hasPendingAwaitedAction={hasPendingAwaitedAction}
+                currentChatMetadata={currentChatMetadata}
+                hasPendingBlueprintProposal={hasPendingBlueprintProposal}
+                discardingChangesChatIds={discardingChangesChatIds}
+                discardChangesTarget={discardChangesTarget}
+                setDiscardChangesTarget={setDiscardChangesTarget}
+                handleDiscardPendingChanges={handleDiscardPendingChanges}
+                handleAcceptChanges={handleAcceptChanges}
+              />
             </>
           )}
         </div>
