@@ -5,7 +5,7 @@
 
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ALICE, FakeZoomInfo, failure, hooks, seedAccount, unwrap } from "./fake-zoominfo";
+import { FakeZoomInfo, failure, hooks, seedAccount, unwrap } from "./fake-zoominfo";
 
 afterEach(() => {
   vi.unstubAllGlobals();

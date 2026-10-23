@@ -31,7 +31,7 @@ import type {
 // outcome is small and gated behind a human approval, so this window is generous).
 const MAX_RETAINED_ENRICHMENTS = 100;
 
-// A submitted-but-not-yet-applied enrichment: enough to replay the ZoomInfo call on approval.
+/** A submitted-but-not-yet-applied enrichment: enough to replay the ZoomInfo call on approval. */
 export type PendingEnrichment = {
   kind: EnrichmentKind;
   summary: string;
@@ -39,10 +39,12 @@ export type PendingEnrichment = {
   page?: PageRequest;
 };
 
-// The stored outcome once the user has decided (mirrors EnrichmentOutcome minus the "pending" state,
-// which is represented by the absence of a stored outcome while the request is still pending). The
-// "unknown" outcome is claimed before an approved enrichment is dispatched, so an activation that
-// dies past the claim leaves a record that blocks the enrichment from being replayed blind.
+/**
+ * The stored outcome once the user has decided (mirrors EnrichmentOutcome minus the "pending" state,
+ * which is represented by the absence of a stored outcome while the request is still pending). The
+ * "unknown" outcome is claimed before an approved enrichment is dispatched, so an activation that
+ * dies past the claim leaves a record that blocks the enrichment from being replayed blind.
+ */
 export type StoredEnrichmentOutcome =
   | { status: "ready"; result: unknown }
   | { status: "rejected" }
@@ -101,8 +103,10 @@ export class EnrichmentStore {
   }
 }
 
-// Replay an approved enrichment against the ZoomInfo API and shape the response into the same
-// payload the (former) synchronous method would have returned. Dispatches on the stored kind.
+/**
+ * Replay an approved enrichment against the ZoomInfo API and shape the response into the same
+ * payload the (former) synchronous method would have returned. Dispatches on the stored kind.
+ */
 export async function performEnrichment(api: ZoomInfoApi, pending: PendingEnrichment): Promise<unknown> {
   const { kind, attributes, page } = pending;
   switch (kind) {

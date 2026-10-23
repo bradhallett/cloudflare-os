@@ -45,15 +45,19 @@ export function bool(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
-// Coerce an id-like value to a number when it is a numeric string (ZoomInfo expects int64 ids in
-// enrich/insight inputs), leaving non-numeric values untouched.
+/**
+ * Coerce an id-like value to a number when it is a numeric string (ZoomInfo expects int64 ids in
+ * enrich/insight inputs), leaving non-numeric values untouched.
+ */
 export function idValue(value: string | undefined): number | string | undefined {
   if (value === undefined) return undefined;
   return Number.isFinite(Number(value)) && value.trim() !== "" ? Number(value) : value;
 }
 
-// Drop undefined entries so we don't send empty attribute keys. Generic so callers keep their
-// narrow value types (e.g. a query-param bag stays assignable to QueryParams).
+/**
+ * Drop undefined entries so we don't send empty attribute keys. Generic so callers keep their
+ * narrow value types (e.g. a query-param bag stays assignable to QueryParams).
+ */
 export function clean<T extends Record<string, unknown>>(obj: T): Partial<T> {
   const out: Partial<T> = {};
   for (const k in obj) {

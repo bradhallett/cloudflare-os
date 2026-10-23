@@ -4,7 +4,7 @@
 
 import type { SupabaseValue } from "./types";
 
-// A mutating SQL statement queued for human approval and applied once approved.
+/** A mutating SQL statement queued for human approval and applied once approved. */
 export type StoredExecuteAction = {
   ref: string;
   sql: string;
@@ -41,9 +41,11 @@ export class PendingActionStore {
   }
 }
 
-// Cache for stable, read-only metadata (project info, schema introspection, etc.). Backed by the
-// gatekeeper DO's KV storage and keyed within a "generation" that is bumped when an action is
-// applied, so structural changes invalidate cached schema in one stroke.
+/**
+ * Cache for stable, read-only metadata (project info, schema introspection, etc.). Backed by the
+ * gatekeeper DO's KV storage and keyed within a "generation" that is bumped when an action is
+ * applied, so structural changes invalidate cached schema in one stroke.
+ */
 export class SupabaseCache {
   #kv: DurableObjectStorage["kv"];
 
