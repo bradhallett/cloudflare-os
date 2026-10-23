@@ -137,6 +137,30 @@ Revocation is a two-phase process in the UI:
 
 A non-owner can only sever their own `user` edge to the target (and only if such an edge exists -- otherwise the call is rejected). If the target still has edges from other sources, they retain access, though possibly at a lower role; if the caller's edge was their only support, the target becomes unreachable like any other lazily-removed user.
 
+### Deprovisioning a user
+
+`UserDurableObject.deprovision()` closes an account: every session (browser and device) is
+deleted along with staged device handoffs and picker tickets, connected gatekeeper accounts are
+revoked best-effort and deleted, the password is destroyed, and a `deprovisioned` flag makes
+every sign-in path (password, gatekeeper, Cloudflare Access) refuse the account from then on.
+For workspaces, the user's Durable Object sweeps its own gadgets index -- every workspace shared
+*with* them -- and asks each Overseer to sever their edges (`severCollaboratorAccess`), an
+owner-style removal that force-restarts each workspace that actually lost them, so their live
+chat sessions die with the restart.
+
+Two lazy residuals are accepted there, consistent with the model above:
+
+- The gadgets index is written on open, so a share the user never opened is invisible to the
+  sweep and its edge lingers. It is inert: an edge grants nothing without an open, and a
+  deprovisioned user can never open anything again.
+- The post-restart cleanup (observer teardown, listing refresh) races the abort exactly as in
+  `removeCollaborator`, and whatever the abort cuts off self-heals lazily (a stale observer
+  registration blocks fail-closed until cleaned; a stale listing yields a denied open).
+
+Deprovisioning does not touch the user's *own* workspaces or their data -- it removes access,
+not content. Removing a user's own workspaces (and, with them, the access they granted others)
+is a separate, explicitly destructive operation.
+
 ## Resource isolation between collaborators
 
 Collaborators share the gadget's code, storage, and AI chat history, but certain resources are scoped to individual users:

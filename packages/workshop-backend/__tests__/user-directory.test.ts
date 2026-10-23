@@ -144,4 +144,35 @@ describe("UserDirectoryDurableObject", () => {
       Array.from({ length: 10 }, (_, index) => `user${(index + 2).toString().padStart(2, "0")}@example.com`),
     );
   });
+
+  it("hides a deprovisioned user, and a later profile sync cannot un-hide them", async () => {
+    const dir = directory("deprovisioned");
+    await dir.syncUser(user("gone@example.com", "Gone User"), 1);
+    await dir.syncUser(user("stay@example.com", "Stay User"), 1);
+    expect((await dir.searchUsers("gone", [])).map(result => result.id))
+        .toEqual(["gone@example.com"]);
+
+    await dir.markUserDeprovisioned("gone@example.com", true);
+    expect(await dir.searchUsers("gone", [])).toEqual([]);
+
+    // The user's own DO still syncs profile updates (e.g. a display-name change landing late);
+    // the upsert must not resurrect the flag it doesn't know about.
+    await dir.syncUser(user("gone@example.com", "Renamed"), 5);
+    expect(await dir.searchUsers("gone", [])).toEqual([]);
+    expect(await dir.searchUsers("renamed", [])).toEqual([]);
+
+    // Unflagging restores them, with the latest synced profile.
+    await dir.markUserDeprovisioned("gone@example.com", false);
+    expect(await dir.searchUsers("renamed", []))
+        .toEqual([user("gone@example.com", "Renamed")]);
+  });
+
+  it("flags a user whose directory record has not arrived yet", async () => {
+    const dir = directory("deprovisioned-missing");
+    await dir.markUserDeprovisioned("never@example.com", true);
+    // The profile sync races the flag (deprovision runs while a sync is in flight); whichever
+    // lands first, the flag wins.
+    await dir.syncUser(user("never@example.com", "Late Sync"), 3);
+    expect(await dir.searchUsers("never", [])).toEqual([]);
+  });
 });
