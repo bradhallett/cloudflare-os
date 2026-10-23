@@ -39,6 +39,14 @@ vi.mock('./useAuth', () => ({
 vi.mock('./components/Header', () => ({ default: () => <header data-testid="header">Header</header> }))
 vi.mock('./LoginPage', () => ({ default: () => <div data-testid="login">Login</div> }))
 
+// The gate is compile-time; here it is faked so both builds' root wiring can be exercised in one
+// suite. The gate's own logic is saasRoute.test.tsx; the bundle-level wiring is saasBundle.test.ts.
+const saasGate = vi.hoisted(() => ({ on: false }))
+vi.mock('./features/saas/saasRoute', () => ({
+  isSaasRoute: (pathname: string) => saasGate.on && pathname.startsWith('/saas'),
+  SaasSurface: () => <div data-testid="saas-surface">SaaS surface</div>,
+}))
+
 import { Route } from './routes/__root'
 import { RpcContext } from './RpcContext'
 import { HANDOFF_PATH } from './connectHandoff'
@@ -58,6 +66,7 @@ describe('root route standalone rendering', () => {
     testState.pathname = '/'
     testState.isLoading = false
     testState.authenticatedApi = null
+    saasGate.on = false
   })
 
   async function renderAt(pathname: string, isLoading = false) {
@@ -119,5 +128,23 @@ describe('root route standalone rendering', () => {
 
     expect(page.querySelector('[data-testid="login"]')).not.toBeNull()
     expect(page.querySelector('[data-testid="outlet"]')).toBeNull()
+  })
+
+  it('renders the SaaS surface standalone when the gate is on, without waiting on auth', async () => {
+    saasGate.on = true
+    // isLoading=true: the SaaS gate must render before the loading/auth gates, like the handoff.
+    const page = await renderAt('/saas', true)
+
+    expect(page.querySelector('[data-testid="saas-surface"]')).not.toBeNull()
+    expect(page.querySelector('[data-testid="login"]')).toBeNull()
+    expect(page.querySelector('[data-testid="outlet"]')).toBeNull()
+    expect(page.textContent).not.toContain('Loading')
+  })
+
+  it('routes /saas into the workshop as before when the gate is off (the OSS build)', async () => {
+    const page = await renderAt('/saas')
+
+    expect(page.querySelector('[data-testid="saas-surface"]')).toBeNull()
+    expect(page.querySelector('[data-testid="login"]')).not.toBeNull()
   })
 })

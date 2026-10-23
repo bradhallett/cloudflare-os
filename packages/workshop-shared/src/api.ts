@@ -1674,6 +1674,13 @@ export type ServerConfig = {
    * default, e.g. self-hosted), usage is unlimited and the credits UI is hidden.
    */
   cloudflareLimitsEnabled: boolean;
+  /**
+   * Whether this deployment runs in hosted SaaS mode (env-driven, default false). The compile-time
+   * `VITE_SAAS` build flag decides which frontend bundle has SaaS surfaces at all; this value lets
+   * that bundle also learn the backend's mode at runtime.
+   */
+  saasEnabled: boolean;
+
 
   /**
    * Whether new account signups are allowed (admin-configurable, default true). The signup page
