@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import type { UserDirectoryDurableObject } from "../src/user-directory.js";
+import { MAX_SCOPE_IDS, type UserDirectoryDurableObject } from "../src/user-directory.js";
 // Load the whole backend (the pool's `main`) up front. Otherwise the pool loads it on the first
 // RPC into the Durable Object, and that slow load counts against the first test's timeout.
 import "./test-worker.js";
@@ -36,17 +36,20 @@ describe("UserDirectoryDurableObject", () => {
     await stub.syncUser(user("ada@example.com", "Ada Lovelace"), 0);
     await stub.syncUser(user("grace@example.com", "Grace Hopper"), 0);
 
-    await expect(stub.searchUsers("LOVE", [])).resolves.toEqual([
-      user("ada@example.com", "Ada Lovelace"),
-    ]);
-    await expect(stub.searchUsers("love", ["ada@example.com"])).resolves.toEqual([]);
-    await expect(stub.searchUsers("grace@", ["ada@example.com"])).resolves.toEqual([
-      user("grace@example.com", "Grace Hopper"),
-    ]);
+    await expect(stub.searchUsers("LOVE", [], ["ada@example.com", "grace@example.com"]))
+      .resolves.toEqual([
+        user("ada@example.com", "Ada Lovelace"),
+      ]);
+    await expect(stub.searchUsers("love", ["ada@example.com"],
+      ["ada@example.com", "grace@example.com"])).resolves.toEqual([]);
+    await expect(stub.searchUsers("grace@", ["ada@example.com"],
+      ["ada@example.com", "grace@example.com"])).resolves.toEqual([
+        user("grace@example.com", "Grace Hopper"),
+      ]);
 
     await stub.syncUser(user("ada@example.com", "Augusta Ada King"), 1);
-    await expect(stub.searchUsers("lovelace", [])).resolves.toEqual([]);
-    await expect(stub.searchUsers("augusta", [])).resolves.toEqual([
+    await expect(stub.searchUsers("lovelace", [], ["ada@example.com"])).resolves.toEqual([]);
+    await expect(stub.searchUsers("augusta", [], ["ada@example.com"])).resolves.toEqual([
       user("ada@example.com", "Augusta Ada King"),
     ]);
   });
@@ -58,12 +61,12 @@ describe("UserDirectoryDurableObject", () => {
     // both ignored; only a higher revision replaces the record.
     await stub.syncUser(user("ada@example.com", "Stale"), 1);
     await stub.syncUser(user("ada@example.com", "Replay"), 2);
-    await expect(stub.searchUsers("ada@", [])).resolves.toEqual([
+    await expect(stub.searchUsers("ada@", [], ["ada@example.com"])).resolves.toEqual([
       user("ada@example.com", "Newest"),
     ]);
 
     await stub.syncUser(user("ada@example.com", "Newer Still"), 3);
-    await expect(stub.searchUsers("ada@", [])).resolves.toEqual([
+    await expect(stub.searchUsers("ada@", [], ["ada@example.com"])).resolves.toEqual([
       user("ada@example.com", "Newer Still"),
     ]);
   });
@@ -75,17 +78,18 @@ describe("UserDirectoryDurableObject", () => {
     await stub.syncUser(user("%percent", "Percent"), 0);
     await stub.syncUser(user("q@example.com", "A \"Quoted\" AND Person"), 0);
 
-    await expect(stub.searchUsers("al", [])).resolves.toEqual([
+    const scope = ["al@example.com", "sally@example.com", "%percent", "q@example.com"];
+    await expect(stub.searchUsers("al", [], scope)).resolves.toEqual([
       user("al@example.com", "Al Li"),
       user("sally@example.com", "Sally"),
     ]);
-    await expect(stub.searchUsers("%", [])).resolves.toEqual([
+    await expect(stub.searchUsers("%", [], scope)).resolves.toEqual([
       user("%percent", "Percent"),
     ]);
-    await expect(stub.searchUsers("\"Quoted\" AND", [])).resolves.toEqual([
+    await expect(stub.searchUsers("\"Quoted\" AND", [], scope)).resolves.toEqual([
       user("q@example.com", "A \"Quoted\" AND Person"),
     ]);
-    await expect(stub.searchUsers("  ", [])).resolves.toEqual([]);
+    await expect(stub.searchUsers("  ", [], scope)).resolves.toEqual([]);
   });
 
   it("ranks an exact canonical id ahead of an identical display name", async () => {
@@ -93,7 +97,8 @@ describe("UserDirectoryDurableObject", () => {
     await stub.syncUser(user("attacker@example.com", "victim@example.com"), 0);
     await stub.syncUser(user("victim@example.com", "Real Victim"), 0);
 
-    await expect(stub.searchUsers("victim@example.com", [])).resolves.toEqual([
+    await expect(stub.searchUsers("victim@example.com", [],
+      ["attacker@example.com", "victim@example.com"])).resolves.toEqual([
       user("victim@example.com", "Real Victim"),
       user("attacker@example.com", "victim@example.com"),
     ]);
@@ -103,29 +108,36 @@ describe("UserDirectoryDurableObject", () => {
     const stub = directory("boundary");
     await stub.syncUser(user("ada@example.com", "Grace"), 0);
 
-    await expect(stub.searchUsers("ceada", [])).resolves.toEqual([]);
-    await expect(stub.searchUsers("grace", [])).resolves.toEqual([
+    await expect(stub.searchUsers("ceada", [], ["ada@example.com"])).resolves.toEqual([]);
+    await expect(stub.searchUsers("grace", [], ["ada@example.com"])).resolves.toEqual([
       user("ada@example.com", "Grace"),
     ]);
     // The stored id and name are separated by a newline, so a query may not contain one.
-    await expectRejection(stub.searchUsers("com\ngra", []), "no line breaks");
-    await expectRejection(stub.searchUsers("com\rgra", []), "no line breaks");
+    await expectRejection(
+      stub.searchUsers("com\ngra", [], ["ada@example.com"]), "no line breaks");
+    await expectRejection(
+      stub.searchUsers("com\rgra", [], ["ada@example.com"]), "no line breaks");
   });
 
   it("bounds the query length and the distinct exclusions", async () => {
     const stub = directory("bounds");
     await stub.syncUser(user("ada@example.com", "Ada"), 0);
 
-    await expect(stub.searchUsers("a".repeat(1000), [])).resolves.toEqual([]);
-    await expectRejection(stub.searchUsers("a".repeat(1001), []), "at most 1000 characters");
+    await expect(stub.searchUsers("a".repeat(1000), [], ["ada@example.com"]))
+      .resolves.toEqual([]);
+    await expectRejection(
+      stub.searchUsers("a".repeat(1001), [], ["ada@example.com"]), "at most 1000 characters");
 
     const distinct = Array.from({ length: 1000 }, (_, index) => `user${index}`);
-    await expect(stub.searchUsers("ada", distinct)).resolves.toEqual([user("ada@example.com", "Ada")]);
+    await expect(stub.searchUsers("ada", distinct, ["ada@example.com"]))
+      .resolves.toEqual([user("ada@example.com", "Ada")]);
     // Duplicates collapse before the limit applies; one more distinct id is over it.
-    await expect(stub.searchUsers("ada", [...distinct, ...distinct])).resolves.toEqual([
-      user("ada@example.com", "Ada"),
-    ]);
-    await expectRejection(stub.searchUsers("ada", [...distinct, "user1000"]), "At most 1000 users");
+    await expect(stub.searchUsers("ada", [...distinct, ...distinct], ["ada@example.com"]))
+      .resolves.toEqual([
+        user("ada@example.com", "Ada"),
+      ]);
+    await expectRejection(stub.searchUsers("ada", [...distinct, "user1000"], ["ada@example.com"]),
+      "At most 1000 users");
   });
 
   it("applies exclusions before capping broad matches at ten results", async () => {
@@ -135,10 +147,12 @@ describe("UserDirectoryDurableObject", () => {
       `Common Person ${index.toString().padStart(2, "0")}`,
     ), 0)));
 
+    const scope = Array.from({ length: 12 },
+      (_, index) => `user${index.toString().padStart(2, "0")}@example.com`);
     const results = await stub.searchUsers("common", [
       "user00@example.com",
       "user01@example.com",
-    ]);
+    ], scope);
     expect(results).toHaveLength(10);
     expect(results.map(result => result.id)).toEqual(
       Array.from({ length: 10 }, (_, index) => `user${(index + 2).toString().padStart(2, "0")}@example.com`),
@@ -149,21 +163,22 @@ describe("UserDirectoryDurableObject", () => {
     const dir = directory("deprovisioned");
     await dir.syncUser(user("gone@example.com", "Gone User"), 1);
     await dir.syncUser(user("stay@example.com", "Stay User"), 1);
-    expect((await dir.searchUsers("gone", [])).map(result => result.id))
+    const everyone = ["gone@example.com", "stay@example.com"];
+    expect((await dir.searchUsers("gone", [], everyone)).map(result => result.id))
         .toEqual(["gone@example.com"]);
 
     await dir.markUserDeprovisioned("gone@example.com", true);
-    expect(await dir.searchUsers("gone", [])).toEqual([]);
+    expect(await dir.searchUsers("gone", [], everyone)).toEqual([]);
 
     // The user's own DO still syncs profile updates (e.g. a display-name change landing late);
     // the upsert must not resurrect the flag it doesn't know about.
     await dir.syncUser(user("gone@example.com", "Renamed"), 5);
-    expect(await dir.searchUsers("gone", [])).toEqual([]);
-    expect(await dir.searchUsers("renamed", [])).toEqual([]);
+    expect(await dir.searchUsers("gone", [], everyone)).toEqual([]);
+    expect(await dir.searchUsers("renamed", [], everyone)).toEqual([]);
 
     // Unflagging restores them, with the latest synced profile.
     await dir.markUserDeprovisioned("gone@example.com", false);
-    expect(await dir.searchUsers("renamed", []))
+    expect(await dir.searchUsers("renamed", [], everyone))
         .toEqual([user("gone@example.com", "Renamed")]);
   });
 
@@ -173,6 +188,30 @@ describe("UserDirectoryDurableObject", () => {
     // The profile sync races the flag (deprovision runs while a sync is in flight); whichever
     // lands first, the flag wins.
     await dir.syncUser(user("never@example.com", "Late Sync"), 3);
-    expect(await dir.searchUsers("never", [])).toEqual([]);
+    expect(await dir.searchUsers("never", [], ["never@example.com"])).toEqual([]);
+  });
+
+  it("returns only the ids the caller's scope names, however well anyone else matches", async () => {
+    const stub = directory("scope");
+    await stub.syncUser(user("insider@example.com", "Pat Inside"), 0);
+    await stub.syncUser(user("outsider@example.com", "Patricia Outside"), 0);
+
+    // The outsider is the better "pat" match; a scope that omits her hides her entirely.
+    await expect(stub.searchUsers("pat", [], ["insider@example.com"])).resolves.toEqual([
+      user("insider@example.com", "Pat Inside"),
+    ]);
+    await expect(stub.searchUsers("patricia", [], ["insider@example.com"])).resolves.toEqual([]);
+  });
+
+  it("bounds the distinct ids a scope may name", async () => {
+    const stub = directory("scope-bounds");
+    await stub.syncUser(user("ada@example.com", "Ada"), 0);
+
+    const scope = Array.from({ length: MAX_SCOPE_IDS }, (_, index) => `user${index}`);
+    await expect(stub.searchUsers("ada", [], scope)).resolves.toEqual([]);
+    // Duplicates collapse before the limit applies; one more distinct id is over it.
+    await expect(stub.searchUsers("ada", [], [...scope, ...scope])).resolves.toEqual([]);
+    await expectRejection(stub.searchUsers("ada", [], [...scope, "one-more"]),
+      `A search scope may name at most ${MAX_SCOPE_IDS} users.`);
   });
 });

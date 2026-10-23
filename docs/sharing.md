@@ -35,6 +35,11 @@ There are two ways to grant someone collaborator access:
 
 **Direct add.** The owner or an existing collaborator enters a username (an email address on OAuth/CF Access deployments; a normalized alphanumeric handle on password deployments) in the Share modal. The system looks up the corresponding user account; if it exists, a collaborator record is created. The target user does not receive an in-product notification -- the sharer is expected to send them a link or tell them out of band.
 
+**Directory search scope.** The Share modal's people search (and the gatekeeper user picker's;
+see `docs/tenancy.md`) is scoped: it offers only the searcher's active org co-members plus the
+owners of workspaces shared with the searcher. Typing another user's exact identifier remains the
+unscoped path for a direct add -- the directory is discovery, not the authorization boundary.
+
 **Share link.** Any collaborator (or the owner) can create a share link, which encodes a secret key in the URL as a `#share=<key>` fragment. Anyone who opens this link is automatically added as a collaborator. A link is a durable handle that owns one or more keys: creating it mints its first key, and "copying" the link later mints another key for the same link. The raw key is shown to the creator only once at mint time and is never stored server-side, so re-copying can't reproduce an old key -- it mints a new one. Any of a link's keys can be redeemed by multiple people, or the same person multiple times, until the link is revoked, which invalidates every key minted for it.
 
 Share key security: the server generates a random 128-bit key and stores only its HMAC-SHA-256 hash (using a fixed domain-separation constant, `SHARE_KEY_HMAC_KEY`). When a user redeems a share link, the client sends the raw key to the server, which computes the hash and looks it up. This means the server cannot reconstruct share links from its stored data, and a database leak does not expose valid share keys.

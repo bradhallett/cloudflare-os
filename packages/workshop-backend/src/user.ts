@@ -54,6 +54,19 @@ export type ProvidedAccountInfo = {
   description: AccountDescription;   // carries `singleton` / `providesUi` declarations
 };
 
+/**
+ * The caller's user-directory scope: who they may find with `searchUsers()` and pick with a
+ * gatekeeper user-selection ticket. One entry per org that still holds the caller as an active
+ * member (re-checked live through the org's own member listing, so a stale index entry or a
+ * removed membership yields no entry), naming that org's active member ids; `partnerIds` adds the
+ * owners of workspaces shared with the caller, the explicit share relationships that outlive org
+ * boundaries. Together these are the whole searchable set — nobody outside them is discoverable.
+ */
+export type UserDirectoryScope = {
+  orgs: { orgId: string; memberIds: string[] }[];
+  partnerIds: string[];
+};
+
 // The singleton/UI methods (createAccount on GatekeeperVendor; getSingletonGatekeeperClass /
 // startAppUi on GatekeeperUser) are optional on their interfaces. We don't need to probe whether a
 // method is present — we already know from the declaration flags (autoProvisionsAccount /
@@ -1914,11 +1927,54 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
+   * The caller's directory scope (see `UserDirectoryScope`), as `searchUsers` and the gatekeeper
+   * user picker compute it. The user's mirrored membership index names the orgs; each org's own
+   * member listing — an actor-checked read, so it re-checks this membership live — names the
+   * people. An org that cannot be read (the index is stale, the membership ended, or the read
+   * failed) contributes nothing: the scope fails closed, so an unreachable org can only shrink
+   * discovery, never widen it.
+   */
+  async getDirectoryScope(): Promise<UserDirectoryScope> {
+    const me = this.storage.profile.get().id;
+    const orgs = await Promise.allSettled([...this.storage.orgMemberships.list()].map(
+        async (entry): Promise<UserDirectoryScope["orgs"][number]> => ({
+          orgId: entry.orgId,
+          memberIds: (await this.ctx.exports.OrgDurableObject.getByName(entry.orgId)
+              .listMembersFor(me))
+              .filter(member => member.status === "active")
+              .map(member => member.userId),
+        })));
+    return {
+      orgs: orgs.flatMap(result => result.status === "fulfilled" ? [result.value] : []),
+      partnerIds: [...this.#sharePartnerIds()],
+    };
+  }
+
+  /**
+   * The ids of people this user already holds an explicit share relationship with: the owners of
+   * workspaces shared with them, as their own object records from opening each share. (The
+   * converse — collaborators on workspaces this user owns — lives in those workspaces' Overseers,
+   * not here, and org scoping of sharing graphs tracks it in later issues.) A dismissed share
+   * drops its record, and with it the partnership.
+   */
+  #sharePartnerIds(): Set<string> {
+    const partners = new Set<string>();
+    for (const gadget of this.storage.gadgets.list()) {
+      if (gadget.owner) partners.add(gadget.owner.id);
+    }
+    return partners;
+  }
+
+  /**
    * Mint a single-use ticket for a user selected on behalf of a gatekeeper app,
    * redeemable through that gatekeeper app's exchange capability (see
    * GatekeeperUserSelectionExchangeImpl). Returns null if the selected user is
-   * this user or does not exist. Self-selection uses stable DO identity because
-   * ctx.id.name may be absent after a cold start through idFromString().
+   * this user, does not exist, or falls outside the caller's directory scope
+   * (see `UserDirectoryScope`) — the same scope `searchUsers` covers, so an
+   * org's members can be neither searched nor picked from outside it. The
+   * ticket records the orgs that justified the pick; redemption re-checks them
+   * live. Self-selection uses stable DO identity because ctx.id.name may be
+   * absent after a cold start through idFromString().
    */
   async createGatekeeperUserSelection(
       appAccountId: number, selectedUserId: string,
@@ -1929,11 +1985,16 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (this.ctx.id.equals(selectedId)) return null;
     let selectedProfile = await this.ctx.exports.UserDurableObject.get(selectedId).whoamiIfExists();
     if (!selectedProfile) return null;
+    let scope = await this.getDirectoryScope();
+    let orgIds = scope.orgs
+        .filter(org => org.memberIds.includes(selectedUserId))
+        .map(org => org.orgId);
+    if (orgIds.length === 0 && !scope.partnerIds.includes(selectedUserId)) return null;
     let profile = { displayName: selectedProfile.name };
     let { secret, hash: ticketHash } = await newSecretToken();
     let expiresAt = new Date(Date.now() + GATEKEEPER_USER_SELECTION_LIFETIME_MS);
     this.storage.pendingUserSelections.put({
-      ticketHash, appAccountId, vendorId: app.vendorId, selectedUserId, expiresAt,
+      ticketHash, appAccountId, vendorId: app.vendorId, selectedUserId, orgIds, expiresAt,
     });
     await this.#armExpirySweep();
     return { ticket: secret.toHex(), profile };
@@ -1948,6 +2009,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * zero or multiple results. A ticket represents a Workshop user, not a
    * connected account, so a 1:1 mapping with a connected account is not
    * guaranteed.
+   *
+   * The pick's justification is re-checked live: for an org-justified ticket,
+   * some recorded org must still hold both the selector and the selected as
+   * active members (the lazy-revocation contract — a removed member's pending
+   * picks die at redemption); a share-justified ticket requires the share
+   * relationship to still stand.
    */
   async redeemGatekeeperUserSelection(
       appAccountId: number, ticket: string,
@@ -1964,8 +2031,33 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
     let app = await this.#uiAccountRecord(appAccountId);
     if (!app || app.vendorId !== record.vendorId) throw new Error("No such app.");
+    if (!(await this.#selectionStillJustified(record))) {
+      throw new Error("This selection is no longer available. Please select the user again.");
+    }
     return this.ctx.exports.UserDurableObject.getByName(record.selectedUserId)
         .selectableGatekeeperUsers(record.vendorId);
+  }
+
+  /**
+   * Whether a pending selection's recorded justification still holds. Org-justified tickets name
+   * their orgs (`orgIds`); each is asked, as the authority on its own membership, whether the
+   * selector and the selected are still active members — one surviving org suffices. A ticket
+   * without orgs was justified by a workspace share, which must still be recorded here. Tickets
+   * minted before org scoping recorded no orgIds and read as share-justified.
+   */
+  async #selectionStillJustified(
+      record: { orgIds?: string[]; selectedUserId: string },
+  ): Promise<boolean> {
+    let orgIds = record.orgIds ?? [];
+    if (orgIds.length === 0) return this.#sharePartnerIds().has(record.selectedUserId);
+    let me = this.storage.profile.get().id;
+    for (let orgId of orgIds) {
+      let org = this.ctx.exports.OrgDurableObject.getByName(orgId);
+      let [mine, theirs] = await Promise.all([
+        org.getMember(me), org.getMember(record.selectedUserId)]);
+      if (mine?.status === "active" && theirs?.status === "active") return true;
+    }
+    return false;
   }
 
   /**

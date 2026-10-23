@@ -46,6 +46,22 @@ Library org grants, SCIM-provisioned members) holds its grant and **re-checks** 
 member's access therefore ends at the next check, without cascading deletes across resource
 owners, and a later re-add restores it seamlessly.
 
+## Org-scoped user directory
+
+`AuthenticatedApi.searchUsers` and the gatekeeper user picker are scoped to the caller's
+**directory scope**: the active members of the orgs the user belongs to, plus the owners of
+workspaces shared with them (`UserDurableObject.getDirectoryScope()`). The user's membership
+index names the orgs, but each org's own member listing — an actor-checked read — names the
+people, so the scope is computed live and fails closed: an org that cannot be read (membership
+ended, mirror lost, read failed) contributes nothing, and a deployment without orgs falls back to
+share partners alone. No query can enumerate users outside the scope; the directory DO itself
+accepts an explicit scope only (`searchUsers(query, excludeIds, includeIds)`).
+
+A picker ticket (`createGatekeeperUserSelection`) records the orgs that justified the pick
+(`orgIds`), and redemption re-checks them live — the same lazy-revocation contract as above, so a
+removed member's pending picks die at redemption. A ticket justified by a share relationship
+(empty `orgIds`) instead requires that relationship to still stand.
+
 ## Observability
 
 Org events are logged under the `workshop.org` component (`org.created`, `org.member.invited`,
