@@ -1,5 +1,5 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, type DeviceSessionHandoffStart, type BotDefinition, type BotInfo, type BotSelection, type BotSkillChoice, type BotSkillRef } from '@gadgets/workshop-shared/api';
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, type DeviceSessionHandoffStart, type BotDefinition, type BotInfo, type BotSelection, type BotSkillChoice, type BotSkillRef, type OrgMemberStatus, type OrgRole } from '@gadgets/workshop-shared/api';
 import { ActionDescription, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperUserSelection, GatekeeperUserSelectionExchange, RedeemedGatekeeperUserSelection } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { botKey, normalizeBotDefinition } from "./bot-config.js";
@@ -9,7 +9,8 @@ import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
   makeUserStorage, type BlueprintUserRecord, type CloudflareBilling, type ConnectedAccountRecord,
   type GadgetRecord, type PendingConnectFlow, type PendingDeviceHandoffRecord,
-  type PendingHandoffRecord, type UserAiModelRecord, type UserStorage, type WorkspaceOutputEntry,
+  type PendingHandoffRecord, type OrgMembershipRecord, type UserAiModelRecord, type UserStorage,
+  type WorkspaceOutputEntry,
 } from "./storage-schema/user-storage.js";
 import { recordAnalytics } from "./analytics";
 import { createWorkshopLogger } from "./observability";
@@ -1170,6 +1171,26 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     for (let entry of entries) {
       this.storage.outputs.put({...entry, workspaceId});
     }
+  }
+
+  /**
+   * Mirror one organization membership into this user's index, or drop it with null. Called by
+   * the org's Durable Object whenever the membership changes (see OrgDurableObject). The org is
+   * the authority; this index only lets listMyOrgs find the orgs in one read of the user's own
+   * object, and every entry is re-checked against its org when read.
+   */
+  syncOrgMembership(
+      orgId: string, membership: { role: OrgRole; status: OrgMemberStatus } | null): void {
+    if (membership === null) {
+      this.storage.orgMemberships.delete(orgId);
+    } else {
+      this.storage.orgMemberships.put({ orgId, ...membership });
+    }
+  }
+
+  /** The user's mirrored org memberships (see syncOrgMembership), sorted by org id. */
+  listOrgMemberships(): OrgMembershipRecord[] {
+    return [...this.storage.orgMemberships.list()];
   }
 
   async listOutputs(): Promise<ListOutputsResult> {
