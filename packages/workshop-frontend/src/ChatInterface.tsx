@@ -8,14 +8,8 @@ import {
   useCallback,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import {
-  Dialog,
-  useKumoToastManager,
-} from "@cloudflare/kumo";
+import { useKumoToastManager } from "@cloudflare/kumo";
 
-import {
-  X,
-} from "@phosphor-icons/react";
 import { RpcStub } from "capnweb";
 import {
   getStoredSelectedModel,
@@ -37,24 +31,19 @@ import {
 } from "@gadgets/workshop-shared/api";
 import { ChatListPanel, type ChatListScope } from "./features/chat/ChatListPanel";
 import { ChatTranscript } from "./features/chat/ChatTranscript";
+import { ChatDialogs } from "./features/chat/ChatDialogs";
 import { ChatHeaderBar } from "./features/chat/ChatHeaderBar";
 import { ChatComposerBar } from "./features/chat/ChatComposerBar";
 import type { ChatContentReader } from "./features/code/otClient";
 import { commitFileStore, type CommitFileReader } from "./features/code/commitFileStore";
-import GatekeeperModal from "./GatekeeperModal";
 import { hookToggleFailureToast } from "./components/HookToggle";
-import DeleteConfirmationDialog from "./components/DeleteConfirmationDialog";
-import AutoApproveConfirmDialog from "./components/AutoApproveConfirmDialog";
-import { WorkshopButton, WorkshopIconButton } from "./components/WorkshopControls";
 import { useAlwaysApproveTag } from "./useAlwaysApproveTag";
 import { useResolveAction } from "./useResolveAction";
 import { useAuthenticatedApi } from "./AuthContext";
-import OutOfCreditsModal from "./components/billing/OutOfCreditsModal";
 import { copyToClipboard } from "./clipboard";
 import {
   findUnresolvedConflicts, listConflictedFiles, type UnresolvedConflict,
 } from "./features/chat/mergeConflicts";
-import { UnresolvedConflictsDialog } from "./features/chat/UnresolvedConflictsDialog";
 import {
   type ActiveFileTarget,
   type ChatCodeChanges,
@@ -1479,125 +1468,30 @@ function ChatInterface({
         </div>
       ) : null}
 
-      {/* An accept came back stale: mainline advanced past this chat's pins, so the changes can
-          only land after merging the gadget's current version into the chat first. */}
-      <Dialog.Root
-        open={staleAcceptChatId !== null}
-        onOpenChange={(nextOpen) => {
-          if (!isUpdatingFromMainline && !nextOpen) setStaleAcceptChatId(null);
-        }}
-      >
-        <Dialog
-          className="!z-[1000] !w-[min(440px,calc(100vw-32px))] overflow-hidden bg-kumo-base p-0 !top-[20%] !-translate-y-0"
-          size="sm"
-        >
-          <div className="flex items-start justify-between gap-4 border-b border-kumo-line px-5 py-4">
-            <div className="min-w-0">
-              <Dialog.Title className="text-[15px] leading-5 font-medium tracking-[-0.3px] text-kumo-default">
-                The gadget changed since this draft started
-              </Dialog.Title>
-              <Dialog.Description className="mt-1 text-[12px] leading-4 font-normal tracking-[-0.2px] text-kumo-subtle">
-                Someone else&apos;s changes were accepted in the meantime, so this draft&apos;s
-                changes can&apos;t be applied as-is. Bring the latest changes into this draft
-                first; any conflicts will be marked in the code for you (or the agent) to resolve
-                before accepting again.
-              </Dialog.Description>
-            </div>
-            <Dialog.Close
-              render={(props) => (
-                <WorkshopIconButton
-                  {...props}
-                  className="!h-7 !w-7"
-                  disabled={isUpdatingFromMainline}
-                  aria-label="Close"
-                >
-                  <X size={16} />
-                </WorkshopIconButton>
-              )}
-            />
-          </div>
-
-          <div className="flex items-center justify-end gap-2 border-t border-kumo-line bg-kumo-base px-5 py-3">
-            <Dialog.Close
-              render={(props) => (
-                <WorkshopButton
-                  {...props}
-                  className="!h-9"
-                  disabled={isUpdatingFromMainline}
-                >
-                  Not now
-                </WorkshopButton>
-              )}
-            />
-            <WorkshopButton
-              tone="primary"
-              onClick={() => { void handleUpdateFromMainline(); }}
-              disabled={isUpdatingFromMainline}
-              className="!h-9 min-w-[64px]"
-            >
-              {isUpdatingFromMainline ? "Updating..." : "Bring in latest changes"}
-            </WorkshopButton>
-          </div>
-        </Dialog>
-      </Dialog.Root>
-
-      {unresolvedConflicts !== null && (
-        <UnresolvedConflictsDialog
-          conflicts={unresolvedConflicts}
-          onCancel={() => setUnresolvedConflicts(null)}
-          onAcceptAnyway={() => {
-            setUnresolvedConflicts(null);
-            void handleMergeChanges();
-          }}
-        />
-      )}
-
-      <DeleteConfirmationDialog
-        open={deleteTarget !== null}
-        title="Delete conversation?"
-        description={<>This removes <span className="font-medium text-kumo-default">{deleteTarget?.title}</span>. You can&apos;t undo this.</>}
+      <ChatDialogs
+        staleAcceptChatId={staleAcceptChatId}
+        setStaleAcceptChatId={setStaleAcceptChatId}
+        isUpdatingFromMainline={isUpdatingFromMainline}
+        handleUpdateFromMainline={handleUpdateFromMainline}
+        unresolvedConflicts={unresolvedConflicts}
+        setUnresolvedConflicts={setUnresolvedConflicts}
+        handleMergeChanges={handleMergeChanges}
+        deleteTarget={deleteTarget}
+        setDeleteTarget={setDeleteTarget}
         isDeleting={isDeleting}
-        onOpenChange={(open) => {
-          if (!open) setDeleteTarget(null);
-        }}
-        onConfirm={handleDeleteConfirm}
-      />
-
-      {/* The workspace latched: the affordance is gone and confirming could only error. */}
-      {!restricted && autoApproveConfirm && (
-        <AutoApproveConfirmDialog
-          open
-          actionLabel={autoApproveConfirm.actionLabel}
-          resourceTitle={autoApproveConfirm.resourceTitle}
-          isProcessing={processingActions.has(autoApproveConfirm.actionId)}
-          onOpenChange={(open) => {
-            if (!open) setAutoApproveConfirm(null);
-          }}
-          onConfirm={async () => {
-            const { actionId, gatekeeperId, actionKind } = autoApproveConfirm;
-            if (await alwaysApproveTag(actionId, gatekeeperId, actionKind)) {
-              setAutoApproveConfirm(null);
-            }
-          }}
-        />
-      )}
-
-      {creationAccountModal}
-
-      {/* Accept flow for an agent connection request: pre-seeds the gatekeeper modal and, on
-          creation, finalizes the request so the agent resumes. */}
-      <GatekeeperModal
-        open={connectionAccept !== null}
-        onClose={() => setConnectionAccept(null)}
+        handleDeleteConfirm={handleDeleteConfirm}
+        restricted={restricted}
+        autoApproveConfirm={autoApproveConfirm}
+        processingActions={processingActions}
+        setAutoApproveConfirm={setAutoApproveConfirm}
+        alwaysApproveTag={alwaysApproveTag}
+        creationAccountModal={creationAccountModal}
+        connectionAccept={connectionAccept}
+        setConnectionAccept={setConnectionAccept}
         getOverseer={getOverseer}
-        onCreated={handleConnectionCreated}
-        initialVendorId={connectionAccept?.vendorId}
-        initialResourceUrl={connectionAccept?.resourceUrl}
-        initialResourceUrlPattern={connectionAccept?.resourceUrlPattern}
-      />
-      <OutOfCreditsModal
-        open={usageModalOpen}
-        onClose={() => setUsageModalOpen(false)}
+        handleConnectionCreated={handleConnectionCreated}
+        usageModalOpen={usageModalOpen}
+        setUsageModalOpen={setUsageModalOpen}
       />
     </div>
   );
