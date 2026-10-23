@@ -18,6 +18,10 @@ augment it inline. Reporting is a no-op when the binding is absent.
 The optional `@gadgets/observability/metrics` entry point writes usage metrics to a Workers
 Analytics Engine dataset bound as `METRICS`, and is likewise a no-op without the binding. Each event
 is written once to its actor's index, the canonical copy to count, and once more per owner or
-workspace it names, so per-entity queries read their own index. The column layout lives in the import-free `metrics-schema.ts` (also
-exported as `@gadgets/observability/metrics-schema`), so dashboards can name columns rather than
-`blobN`.
+workspace it names, so per-entity queries read their own index. The column layout lives in the
+import-free `metrics-schema.ts` (also exported as `@gadgets/observability/metrics-schema`), so query
+code names columns rather than `blobN`. The read side is checked in as
+`@gadgets/observability/metrics-queries`: canonical SQL (daily activity, active users, per-type
+counts, per-workspace history) for the Analytics Engine SQL API — POST the query to
+`https://api.cloudflare.com/client/v4/accounts/<account_id>/analytics_engine/sql` with an Account
+Analytics Read bearer token — or paste it into a dashboard widget's SQL editor.

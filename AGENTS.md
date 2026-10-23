@@ -142,8 +142,10 @@ IMPORTANT: Server-side logging uses `@gadgets/observability/logger` (frontend br
   destination). Only bounded scalars are retained as attributes; reported context obeys the same
   no-secrets rules as log fields.
 - Usage metrics go to the optional `METRICS` Analytics Engine dataset through
-  `@gadgets/observability/metrics`, whose column layout (`metrics-schema.ts`) is also what
-  dashboards query; Workshop product events reach it through `recordAnalytics`.
+  `@gadgets/observability/metrics`; Workshop product events reach it through `recordAnalytics`.
+  The read side is checked in as `@gadgets/observability/metrics-queries`, whose SQL resolves
+  column names from `metrics-schema.ts` — run it against the Analytics Engine SQL API or paste it
+  into a dashboard widget. Do not hand-write `blobN` queries beside these.
 
 IMPORTANT: Frontend error reporting is a separate, opt-in path:
 - `@gadgets/error-reporting` owns the vendor-neutral browser/Worker event contract and tolerant,
