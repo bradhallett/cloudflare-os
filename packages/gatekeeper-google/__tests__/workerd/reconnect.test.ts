@@ -61,8 +61,8 @@ let connections = 0;
 /** Connects a fresh account through the OAuth flow, with Google answering the code exchange. */
 async function connect(google: FakeGoogle) {
   const name = `account-${++connections}`;
-  const id = env.UserAccount.newUniqueId();
-  const account = env.UserAccount.get(id);
+  const id = env.USER_ACCOUNT.newUniqueId();
+  const account = env.USER_ACCOUNT.get(id);
   await runInDurableObject(account, async (instance, state) => {
     await instance.setCallback(
       exportsOf(state).TestConnectCallback({ props: { name } }), "initiation-nonce", [], "connect");
@@ -76,7 +76,7 @@ async function connect(google: FakeGoogle) {
 /** The live grant and the subject it is pinned to, as plain data. */
 async function storedConnection(userObjectId: string) {
   return await runInDurableObject(
-    env.UserAccount.get(env.UserAccount.idFromString(userObjectId)),
+    env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(userObjectId)),
     async (_instance, state) => ({
       refreshToken: await state.storage.kv.get<string>("refreshToken"),
       accountSubject: await state.storage.kv.get<string>("accountSubject"),
@@ -151,7 +151,7 @@ describe("reconnecting", () => {
     const google = new FakeGoogle();
     const { account, id } = await connect(google);
     // The account predates pinning: nothing recorded which Google account it belongs to.
-    await runInDurableObject(env.UserAccount.get(env.UserAccount.idFromString(id.toString())),
+    await runInDurableObject(env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(id.toString())),
       (_instance, state) => {
         state.storage.kv.delete("accountSubject");
       });
@@ -168,8 +168,8 @@ describe("reconnecting", () => {
 
   it("refuses to finish a connect when Google will not say which account authorized", async () => {
     const google = new FakeGoogle();
-    const id = env.UserAccount.newUniqueId();
-    await runInDurableObject(env.UserAccount.get(id), async (instance, state) => {
+    const id = env.USER_ACCOUNT.newUniqueId();
+    await runInDurableObject(env.USER_ACCOUNT.get(id), async (instance, state) => {
       await instance.setCallback(
         exportsOf(state).TestConnectCallback({ props: { name: "unreadable" } }),
         "initiation-nonce", [], "connect");
