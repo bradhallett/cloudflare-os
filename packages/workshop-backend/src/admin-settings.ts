@@ -1,4 +1,4 @@
-import { AdminApi, AdminFormat, AdminFormatPatch, AdminModel, AdminResourceVendor, AdminSettingsView, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentUpdateStatus, GatewayModel, GatewayModelLevelTest, GatewayModelMode, GatewayModelSettings, GatewayModelTest, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, MAX_UPDATE_CHECK_INTERVAL_MINUTES, MAX_UPDATE_HOURS, ReasoningLevel, SUGGESTED_MODELS, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
+import { AdminApi, AdminFormat, AdminFormatPatch, AdminModel, AdminResourceVendor, AdminSettingsView, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, BotDefinition, DeploymentUpdateStatus, GatewayModel, GatewayModelLevelTest, GatewayModelMode, GatewayModelSettings, GatewayModelTest, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, MAX_UPDATE_CHECK_INTERVAL_MINUTES, MAX_UPDATE_HOURS, ReasoningLevel, SUGGESTED_MODELS, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
 import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
 import { RpcTarget } from 'capnweb';
@@ -7,6 +7,7 @@ import { createWorkshopLogger } from "./observability";
 import { sanitizeBlueprintOutput } from './blueprint-archive.js';
 import { ADMIN_CONFIG_KEY, FEATURED_BLUEPRINTS_KEY, isReservedBlueprintKey, parseBlueprintKvRecord, readBlueprintKvRecord, serializeFeaturedBlueprints } from './storage-schema/blueprints-kv.js';
 import { MAX_AGENT_HINT, defaultOutputFormatId, isUpdateCheckInterval, isUpdateHours, listPromotedFormats, normalizeAdminConfig, reorderFormats, sanitizeAddedModel, sanitizeModelSettings, sanitizeOutputOverrides, serializeAdminConfig } from './admin-config.js';
+import { normalizeBotDefinition } from './bot-config.js';
 import { makeAdminSettingsStorage, type AdminConfig, type AdminSettingsStorage, type FormatCuration } from './storage-schema/admin-settings-storage.js';
 import { getModelTokenLimits } from './agent-compaction.js';
 import { AiGatewayConfig, GatewayModels, assertGatewayProvider, gatewayModelConfig, gatewayRunConfig, getAiGatewayConfig, isCatalogModel } from './ai-gateway.js';
@@ -57,6 +58,17 @@ function updateHours(setting: string, hours: number): number {
     throw new Error(`The ${setting} must be a whole number of hours from 0 to ${MAX_UPDATE_HOURS}.`);
   }
   return hours;
+}
+
+// Refuse a deployment bot id that is not a lowercase slug, the form a BotSelection carries: one
+// that slipped through would be stored here and then silently dropped on read
+// (parseDeploymentBots in admin-config.ts), so it is refused at the door instead.
+function assertDeploymentBotId(id: string): void {
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) {
+    throw new Error(
+        "A deployment bot's id must be a lowercase slug of letters, digits, and hyphens, " +
+        "starting with a letter or digit.");
+  }
 }
 
 // One of the tests an admin runs through the gateway: the event and the message of its log line,
@@ -970,6 +982,60 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     }
   }
 
+  // --- Deployment bots ---
+
+  /**
+   * List the deployment-wide bots every user is offered, id first, as the admin panel edits
+   * them. The stored `{id, def}` pairs are flattened: the id names the entry, the definition is
+   * its content.
+   */
+  listDeploymentBots(): (BotDefinition & {id: string})[] {
+    return this.#config().deploymentBots.map(({id, def}) => ({id, ...def}));
+  }
+
+  /**
+   * Add a deployment-wide bot under a lowercase-slug id, its definition validated like a user
+   * bot's (normalizeBotDefinition). Whether the id is free is decided within the mutation, so
+   * that two concurrent calls can't both add the same one.
+   */
+  async addDeploymentBot(id: string, def: BotDefinition): Promise<void> {
+    assertDeploymentBotId(id);
+    let normalized = normalizeBotDefinition(def);
+    await this.#mutateAdminConfig(config => {
+      if (config.deploymentBots.some(bot => bot.id === id)) {
+        throw new Error(`A deployment bot with id "${id}" already exists.`);
+      }
+      return { ...config, deploymentBots: [...config.deploymentBots, {id, def: normalized}] };
+    });
+  }
+
+  /** Replace a deployment-wide bot's definition, keeping its place in the list. */
+  async updateDeploymentBot(id: string, def: BotDefinition): Promise<void> {
+    assertDeploymentBotId(id);
+    let normalized = normalizeBotDefinition(def);
+    await this.#mutateAdminConfig(config => {
+      let known = false;
+      let deploymentBots = config.deploymentBots.map(bot => {
+        if (bot.id !== id) return bot;
+        known = true;
+        return {id, def: normalized};
+      });
+      if (!known) throw new Error(`No such deployment bot: ${id}`);
+      return { ...config, deploymentBots };
+    });
+  }
+
+  /** Remove a deployment-wide bot. Chats that used it keep their frozen snapshot. */
+  async removeDeploymentBot(id: string): Promise<void> {
+    await this.#mutateAdminConfig(config => {
+      let deploymentBots = config.deploymentBots.filter(bot => bot.id !== id);
+      if (deploymentBots.length === config.deploymentBots.length) {
+        throw new Error(`No such deployment bot: ${id}`);
+      }
+      return { ...config, deploymentBots };
+    });
+  }
+
   // Admin view of every bound gatekeeper's resource types, annotated with their enabled state.
   // Unlike the user-facing listGatekeeperVendors, this does NOT hide disabled resources (so admins
   // can re-enable them). `adminUserId` is forwarded to getSupportedResources() so RBAC-gated
@@ -1078,6 +1144,22 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
       throw new Error(`Instructions too long (max ${MAX_INSTANCE_INSTRUCTIONS_LENGTH} characters).`);
     }
     await this.admin.updateAdminConfig({ instanceInstructions: text });
+  }
+
+  listDeploymentBots(): Promise<(BotDefinition & {id: string})[]> {
+    return this.admin.listDeploymentBots();
+  }
+
+  addDeploymentBot(id: string, def: BotDefinition): Promise<void> {
+    return this.admin.addDeploymentBot(id, def);
+  }
+
+  updateDeploymentBot(id: string, def: BotDefinition): Promise<void> {
+    return this.admin.updateDeploymentBot(id, def);
+  }
+
+  removeDeploymentBot(id: string): Promise<void> {
+    return this.admin.removeDeploymentBot(id);
   }
 
   setResourceEnabled(vendorId: string, urlPattern: string, enabled: boolean): Promise<void> {

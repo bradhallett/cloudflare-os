@@ -28,6 +28,7 @@ import { formatInstanceInstructions } from "./admin-config";
 import type { AiGatewayLogRoute } from "./ai-gateway";
 import type { SpawnCallableOptions } from "./agent-spawner-binding";
 import { traceRejectedToolCall, traceTool } from "./agent-tracing";
+import { dedupCatalogsForBot } from "./bot-config";
 import { AgentTurnError, completeText, httpStatusFromError, zeroUsage } from "./ai-invoke";
 import type { CachedRequest, ModelHandle } from "./ai-models";
 import { blobOid } from "./git-store";
@@ -655,6 +656,37 @@ export interface AgentHooks {
     files: Record<string, string>, notes: string, output?: BlueprintOutput,
     merge: Omit<BlueprintMerge, "gadgetId">,
   }>;
+
+  /**
+   * Activate one of this chat's bot skills (agentContext.botSkills) by commandId or unique
+   * title, invoking it against the workspace and returning its agent-visible result text.
+   * Throws an agent-readable error when the skill is unknown, ambiguous, or no longer usable.
+   */
+  invokeBotSkill(chatId: number, skill: string): Promise<string>;
+
+  /**
+   * The bots the turn's initiator may delegate to or message (merged user + deployment bots,
+   * only the available ones), as the bot tools' descriptions list them. Empty -- and the
+   * delegateToBot/messageBot tools are omitted -- when there are none (or no initiator).
+   */
+  listDelegatableBots(chatId: number): Promise<{key: string, name: string, description?: string}[]>;
+
+  /**
+   * Run (or continue) a bot's thread as this chat's subagent and await its reply: idempotent by
+   * `toolCallId` (a re-executed tool call returns the existing child, never a duplicate), and
+   * returning the child's last reply or an honest status string when it ended without one.
+   * Refuses cycles, self-delegation, and over-deep chains with agent-readable errors.
+   */
+  runBotSubagent(chatId: number, bot: string, message: string, threadId: number | undefined,
+      toolCallId: string, signal: AbortSignal): Promise<{threadId: number, response: string}>;
+
+  /**
+   * Deliver a direct message to another bot's thread in this chat's delegation tree (waking an
+   * idle one, auto-spawning a missing one, steering a mid-turn one) or to "orchestrator" (the
+   * chat's parent). Returns confirmation text for the sender; throws an agent-readable error
+   * when the target can't be resolved or the tree's DM budget is exhausted.
+   */
+  deliverBotMessage(chatId: number, to: string, text: string): Promise<string>;
 }
 
 // =======================================================================================
@@ -2125,9 +2157,19 @@ async function runAgentPass(
   // so it stays the same when a catalog changes or the chat gains a resource; the model is told
   // instead (see AiChatAgentContext.alwaysAvailableResources). One the chat can no longer reach
   // drops out.
-  let currentResources = alwaysAvailableResources(seedBindings);
-  let listedResources = checkpoint?.alwaysAvailableResources ??
-      agentContext.alwaysAvailableResources ?? currentResources;
+  // A bot chat's declared skills appear only in its bot section (agentContext.botSection),
+  // never duplicated by the ambient catalogs: every resource stream below is filtered through
+  // the chat's resolved botSkills (an empty list passes everything through unchanged). A
+  // per-turn derived filter, never persisted, so switching bots mid-chat cannot serve a stale
+  // filtered snapshot -- the stored and checkpointed lists stay untouched, and a bot-less turn
+  // reads them unchanged.
+  let seedTargets = new Map(seedBindings.map(seed => [seed.name, seed.target]));
+  let currentResources = dedupCatalogsForBot(
+      alwaysAvailableResources(seedBindings), seedTargets, agentContext.botSkills ?? []);
+  let listedResources = dedupCatalogsForBot(
+      checkpoint?.alwaysAvailableResources ?? agentContext.alwaysAvailableResources
+          ?? currentResources,
+      seedTargets, agentContext.botSkills ?? []);
   let alwaysAvailable = listedResources.filter(listed =>
       currentResources.some(current => current.name === listed.name));
   let alwaysAvailableResourcesPrompt = alwaysAvailable.length > 0
@@ -2546,6 +2588,11 @@ async function runAgentPass(
                 case "listBlueprints":
                 case "listConnectableResources":
                 case "requestConnection":
+                  toolOutput = {text: toolCall.output ?? ""};
+                  break;
+                case "activateSkill":
+                case "delegateToBot":
+                case "messageBot":
                   toolOutput = {text: toolCall.output ?? ""};
                   break;
                 case "createExternalResource":
@@ -3174,7 +3221,12 @@ async function runAgentPass(
       SYSTEM_PROMPT,
       (standardFormats ? `${standardFormats}\n\n` : "") +
           `${savedWorkspace ?? systemPromptWorkspace}${systemPromptConnections}` +
-          (alwaysAvailableResourcesPrompt ? `\n\n${alwaysAvailableResourcesPrompt}` : ""),
+          (alwaysAvailableResourcesPrompt ? `\n\n${alwaysAvailableResourcesPrompt}` : "") +
+          // The bot section is part of the chat's identity, so it lives in the dynamic slot
+          // (slot 1): slot 0 stays byte-stable, preserving the cross-chat cache prefix, and a
+          // mid-chat bot switch costs exactly one cache miss. Only regular chats run as bots --
+          // gadget-spawned agents never do -- so the spawner branch above needs nothing.
+          (agentContext.botSection ? `\n\n${agentContext.botSection}` : ""),
     ];
   }
 
@@ -3233,6 +3285,16 @@ async function runAgentPass(
         "in the system prompt or chosen when creating it.",
   });
 
+  // Bot tools. activateSkill exists only in a bot chat; delegateToBot/messageBot exist only
+  // when the initiator has bots to talk to. None is offered to gadget-spawned agents (they are
+  // excluded by SPAWNED_AGENT_TOOLS below): no user is present to review what a bot-driven
+  // turn might do. Bot tools are for interactive chats, where the human watches the threads.
+  let delegatableBots = agentContext.spawnerConfig ? []
+      : await hooks.listDelegatableBots(chatId);
+  let delegatableBotsList = delegatableBots.length === 0 ? ""
+      : delegatableBots.map(bot =>
+            `- ${bot.name} (${bot.key})${bot.description ? `: ${bot.description}` : ""}`)
+          .join("\n");
   let tools: Record<string, AgentTool> = {
     readFile: defineTool({
       name: "readFile",
@@ -3972,6 +4034,94 @@ async function runAgentPass(
       }
     }),
   };
+
+  if (agentContext.botConfig) {
+    tools.activateSkill = defineTool({
+      name: "activateSkill",
+      label: "Activate skill",
+      description:
+          "Activate one of this bot's skills on demand (see the Skills section of the system " +
+          "prompt). Pass the skill's command id, or its title when unambiguous. Returns the " +
+          "skill's agent-visible result text.",
+      parameters: Type.Object({
+        skill: Type.String({
+          description: 'The skill to activate: its command id (e.g. "search") or its title.',
+        }),
+      }),
+      execute: async (toolCallId, input) => {
+        try {
+          let output = await hooks.invokeBotSkill(chatId, input.skill);
+          return toolResult(output, {output});
+        } catch (error) {
+          toolCallNotes.set(toolCallId, {error: toolErrorText(error)});
+          throw error;
+        }
+      }
+    });
+  }
+
+  if (delegatableBots.length > 0) {
+    tools.delegateToBot = defineTool({
+      name: "delegateToBot",
+      label: "Delegate to bot",
+      description:
+          "Run another bot as a subagent of this chat: it starts (or continues) its own " +
+          "visible thread, works on the task, and this chat waits for its reply. Pass " +
+          "threadId from a earlier call to send the same bot a follow-up on its thread. " +
+          "Bots available to the initiator of this chat:\n" + delegatableBotsList,
+      parameters: Type.Object({
+        bot: Type.String({
+          description: 'The bot to run, by key (e.g. "u:3" or "d:slug").',
+        }),
+        message: Type.String({
+          description: "The task for the bot, stated completely: it sees no other context " +
+              "from this chat.",
+        }),
+        threadId: Type.Optional(Type.Number({
+          description: "threadId returned by an earlier delegateToBot call, to continue that " +
+              "thread instead of starting a new one.",
+        })),
+      }),
+      execute: async (toolCallId, input) => {
+        try {
+          let result = await hooks.runBotSubagent(
+              chatId, input.bot, input.message, input.threadId, toolCallId, abortSignal);
+          let output = JSON.stringify(result);
+          return toolResult(output, {output});
+        } catch (error) {
+          toolCallNotes.set(toolCallId, {error: toolErrorText(error)});
+          throw error;
+        }
+      }
+    });
+
+    tools.messageBot = defineTool({
+      name: "messageBot",
+      label: "Message bot",
+      description:
+          'Send a direct message to another bot (or to "orchestrator", the chat that ' +
+          'delegated to this one) without waiting for a reply: an idle bot starts a turn and ' +
+          'answers in its own thread; a mid-turn bot receives it as a steer. Use ' +
+          'delegateToBot for blocking Q&A; use this to hand off, notify, or coordinate ' +
+          'asynchronously. Targets are bot keys (e.g. "u:3", "d:slug"), bot names, or ' +
+          '"orchestrator".',
+      parameters: Type.Object({
+        to: Type.String({
+          description: 'The recipient: a bot key, a bot name, or "orchestrator".',
+        }),
+        text: Type.String({description: "The message body."}),
+      }),
+      execute: async (toolCallId, input) => {
+        try {
+          let output = await hooks.deliverBotMessage(chatId, input.to, input.text);
+          return toolResult(output, {output});
+        } catch (error) {
+          toolCallNotes.set(toolCallId, {error: toolErrorText(error)});
+          throw error;
+        }
+      }
+    });
+  }
 
   if (agentContext.spawnerConfig) {
     // Restrict sub-agents to a narrower set of tools. No user is present to approve changes, so

@@ -24,6 +24,7 @@ interface OverseerInternals {
       getChatContext(): Promise<{ profile: AiChatAuthorInfo, aiModel: AiModel }>;
       getCloudflareGatekeeperAccount(): Promise<null>;
       consumeDailyLlmCall(): Promise<{ withinLimits: boolean }>;
+      listBots(): Promise<never[]>;
       publishNotification(notification: UserNotification): Promise<void>;
     };
   };
@@ -187,6 +188,7 @@ function startTurn(responses: (() => Response)[], {
         getChatContext: async () => ({ profile: OWNER, aiModel: { profile: MODEL, config } }),
         getCloudflareGatekeeperAccount: async () => null,
         consumeDailyLlmCall: async () => ({ withinLimits: false }),
+        listBots: async () => [],
         publishNotification: async notification => {
           notifications.push([userId, notification]);
         },

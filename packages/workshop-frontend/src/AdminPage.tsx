@@ -12,6 +12,7 @@ import { useDocumentTitle } from './useDocumentTitle'
 import AdminFormatsPanel from './components/format/AdminFormatsPanel'
 import { AdminModelsPanel } from './features/ai-models/AdminModelsPanel'
 import { AdminUpdatesPanel } from './features/deployment-updates/AdminUpdatesPanel'
+import { DeploymentBotsPanel } from './features/bots/DeploymentBotsPanel'
 import { latestReads } from './features/deployment-updates/latestReads'
 import { probeRouterTag } from './features/deployment-updates/probeRouterTag'
 import { isAdminTab, resolveAdminTab } from './adminTab'
@@ -464,6 +465,7 @@ export default function AdminPage() {
           { value: 'gatekeepers', label: 'Gatekeepers' },
           { value: 'formats', label: 'Formats' },
           { value: 'models', label: 'Models' },
+          { value: 'bots', label: 'Bots' },
           { value: 'access', label: 'Access' },
           // Also listed while a requested Updates tab waits for the status, so it shows as selected.
           ...(activeTab === 'updates' || (updateStatus !== null && updateStatus !== 'pending')
@@ -497,6 +499,8 @@ export default function AdminPage() {
           onChanged={async () => { setFormats((await admin.api.getSettings()).formats) }}
         />
       )}
+      {/* Deployment-wide bots */}
+      {activeTab === 'bots' && admin && <DeploymentBotsPanel admin={admin.api} />}
 
       {/* AI Gateway models */}
       {activeTab === 'models' && (

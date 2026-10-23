@@ -12,6 +12,17 @@ export type WorkshopObservabilityFields = {
   cacheWriteTokens: number;
   callbackInitiated: boolean;
   chatId: number;
+  /** Declared bots: identifiers, keys, and counters only. A bot's instructions, its composed
+   *  prompt section, direct-message text, and tool outputs never enter logs or spans. */
+  botKey: string;
+  commandId: string;
+  /** Count of interrupted agent-turn records found by the constructor's resume sweep. */
+  resumeRecords: number;
+  dmCount: number;
+  fromChatId: number;
+  threadId: number;
+  toChatId: number;
+  treeDmCount: number;
   changeStage: "buffer" | "persist";
   changeIndex: number;
   changeWorkpieceCount: number;

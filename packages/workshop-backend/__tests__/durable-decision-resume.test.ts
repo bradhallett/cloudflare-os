@@ -101,8 +101,9 @@ function decisionClient(impl: Impl, profile = USER, overrides: object = {}) {
   return openFakeOverseer(impl.storage, {impl: {
     users: {idFromString: (id: string) => id,
       get: (id: string) => ({id: {toString: () => userId ?? id}, whoami: async () => profile,
-        getChatContext: async () => ({profile: USER, aiModel: MODEL})})},
+        getChatContext: async () => ({profile: USER, aiModel: MODEL}), listBots: async () => []})},
     rememberDecisionInitiator: impl.rememberDecisionInitiator.bind(impl),
+    getChatAgentContext: impl.getChatAgentContext.bind(impl),
     resumeAgentAfterDecision: impl.resumeAgentAfterDecision.bind(impl),
     getChatTimestamp: impl.getChatTimestamp.bind(impl),
     assertChatNotActive: impl.assertChatNotActive.bind(impl),
@@ -117,7 +118,7 @@ function decisionClient(impl: Impl, profile = USER, overrides: object = {}) {
 function modelLookup(impl: Impl, lookup: () => Promise<{profile: typeof USER, aiModel: typeof MODEL}>) {
   // Hold/fail the caller-side read, without an unrelated user-DO RPC keeping an eviction alive.
   impl.users = {idFromString: (id: string) => id,
-    get: () => ({getChatContext: lookup, publishNotification: async () => {}})} as
+    get: () => ({getChatContext: lookup, listBots: async () => [], publishNotification: async () => {}})} as
       unknown as typeof impl.users;
 }
 

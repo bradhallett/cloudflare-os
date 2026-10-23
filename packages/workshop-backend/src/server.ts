@@ -1,7 +1,7 @@
 import { RpcStub, RpcTarget, newHttpBatchRpcResponse, newWebSocketRpcSession, RpcSessionOptions } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type { JWTPayload } from "jose";
-import { PublicApi, ROUTER_TAG_PROBE_PATH, VERSION_PATH, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, RedactedAiModelConfig, AiGatewayInfo, AiModelProvider, ModelKind, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, UserDirectoryRecord, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, NotificationSubscriber, NotificationMute } from '@gadgets/workshop-shared/api';
+import { PublicApi, ROUTER_TAG_PROBE_PATH, VERSION_PATH, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, RedactedAiModelConfig, AiGatewayInfo, AiModelProvider, ModelKind, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, UserDirectoryRecord, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, NotificationSubscriber, NotificationMute, type BotDefinition, type BotInfo, type BotSkillChoice } from '@gadgets/workshop-shared/api';
 import type { UiFeatureFlags } from "@gadgets/workshop-shared/feature-flags";
 import { backendVersion, getServerConfig } from "./deployment-config.js";
 import { isPasswordAuthEnabled, getAuthGatekeeperAllowlist } from "./auth/config.js";
@@ -181,6 +181,29 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
   listModels(kind?: ModelKind): Promise<AiChatAuthorInfo[]> {
     return retryOnDoReset(() => this.#user.listModels(kind));
+  }
+
+  // --- Declared bots (see the Bot* types in @gadgets/workshop-shared/api) ---
+
+  listBots(): Promise<BotInfo[]> {
+    return retryOnDoReset(() => this.#user.listBots());
+  }
+  getBot(id: string): Promise<BotDefinition> {
+    return retryOnDoReset(() => this.#user.getBot(id));
+  }
+  // Writes never retry across a user-DO reset (see whoami): a reset can't tell "never applied"
+  // from "applied, response lost", and createBot's id must not be minted twice.
+  createBot(def: BotDefinition): Promise<string> {
+    return this.#user.createBot(def);
+  }
+  updateBot(id: string, def: BotDefinition): Promise<void> {
+    return this.#user.updateBot(id, def);
+  }
+  deleteBot(id: string): Promise<void> {
+    return this.#user.deleteBot(id);
+  }
+  listBotSkills(): Promise<BotSkillChoice[]> {
+    return retryOnDoReset(() => this.#user.listBotSkills());
   }
   addModel(profile: AiChatAuthorInfo, config: RedactedAiModelConfig,
            copySecretsFrom?: string): Promise<void> {

@@ -140,6 +140,7 @@ describe("ChatComposer", () => {
       undefined,
       undefined,
       undefined,
+      undefined,
     );
     expect(textarea.disabled).toBe(false);
 
@@ -239,7 +240,7 @@ describe("ChatComposer", () => {
 
       await typeText(textarea(), "Make it dark.");
       await pressEnter();
-      expect(onSend).toHaveBeenCalledWith("Make it dark.", "model-a", undefined, undefined, undefined);
+      expect(onSend).toHaveBeenCalledWith("Make it dark.", "model-a", undefined, undefined, undefined, undefined);
       expect(button("Stop agent")!.disabled).toBe(true);
       await act(async () => finishSend!());
       expect(textarea().value).toBe("");
@@ -265,7 +266,7 @@ describe("ChatComposer", () => {
 
       await render({ onSend, onStop, queuedSteers: [], isAgentActive: false });
       await pressEnter();
-      expect(onSend).toHaveBeenCalledWith("Half a thought\n\nA", "model-a", undefined, undefined, undefined);
+      expect(onSend).toHaveBeenCalledWith("Half a thought\n\nA", "model-a", undefined, undefined, undefined, undefined);
     });
 
     it("keeps the dropped steers in the draft when Stop fails", async () => {
@@ -396,6 +397,7 @@ describe("ChatComposer", () => {
       undefined,
       undefined,
       undefined,
+      undefined,
     );
   });
 
@@ -432,7 +434,7 @@ describe("ChatComposer", () => {
     expect(document.querySelector('[role="listbox"]')).toBeNull();
     expect(overseer.listSlashCommands).not.toHaveBeenCalled();
     expect(onSend).toHaveBeenCalledWith(
-      "//deploy literally", null, undefined, undefined, undefined,
+      "//deploy literally", null, undefined, undefined, undefined, undefined,
     );
   });
 

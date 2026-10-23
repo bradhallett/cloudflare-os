@@ -22,6 +22,7 @@ import { createTypedStorage, collection, singleton, keyString } from "@gadgets/t
 import {
   actionChangeTime,
   type ActionState, type AgentSpawnerConfig, type AiChatAuthorInfo, type AiChatMessage,
+  type BotSelection, type BotSkillRef,
   type AlwaysAvailableResource,
   type AiChatMetadata, type BlueprintBindingAnnotation, type BlueprintMetadata,
   type BlueprintOutput, type ChatGadgetPinRecord, type CollaboratorRole, type GadgetUpstream,
@@ -33,6 +34,7 @@ import type {
   ActionDescription, ActionKind, Gatekeeper, GitObjectType, GitOid, HookController,
   HookDescription, ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
+import type {ResolvedBotSkill, UnavailableBotSkill} from "../bot-config";
 import type { SpawnCallableOptions } from "../agent-spawner-binding";
 
 // =======================================================================================
@@ -649,6 +651,76 @@ export type AiChatAgentContext = {
    * list.
    */
   alwaysAvailableResources?: AlwaysAvailableResource[];
+
+  /**
+   * The bot this chat runs as, snapshotted at chat start (or a mid-chat switch, which requires
+   * an idle chat): the frozen declaration -- identity, instructions, model, declared skills --
+   * not re-resolved per turn, so a later edit or deletion of the bot never rewrites a running
+   * chat. Its `modelId` is what retries and DM-driven turns resolve (never a fallback model),
+   * and `selection` is the bot key's source (botKey()) for delegation-chain and DM targeting.
+   */
+  botConfig?: {
+    selection: BotSelection;
+    name: string;
+    description?: string;
+    instructions: string;
+    modelId: string;
+    skills: BotSkillRef[];
+  };
+
+  /**
+   * The bot's declared skills as this workspace resolved them at the snapshot: each command
+   * pinned to the gatekeeper workpiece offering it. This is what `activateSkill` validates
+   * against and what `dedupCatalogsForBot` keeps out of the ambient catalogs (a bot's skills
+   * appear only in its bot section). Re-resolved on every bot switch.
+   */
+  botSkills?: ResolvedBotSkill[];
+
+  /**
+   * Skills the bot declared that this workspace could not resolve (no usable gatekeeper offers
+   * the command, or two of the same vendor do -- ambiguous). Recorded rather than dropped so
+   * the bot section can say so; the agent cannot activate them.
+   */
+  unavailableBotSkills?: UnavailableBotSkill[];
+
+  /**
+   * The composed "# Bot:" system-prompt section (identity, instructions, skills; see
+   * formatBotSection), read by every turn from here -- deliberately NOT part of
+   * CompactionCheckpoint, because a mid-chat bot switch rewrites it and a checkpoint field is
+   * write-once. Mutable by design; the prompt-cache cost of a switch is one miss.
+   */
+  botSection?: string;
+
+  /** The chat that delegated to this one, when this chat is a bot's subagent thread. */
+  parentChatId?: number;
+
+  /**
+   * The root chat of this chat's delegation tree: the delegating chat's own root for a child
+   * (its own id when it is the root). Bots find each other's threads by this field, and the
+   * root's `treeInboundBotMessages` bounds the whole tree's bot-driven turns.
+   */
+  rootChatId?: number;
+
+  /**
+   * The bot keys (botKey()) of the chats this one was delegated through, outermost first --
+   * ending with the delegating chat's own bot when it runs as one. Cycle and depth checks read
+   * it; MAX_DELEGATION_DEPTH bounds its growth.
+   */
+  delegationChain?: string[];
+
+  /**
+   * Bot-driven messages this chat has received (a DM, or a delegation's task): every inbound
+   * increments it atomically with its commit, and over MAX_BOT_DMS_PER_CHAT refuses the sender.
+   * The bound on unattended turns a DM can buy -- they bill the workspace owner's allowance.
+   */
+  inboundBotMessages?: number;
+
+  /**
+   * Only on the root chat of a delegation tree: bot-driven messages delivered to any chat of
+   * the tree (see rootChatId). Over MAX_BOT_DMS_PER_TREE the whole tree refuses further bot
+   * traffic, so N bots cannot buy N times the per-chat budget.
+   */
+  treeInboundBotMessages?: number;
 };
 
 /**
@@ -1200,6 +1272,9 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       //       an `upstream` once it is permanent.
       //   6 = agent spawners' bindings are GatekeeperRecord.bindings edges; their creationSpec
       //       config no longer carries `env`.
+      //   7 = declared bots: chats may carry a bot snapshot (AiChatAgentContext.botConfig and
+      //       the other bot fields) and bot delegations are tracked in `pendingDelegations`.
+      //       Purely additive -- no stored record changes shape -- so the migration only stamps.
       version: 0,
 
       // The workspace title. (Each chat, gatekeeper, and gadget has its own title, elsewhere.)
@@ -1492,6 +1567,18 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
         primaryKey: (entry) => chatKey(entry.chatId, entry.callId),
       }),
 
+      // A `delegateToBot` delegation in flight or completed, keyed by the tool call id (see
+      // PendingDelegationRecord): the durability record that makes re-executing the tool call
+      // return the existing child instead of spawning a duplicate. Indexed by both chats so
+      // deleteChat can sweep a deleted chat's records from either side.
+      pendingDelegations: collection<PendingDelegationRecord>()({
+        primaryKey: "toolCallId",
+        nonUniqueIndexes: {
+          byParentChatId(record: PendingDelegationRecord) { return record.parentChatId; },
+          byChildChatId(record: PendingDelegationRecord) { return record.childChatId; },
+        },
+      }),
+
       // Model-facing snapshots of agent steps, replayed verbatim on later turns so reasoning
       // (including provider-opaque signatures) and true model provenance survive turn boundaries
       // and restarts. Stored separately from the chat messages so these payloads -- opaque and
@@ -1548,3 +1635,18 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
 
 /** The Overseer's typed storage. See makeOverseerStorage. */
 export type OverseerStorage = ReturnType<typeof makeOverseerStorage>;
+
+/**
+ * A `delegateToBot` delegation, keyed by the tool call id: the record that makes the tool's
+ * effect durable the moment the child is created, so a DO reset mid-step -- which re-executes
+ * the tool call -- returns the existing child instead of spawning (and re-billing) a duplicate.
+ * Kept (marked `done` when the child's awaited turn ends) until the chat's records are deleted,
+ * since a re-executed step can follow a completed one. See runBotSubagent.
+ */
+export type PendingDelegationRecord = {
+  toolCallId: string;
+  parentChatId: number;
+  childChatId: number;
+  startedAt: Date;
+  done?: true;
+};

@@ -613,6 +613,41 @@ export interface AuthenticatedApi extends RpcTarget {
   /** Mark the onboarding wizard as completed. */
   completeOnboarding(): Promise<void>;
 
+  // --- Bots ---
+
+  /**
+   * List the bots offered to this user: their own plus the deployment's (see AdminApi), merged.
+   * A bot whose model no longer resolves for this user is listed with `available: false` rather
+   * than dropped, so it stays visible wherever it was picked.
+   */
+  listBots(): Promise<BotInfo[]>;
+
+  /**
+   * Get one of this user's own bots' definitions. Deployment bots are public metadata already
+   * covered by `listBots()` and are never read through this method, so a deployment slug
+   * colliding with a user bot id is impossible.
+   */
+  getBot(id: string): Promise<BotDefinition>;
+
+  /**
+   * Create a bot owned by this user and return its id. `name` must be unique among the user's
+   * own bots; lengths and skill counts are capped as the MAX_BOT_* constants declare.
+   */
+  createBot(def: BotDefinition): Promise<string>;
+
+  /** Replace one of this user's own bots' definitions. */
+  updateBot(id: string, def: BotDefinition): Promise<void>;
+
+  /** Delete one of this user's own bots. Chats that used it keep their frozen snapshot. */
+  deleteBot(id: string): Promise<void>;
+
+  /**
+   * List the skills this user can declare on a bot: the slash commands offered by their
+   * connected accounts' agent singletons (e.g. the Context Library). Vendors whose singleton
+   * cannot be reached are skipped, not fatal.
+   */
+  listBotSkills(): Promise<BotSkillChoice[]>;
+
   // --- Optional Cloudflare limits / top-up flow (only meaningful when enabled server-side) ---
 
   /** Get the user's current free-tier usage and connected-account balance. */
@@ -1314,6 +1349,24 @@ export interface AdminApi {
 
   /** Replace the agent system-prompt instructions. Pass "" to clear. Rejects over MAX_INSTANCE_INSTRUCTIONS_LENGTH. */
   setInstanceInstructions(text: string): Promise<void>;
+
+  /**
+   * List the deployment's bots, offered to every user alongside their own (see
+   * AuthenticatedApi.listBots).
+   */
+  listDeploymentBots(): Promise<(BotDefinition & {id: string})[]>;
+
+  /**
+   * Add a deployment-wide bot. `id` is a lowercase slug naming it in BotSelections; it must be a
+   * valid unique identifier. The definition is validated like a user bot's.
+   */
+  addDeploymentBot(id: string, def: BotDefinition): Promise<void>;
+
+  /** Replace a deployment-wide bot's definition. The `id` names it; the definition has no id. */
+  updateDeploymentBot(id: string, def: BotDefinition): Promise<void>;
+
+  /** Remove a deployment-wide bot. Chats that used it keep their frozen snapshot. */
+  removeDeploymentBot(id: string): Promise<void>;
 
   /**
    * Enable or disable a single gatekeeper resource type, keyed by vendor id + resource urlPattern.
@@ -3025,10 +3078,15 @@ export interface Overseer extends RpcTarget {
    * `formats` records where the message names one of the deployment's standard output formats, so
    * the transcript can draw it as a chip. Display only -- what the agent reads is the noun, which
    * is already in the text.
+   *
+   * `bot` optionally names a declared bot to run the chat as (see AuthenticatedApi.listBots()).
+   * When present it wins over `modelId`: the chat runs on the bot's model, and the bot's
+   * instructions and skills join its prompt. Throws visibly if the bot, or its model, no longer
+   * resolves for this user.
    */
   newChat(initialMessage: string | SlashCommandRequest, modelId: string | null,
           capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
-          formats?: MessageFormatRef[]): Promise<number>;
+          formats?: MessageFormatRef[], bot?: BotSelection): Promise<number>;
 
   /**
    * Send a message to the chat from this client. Sending a message causes the LLM to start
@@ -3044,10 +3102,15 @@ export interface Overseer extends RpcTarget {
    * `modelId` is one of the IDs in the result of `listModels()`, or null to inhibit AI response
    * (useful when using chat to talk between humans).
    *
+   * `bot` switches the chat's bot: a BotSelection re-snapshots that bot (model, instructions,
+   * skills) for turns from this message on -- only on an idle chat -- while "none" clears the
+   * chat's bot, leaving a bare-model chat. Absent means no change (retries and steers pass
+   * nothing). A selection whose bot or model no longer resolves throws visibly.
+   *
    */
   sendChatMessage(chatId: number, message: string | SlashCommandRequest, modelId: string | null,
                   capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
-                  formats?: MessageFormatRef[]): Promise<void>;
+                  formats?: MessageFormatRef[], bot?: BotSelection | "none"): Promise<void>;
 
   /**
    * Store raw bytes as an immutable Git blob and return its OID after durable storage.
@@ -3381,6 +3444,17 @@ export type AiChatMetadata = {
 
   /** If this was started from an agent spawner, the spawner's display name. */
   spawnerName?: string;
+
+  /** If this chat runs as a declared bot (see AuthenticatedApi.listBots()), the bot's name. */
+  botName?: string;
+
+  /**
+   * The bot this chat last ran as, if any: the identity the in-chat picker initializes from.
+   * Clearing the chat's bot (sendChatMessage with "none") removes this and `botName`. The bot
+   * itself may since have been deleted or become unavailable; the picker then shows it as no
+   * longer available rather than silently switching.
+   */
+  bot?: BotSelection;
 
   /**
    * Tokens the model reported for this conversation's last step, if known. Cleared when compaction
@@ -3718,9 +3792,11 @@ export type AiChatAuthorInfo = {
   /**
    * Is the author a human, AI, or Gadget?
    *
-   * "gadget" means this is a prompt sent to an agent spawner -- i.e. a gadget spawned an
-   * agent programmatically. In this case `id` is the gadget's owner's ID (for accounting purposes)
-   * and `name` is the gadget title.
+   * "gadget" means an automated actor sent this on a chat's behalf: a prompt sent to an agent
+   * spawner (a gadget spawned an agent programmatically -- `id` is then the gadget owner's ID,
+   * for accounting purposes, and `name` the gadget title), or a message a bot sent to another
+   * chat (a subagent task or an inter-bot DM -- `id` is then the sending bot's key,
+   * "u:<id>" or "d:<slug>", and `name` the bot's name).
    */
   type: "user" | "agent" | "gadget";
 
@@ -4525,6 +4601,40 @@ export type AiToolCall = {
   output?: string;
 } | {
   /**
+   * Activate one of the chat bot's declared skills (a slash command from a gatekeeper): the
+   * skill's commandId, or its unique title. Bot chats only.
+   */
+  toolName: "activateSkill";
+  input: {
+    skill: string;
+  };
+  output?: string;
+} | {
+  /**
+   * Run another bot as a blocking subagent: the bot key ("u:<id>" for a user bot, "d:<slug>" for
+   * a deployment bot), the task message, and optionally a prior child thread to continue. Returns
+   * the child's threadId and its reply.
+   */
+  toolName: "delegateToBot";
+  input: {
+    bot: string;
+    message: string;
+    threadId?: number;
+  };
+  output?: string;
+} | {
+  /**
+   * Send an async direct message to another bot (by key or name) or to "orchestrator" (the
+   * delegating parent thread). Delivered as an inbound message; the recipient's next turn sees it.
+   */
+  toolName: "messageBot";
+  input: {
+    to: string;
+    text: string;
+  };
+  output?: string;
+} | {
+  /**
    * Create a new external resource of a creatable type (see `SupportedResource.creatable`). Its
    * binding is usable at once: the gatekeeper simulates the resource until a user approves the
    * creation action, choosing the account to create it in.
@@ -4627,6 +4737,94 @@ export type CapsuleSpecifier = {
   bindingName?: string;
 };
 
+// --- Bots ---
+
+/**
+ * A declared bot: a named agent with pre-set instructions, a model, and skills, picked instead
+ * of a model when starting or steering a chat. Bots exist in two scopes, merged everywhere they
+ * are listed: each user's own (AuthenticatedApi) and the deployment's (AdminApi). A chat running
+ * as a bot can delegate to other bots as subagents and exchange direct messages with them.
+ */
+
+/**
+ * A skill a bot declares, identified like a slash command (`vendorId` + `commandId`), which is
+ * stable across workspaces. `name` is display-only, captured at declaration time; the reference
+ * is resolved against a workspace's gatekeepers when a bot chat starts.
+ */
+export type BotSkillRef = {
+  /** Vendor whose gatekeeper offers the skill. */
+  vendorId: string;
+  /** The command to activate, as that vendor names it. */
+  commandId: string;
+  /** Display name captured when the skill was declared; never used for resolution. */
+  name: string;
+};
+
+/** Maximum length (characters) of a bot's name. */
+export const MAX_BOT_NAME_LENGTH = 64;
+
+/** Maximum length (characters) of a bot's description. */
+export const MAX_BOT_DESCRIPTION_LENGTH = 200;
+
+/** Maximum length (characters) of a bot's instructions. */
+export const MAX_BOT_INSTRUCTIONS_LENGTH = 8000;
+
+/** Maximum number of skills a bot may declare. */
+export const MAX_BOT_SKILLS = 50;
+
+/**
+ * A bot's declaration. `modelId` names a model as it resolved for the declaring user; a chat
+ * started as the bot refuses visibly if that model no longer resolves for the user starting it.
+ */
+export type BotDefinition = {
+  /** Unique within the bot's scope. */
+  name: string;
+  /** One-line summary shown in pickers and bot lists. */
+  description?: string;
+  /** Standing instructions added to the bot's system prompt. */
+  instructions: string;
+  /** The model the bot runs on. */
+  modelId: string;
+  /** Skills the bot may activate on demand (see the activateSkill tool). */
+  skills: BotSkillRef[];
+};
+
+/** Identifies a bot by scope, for passing into chat APIs. */
+export type BotSelection = {
+  scope: "user" | "deployment";
+  id: string;
+};
+
+/** One bot as listed for pickers: its identity plus whether it can start a chat right now. */
+export type BotInfo = {
+  selection: BotSelection;
+  name: string;
+  description?: string;
+  modelId: string;
+  /** Display name of the bot's model, when it resolves. */
+  modelName?: string;
+  /**
+   * Whether a chat can start with this bot now. False means the bot's model no longer resolves
+   * for this user; such a bot stays listed (disabled, with `unavailableReason`) rather than
+   * disappearing from underneath chats that picked it.
+   */
+  available: boolean;
+  unavailableReason?: string;
+};
+
+/** One skill a bot can declare, as offered by the user's connected accounts. */
+export type BotSkillChoice = {
+  /** With `commandId`, the stable reference to store in a BotSkillRef. */
+  vendorId: string;
+  /** With `vendorId`, the stable reference to store in a BotSkillRef. */
+  commandId: string;
+  /** Display name captured into the declaration. */
+  name: string;
+  /** What the skill does, shown in the picker. */
+  description: string;
+  /** Name of the account or gatekeeper offering the skill. */
+  providerLabel: string;
+};
 /** Identifies a Gatekeeper slash command or the built-in `/compact` command. */
 export type SlashCommandId = {
   gatekeeperId: WorkpieceId;
