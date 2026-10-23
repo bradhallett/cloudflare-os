@@ -217,10 +217,13 @@ export type GoogleAccountProfile = {
   picture?: string;
 };
 
-export async function getGoogleAccountProfile(accessToken: string | AccessTokenProvider): Promise<GoogleAccountProfile> {
+export async function getGoogleAccountProfile(
+    accessToken: string | AccessTokenProvider,
+    signal?: AbortSignal): Promise<GoogleAccountProfile> {
   const response = await fetchWithAuthRetry('https://www.googleapis.com/oauth2/v3/userinfo', {
     method: 'GET',
     headers: { 'Accept': 'application/json' },
+    ...(signal ? { signal } : {}),
   }, typeof accessToken === "string" ? async () => accessToken : accessToken);
 
   if (!response.ok) {
@@ -233,9 +236,9 @@ export async function getGoogleAccountProfile(accessToken: string | AccessTokenP
   return data as GoogleAccountProfile;
 }
 
-/** Return the stable Google subject used to pin long-lived Gmail capabilities to one account. */
-export async function getGoogleAccountSubject(accessToken: string): Promise<string> {
-  return (await getGoogleAccountProfile(accessToken)).sub;
+/** Return the stable Google subject (`sub`) identifying the account behind an access token. */
+export async function getGoogleAccountSubject(accessToken: string, signal?: AbortSignal): Promise<string> {
+  return (await getGoogleAccountProfile(accessToken, signal)).sub;
 }
 
 export async function getGoogleAccountDescription(accessToken: string)
