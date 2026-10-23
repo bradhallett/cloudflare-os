@@ -1,6 +1,6 @@
 // The column layout of the Gadgets metrics dataset. Deliberately import-free (not even
-// `cloudflare:workers`), so dashboards-as-code can resolve column names from this file rather
-// than hardcoding `blobN`/`doubleN`.
+// `cloudflare:workers`), so query code (`metrics-queries.ts`) can resolve column names from this
+// file rather than hardcoding `blobN`/`doubleN`.
 
 /** Name of the Workers Analytics Engine dataset every Gadgets metric point is written to. */
 export const METRIC_DATASET = "gadgets_metrics_v1";

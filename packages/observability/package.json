@@ -20,6 +20,10 @@
       "types": "./src/error-reporting.ts",
       "import": "./src/error-reporting.ts"
     },
+    "./metrics-queries": {
+      "types": "./src/metrics-queries.ts",
+      "import": "./src/metrics-queries.ts"
+    },
     "./metrics": {
       "types": "./src/metrics.ts",
       "import": "./src/metrics.ts"
