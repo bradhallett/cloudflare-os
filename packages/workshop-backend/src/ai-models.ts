@@ -36,8 +36,7 @@ import {
   AiGatewayConfig, getAiGatewayConfig, getGatewayModels, type AiGatewayLogRoute,
 } from "./ai-gateway.js";
 import { completeText } from "./ai-invoke.js";
-import { checkUsageAndBalance } from "./ai-gateway-billing/limits/usage-checker.js";
-import type { UserDurableObject } from "./user.js";
+import { bindingUsageGate } from "./ai-model-usage-gate.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
 import { hasGpt56PromptCaching, splitSystemPrompt } from "./system-prompt-blocks.js";
 
@@ -986,28 +985,6 @@ async function refuseRevokedModel(env: Cloudflare.Env, props: AiModelGatekeeperP
   } else {
     models?.refuseUserModel(props.displayName);
   }
-}
-
-/**
- * The usage gate every binding call passes: the same checkUsageAndBalance() a chat turn passes
- * at its head, so each run()/decide() call draws one call on the workspace owner's allowance
- * and refuses with the checker's reason once it is exhausted. Bindings never route through the
- * owner's own gateway; a funded owner simply clears the gate without consuming the daily
- * counter, since the daily counter is only spent on the platform gateway.
- *
- * Bindings minted before spend gating carry no ownerUserId in their frozen props, and the
- * stored gatekeeper record cannot supply it (a DurableObjectClass hides its props), so those
- * bindings keep a no-op gate rather than breaking on upgrade.
- */
-function bindingUsageGate(
-    env: Cloudflare.Env, ownerUserId: string | undefined,
-    users: DurableObjectNamespace<UserDurableObject>): () => Promise<void> {
-  if (ownerUserId === undefined) return async () => {};
-  let userStub = users.get(users.idFromString(ownerUserId));
-  return async () => {
-    let usage = await checkUsageAndBalance(env, userStub);
-    if (!usage.allowed) throw new Error(usage.reason ?? "Usage limit reached.");
-  };
 }
 
 export class LanguageModelGatekeeper

@@ -71,7 +71,7 @@ import type { AgentSpawnerBinding, CallableAgent, SpawnCallableOptions } from ".
 import { recordAnalytics } from "./analytics";
 import { reportIssue } from "@gadgets/observability/error-reporting";
 import type { ProductAnalyticsConnectionType, ProductAnalyticsGadgetInput } from "./analytics";
-import { checkUsageAndBalance } from "./ai-gateway-billing/limits/usage-checker";
+import { checkOwnerUsage, checkUsageAndBalance } from "./ai-gateway-billing/limits/usage-checker";
 import { normalizeAgentCatalog } from "./agent-catalog";
 import { refreshCachedBalance } from "./ai-gateway-billing/cloudflare/connection-service";
 import { SharingManager, SharingCaller, roleRank } from "./sharing";
@@ -7776,15 +7776,12 @@ class OverseerImpl implements AgentHooks {
     }
   }
 
-  // Whether a free quick-model call (thread/gadget titles, binding names) may run: the workspace
-  // owner must still be within their LLM allowance (the same checkUsageAndBalance() a chat turn
-  // passes). These calls are cosmetic, so callers skip them when this returns false instead of
-  // surfacing an error; when the limits flow is disabled the checker allows without consuming
-  // anything, so self-hosted deployments are unaffected.
+  // Whether a quick-model side call (thread/gadget titles, binding names) may run: cosmetic, so
+  // callers skip it when the owner's allowance is spent instead of surfacing an error. The checker
+  // allows without consuming anything when the limits flow is disabled (self-hosted default).
   async #allowQuickModelCall(): Promise<boolean> {
     if (!this.ownerId) return false;
-    let ownerStub = this.users.get(this.users.idFromString(this.ownerId));
-    return (await checkUsageAndBalance(this.env, ownerStub)).allowed;
+    return (await checkOwnerUsage(this.env, this.ownerId, this.users)).allowed;
   }
 
   // The quick-model context used for turn-start binding naming, fetched lazily (the naming path
@@ -11467,8 +11464,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       config: chatMeta.aiModel!.config,
       initiator: this.impl.gadgetAuthorFor(chatMeta.profile),
       metadata: { source: "model-binding", gadgetId: this.impl.ctx.id.toString() },
-      // Spend gating: the binding's calls draw on the workspace owner's allowance, whoever
-      // mints it (see bindingUsageGate in ai-models.ts).
+      // Spend gating: the binding's calls draw on the workspace owner's allowance (whoever
+      // mints it); see bindingUsageGate in ai-models.ts.
       ownerUserId: this.impl.ownerId,
     }
 

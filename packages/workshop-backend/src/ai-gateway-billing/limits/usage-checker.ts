@@ -126,6 +126,18 @@ export async function checkUsageAndBalance(
 }
 
 /**
+ * Check the usage allowance of the workspace owner addressed by `ownerId`, the user every
+ * billable model call (chat turns, model bindings, quick-model side calls) draws on. Callers
+ * that need the full result call checkUsageAndBalance() themselves; this just resolves the
+ * owner's stub from the namespace.
+ */
+export async function checkOwnerUsage(
+  env: Cloudflare.Env, ownerId: string, users: DurableObjectNamespace<UserDurableObject>,
+): Promise<UsageCheckResult> {
+  return checkUsageAndBalance(env, users.get(users.idFromString(ownerId)));
+}
+
+/**
  * Read the user's current usage + connection status WITHOUT counting a call. Used by the UI to
  * render the usage banner. Returns an "unlimited" snapshot when limits are disabled.
  */
