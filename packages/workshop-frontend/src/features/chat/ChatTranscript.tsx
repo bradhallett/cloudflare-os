@@ -477,7 +477,7 @@ export function ChatTranscript({
                       const endsUserGroup = !continuesUserGroup(entry, displayEntries[entryIndex + 1]);
 
                       return (
-                        <div key={entry.key} className={entryTopClass}>
+                        <div key={entry.key} data-entry-key={entry.key} className={entryTopClass}>
                         {/* ── user / AI text message ── */}
                         {msg.type === "slashCommand" && (
                           <div className="group/message relative flex flex-col items-end">

@@ -291,7 +291,7 @@ function PaneWorkpieceTabs({
   return (
     <div
       ref={scrollerRef}
-      className="hide-scrollbar flex min-w-0 flex-1 items-center gap-1 overflow-x-auto"
+      className="hide-scrollbar scroll-fade-x flex min-w-0 flex-1 items-center gap-1 overflow-x-auto"
     >
       {gadgets.map(gadget => {
         const active = gadget.id === activeId
@@ -2043,16 +2043,18 @@ export default function GadgetEditor() {
 
           <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
             {paneShowsActivity && (
-              <div className="flex h-11 items-center gap-1 overflow-x-auto border-b border-kumo-line px-2 md:hidden">
-                {ACTIVITY_TABS.map(tab => (
-                  <PaneTab
-                    key={tab.value}
-                    active={activityView === tab.value}
-                    label={tab.label}
-                    count={tab.value === 'review' ? pendingActionCount : undefined}
-                    onClick={() => setActivityView(tab.value)}
-                  />
-                ))}
+              <div className="h-11 shrink-0 border-b border-kumo-line md:hidden">
+                <div className="scroll-fade-x flex h-full items-center gap-1 overflow-x-auto px-2">
+                  {ACTIVITY_TABS.map(tab => (
+                    <PaneTab
+                      key={tab.value}
+                      active={activityView === tab.value}
+                      label={tab.label}
+                      count={tab.value === 'review' ? pendingActionCount : undefined}
+                      onClick={() => setActivityView(tab.value)}
+                    />
+                  ))}
+                </div>
               </div>
             )}
             {paneShowsActivity && (
