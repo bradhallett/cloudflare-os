@@ -125,15 +125,19 @@ export abstract class OverseerCore {
   /** Drains of pending agent calls currently in flight, by chat (see drainPendingAgentCalls). */
   protected pendingCallDrains = new Map<number, Promise<void>>();
 
-  // Chats with a delegateToBot call awaiting a subagent's turn (see runBotSubagent), keyed by
-  // the *child* chat: every turn-terminal path calls settleSubagentWaiters(chatId), so however
-  // the child's turn ends -- reply, error, approval park, abort -- the parent's tool call
-  // resolves. Rebuilt from the durable pendingDelegations record when a reset re-executes the
-  // tool call, so the await survives DO restarts.
+  /**
+   * Chats with a delegateToBot call awaiting a subagent's turn (see runBotSubagent), keyed by
+   * the *child* chat: every turn-terminal path calls settleSubagentWaiters(chatId), so however
+   * the child's turn ends -- reply, error, approval park, abort -- the parent's tool call
+   * resolves. Rebuilt from the durable pendingDelegations record when a reset re-executes the
+   * tool call, so the await survives DO restarts.
+   */
   protected subagentWaiters = new Map<number, Set<() => void>>();
 
-  // Resolve however the chat's turn ends: wake every delegateToBot await keyed to it and mark
-  // its delegation records done (the await re-arms if the parent re-executes the tool call).
+  /**
+   * Resolve however the chat's turn ends: wake every delegateToBot await keyed to it and mark
+   * its delegation records done (the await re-arms if the parent re-executes the tool call).
+   */
   protected settleSubagentWaiters(chatId: number): void {
     let waiters = this.subagentWaiters.get(chatId);
     if (waiters) {
@@ -321,9 +325,11 @@ export abstract class OverseerCore {
     }
   }
 
-  // Rouses waitForAllAgentsToComplete's waiters to re-check their conditions. Waking is always
-  // safe: a waiter whose condition still holds (an agent still running, a drain still in flight)
-  // re-arms itself.
+  /**
+   * Rouses waitForAllAgentsToComplete's waiters to re-check their conditions. Waking is always
+   * safe: a waiter whose condition still holds (an agent still running, a drain still in flight)
+   * re-arms itself.
+   */
   protected wakeIdleWaiters(): void {
     for (let waiter of this.#allAgentsIdleWaiters) {
       waiter();

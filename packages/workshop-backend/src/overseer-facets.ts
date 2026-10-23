@@ -790,10 +790,12 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
   // (see src/bot-config.ts; the bots' runtime -- subagents and DMs -- is overseer-bots.ts)
   // =======================================================================================
 
-  // The snapshot a bot chat carries (newChat, a mid-chat switch, and every bot child chat):
-  // the frozen declaration as botConfig, this workspace's skill resolution, and the composed
-  // prompt section. One await (the skill resolution); callers persist it in their own storage
-  // transaction so the snapshot lands atomically with what references it.
+  /**
+   * The snapshot a bot chat carries (newChat, a mid-chat switch, and every bot child chat):
+   * the frozen declaration as botConfig, this workspace's skill resolution, and the composed
+   * prompt section. One await (the skill resolution); callers persist it in their own storage
+   * transaction so the snapshot lands atomically with what references it.
+   */
   protected async snapshotBotForChat(bot: NonNullable<UserChatContext["bot"]>): Promise<{
       botConfig: NonNullable<AiChatAgentContext["botConfig"]>;
       botSkills: ResolvedBotSkill[];

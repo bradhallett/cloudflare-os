@@ -7,7 +7,6 @@ import { ChatCacheWarmer } from "./chat-cache-warming";
 import { UserDurableObject } from "./user";
 import type { UserChatContext } from "./user";
 import { AutoApprovalDrainer } from "./auto-approval";
-import { OverseerGatekeepers } from "./overseer-gatekeepers";
 import { OverseerBots } from "./overseer-bots";
 import { AGENT_KEEPALIVE_ALARM_MS, ALARM_MAX_RETRIES, stringifyError } from "./overseer-support";
 import { GIT_BINDING_NAME } from "./agent";
@@ -353,8 +352,10 @@ export class OverseerImpl extends OverseerBots implements AgentHooks {
     this.bindWorkpiece(gadget.id, name, target, chatId);
   }
 
-  // Throws unless `target` may be bound into an agent spawner as `name`, by chat `chatId` if
-  // given: each agent the spawner starts gets it as `env.<name>` (see GatekeeperRecord.bindings).
+  /**
+   * Throws unless `target` may be bound into an agent spawner as `name`, by chat `chatId` if
+   * given: each agent the spawner starts gets it as `env.<name>` (see GatekeeperRecord.bindings).
+   */
   validateSpawnerBinding(name: string, target: WorkpieceId, chatId?: number): void {
     validateBindingName(name);
     if (name === GIT_BINDING_NAME) {

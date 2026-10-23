@@ -587,9 +587,11 @@ export abstract class OverseerPublishing extends OverseerFacets {
     this.addRequestCost(chatId, usage, aiGatewayLogId, aiGatewayLogRoute, true);
   }
 
-  // Adds a model request's cost to the chat's and workspace's totals: the cost AI Gateway logged
-  // for it where it went through one, else the catalog-priced estimate in `usage`. See
-  // #addChatCost for `isActivity`.
+  /**
+   * Adds a model request's cost to the chat's and workspace's totals: the cost AI Gateway logged
+   * for it where it went through one, else the catalog-priced estimate in `usage`. See
+   * #addChatCost for `isActivity`.
+   */
   protected addRequestCost(chatId: number, usage: Usage | undefined,
                            aiGatewayLogId: string | undefined,
                            aiGatewayLogRoute: AiGatewayLogRoute | undefined, isActivity: boolean) {

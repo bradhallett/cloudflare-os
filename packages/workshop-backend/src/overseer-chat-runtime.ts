@@ -258,9 +258,11 @@ export abstract class OverseerChatRuntime extends OverseerChats {
     return wrapDoStubForTelemetry(stub, this.logger, e => this.restartIfLoopLimited(e));
   }
 
-  // Every record holding binding edges: each gadget, and each agent spawner (see
-  // GatekeeperRecord.bindings). Listed in full up front, so callers may read other collections
-  // as they go.
+  /**
+   * Every record holding binding edges: each gadget, and each agent spawner (see
+   * GatekeeperRecord.bindings). Listed in full up front, so callers may read other collections
+   * as they go.
+   */
   protected bindingHolders(): BindingHolder[] {
     return [...this.storage.gadgets.list(), ...this.storage.gatekeepers.list()]
         .flatMap(record => this.bindingHolder(record) ?? []);
@@ -278,8 +280,10 @@ export abstract class OverseerChatRuntime extends OverseerChats {
     }};
   }
 
-  // Deletes every binding edge `doomed` picks, from gadgets and agent spawners alike, and
-  // reloads each gadget that loses one. Returns the chats whose pending edges were deleted.
+  /**
+   * Deletes every binding edge `doomed` picks, from gadgets and agent spawners alike, and
+   * reloads each gadget that loses one. Returns the chats whose pending edges were deleted.
+   */
   protected deleteBindingEdges(doomed: (edge: BindingRecord, holder: WorkpieceId) => boolean)
       : Set<number> {
     let chats = new Set<number>();
@@ -297,15 +301,17 @@ export abstract class OverseerChatRuntime extends OverseerChats {
     return chats;
   }
 
-  // The chats proposing changes to workpiece `id` (see proposedChangeWorkpieceIds).
+  /** The chats proposing changes to workpiece `id` (see proposedChangeWorkpieceIds). */
   protected chatsProposing(id: WorkpieceId): Set<number> {
     return new Set(Array.from(this.storage.chatMeta.list())
         .filter(meta => this.proposedChangeWorkpieceIds(meta.id, meta).includes(id))
         .map(meta => meta.id));
   }
 
-  // Re-puts the chats' metadata, re-broadcasting what they propose: removing a workpiece or an
-  // edge changes that with no chatMeta write of the chat's own (as reconcilePendingGadgets).
+  /**
+   * Re-puts the chats' metadata, re-broadcasting what they propose: removing a workpiece or an
+   * edge changes that with no chatMeta write of the chat's own (as reconcilePendingGadgets).
+   */
   protected rebroadcastChatMeta(chatIds: Iterable<number>): void {
     for (let chatId of chatIds) {
       let meta = this.storage.chatMeta.get(chatId);

@@ -1,6 +1,6 @@
 import { RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
-import { Overseer, GadgetMetadata, WorkpieceId, WorkpiecesSubscriber, GadgetClient, GatekeeperClient, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, CodeChangeSubmission, CommitInfo, FileAtCommit, MAX_READ_FILES_PER_CALL, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AgentSpawnerConfig, ConsoleLogSubscriber, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverBindingNeed, MessageFormatRef, BlueprintGadgetSummary, BlueprintScreenshotUpload, blueprintScreenshotUrl, ChatAttachmentHandle, BoundHookInfo, PreApprovableAction, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, modelKind } from "@gadgets/workshop-shared/api";
+import { Overseer, GadgetMetadata, WorkpieceId, WorkpiecesSubscriber, GadgetClient, GatekeeperClient, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, CodeChangeSubmission, CommitInfo, FileAtCommit, MAX_READ_FILES_PER_CALL, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AgentSpawnerConfig, ConsoleLogSubscriber, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverBindingNeed, MessageFormatRef, BlueprintGadgetSummary, BlueprintScreenshotUpload, blueprintScreenshotUrl, ChatAttachmentHandle, BoundHookInfo, PreApprovableAction, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, modelKind } from "@gadgets/workshop-shared/api";
 import { HookInitiator, ActionKind } from "@gadgets/workshop-shared/gatekeeper";
 import { BotSelection } from "@gadgets/workshop-shared/api";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
@@ -10,7 +10,6 @@ import { actionLastChangedKey, chatKey, chatKeyPrefix } from "./storage-schema/o
 import type { ActionRecord, AgentSpawnerBindingProps, BlueprintGadgetRecord, StoredChatMessage } from "./storage-schema/overseer-storage";
 import { commitIdentityForAuthor } from "./git-store";
 import { AiModelGatekeeperProps } from "./ai-models";
-import { GIT_BINDING_NAME } from "./agent";
 import { UserDurableObject } from "./user";
 import type { ProductAnalyticsConnectionType } from "./analytics";
 import { SharingCaller } from "./sharing";

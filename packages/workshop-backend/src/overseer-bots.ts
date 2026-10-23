@@ -23,8 +23,10 @@ export abstract class OverseerBots extends OverseerGatekeepers {
   // Declared bots (see storage-schema/overseer-storage.ts's bot fields and src/bot-config.ts)
   // =======================================================================================
 
-  // Loop-safety bounds (tunable, not product): delegation depth, a subagent await's timeout,
-  // and the per-chat / per-tree caps on bot-driven inbound messages.
+  /**
+   * Loop-safety bounds (tunable, not product): delegation depth, a subagent await's timeout,
+   * and the per-chat / per-tree caps on bot-driven inbound messages.
+   */
   static readonly MAX_DELEGATION_DEPTH = 3;
   static readonly SUBAGENT_TIMEOUT_MS = 10 * 60 * 1000;
   static readonly MAX_BOT_DMS_PER_CHAT = 50;
