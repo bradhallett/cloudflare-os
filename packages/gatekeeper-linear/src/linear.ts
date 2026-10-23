@@ -21,7 +21,7 @@ import {
 import {
   type ActionDescriptionBuilder, buildDescription, plainInline, type RenderedDescription,
 } from "@gadgets/gatekeeper-kit/action-description";
-import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
+import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
 import type {
@@ -461,12 +461,15 @@ export default {
       }
 
       const stub = ctx.exports.UserAccount.get(ctx.exports.UserAccount.idFromString(doId));
-      const handoff = await stub.acceptAuthCode(code, oauthNonce);
-      if (!handoff) {
+      const result = await stub.acceptAuthCode(code, oauthNonce);
+      if (!result) {
         return new Response(INVALID_LINK_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
       }
+      if ("refused" in result) {
+        return htmlResponse(errorPageHtml(result.refused.title, result.refused.detail), 409);
+      }
 
-      return htmlResponse(connectHandoffPageHtml(handoff));
+      return htmlResponse(connectHandoffPageHtml(result.handoff));
     }
 
     return new Response("Not Found", { status: 404 });
@@ -529,6 +532,33 @@ type StoredNonce = {
   reconnect?: true;
 };
 
+/**
+ * The Linear account a connection is pinned to: one user in one workspace. A reconnect that
+ * comes back as anyone else, or into any other workspace, is refused and its grant revoked.
+ */
+type PinnedSubject = {
+  userId: string;
+  userName: string;
+  orgId: string;
+  orgName: string;
+  orgUrlKey: string;
+};
+
+/** How the callback ended: a handoff for the browser, or a refusal to show it. */
+type CallbackResult = { handoff: ConnectHandoff } | { refused: { title: string; detail: string } };
+
+/** Reads the Linear user and workspace an access token belongs to. */
+async function fetchSubject(accessToken: string): Promise<PinnedSubject> {
+  const { user, organization } = await new LinearApi(async () => accessToken).getViewer();
+  return {
+    userId: user.id,
+    userName: user.displayName ?? user.name,
+    orgId: organization.id,
+    orgName: organization.name,
+    orgUrlKey: organization.urlKey,
+  };
+}
+
 export class UserAccount extends DurableObject<Env> {
   async setCallback(callback: Fetcher<GatekeeperConnectCallback>, initiationNonce: string): Promise<void> {
     if (!this.ctx.storage.kv.get<LinearOAuthGrant>("grant")) {
@@ -569,10 +599,11 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   /**
-   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on, or
-   * null when the callback's nonce doesn't match.
+   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on,
+   * null when the callback's nonce doesn't match, or a refusal when the grant came back as a
+   * different Linear user or workspace than the connection is pinned to.
    */
-  async acceptAuthCode(code: string, oauthNonce: string): Promise<ConnectHandoff | null> {
+  async acceptAuthCode(code: string, oauthNonce: string): Promise<CallbackResult | null> {
     const stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
     if (!stored || stored.stage !== "oauth" || Date.now() >= stored.expiresAt ||
         !constantTimeEqual(stored.value, oauthNonce)) {
@@ -596,34 +627,64 @@ export class UserAccount extends DurableObject<Env> {
       redirectUri: `${getBaseUrl(this.env)}/oauth`,
     });
 
+    let subject: PinnedSubject;
+    try {
+      subject = await fetchSubject(grant.accessToken);
+    } catch (error) {
+      // A first connect's unreadable grant leaves tokens nobody owns, so revoke it; a
+      // reconnect's is just dropped, keeping the live grant as it is.
+      if (!stored.reconnect) await this.#revokeGrant(grant);
+      throw new Error("Could not read which Linear account authorized this connection. Please try again.",
+        { cause: error });
+    }
+
     let handoff: ConnectHandoff;
     if (stored.reconnect) {
+      // The connection is pinned to the Linear user and workspace it was made as: a reconnect
+      // that comes back as anyone else, or into any other workspace, is refused and its grant
+      // revoked, rather than silently swapping the account every binding reads.
+      const pinned = this.ctx.storage.kv.get<PinnedSubject>("subject");
+      if (pinned !== undefined && (pinned.userId !== subject.userId || pinned.orgId !== subject.orgId)) {
+        await this.#revokeGrant(grant);
+        return {
+          refused: {
+            title: "That's a different Linear account",
+            detail: `This connection is for ${pinned.userName} in the ${pinned.orgName} workspace, but Linear ` +
+              `authorized ${subject.userName} in the ${subject.orgName} workspace. Sign in to Linear as ` +
+              `${pinned.userName} and reconnect, or connect the other account separately.`,
+          },
+        };
+      }
       // The reconnect URL is a bearer capability, so the new grant is only staged until the Workshop
       // has confirmed the browser that finished the flow is the owner's (see commitReconnect). Bound
       // gadgets keep reading the current token meanwhile.
-      const stageId = stageCredentials(this.ctx.storage.kv, grant, Date.now());
+      const stageId = stageCredentials(this.ctx.storage.kv, { grant, subject }, Date.now());
       handoff = await callback.reconnectComplete(stageId);
     } else {
       this.ctx.storage.kv.put<LinearOAuthGrant>("grant", grant);
+      this.ctx.storage.kv.put<PinnedSubject>("subject", subject);
       clearCredentialExpiryLatch(this.ctx.storage.kv);
       try {
         const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
         handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
       } catch (err) {
         this.ctx.storage.kv.delete("grant");
+        this.ctx.storage.kv.delete("subject");
         throw err;
       }
     }
 
     await this.ctx.storage.deleteAlarm();
-    return handoff;
+    return { handoff };
   }
 
   /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
   async commitReconnect(stageId: string): Promise<void> {
-    const grant = commitStagedCredentials<LinearOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
-    if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
-    this.ctx.storage.kv.put<LinearOAuthGrant>("grant", grant);
+    const staged = commitStagedCredentials<{ grant: LinearOAuthGrant; subject: PinnedSubject }>(
+      this.ctx.storage.kv, Date.now(), stageId);
+    if (!staged) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+    this.ctx.storage.kv.put<LinearOAuthGrant>("grant", staged.grant);
+    this.ctx.storage.kv.put<PinnedSubject>("subject", staged.subject);
     clearCredentialExpiryLatch(this.ctx.storage.kv);
   }
 
@@ -671,18 +732,21 @@ export class UserAccount extends DurableObject<Env> {
 
   async revoke(): Promise<void> {
     const grant = this.ctx.storage.kv.get<LinearOAuthGrant>("grant");
-    if (grant) {
-      try {
-        await revokeToken(grant.accessToken);
-        if (grant.refreshToken) await revokeToken(grant.refreshToken);
-      } catch (err) {
-        logger.error("failed to revoke Linear token", {
-          event: "oauth.token.revoke.failed", error: err,
-        });
-      }
-    }
+    if (grant) await this.#revokeGrant(grant);
     await this.ctx.storage.deleteAlarm();
     await this.ctx.storage.deleteAll();
+  }
+
+  /** Revokes a grant's tokens, best-effort: a token Linear already refuses is not worth failing over. */
+  async #revokeGrant(grant: LinearOAuthGrant): Promise<void> {
+    try {
+      await revokeToken(grant.accessToken);
+      if (grant.refreshToken) await revokeToken(grant.refreshToken);
+    } catch (err) {
+      logger.error("failed to revoke Linear token", {
+        event: "oauth.token.revoke.failed", error: err,
+      });
+    }
   }
 }
 

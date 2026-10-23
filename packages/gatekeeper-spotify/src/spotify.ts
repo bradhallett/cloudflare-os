@@ -18,8 +18,10 @@ import {
   type VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { buildDescription, type RenderedDescription } from "@gadgets/gatekeeper-kit/action-description";
-import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
+import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import { canTransition, type ActionState } from "./action-state";
+import { type CallbackResult, fetchSubject, type PinnedSubject, pinRefusal } from "./connect-subject";
 import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
 import {
   SpotifyApi,
@@ -454,12 +456,15 @@ export default {
       const stub: DurableObjectStub<UserAccount> = ctx.exports.UserAccount.get(
         ctx.exports.UserAccount.idFromString(doId),
       );
-      const handoff = await stub.acceptAuthCode(code, oauthNonce);
-      if (!handoff) {
+      const result = await stub.acceptAuthCode(code, oauthNonce);
+      if (!result) {
         return new Response(INVALID_LINK_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
       }
+      if ("refused" in result) {
+        return htmlResponse(errorPageHtml(result.refused.title, result.refused.detail), 409);
+      }
 
-      return htmlResponse(connectHandoffPageHtml(handoff));
+      return htmlResponse(connectHandoffPageHtml(result.handoff));
     }
 
     return new Response("Not Found", { status: 404 });
@@ -551,10 +556,11 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   /**
-   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on, or
-   * null when the callback's nonce doesn't match.
+   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on,
+   * null when the callback's nonce doesn't match, or a refusal when the grant came back as a
+   * different Spotify account than the connection is pinned to.
    */
-  async acceptAuthCode(code: string, oauthNonce: string): Promise<ConnectHandoff | null> {
+  async acceptAuthCode(code: string, oauthNonce: string): Promise<CallbackResult | null> {
     const stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
     if (!stored || stored.stage !== "oauth" || Date.now() >= stored.expiresAt ||
         !constantTimeEqual(stored.value, oauthNonce)) {
@@ -580,34 +586,51 @@ export class UserAccount extends DurableObject<Env> {
       scopes: grant.scopes,
     };
 
+    let subject: PinnedSubject;
+    try {
+      subject = await fetchSubject(credentials.accessToken);
+    } catch (error) {
+      throw new Error("Could not read which Spotify account authorized this connection. Please try again.",
+        { cause: error });
+    }
+
     let handoff: ConnectHandoff;
     if (stored.reconnect) {
+      // The connection is pinned to the Spotify user it was made as: a reconnect that comes back
+      // as anyone else is refused (Spotify has no token-revocation endpoint, so the refused grant
+      // is simply dropped) rather than silently swapping the account every binding reads.
+      const refusal = pinRefusal(this.ctx.storage.kv.get<PinnedSubject>("subject"), subject);
+      if (refusal) return refusal;
       // The reconnect URL is a bearer capability, so the new grant is only staged until the Workshop
       // has confirmed the browser that finished the flow is the owner's (see commitReconnect). Bound
       // gadgets keep reading the current token meanwhile.
-      const stageId = stageCredentials(this.ctx.storage.kv, credentials, Date.now());
+      const stageId = stageCredentials(this.ctx.storage.kv, { credentials, subject }, Date.now());
       handoff = await callback.reconnectComplete(stageId);
     } else {
       this.#storeCredentials(credentials);
+      this.ctx.storage.kv.put<PinnedSubject>("subject", subject);
       try {
         const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
         handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
       } catch (err) {
         this.ctx.storage.kv.delete("refreshToken");
         this.ctx.storage.kv.delete("accessToken");
+        this.ctx.storage.kv.delete("subject");
         throw err;
       }
     }
 
     await this.ctx.storage.deleteAlarm();
-    return handoff;
+    return { handoff };
   }
 
   /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
   async commitReconnect(stageId: string): Promise<void> {
-    const credentials = commitStagedCredentials<StoredCredentials>(this.ctx.storage.kv, Date.now(), stageId);
-    if (!credentials) throw new Error("No reconnect is awaiting confirmation. Please try again.");
-    this.#storeCredentials(credentials);
+    const staged = commitStagedCredentials<{ credentials: StoredCredentials; subject: PinnedSubject }>(
+      this.ctx.storage.kv, Date.now(), stageId);
+    if (!staged) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+    this.#storeCredentials(staged.credentials);
+    this.ctx.storage.kv.put<PinnedSubject>("subject", staged.subject);
   }
 
   #storeCredentials(credentials: StoredCredentials): void {
@@ -805,7 +828,6 @@ export class SpotifyVerifier extends WorkerEntrypoint<Env> implements Gatekeeper
 
 type WithApi = <T>(fn: (api: SpotifyApi) => Promise<T>) => Promise<T>;
 
-type ActionState = "staged" | "pending" | "approved" | "rejected" | "failed";
 
 type BaseAction = { approvalId: number; submittedAt: number };
 
@@ -1222,6 +1244,21 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     const record = this.#getRecord(id);
     if (!record) throw new Error(`No queued Spotify action exists with id ${id}.`);
     return record;
+  }
+
+  /**
+   * Moves the live record for `id` to `to`, if the state it is stored in still allows that step.
+   * Only the live key is read — never the retired fallback — and a record that reached a terminal
+   * state meanwhile (applied or rejected through the queue while a submit or apply on it was
+   * awaiting its own RPC reply) keeps the state the lifecycle gave it: nothing brings a retired
+   * action back, so an applied action cannot go pending and be applied twice.
+   */
+  #advance(id: number, to: ActionState): void {
+    const record = this.ctx.storage.kv.get<StoredActionRecord>(this.#actionKey(id));
+    if (record === undefined || !canTransition(record.state, to)) return;
+    record.state = to;
+    this.ctx.storage.kv.put(this.#actionKey(id), record);
+    this.#invalidatePendingCache();
   }
 
   #retire(id: number, record: StoredActionRecord): void {
@@ -1817,10 +1854,7 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
       this.ctx.storage.kv.delete(this.#actionKey(action.approvalId));
       throw error;
     }
-    const record = this.#requireRecord(action.approvalId);
-    record.state = "pending";
-    this.ctx.storage.kv.put(this.#actionKey(action.approvalId), record);
-    this.#invalidatePendingCache();
+    this.#advance(action.approvalId, "pending");
   }
 
   // -------------------------------------------------------------------------
@@ -1873,7 +1907,7 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
   async applyAction(actionId: number): Promise<void> {
     const record = this.#requireRecord(actionId);
     // "failed" is retryable (a prior apply threw); the overseer may call applyAction again.
-    if (record.state !== "pending" && record.state !== "staged" && record.state !== "failed") {
+    if (!canTransition(record.state, "approved")) {
       throw new Error(`Spotify action ${actionId} is no longer pending.`);
     }
     const action = record.action;
@@ -1881,10 +1915,9 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
       await this.#performAction(action, record);
     } catch (error) {
       // Apply failed (and won't take effect on Spotify). Mark it failed so its simulated effect
-      // stops masking real library/follow/playlist state, while keeping it retryable/discardable.
-      record.state = "failed";
-      this.ctx.storage.kv.put(this.#actionKey(actionId), record);
-      this.#invalidatePendingCache();
+      // stops masking real library/follow/playlist state, while keeping it retryable/discardable —
+      // unless the record retired while the attempt was in flight, in which case it stays there.
+      this.#advance(actionId, "failed");
       throw error;
     }
     record.state = "approved";
@@ -1969,7 +2002,7 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     // stale queue entry from a prior session) is treated as a no-op success so the overseer can
     // always clear it from its queue. Throwing here would leave such entries stuck.
     const record = this.#getRecord(actionId);
-    if (!record || (record.state !== "pending" && record.state !== "staged" && record.state !== "failed")) {
+    if (!record || !canTransition(record.state, "rejected")) {
       return;
     }
     const action = record.action;
