@@ -1,14 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type {
-  GatekeeperUserVerifier,
-  ObservationAuthorizer,
+import {
+  OBSERVATION_REFUSED_CODE,
+  type GatekeeperUserVerifier,
+  type ObservationAuthorizer,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type { RpcStub } from "cloudflare:workers";
 import {
   aclObservers,
   escapeObservationValue,
-  isObservationRefused,
-  OBSERVATION_REFUSED_CODE,
   ObservationGate,
   OBSERVER_ATTEMPT_LIFETIME_MS,
   OBSERVER_DENIED,
@@ -59,8 +58,8 @@ function fakeAuthorizer(authorizeObservation = vi.fn(async () => {})) {
   return { authorizeObservation } as unknown as RpcStub<ObservationAuthorizer>;
 }
 
-// The mark the overseer carries on a policy refusal. No kernel error class exists yet, so the
-// protocol is exercised the way the transport delivers it: an enumerable own `code`.
+// The mark the overseer puts on a policy refusal (createObservationRefusedError), exercised the
+// way the transport delivers it: an enumerable own `code`.
 function refusal(message = "a collaborator may not see this"): Error {
   return Object.assign(new Error(message), { code: OBSERVATION_REFUSED_CODE });
 }
@@ -692,23 +691,6 @@ describe("escapeObservationValue", () => {
 
   it("returns an empty string unchanged", () => {
     expect(escapeObservationValue("")).toBe("");
-  });
-});
-
-describe("isObservationRefused", () => {
-  it("matches the mark on a rebuilt error's `code`, as the transport delivers it", () => {
-    expect(isObservationRefused(refusal())).toBe(true);
-  });
-
-  it("matches the mark on `name`, as a thrown class carries it", () => {
-    const thrown = new Error("refused");
-    thrown.name = OBSERVATION_REFUSED_CODE;
-    expect(isObservationRefused(thrown)).toBe(true);
-  });
-
-  it("reads an unmarked failure as an unknown outcome", () => {
-    expect(isObservationRefused(new Error("connection lost"))).toBe(false);
-    expect(isObservationRefused(OBSERVATION_REFUSED_CODE)).toBe(false);
   });
 });
 

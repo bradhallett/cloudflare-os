@@ -812,12 +812,12 @@ Every other failure has an unknown outcome. The gate releases in-memory bookkeep
 durable fences because a lost reply may have left an observation record. A tracked-collection marker is
 reclaimed only after every read that disclosed the collection was refused. One unknown result retains it.
 
-The Workshop overseer does not yet add this code: both pre-recording refusal paths — owner-only
-observations in shared workspaces, and collaborator exclusions — still throw plain errors. Until a
-kernel change marks them, every failure takes the fail-closed unknown-outcome path above, and
-`discard()` never runs. For a `withholdFromObservers` read that is not merely a retained marker:
-`abandon` latches the binding unshareable for good, so a refused owner-only read costs the
-workspace its sharing until the kernel distinguishes the two.
+The Workshop overseer marks its refusals with this code: `authorizeObservation` throws it from
+`createObservationRefusedError()` (in `@gadgets/workshop-shared/gatekeeper`) for every pre-recording
+refusal — owner-only observations in shared workspaces and collaborator exclusions alike — so
+`discard()` runs on them and a refused owner-only read no longer costs the workspace its sharing.
+A refusal from an overseer deployment older than the mark reads as an unknown outcome, which keeps
+the fail-closed direction above.
 
 ## Bounds
 

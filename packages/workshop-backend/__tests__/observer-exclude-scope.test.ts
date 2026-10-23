@@ -9,7 +9,9 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import type { ObservationDescription } from "@gadgets/workshop-shared/gatekeeper";
+import {
+  isObservationRefused, OBSERVATION_REFUSED_CODE, type ObservationDescription,
+} from "@gadgets/workshop-shared/gatekeeper";
 import type { OverseerDurableObject } from "../src/overseer.js";
 
 declare module "cloudflare:workers" {
@@ -89,7 +91,24 @@ describe("excludeObservers against the observer's verification scope", () => {
       () => withImpl("use", async (impl, removals) => {
     bindIntoGadget(impl);
 
-    await expect(observe(impl)).rejects.toThrow(/not permitted to see/);
+    let refusal = await observe(impl).then(
+        () => { throw new Error("expected the observation to be refused"); },
+        error => error);
+
+    // Producer-to-classifier round trip: the refusal the overseer actually throws carries the
+    // transport-stable mark, and the gatekeeper-side classifier -- which reclaims prepared
+    // observer state only on a marked refusal -- matches it both as thrown and as the transport
+    // delivers it (Cap'n Web rebuilds the error, keeping own enumerable props but not the name).
+    // There is no message or name fallback: an unmarked error from an overseer deployment too old
+    // to mark its refusals stays an unknown outcome, so durable fences are retained.
+    expect(refusal).toBeInstanceOf(Error);
+    expect(refusal.message).toMatch(/not permitted to see/);
+    expect(Object.prototype.propertyIsEnumerable.call(refusal, "code")).toBe(true);
+    expect(refusal.code).toBe(OBSERVATION_REFUSED_CODE);
+    expect(isObservationRefused(refusal)).toBe(true);
+    expect(isObservationRefused(Object.assign(
+        new Error(refusal.message), {code: refusal.code}))).toBe(true);
+    expect(isObservationRefused(new Error(refusal.message))).toBe(false);
 
     // A blocked observation leaves no teardown behind it.
     expect(removals).toEqual([]);

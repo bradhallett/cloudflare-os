@@ -2376,7 +2376,9 @@ mid-walk is honoured.
 settlement is fail-closed by outcome: the kit defines and classifies a transport-stable
 `OBSERVATION_REFUSED_CODE`, but **no producer exists yet** — `workshop-shared` owns no such code
 and both of the overseer's pre-recording refusal paths still throw plain `Error`, so `discard` is
-unreachable in production and every policy refusal fences permanently. Layer 2 must not assume
+unreachable in production and every policy refusal fences permanently. (Resolved 2026-10-22: the
+overseer now throws `createObservationRefusedError()` from `@gadgets/workshop-shared/gatekeeper`,
+so `discard` runs on marked refusals.) Layer 2 must not assume
 reclamation until that kernel change lands (§4.8). A marked refusal may discard prepared state, while an unknown
 result abandons only in-memory claims and retains durable fences. Pending-set reclamation is
 claim-counted per storage. On the next admission, a crash-stranded withheld-read marker is promoted
