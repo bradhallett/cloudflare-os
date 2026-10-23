@@ -19,6 +19,7 @@ import { ActionFileStore, type ActionFileReference } from "@gadgets/gatekeeper-k
 import { ActionJournal, type ActionSubmitter } from "@gadgets/gatekeeper-kit/actions";
 import { KvTtlCache } from "@gadgets/gatekeeper-kit/cache";
 import { ObservationGate, trackedCollectionObservers } from "@gadgets/gatekeeper-kit/observers";
+import { AttemptJournal } from "@gadgets/gatekeeper-kit/outcome-unknown";
 import { ProvisionalIds } from "@gadgets/gatekeeper-kit/simulation";
 import type { XAccountSession, XList, XPost, XProfile } from "./types";
 import TYPES_CODE from "./types.txt";
@@ -102,6 +103,7 @@ function snippet(text: string): string {
 @validateRpc()
 export class XGatekeeperImpl extends DurableObject<Env, XGatekeeperImplProps> implements Gatekeeper<XSession> {
   readonly #creds = accountSource(this.ctx.exports, this.ctx.props.userObjectId);
+  readonly #attempts = new AttemptJournal<SendAttempt>(this.ctx.storage.kv, { markerPrefix: ATTEMPT_PREFIX });
   readonly #journal = new ActionJournal<XAction>(this.ctx.storage.kv, { namespace: "x" });
   readonly #refs = new ProvisionalIds<string>(this.ctx.storage.kv, {
     namespace: "refs:",
@@ -154,11 +156,7 @@ export class XGatekeeperImpl extends DurableObject<Env, XGatekeeperImplProps> im
       put: (id, before) => this.ctx.storage.kv.put(`${PREVIOUS_PREFIX}${id}`, before),
       delete: id => this.ctx.storage.kv.delete(`${PREVIOUS_PREFIX}${id}`),
     },
-    attempts: {
-      get: key => this.ctx.storage.kv.get<SendAttempt>(`${ATTEMPT_PREFIX}${key}`),
-      put: (key, attempt) => this.ctx.storage.kv.put(`${ATTEMPT_PREFIX}${key}`, attempt),
-      delete: key => this.ctx.storage.kv.delete(`${ATTEMPT_PREFIX}${key}`),
-    },
+    attempts: this.#attempts,
     invalidate: async () => this.#cache.invalidateAll(),
   };
 
@@ -387,12 +385,13 @@ export class XGatekeeperImpl extends DurableObject<Env, XGatekeeperImplProps> im
 
         const waiting = new Set(this.#journal.listPending().map(({ id }) => id));
         const leftovers: string[] = [];
-        for (const prefix of [PROGRESS_PREFIX, ATTEMPT_PREFIX, PREVIOUS_PREFIX]) {
+        for (const prefix of [PROGRESS_PREFIX, PREVIOUS_PREFIX]) {
           for (const [key] of kv.list({ prefix })) {
             if (!waiting.has(Number.parseInt(key.slice(prefix.length), 10))) leftovers.push(key);
           }
         }
         for (const key of leftovers) kv.delete(key);
+        this.#attempts.clearExcept(waiting);
       });
     } catch (error) {
       logger.warn("X gatekeeper housekeeping failed", { event: "x.housekeeping.failed", error });

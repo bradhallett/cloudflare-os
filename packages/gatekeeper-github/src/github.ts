@@ -90,6 +90,7 @@ import {
   simulateBranchHead,
   validateBranchName,
 } from "@gadgets/gatekeeper-kit/git-transport";
+import { desiredStateReached } from "@gadgets/gatekeeper-kit/outcome-unknown";
 import {
   actorFromUser,
   commitDetailsFromGitObject,
@@ -4236,14 +4237,12 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
             pack));
         } catch (error) {
           if (!(error instanceof GitRefUpdateRejectedError)) throw error;
-          // Desired-state semantics: apply succeeds iff the branch ends up at newSha -- by our
-          // CAS'd push, or by finding it already there (a retried apply whose first attempt
-          // landed but crashed before this record was persisted, or a third party's
-          // byte-identical push -- indistinguishable, and the approved end state holds either
-          // way).
-          const head = await this.#withApi(api =>
-            api.getBranchHead(action.owner, action.repo, action.branch));
-          if (head !== action.newSha) throw this.#pushRefusal(action, head, error);
+          // Desired-state semantics live in the kit: a head already at `newSha` settles the apply.
+          const head = await desiredStateReached(
+            () => this.#withApi(api => api.getBranchHead(action.owner, action.repo, action.branch)),
+            action.newSha,
+          );
+          if (head !== undefined) throw this.#pushRefusal(action, head, error);
         }
         this.#markActionApproved(action);
         this.#clearCaches();

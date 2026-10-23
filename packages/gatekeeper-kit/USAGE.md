@@ -567,6 +567,20 @@ provided by a pending or claimed action: once its provider was rejected or faile
 would fail retryably, and an auto-approvable one would stall the drain behind it. A provider
 decided while the dependent was being delivered fails it instead, as the cascade would have.
 
+### A dispatch that can lose its reply is marked before it goes out
+
+`ActionOutcomeUnknownError` is the end of the outcome-unknown protocol, not the whole of it: it
+records a dispatch that can no longer be reconciled. A dispatch that can be — the provider's
+records can say what became of it — is marked first and looked for on the next apply, so a
+re-delivered apply never repeats a non-idempotent write blind, and the action is refused rejection
+while any dispatch is unreported (rejecting would discard the only warning that the provider may
+already have changed). `./outcome-unknown` owns that state: `AttemptJournal` for the markers
+(keyed by action and step, surviving the crash between dispatch and reconciliation), and
+`desiredStateReached` for a write whose provider state settles it without a marker — a
+compare-and-swap'd push or a merge bound to a head, whose refusal answers "already at the approved
+state" exactly when the earlier dispatch landed. The provider look that reconciles a marker, and
+every refusal's wording, stay in the gatekeeper.
+
 ### Describe with `buildDescription`
 
 Write `describe` with `buildDescription` from `@gadgets/gatekeeper-kit/action-description`. The
