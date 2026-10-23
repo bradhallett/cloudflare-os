@@ -17,6 +17,17 @@ When a Gadget is connected to an email address:
 
 Emails are parsed using [postal-mime](https://www.npmjs.com/package/postal-mime), so the hook receives structured data (from, to, subject, text body, HTML body, attachments) rather than raw MIME.
 
+## Sender Authentication
+
+The `From` header, subject, and body of an inbound email are attacker-controlled text, so the
+gatekeeper verifies DKIM signatures (RFC 6376) over the raw message before parsing it. The hook
+receives an `authentication` field alongside the parsed content: `dkim` is `aligned` when a
+signature verifies under a domain equal to (or a parent of) the `From` domain, `unaligned` when
+it verifies under some other domain, `fail` when signatures are present but invalid, and `none`
+when the message is unsigned. The envelope sender is included too, with a mismatch flag when it
+disagrees with the `From` domain — a common spoofing signal. Treat sender, subject, and body
+content as untrusted unless `dkim` is `aligned`; observation titles mark the verdict either way.
+
 ## Creating a Binding
 
 1. Start the dev server (see root README).
