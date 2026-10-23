@@ -32,7 +32,9 @@ export default {
         command: withTestTimeout("node --test 'scripts/**/*.test.ts'"),
         cwd: "..",
         cache: {
-          env: TESTS_WITH_TIMEOUT_ENV,
+          // WORKER_SCAN_ROOTS is read by scan-roots.ts (manifest-lib.test.ts's golden run), so an
+          // overlay-root invocation must not replay a core-only cache hit.
+          env: [...TESTS_WITH_TIMEOUT_ENV, "WORKER_SCAN_ROOTS"],
           // Workspace-wide, matching `cwd`: the suites read across `packages/` and the root
           // manifests, and a guard that stopped seeing a file it asserts about would cache-hit its
           // way to a stale pass.
