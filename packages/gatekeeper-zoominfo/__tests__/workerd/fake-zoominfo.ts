@@ -105,10 +105,10 @@ export async function seedAccount(zi: FakeZoomInfo, user: FakeZoomInfoUser = ALI
     state.storage.kv.put("refreshToken", refreshToken);
     state.storage.kv.put("accessTokenExpiresAt", Date.now() + 60 * 60 * 1000);
     state.storage.kv.put("scopes", ["read"]);
-    state.storage.kv.put("identity", {
+    state.storage.kv.put("connectionSubject", {
+      id: user.sub,
       displayName: user.name,
       uniqueName: user.email,
-      subject: user.sub,
     });
   });
   return accountId.toString();

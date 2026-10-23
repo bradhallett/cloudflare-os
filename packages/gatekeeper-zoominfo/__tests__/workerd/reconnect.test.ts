@@ -9,7 +9,7 @@ import worker from "../../src/zoominfo";
 import type { ConnectHandoff } from "@gadgets/workshop-shared/gatekeeper";
 import { ALICE, BOB, FakeZoomInfo, accountStub, hooks, reconnectAs, seedAccount, unwrap } from "./fake-zoominfo";
 
-type StoredIdentity = { displayName?: string; uniqueName?: string; subject?: string };
+type PinnedSubject = { id: string; displayName?: string; uniqueName?: string };
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -19,9 +19,9 @@ function ctx() {
   return { exports: { UserAccount: env.USER_ACCOUNT } } as unknown as ExecutionContext;
 }
 
-async function storedIdentity(userObjectId: string): Promise<StoredIdentity | undefined> {
+async function storedSubject(userObjectId: string): Promise<PinnedSubject | undefined> {
   return await runInDurableObject(accountStub(userObjectId), async (_instance, state) =>
-    state.storage.kv.get<StoredIdentity>("identity"));
+    state.storage.kv.get<PinnedSubject>("connectionSubject"));
 }
 
 async function storedToken(userObjectId: string): Promise<string | undefined> {
@@ -38,7 +38,7 @@ describe("reconnect pinning", () => {
     expect(result.refused.title).toContain("different ZoomInfo account");
     // The pinned connection is untouched: no new grant, no new identity.
     expect(await storedToken(id)).toBe(`zi-access-${ALICE.sub}`);
-    expect((await storedIdentity(id))?.subject).toBe(ALICE.sub);
+    expect((await storedSubject(id))?.id).toBe(ALICE.sub);
   });
 
   it("hands off a stage to commit when the same ZoomInfo account authorized", async () => {
@@ -49,7 +49,7 @@ describe("reconnect pinning", () => {
     expect(typeof result.handoff.ticket).toBe("string");
     unwrap(await hooks().account(id, "commitReconnect", result.handoff.ticket));
     expect(await storedToken(id)).toBe(`zi-access-${ALICE.sub}`);
-    expect((await storedIdentity(id))?.subject).toBe(ALICE.sub);
+    expect((await storedSubject(id))?.id).toBe(ALICE.sub);
   });
 
   it("shows the refusal page when ZoomInfo authorized a different account", async () => {

@@ -20,7 +20,10 @@ import {
 import { buildDescription, codeSpan } from "@gadgets/gatekeeper-kit/action-description";
 import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import { ActionOutcomeUnknownError, APPLY_OUTCOME_UNKNOWN_MESSAGE } from "@gadgets/gatekeeper-kit/actions";
-import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import {
+  clearConnectionSubject, commitReconnect, ConnectionSubject, pinConnectionSubject,
+  pinnedConnectionSubject, stageReconnect,
+} from "@gadgets/gatekeeper-kit/credential-stage";
 import {
   ZoomInfoApi,
   ZoomInfoApiError,
@@ -124,13 +127,19 @@ type StoredIdentity = {
   subject?: string;
 };
 
+/** The subject a grant's identity pins the connection to: `id` is what the kit's fence compares,
+ * the names are for display and refusal messages. */
+type ZoomInfoSubject = ConnectionSubject & {
+  displayName?: string;
+  uniqueName?: string;
+};
+
 /** The values a token grant is persisted as; staged whole during a reconnect (see commitReconnect). */
 type StoredGrant = {
   refreshToken: string;
   accessToken: string;
   accessTokenExpiresAt: number;
   scopes: string[];
-  identity: StoredIdentity;
 };
 
 type ZoomInfoGatekeeperImplProps = {
@@ -274,17 +283,23 @@ function parseIdTokenClaims(idToken: string | null): StoredIdentity {
 }
 
 /**
- * The immutable property of a ZoomInfo identity a reconnect pins against: the OIDC `sub` claim
- * when the ID token carried one, else the mutable-but-best-available unique name. Identities
- * without either cannot be told apart, so a reconnect cannot be refused on their account.
+ * The connection subject an identity establishes: the immutable OIDC `sub` claim when the ID token
+ * carried one, else the mutable-but-best-available unique name. An identity carrying neither
+ * cannot be told from any other account's, so it establishes no subject: its reconnect stages
+ * subjectless and the fence does not compare it.
  */
-function reconnectKeyOf(identity: StoredIdentity | undefined): string | undefined {
-  return identity?.subject ?? identity?.uniqueName;
+function connectionSubjectOf(identity: StoredIdentity): ZoomInfoSubject | undefined {
+  const id = identity.subject ?? identity.uniqueName;
+  return id === undefined ? undefined : {
+    id,
+    ...(identity.displayName !== undefined ? { displayName: identity.displayName } : {}),
+    ...(identity.uniqueName !== undefined ? { uniqueName: identity.uniqueName } : {}),
+  };
 }
 
-/** How an identity is named in user-facing reconnect refusals. */
-function describeZoomInfoAccount(identity: StoredIdentity): string {
-  return identity.displayName || identity.uniqueName || "the original account";
+/** How an account-carrying record is named in user-facing reconnect refusals. */
+function describeZoomInfoAccount(named: { displayName?: string; uniqueName?: string }): string {
+  return named.displayName || named.uniqueName || "the original account";
 }
 
 // ---------------------------------------------------------------------------
@@ -499,41 +514,37 @@ export class UserAccount extends DurableObject<Env> {
       accessToken: grant.accessToken,
       accessTokenExpiresAt: Date.now() + grant.expiresIn * 1000,
       scopes: grant.scopes,
-      identity: parseIdTokenClaims(grant.idToken),
     };
+    const subject = connectionSubjectOf(parseIdTokenClaims(grant.idToken));
 
     let handoff: ConnectHandoff;
     if (stored.reconnect) {
       // A reconnect only ever reconnects the account it was made for: the OIDC subject the grant
       // carries must be the one this connection is pinned to. A different account's grant is
       // dropped unstaged (ZoomInfo offers no token revocation endpoint to retire it with).
-      const pinned = this.ctx.storage.kv.get<StoredIdentity>("identity") ?? {};
-      const pinnedKey = reconnectKeyOf(pinned);
-      const grantedKey = reconnectKeyOf(storedGrant.identity);
-      if (pinnedKey !== undefined && grantedKey !== undefined && pinnedKey !== grantedKey) {
-        return {
-          refused: {
-            title: "That's a different ZoomInfo account",
-            detail: `This connection is for ${describeZoomInfoAccount(pinned)}, but ZoomInfo ` +
-              `authorized ${describeZoomInfoAccount(storedGrant.identity)}. Sign in to ZoomInfo as ` +
-              `${describeZoomInfoAccount(pinned)} and reconnect, or connect ` +
-              `${describeZoomInfoAccount(storedGrant.identity)} as a separate account.`,
-          },
-        };
-      }
+      const staged = stageReconnect(this.ctx.storage.kv, storedGrant, subject, Date.now(),
+        (pinned, granted) => ({
+          title: "That's a different ZoomInfo account",
+          detail: `This connection is for ${describeZoomInfoAccount(pinned)}, but ZoomInfo ` +
+            `authorized ${describeZoomInfoAccount(granted)}. Sign in to ZoomInfo as ` +
+            `${describeZoomInfoAccount(pinned)} and reconnect, or connect ` +
+            `${describeZoomInfoAccount(granted)} as a separate account.`,
+        }));
+      if ("refused" in staged) return { refused: staged.refused };
       // The reconnect URL is a bearer capability, so the new grant is only staged until the Workshop
       // has confirmed the browser that finished the flow is the owner's (see commitReconnect). Bound
       // gadgets keep reading the current token meanwhile.
-      const stageId = stageCredentials(this.ctx.storage.kv, storedGrant, Date.now());
-      handoff = await callback.reconnectComplete(stageId);
+      handoff = await callback.reconnectComplete(staged.stageId);
     } else {
       this.#writeGrant(storedGrant);
+      if (subject !== undefined) pinConnectionSubject(this.ctx.storage.kv, subject);
       try {
         const props: ZoomInfoGatekeeperImplProps = { userObjectId: this.ctx.id.toString() };
         handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
       } catch (err) {
         this.ctx.storage.kv.delete("refreshToken");
         this.ctx.storage.kv.delete("accessToken");
+        clearConnectionSubject(this.ctx.storage.kv);
         throw err;
       }
     }
@@ -542,9 +553,11 @@ export class UserAccount extends DurableObject<Env> {
     return { handoff };
   }
 
-  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
+  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. The kit
+   * re-pins the staged subject when the grant carried one, adopting a connection made before any
+   * pin and never moving an established one. */
   async commitReconnect(stageId: string): Promise<void> {
-    const grant = commitStagedCredentials<StoredGrant>(this.ctx.storage.kv, Date.now(), stageId);
+    const grant = commitReconnect<StoredGrant>(this.ctx.storage.kv, Date.now(), stageId);
     if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
     this.#writeGrant(grant);
   }
@@ -554,7 +567,6 @@ export class UserAccount extends DurableObject<Env> {
     this.ctx.storage.kv.put("accessToken", grant.accessToken);
     this.ctx.storage.kv.put("accessTokenExpiresAt", grant.accessTokenExpiresAt);
     this.ctx.storage.kv.put("scopes", grant.scopes);
-    this.ctx.storage.kv.put<StoredIdentity>("identity", grant.identity);
     clearCredentialExpiryLatch(this.ctx.storage.kv);
   }
 
@@ -591,7 +603,9 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async getIdentity(): Promise<StoredIdentity> {
-    return this.ctx.storage.kv.get<StoredIdentity>("identity") ?? {};
+    // The connection's pinned subject carries the identity: its names came from the ID token the
+    // grant that earned the pin was verified with. A keyless grant pins nothing, so nothing shows.
+    return pinnedConnectionSubject<ZoomInfoSubject>(this.ctx.storage.kv) ?? {};
   }
 
   /**
