@@ -259,8 +259,9 @@ export class GitHubHookDriver extends DurableObject<Env> {
   }
 
   /**
-   * The account's credentials were replaced, perhaps by another GitHub user's, whose own comments
-   * and reviews are then the ones its hooks skip (see UserAccount.commitReconnect()).
+   * The account's credentials were replaced, as the same GitHub user (the account refuses a
+   * reconnect as anyone else) perhaps under a new login: read the viewer again, so the user's own
+   * comments and reviews are the ones its hooks skip (see UserAccount.commitReconnect()).
    */
   async reconnected(): Promise<void> {
     const account = this.ctx.storage.kv.get<string>("account");
