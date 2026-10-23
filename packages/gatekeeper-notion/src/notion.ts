@@ -32,8 +32,10 @@ import {
   type SupportedResource,
   type VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
-import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
-import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
+import {
+  clearConnectionSubject, commitReconnect, ConnectionSubject, pinConnectionSubject, stageReconnect,
+} from "@gadgets/gatekeeper-kit/credential-stage";
 import {
   NotionApi,
   NotionApiError,
@@ -123,6 +125,29 @@ type StoredNonce = {
    */
   reconnect?: true;
 };
+
+/** What finishing an OAuth flow yields: a handoff page, or a refusal to show. */
+type CallbackResult = { handoff: ConnectHandoff } | { refused: { title: string; detail: string } };
+
+/**
+ * The subject a grant pins the connection to: the Notion user who owns the integration's
+ * authorization. Notion omits `owner` on some integration grants; such a grant carries no
+ * provable identity, so it stages subjectless — the kit fences nothing against it, and its
+ * commit leaves the pin exactly as it was.
+ */
+type NotionSubject = ConnectionSubject & { name?: string };
+
+/** The subject a grant establishes, or no subject when the grant names no owner. */
+function notionSubjectOf(grant: NotionOAuthGrant): NotionSubject | undefined {
+  return grant.owner === undefined || grant.owner === null
+    ? undefined
+    : { id: grant.owner.id, name: grant.owner.name };
+}
+
+/** How a pinned subject is named in a reconnect refusal. */
+function describeNotionAccount(subject: NotionSubject): string {
+  return subject.name ?? `the account ${subject.id}`;
+}
 
 type StoredAccountInfo = {
   workspaceId?: string;
@@ -272,13 +297,16 @@ export default {
       if (!code) return new Response("Error: no 'code' provided");
 
       const stub = ctx.exports.UserAccount.get(ctx.exports.UserAccount.idFromString(doId));
-      const handoff = await stub.acceptAuthCode(code, oauthNonce);
-      if (!handoff) {
+      const result = await stub.acceptAuthCode(code, oauthNonce);
+      if (!result) {
         return new Response(INVALID_LINK_HTML, {
           headers: { "Content-Type": "text/html; charset=utf-8" },
         });
       }
-      return htmlResponse(connectHandoffPageHtml(handoff));
+      if ("refused" in result) {
+        return htmlResponse(errorPageHtml(result.refused.title, result.refused.detail), 409);
+      }
+      return htmlResponse(connectHandoffPageHtml(result.handoff));
     } else {
       return new Response("Not Found", { status: 404 });
     }
@@ -371,10 +399,11 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   /**
-   * Exchange the auth code for tokens and return the handoff for the page the browser lands on, or
-   * null if the OAuth nonce is invalid/expired.
+   * Exchange the auth code for tokens and return the handoff for the page the browser lands on: a
+   * handoff, a refusal to show (a reconnect that authorized a different Notion account), or null
+   * if the OAuth nonce is invalid/expired.
    */
-  async acceptAuthCode(code: string, oauthNonce: string): Promise<ConnectHandoff | null> {
+  async acceptAuthCode(code: string, oauthNonce: string): Promise<CallbackResult | null> {
     const stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
     if (!stored || stored.stage !== "oauth" ||
         Date.now() >= stored.expiresAt || !constantTimeEqual(stored.value, oauthNonce)) {
@@ -393,31 +422,50 @@ export class UserAccount extends DurableObject<Env> {
 
     const grant = await exchangeAuthCode(
         code, this.env.CLIENT_ID, this.env.CLIENT_SECRET, getBaseUrl(this.env) + "/oauth");
+    const subject = notionSubjectOf(grant);
 
     let handoff: ConnectHandoff;
     if (stored.reconnect) {
-      // The reconnect URL is a bearer capability, so the new grant is only staged until the Workshop
-      // has confirmed the browser that finished the flow is the owner's (see commitReconnect). Bound
-      // gadgets keep reading the current token meanwhile.
-      const stageId = stageCredentials(this.ctx.storage.kv, grant, Date.now());
-      handoff = await callback.reconnectComplete(stageId);
+      // The connection is pinned to the Notion account it was made as: a reconnect that comes
+      // back as another owner is refused and its grant dropped (Notion offers no revocation
+      // endpoint to retire it with), rather than silently swapping the account every binding
+      // reads. A grant naming no owner cannot be told from any account's, so it stages
+      // subjectless and the kit's fence leaves the pin alone.
+      const staged = stageReconnect(this.ctx.storage.kv, grant, subject, Date.now(),
+        (pinned, authorized) => ({
+          title: "That's a different Notion account",
+          detail: `This connection is for ${describeNotionAccount(pinned)}, but Notion authorized ` +
+            `${describeNotionAccount(authorized)}. Sign in to Notion as ${describeNotionAccount(pinned)} ` +
+            `and reconnect, or connect ${describeNotionAccount(authorized)} as a separate account.`,
+        }));
+      if ("refused" in staged) return { refused: staged.refused };
+      // The reconnect URL is a bearer capability, so the new grant is only staged until the
+      // Workshop has confirmed the browser that finished the flow is the owner's (see
+      // commitReconnect). Bound gadgets keep reading the current token meanwhile.
+      handoff = await callback.reconnectComplete(staged.stageId);
     } else {
       this.#storeGrant(grant);
+      if (subject !== undefined) pinConnectionSubject(this.ctx.storage.kv, subject);
       try {
         const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
         handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
       } catch (err) {
         this.ctx.storage.kv.delete("accessToken");
         this.ctx.storage.kv.delete("refreshToken");
+        this.ctx.storage.kv.delete("accountInfo");
+        clearConnectionSubject(this.ctx.storage.kv);
         throw err;
       }
     }
-    return handoff;
+    return { handoff };
   }
 
-  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
+  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. The kit's
+   * commit is fenced on the connection's pinned subject and re-pins the staged subject, so a
+   * connection made before the pin existed adopts its first reconnect's account; a subjectless
+   * stage commits without touching the pin. */
   async commitReconnect(stageId: string): Promise<void> {
-    const grant = commitStagedCredentials<NotionOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
+    const grant = commitReconnect<NotionOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
     if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
     this.#storeGrant(grant);
   }

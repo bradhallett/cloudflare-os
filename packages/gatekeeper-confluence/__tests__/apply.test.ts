@@ -1,3 +1,4 @@
+import { APPLY_OUTCOME_UNKNOWN_MESSAGE, ActionOutcomeUnknownError } from "@gadgets/gatekeeper-kit/actions";
 import { describe, expect, it } from "vitest";
 import {
   ConfluenceStore,
@@ -8,7 +9,7 @@ import {
   type ConfluenceAction,
   type UploadAttachmentAction,
 } from "../src/confluence-actions";
-import type { ConfluenceApi } from "../src/confluence-api";
+import { ConfluenceApiError, ConfluenceTransportError, type ConfluenceApi } from "../src/confluence-api";
 
 type Storage = ConstructorParameters<typeof ConfluenceStore>[0];
 
@@ -180,6 +181,91 @@ describe("applyStoredAction", () => {
 
     expect(calls.uploadAttachment).toEqual([{ id: "123", filename: "legacy.bin", data }]);
     expect(store.getAction(id)?.state).toBe("applied");
+  });
+});
+
+describe("claim-before-apply", () => {
+  it("refuses a replayed action whose claim was left behind, marking it terminally failed", async () => {
+    const { api, calls } = makeApi();
+    const store = storeWith(api);
+    const id = stage(store, { type: "setTitle", contentId: "123", title: "New", previousTitle: "Title" });
+    // Simulate a dispatch that died after claiming: the record still says `claimed`.
+    store.putAction({ ...store.getAction(id)!, state: "claimed" });
+
+    await expect(applyStoredAction(store, id)).rejects.toThrow(APPLY_OUTCOME_UNKNOWN_MESSAGE);
+
+    expect(calls.updateContent).toHaveLength(0);
+    expect(store.getAction(id)).toMatchObject({ state: "failed", failure: APPLY_OUTCOME_UNKNOWN_MESSAGE });
+    // The failed record is inert: pending reads skip it, and rejection clears it.
+    expect(store.pendingActions()).toHaveLength(0);
+    rejectStoredAction(store, id);
+    expect(store.getAction(id)).toBeUndefined();
+  });
+
+  it("treats a transport failure as an unknown outcome and stops retrying", async () => {
+    const { api } = makeApi();
+    api.updateContent = async () => { throw new ConfluenceTransportError("socket hang up"); };
+    const store = storeWith(api);
+    const id = stage(store, { type: "setContent", contentId: "123", markdown: "new", previousMarkdown: "old" });
+
+    await expect(applyStoredAction(store, id)).rejects.toThrow(ActionOutcomeUnknownError);
+
+    expect(store.getAction(id)).toMatchObject({ state: "failed", failure: expect.stringContaining("socket hang up") });
+    expect(store.pendingActions()).toHaveLength(0);
+  });
+
+  it("treats a Confluence 5xx as an unknown outcome and stops retrying", async () => {
+    const { api } = makeApi();
+    api.updateContent = async () => { throw new ConfluenceApiError(503, "Atlassian overloaded"); };
+    const store = storeWith(api);
+    const id = stage(store, { type: "setContent", contentId: "123", markdown: "new", previousMarkdown: "old" });
+
+    await expect(applyStoredAction(store, id)).rejects.toThrow(ActionOutcomeUnknownError);
+
+    expect(store.getAction(id)).toMatchObject({ state: "failed" });
+  });
+
+  it("returns a retryable 4xx failure to pending, where a retry succeeds", async () => {
+    const { api, calls } = makeApi();
+    let failures = 1;
+    api.updateContent = async (body: { title: string; status?: string }) => {
+      if (failures-- > 0) throw new ConfluenceApiError(400, "bad request");
+      calls.updateContent.push(body);
+      return { id: "123", title: body.title };
+    };
+    const store = storeWith(api);
+    const id = stage(store, { type: "setContent", contentId: "123", markdown: "new", previousMarkdown: "old" });
+
+    await expect(applyStoredAction(store, id)).rejects.toThrow("bad request");
+    expect(store.getAction(id)?.state).toBe("pending");
+
+    await applyStoredAction(store, id);
+
+    expect(store.getAction(id)?.state).toBe("applied");
+    expect(calls.updateContent).toHaveLength(1);
+  });
+
+  it("counts a claimed action as still pending for the simulation and sweep", async () => {
+    const { api } = makeApi();
+    const store = storeWith(api);
+    const id = stage(store, { type: "setTitle", contentId: "123", title: "New", previousTitle: "Title" });
+    store.putAction({ ...store.getAction(id)!, state: "claimed" });
+
+    expect(store.pendingActions()).toHaveLength(1);
+    expect(store.pendingForContent("123")).toHaveLength(1);
+  });
+
+  it("refuses to reject an action whose claim is still outstanding", async () => {
+    const { api } = makeApi();
+    const store = storeWith(api);
+    const id = stage(store, { type: "setTitle", contentId: "123", title: "New", previousTitle: "Title" });
+    store.putAction({ ...store.getAction(id)!, state: "claimed" });
+
+    expect(() => rejectStoredAction(store, id)).toThrow(APPLY_OUTCOME_UNKNOWN_MESSAGE);
+    // The refusal marked it failed; the second rejection — the operator's explicit choice — clears it.
+    expect(store.getAction(id)).toMatchObject({ state: "failed" });
+    rejectStoredAction(store, id);
+    expect(store.getAction(id)).toBeUndefined();
   });
 });
 

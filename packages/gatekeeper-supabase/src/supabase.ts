@@ -27,6 +27,7 @@ import {
   SupabaseApiError,
   exchangeAuthCode,
   fetchProfile,
+  isSupabaseOutcomeUnknown,
   refreshAccessToken,
   revokeRefreshToken,
   type ProjectResponse,
@@ -34,6 +35,9 @@ import {
   type SupabaseProfile,
 } from "./supabase-api";
 import { PendingActionStore, SupabaseCache, type StoredExecuteAction } from "./supabase-storage";
+import {
+  APPLY_OUTCOME_UNKNOWN_MESSAGE, ActionOutcomeUnknownError,
+} from "@gadgets/gatekeeper-kit/actions";
 import { describeTable, listSchemas, listTables } from "./supabase-introspection";
 import {
   SupabaseOrganizationConfiguratorUI,
@@ -154,11 +158,10 @@ const SCHEMA_CACHE_TTL_MS = 30 * 1000;
 // Re-fetch the access token from the UserAccount DO at most this often per gatekeeper session.
 const SESSION_TOKEN_TTL_MS = 30 * 1000;
 
-type ResourceKind = "project" | "organization";
-
-type SupabaseGatekeeperImplProps = {
+/** Props the Overseer instantiates the gatekeeper facet with: the account and resource it serves. */
+export type SupabaseGatekeeperImplProps = {
   userObjectId: string;
-  resourceKind: ResourceKind;
+  resourceKind: "project" | "organization";
   ref?: string;
   slug?: string;
 };
@@ -959,7 +962,11 @@ class SupabaseSessionContext {
         awaitDecision: true,
       });
     } catch (error) {
-      this.#pending.remove(actionId);
+      // An auto-approval can apply the action mid-flight, which proves the overseer received it
+      // -- only the reply was lost, and deleting the record would discard a claim or a settled
+      // outcome. Only a still-pending record (or one never handed over) is safe to drop.
+      const record = this.#pending.record(actionId);
+      if (record === undefined || record.state === "pending") this.#pending.remove(actionId);
       throw error;
     }
   }
@@ -967,6 +974,18 @@ class SupabaseSessionContext {
 
 // ---------------------------------------------------------------------------
 // GatekeeperImpl DO — per-resource instance, runs as a facet of the Overseer.
+
+/**
+ * Records that the outcome of a dispatched SQL run cannot be known, and returns the error that
+ * surfaces it. Terminal: only a rejection clears the record.
+ */
+function failUnknownOutcome(
+  journal: PendingActionStore["journal"] extends () => infer J ? J : never,
+  actionId: number,
+): ActionOutcomeUnknownError {
+  journal.markFailed(actionId, APPLY_OUTCOME_UNKNOWN_MESSAGE, { outcome: "unknown" });
+  return new ActionOutcomeUnknownError(APPLY_OUTCOME_UNKNOWN_MESSAGE);
+}
 
 @validateRpc()
 export class SupabaseGatekeeperImpl extends DurableObject<Env, SupabaseGatekeeperImplProps>
@@ -1137,15 +1156,34 @@ export class SupabaseGatekeeperImpl extends DurableObject<Env, SupabaseGatekeepe
   }
 
   /**
-   * Approved: run the queued SQL statement for real, then drop it and invalidate cached schema
-   * metadata (the database may have changed).
+   * Approved: run the queued SQL statement once, then drop it and invalidate cached schema
+   * metadata (the database may have changed). The claim is taken before the statement runs, so a
+   * replayed or interrupted apply never runs the SQL a second time; a run whose outcome cannot be
+   * known is recorded terminally and surfaced instead.
    */
   async applyAction(actionId: number): Promise<void> {
     const pending = new PendingActionStore(this.ctx.storage.kv);
-    const action = pending.get(actionId);
-    if (!action) {
-      throw new Error(`Unknown pending Supabase action: ${actionId}`);
+    const journal = pending.journal();
+    // A retired id is remembered as applied, so a replayed approval settles instead of erroring.
+    if (journal.wasApplied(actionId)) return;
+    const record = pending.record(actionId);
+    if (!record) throw new Error(`Unknown pending Supabase action: ${actionId}`);
+    // A terminal failure answers every later attempt with the same message, no SQL.
+    if (record.state === "failed") throw new Error(record.error);
+    // A claim left behind means a previous run's outcome is unknown: the statement may have
+    // reached the database. Record it terminally and surface it — never silently re-run SQL.
+    if (record.state === "claimed") throw failUnknownOutcome(journal, actionId);
+    // Retained rows are settled applies an interrupted retire left behind; finish the removal.
+    if (record.state === "applied") {
+      journal.retire(actionId);
+      return;
     }
+    // Staged means a submission whose reply was lost; this callback proves the overseer holds
+    // the id, so promote it rather than strand it.
+    journal.markSubmitted(actionId);
+
+    const action = record.action;
+    journal.markClaimed(actionId);
     try {
       await this.#makeApi().runQuery(action.ref, action.sql, action.params);
     } catch (error) {
@@ -1153,17 +1191,45 @@ export class SupabaseGatekeeperImpl extends DurableObject<Env, SupabaseGatekeepe
       // The action stays queued (we don't remove it) so it can be retried after reconnecting.
       if (error instanceof SupabaseApiError && error.isAuthError) {
         await this.#userAccount().noteCredentialsExpired();
+        journal.restorePending(actionId);
         throw new Error("Supabase credentials have expired or been revoked. Reconnect the account, then retry.", { cause: error });
       }
+      if (isSupabaseOutcomeUnknown(error)) {
+        // No definitive answer arrived, so the statement may have landed. Record the action
+        // terminally with the reason and surface it; a rejection clears the record after the
+        // user checks the database.
+        const message = `${APPLY_OUTCOME_UNKNOWN_MESSAGE} (${error instanceof Error ? error.message : String(error)})`;
+        journal.markFailed(actionId, message, { outcome: "unknown" });
+        throw new ActionOutcomeUnknownError(message);
+      }
+      // Supabase answered with a refusal (or the failure is internal): the statement did not
+      // land, so the record goes back to pending and the failure stays retryable, as before.
+      journal.restorePending(actionId);
       throw error;
     }
-    pending.remove(actionId);
+    // Settled: retire the record and remember the id, so replays settle rather than re-run.
+    journal.retire(actionId);
     new SupabaseCache(this.ctx.storage.kv).bumpGeneration();
   }
 
   /** Rejected: discard the queued statement. There is no simulation state to roll back. */
   async rejectAction(actionId: number): Promise<void> {
-    new PendingActionStore(this.ctx.storage.kv).remove(actionId);
+    const pending = new PendingActionStore(this.ctx.storage.kv);
+    const journal = pending.journal();
+    const record = pending.record(actionId);
+    if (record?.state === "claimed") {
+      // The SQL may already have run; deleting the record would discard the only trace that it
+      // might have. The user checks the database, then rejects again to clear the failure this
+      // records.
+      throw failUnknownOutcome(journal, actionId);
+    }
+    // Rejecting a recorded failure is the user clearing it after checking; anything else simply
+    // goes. Retire (rather than remove) an applied row so a replayed approval still settles.
+    if (record?.state === "applied") {
+      journal.retire(actionId);
+      return;
+    }
+    journal.remove(actionId);
   }
 
   /**

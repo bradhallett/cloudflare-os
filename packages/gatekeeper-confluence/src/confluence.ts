@@ -33,8 +33,10 @@ import {
   type VendorDescription,
   workerVersionTag,
 } from "@gadgets/workshop-shared/gatekeeper";
-import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
-import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
+import {
+  clearConnectionSubject, commitReconnect, ConnectionSubject, pinConnectionSubject, stageReconnect,
+} from "@gadgets/gatekeeper-kit/credential-stage";
 import {
   CONFLUENCE_SCOPES,
   ConfluenceApi,
@@ -60,6 +62,7 @@ import {
   type AtlassianIdentity,
   type ContentResponse,
 } from "./confluence-api";
+
 import {
   ConfluenceStore,
   applyStoredAction,
@@ -115,6 +118,20 @@ import TYPES_CODE from "./types.txt";
 import SITE_CONFIGURATOR_HTML from "./generated/confluence-site-configurator-ui.txt";
 import SPACE_CONFIGURATOR_HTML from "./generated/confluence-space-configurator-ui.txt";
 import PAGE_CONFIGURATOR_HTML from "./generated/confluence-page-configurator-ui.txt";
+
+/** What finishing an OAuth flow yields: a handoff page, or a refusal to show. */
+type CallbackResult = { handoff: ConnectHandoff } | { refused: { title: string; detail: string } };
+
+/**
+ * The subject a grant pins the connection to: the Atlassian account id of the user who
+ * authorized it. The name and email are for display and refusal messages.
+ */
+type ConfluenceSubject = ConnectionSubject & { name?: string; email?: string };
+
+/** How a pinned account is named in a reconnect refusal. */
+function describeAtlassianAccount(subject: ConfluenceSubject): string {
+  return subject.email ?? subject.name ?? `account ${subject.id}`;
+}
 
 // ---------------------------------------------------------------------------------------------
 // Constants & helpers
@@ -232,9 +249,12 @@ export default {
       if (colonIdx < 0) return new Response("Error: malformed state",
         { headers: { "content-type": "text/plain; charset=utf-8" } });
       const stub = ctx.exports.UserAccount.get(ctx.exports.UserAccount.idFromString(state.slice(0, colonIdx)));
-      const handoff = await stub.acceptAuthCode(code, state.slice(colonIdx + 1));
-      if (!handoff) return htmlResponse(INVALID_LINK_HTML);
-      return htmlResponse(connectHandoffPageHtml(handoff));
+      const result = await stub.acceptAuthCode(code, state.slice(colonIdx + 1));
+      if (!result) return htmlResponse(INVALID_LINK_HTML);
+      if ("refused" in result) {
+        return htmlResponse(errorPageHtml(result.refused.title, result.refused.detail), 409);
+      }
+      return htmlResponse(connectHandoffPageHtml(result.handoff));
     }
     return new Response("Not Found", { status: 404 });
   },
@@ -324,7 +344,7 @@ export class UserAccount extends DurableObject<Env> {
    * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on, or
    * null when the callback's nonce doesn't match.
    */
-  async acceptAuthCode(code: string, oauthNonce: string): Promise<ConnectHandoff | null> {
+  async acceptAuthCode(code: string, oauthNonce: string): Promise<CallbackResult | null> {
     const stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
     if (!stored || stored.stage !== "oauth" || Date.now() >= stored.expiresAt ||
         !constantTimeEqual(stored.value, oauthNonce)) {
@@ -341,32 +361,57 @@ export class UserAccount extends DurableObject<Env> {
     const grant = await exchangeAuthCode(
       code, this.env.CLIENT_ID, this.env.CLIENT_SECRET, getBaseUrl(this.env) + "/oauth");
 
+    // The connection is pinned to the Atlassian account it was made as, so the account id is read
+    // from the new grant itself before anything is staged. A grant whose account cannot be read
+    // cannot be pinned to anyone, so the flow fails (Atlassian offers no revocation endpoint to
+    // retire the unusable grant with; it is simply dropped).
+    let subject: ConfluenceSubject;
+    try {
+      const identity = await getAtlassianIdentity(grant.accessToken);
+      subject = { id: identity.accountId, name: identity.name, email: identity.email };
+    } catch (error) {
+      throw new Error("Could not read which Atlassian account authorized this connection. Please try again.",
+        { cause: error });
+    }
+
     let handoff: ConnectHandoff;
     if (stored.reconnect) {
-      // The reconnect URL is a bearer capability, so the new grant is only staged until the Workshop
-      // has confirmed the browser that finished the flow is the owner's (see commitReconnect). Bound
-      // gadgets keep reading the current token meanwhile.
-      const stageId = stageCredentials(this.ctx.storage.kv, grant, Date.now());
+      const staged = stageReconnect(this.ctx.storage.kv, grant, subject, Date.now(),
+        (pinned, authorized) => ({
+          title: "That's a different Atlassian account",
+          detail: `This connection is for ${describeAtlassianAccount(pinned)}, but Atlassian ` +
+            `authorized ${describeAtlassianAccount(authorized)}. Sign in to Atlassian as ` +
+            `${describeAtlassianAccount(pinned)} and reconnect, or connect ` +
+            `${describeAtlassianAccount(authorized)} as a separate account.`,
+        }));
+      if ("refused" in staged) return { refused: staged.refused };
+      // The reconnect URL is a bearer capability, so the new grant is only staged until the
+      // Workshop has confirmed the browser that finished the flow is the owner's (see
+      // commitReconnect). Bound gadgets keep reading the current token meanwhile.
       // No expiry is reported: the access token is refreshed transparently from the rotating
       // refresh token, and GatekeeperConnectCallback says not to report a token-cache expiry.
-      handoff = await callback.reconnectComplete(stageId);
+      handoff = await callback.reconnectComplete(staged.stageId);
     } else {
       this.#storeGrant(grant);
+      pinConnectionSubject(this.ctx.storage.kv, subject);
       await this.#refreshSitesAndIdentity(grant.accessToken);
       try {
         const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
         handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
       } catch (err) {
         this.ctx.storage.kv.delete("grant");
+        clearConnectionSubject(this.ctx.storage.kv);
         throw err;
       }
     }
-    return handoff;
+    return { handoff };
   }
 
-  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
+  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. The kit's
+   * commit is fenced on the connection's pinned subject and re-pins the staged subject, so a
+   * connection made before the pin existed adopts its first reconnect's account. */
   async commitReconnect(stageId: string): Promise<void> {
-    const grant = commitStagedCredentials<StoredGrant>(this.ctx.storage.kv, Date.now(), stageId);
+    const grant = commitReconnect<StoredGrant>(this.ctx.storage.kv, Date.now(), stageId);
     if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
     this.#storeGrant(grant);
     await this.#refreshSitesAndIdentity(grant.accessToken);

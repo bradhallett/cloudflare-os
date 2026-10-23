@@ -22,6 +22,9 @@ export default defineConfig({
         durableObjects: {
           USER_ACCOUNT: { className: "UserAccount", useSQLite: true },
           LINEAR_GATEKEEPER: { className: "LinearGatekeeperImpl", useSQLite: true },
+          // The gatekeeper with a storage-seeding hook (see worker.ts), registered so `ctx.exports`
+          // carries it.
+          SEEDED_LINEAR_GATEKEEPER: { className: "SeededLinearGatekeeper", useSQLite: true },
           TEST_HOOKS: { className: "TestHooks", useSQLite: true },
         },
         bindings: {

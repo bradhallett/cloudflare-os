@@ -18,7 +18,9 @@ import {
   type VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
-import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import {
+  clearConnectionSubject, commitReconnect, ConnectionSubject, pinConnectionSubject, stageReconnect,
+} from "@gadgets/gatekeeper-kit/credential-stage";
 import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
 import { readTextCapped } from "@gadgets/gatekeeper-kit/response-body";
 import INSTANCE_CONFIGURATOR_HTML from "./generated/instance-configurator-ui.txt";
@@ -415,6 +417,15 @@ type CompleteConnectionResult =
   | { kind: "invalid_nonce" }
   | { kind: "error"; message: string };
 
+/**
+ * The subject credentials pin the connection to: the Home Assistant instance itself, spelled by
+ * its normalized base URL. Long-lived access tokens carry no user identity the API will report
+ * back, so the instance is the only provable subject — a token for the SAME instance under a
+ * DIFFERENT user passes the fence below, and that swap is undetectable here (it is only prevented
+ * by the instance's own token discipline, not by this Gatekeeper).
+ */
+type HomeAssistantSubject = ConnectionSubject;
+
 export class UserAccount extends DurableObject<Env> {
   async setCallback(callback: Fetcher<GatekeeperConnectCallback>, nonce: string): Promise<void> {
     if (!this.ctx.storage.kv.get<StoredCredentials>("credentials")) {
@@ -474,8 +485,9 @@ export class UserAccount extends DurableObject<Env> {
       return { kind: "error", message: msg };
     }
 
-    // Consume the nonce now that we've validated.
-    this.ctx.storage.kv.delete("nonce");
+    // Consume the nonce now that we've validated — except a reconnect, whose submission may still
+    // be refused below; that path releases its claim instead so the owner can resubmit.
+    if (!stored.reconnect) this.ctx.storage.kv.delete("nonce");
 
     const callback = this.ctx.storage.kv.get<Fetcher<GatekeeperConnectCallback>>("callback");
     if (!callback) {
@@ -487,23 +499,42 @@ export class UserAccount extends DurableObject<Env> {
     if (stored.reconnect) {
       // The reconnect URL is a bearer capability, so the new credentials are only staged until the
       // Workshop has confirmed the browser that finished the flow is the owner's (see
-      // commitReconnect). Bound gadgets keep reading the current token meanwhile.
-      const stageId = stageCredentials<StoredCredentials>(
-          this.ctx.storage.kv, { baseUrl, token }, Date.now());
+      // commitReconnect). Bound gadgets keep reading the current token meanwhile. The connection
+      // is pinned to its instance, so credentials for a different instance are refused outright —
+      // nothing is staged — and the claim on the nonce is released so the owner can resubmit the
+      // pinned instance's token. (A same-instance user-swap cannot be detected; see
+      // HomeAssistantSubject.)
+      const subject: HomeAssistantSubject = { id: baseUrl };
+      const staged = stageReconnect<StoredCredentials, HomeAssistantSubject>(
+        this.ctx.storage.kv, { baseUrl, token }, subject, Date.now(),
+        (pinned, submitted) => ({
+          title: "That's a different Home Assistant instance",
+          detail: "This connection is for the Home Assistant instance at " + pinned.id +
+            ", but you submitted credentials for " + submitted.id + ". Reconnect with a token " +
+            "for " + pinned.id + ", or connect " + submitted.id + " as a separate account.",
+        }));
+      if ("refused" in staged) {
+        this.#releaseNonceClaim(nonce);
+        return { kind: "error", message: staged.refused.detail };
+      }
+      // Accepted: the nonce is spent.
+      this.ctx.storage.kv.delete("nonce");
       try {
-        handoff = await callback.reconnectComplete(stageId);
-      } catch (e: any) {
-        return { kind: "error", message: `Failed to notify workshop: ${e?.message ?? e}` };
+        handoff = await callback.reconnectComplete(staged.stageId);
+      } catch (e) {
+        return { kind: "error", message: `Failed to notify workshop: ${e instanceof Error ? e.message : e}` };
       }
     } else {
       this.ctx.storage.kv.put<StoredCredentials>("credentials", { baseUrl, token });
+      pinConnectionSubject(this.ctx.storage.kv, { id: baseUrl });
       clearCredentialExpiryLatch(this.ctx.storage.kv);
       try {
         const props: HomeAssistantUserImplProps = { userObjectId: this.ctx.id.toString() };
         handoff = await callback.complete(this.ctx.exports.HomeAssistantUserImpl({ props }));
-      } catch (e: any) {
+      } catch (e) {
         this.ctx.storage.kv.delete("credentials");
-        return { kind: "error", message: `Failed to notify workshop: ${e?.message ?? e}` };
+        clearConnectionSubject(this.ctx.storage.kv);
+        return { kind: "error", message: `Failed to notify workshop: ${e instanceof Error ? e.message : e}` };
       }
     }
 
@@ -520,9 +551,11 @@ export class UserAccount extends DurableObject<Env> {
     this.ctx.storage.kv.put<StoredNonce>("nonce", released);
   }
 
-  /** Makes the credentials staged under `stageId` live; see GatekeeperUser.commitReconnect. */
+  /** Makes the credentials staged under `stageId` live; see GatekeeperUser.commitReconnect. The
+   * kit's commit is fenced on the connection's pinned subject and re-pins the staged subject, so
+   * an account made before the pin existed adopts its first reconnect's instance. */
   async commitReconnect(stageId: string): Promise<void> {
-    const creds = commitStagedCredentials<StoredCredentials>(this.ctx.storage.kv, Date.now(), stageId);
+    const creds = commitReconnect<StoredCredentials>(this.ctx.storage.kv, Date.now(), stageId);
     if (!creds) throw new Error("No reconnect is awaiting confirmation. Please try again.");
     this.ctx.storage.kv.put<StoredCredentials>("credentials", creds);
     clearCredentialExpiryLatch(this.ctx.storage.kv);

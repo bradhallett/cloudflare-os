@@ -7,6 +7,8 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { generateNonce } from "@gadgets/gatekeeper-kit/connect-nonce";
+import { APPLY_OUTCOME_UNKNOWN_MESSAGE } from "@gadgets/gatekeeper-kit/actions";
+import type { LinearGatekeeperImplProps } from "../../src/linear";
 import { TestCallback } from "./worker";
 import worker from "../../src/linear";
 import {
@@ -163,5 +165,61 @@ describe("the connect link", () => {
       new Request(`http://localhost:8787/gatekeeper/linear/oauth?code=${code}&state=${state}`), env, ctx());
     expect(callback.status).toBe(409);
     expect(await callback.text()).toContain("That&#39;s a different Linear account");
+  });
+});
+
+describe("claim-before-apply", () => {
+  // Action records live on the gatekeeper Durable Object, not the account. A create-issue parked
+  // mid-dispatch durably says `claimed`, so any later attempt knows the outcome is unknown rather
+  // than never-run. The record is seeded raw — no validated entry point can produce one on demand.
+  const claimedAction = {
+    id: 7, kind: "createIssue", provisionalId: "~p7", status: "claimed",
+    input: { teamId: "team-1", title: "Claimed" },
+  };
+
+  /** A gatekeeper facet on a fresh connected account, holding `action:7` as given. */
+  async function claimedFacet(facetName: string, action: unknown) {
+    const x = new FakeLinear().install();
+    const userObjectId = await seedAccount(x);
+    const props: LinearGatekeeperImplProps = {
+      userObjectId, workspaceUrlKey: ACME.urlKey, resourceKind: "workspace",
+    };
+    await hooks().seedGatekeeper(facetName, props, { "action:7": action });
+    return { x, props };
+  }
+
+  it("settles a replayed apply against the claim, never re-running the write", async () => {
+    const { x, props } = await claimedFacet("claim-apply", claimedAction);
+
+    const replay = await hooks().applyGatekeeperAction("claim-apply", props, 7);
+
+    expect(failure(replay)).toBe(APPLY_OUTCOME_UNKNOWN_MESSAGE);
+    expect(await hooks().gatekeeperEntry("claim-apply", props, "action:7"))
+      .toMatchObject({ status: "failed" });
+    // The terminal record answers every later attempt the same way, without a Linear call.
+    expect(failure(await hooks().applyGatekeeperAction("claim-apply", props, 7)))
+      .toBe(APPLY_OUTCOME_UNKNOWN_MESSAGE);
+    expect(x.requests.filter(r => (r.body ?? "").includes("issueCreate"))).toHaveLength(0);
+  });
+
+  it("refuses to reject a claimed action, settling it before an explicit second rejection", async () => {
+    const { props } = await claimedFacet("claim-reject", claimedAction);
+
+    expect(failure(await hooks().rejectGatekeeperAction("claim-reject", props, 7)))
+      .toBe(APPLY_OUTCOME_UNKNOWN_MESSAGE);
+    expect(await hooks().gatekeeperEntry("claim-reject", props, "action:7"))
+      .toMatchObject({ status: "failed" });
+    // The operator's explicit second choice clears the settled record.
+    unwrap(await hooks().rejectGatekeeperAction("claim-reject", props, 7));
+    expect(await hooks().gatekeeperEntry("claim-reject", props, "action:7")).toBeUndefined();
+  });
+
+  it("answers a duplicate apply of an already-applied action with success, no second write", async () => {
+    const { x, props } = await claimedFacet(
+      "claim-applied", { ...claimedAction, status: "applied", createdIssueId: "issue-7" });
+
+    unwrap(await hooks().applyGatekeeperAction("claim-applied", props, 7));
+
+    expect(x.requests.filter(r => (r.body ?? "").includes("issueCreate"))).toHaveLength(0);
   });
 });
