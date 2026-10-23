@@ -99,7 +99,7 @@ describe("GatekeeperLoopback", () => {
 
     // Non-function session members (property reads) pass through untouched.
     expect((loopback as unknown as { ready: boolean }).ready).toBe(false);
-    expect(sessionCalls).toEqual([{ method: "postMessage", args: ["hi"] }]);
+    expect(sessionCalls).toEqual([{ method: "send", args: ["hi"] }]);
   });
 
   it("opens the session once with this loopback's props", () => {
