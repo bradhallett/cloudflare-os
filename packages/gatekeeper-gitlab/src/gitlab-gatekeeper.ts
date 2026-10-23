@@ -42,6 +42,7 @@ import {
   pushGitRefUpdate,
   simulateBranchHead,
 } from "@gadgets/gatekeeper-kit/git-transport";
+import { desiredStateReached } from "@gadgets/gatekeeper-kit/outcome-unknown";
 import {
   GitLabApi,
   GitLabApiError,
@@ -2137,12 +2138,12 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
             pack));
         } catch (error) {
           if (!(error instanceof GitRefUpdateRejectedError)) throw error;
-          // Desired-state semantics: apply succeeds iff the branch ends up at newSha -- by our
-          // CAS'd push, or by finding it already there (a retried apply whose first attempt
-          // landed but crashed before this record was persisted, or a third party's
-          // byte-identical push -- indistinguishable, and the approved end state holds either way).
-          const head = (await this.#withApi(api => api.getBranch(projectPath, action.branch)))?.commit.id ?? null;
-          if (head !== action.newSha) {
+          // Desired-state semantics live in the kit: a head already at `newSha` settles the apply.
+          const head = await desiredStateReached(
+            async () => (await this.#withApi(api => api.getBranch(projectPath, action.branch)))?.commit.id ?? null,
+            action.newSha,
+          );
+          if (head !== undefined) {
             // GitLab's pre-receive hooks (protected branches, push rules) explain themselves in
             // the report-status line; that reason is passed through, never matched.
             throw new Error(action.expectedOldSha === ZERO_OID

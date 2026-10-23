@@ -26,6 +26,7 @@
     "./http-errors": "./src/http-errors.ts",
     "./observers": "./src/observers.ts",
     "./oauth-client": "./src/oauth-client.ts",
+    "./outcome-unknown": "./src/outcome-unknown.ts",
     "./preview-oauth": "./src/preview-oauth.ts",
     "./response-body": "./src/response-body.ts",
     "./serial-queue": "./src/serial-queue.ts",
