@@ -1103,7 +1103,7 @@ export function getDecisionModel(env: Cloudflare.Env, config: AiModelConfig,
       });
 }
 
-// =======================================================================================
+/** Props `LanguageModelGatekeeper` derives its per-session model and billing metadata from. */
 export type AiModelGatekeeperProps = {
   displayName: string,
   config: AiModelConfig,
