@@ -3,6 +3,7 @@ import { Overseer, ConsoleLogEvent, CollaboratorRole, ObserverConfigCallback, Bl
 import { ApprovalQueue } from "@gadgets/workshop-shared/gatekeeper";
 import { DurableObject, RpcStub as NativeRpcStub, restore } from "cloudflare:workers";
 import { chatKeyPrefix } from "./storage-schema/overseer-storage";
+import type { BlueprintOwnerSubject } from "./storage-schema/blueprints-kv";
 import type { ExternalChatRecord, GatekeeperCaller } from "./storage-schema/overseer-storage";
 import type { WorkspaceOutputEntry } from "./storage-schema/user-storage";
 import { commitIdentityForAuthor } from "./git-store";
@@ -407,9 +408,11 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
    * describes. Called by AuthenticatedApi.newGadgetFromBlueprint() after creating (and opening)
    * the DO, with the metadata it goes on to set up the gadget's bindings from: the blueprint may
    * be republished meanwhile, and the code has to be the version those bindings belong to.
+   * `owner` is the blueprint's owner subject, which scopes the content it reads.
    */
   async initializeFromBlueprint(
-      blueprintId: string, metadata: BlueprintMetadata, output?: BlueprintOutput): Promise<void> {
+      blueprintId: string, metadata: BlueprintMetadata, output?: BlueprintOutput,
+      blueprintOwner?: BlueprintOwnerSubject): Promise<void> {
     // Set the title. The default gadget (created below) inherits it.
     let { title } = metadata;
     this.impl.storage.title.put(title);
@@ -422,7 +425,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     // gadget's first committed tree. An empty release is refused rather than instantiated as a
     // code-less gadget: blueprints of such gadgets cannot be created (see createBlueprint), so
     // one can only arrive corrupted or hand-crafted.
-    let release = await this.impl.loadBlueprint(blueprintId, metadata);
+    let release = await this.impl.loadBlueprint(blueprintId, metadata, blueprintOwner);
     if ((await this.impl.gitStore.readCommitFiles(release)).size === 0) {
       throw new Error("This blueprint's code archive is empty.");
     }

@@ -5,7 +5,7 @@
 // would leave the org with no owner is refused (the org goes on ownerless only if the last owner's
 // account is ever deleted out from under it, which no API here does).
 
-import type { OrgInvitePolicy, OrgMemberStatus, OrgRole } from "@gadgets/workshop-shared/api";
+import type { OrgInvitePolicy, OrgMember, OrgMemberStatus, OrgRole } from "@gadgets/workshop-shared/api";
 
 /** Roles ranked low to high; a member may never act above, or grant a role above, their own. */
 const ROLE_RANK: Record<OrgRole, number> = { member: 0, admin: 1, owner: 2 };
@@ -26,6 +26,16 @@ export type OrgAccess = {
 /** Whether the user's membership is a standing one: they belong to the org. */
 export function isActingMember(access: OrgAccess): boolean {
   return access.exists && access.role !== null && access.status === "active";
+}
+
+/**
+ * Whether `member` is a standing membership: the user belongs to the org right now. The gate for
+ * org-scoped resources (an org's blueprints, first): the org answers getMember() and this
+ * interprets it, so a pending invite or a removed member holds no access. The same rule as
+ * isActingMember, on the member record itself rather than a full OrgAccess.
+ */
+export function isActiveMember(member: OrgMember | null): boolean {
+  return member !== null && member.status === "active";
 }
 
 /** Whether the user may read the org's member list. */

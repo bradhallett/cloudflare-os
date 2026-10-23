@@ -68,7 +68,7 @@ async function installOne(env: InstallEnv, entry: BundledBlueprint)
   // the reverse is merely an orphaned object. The key names the commit, so reinstalling the same
   // files rewrites the same bytes, and installing new ones leaves the release they replace
   // where a reader that already holds its metadata will still find it.
-  await env.BLUEPRINT_CONTENT.put(blueprintContentKey(entry.blueprintId, installed), pack);
+  await env.BLUEPRINT_CONTENT.put(blueprintContentKey(undefined, entry.blueprintId, installed), pack);
 
   let kvRecord: BlueprintKvRecord = {metadata: installed};
   await env.BLUEPRINTS.put(entry.blueprintId, JSON.stringify(kvRecord));

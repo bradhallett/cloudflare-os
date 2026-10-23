@@ -5,7 +5,7 @@ import { RpcTarget } from 'capnweb';
 import { validateRpc } from 'capnweb-validate';
 import { createWorkshopLogger } from "./observability";
 import { sanitizeBlueprintOutput } from './blueprint-archive.js';
-import { ADMIN_CONFIG_KEY, FEATURED_BLUEPRINTS_KEY, isReservedBlueprintKey, parseBlueprintKvRecord, readBlueprintKvRecord, serializeFeaturedBlueprints } from './storage-schema/blueprints-kv.js';
+import { ADMIN_CONFIG_KEY, FEATURED_BLUEPRINTS_KEY, isReservedBlueprintKey, migrateBlueprintOwnership, parseBlueprintKvRecord, readBlueprintKvRecord, serializeFeaturedBlueprints } from './storage-schema/blueprints-kv.js';
 import { MAX_AGENT_HINT, defaultOutputFormatId, isUpdateCheckInterval, isUpdateHours, listPromotedFormats, normalizeAdminConfig, reorderFormats, sanitizeAddedModel, sanitizeModelSettings, sanitizeOutputOverrides, serializeAdminConfig } from './admin-config.js';
 import { normalizeBotDefinition } from './bot-config.js';
 import { makeAdminSettingsStorage, type AdminConfig, type AdminSettingsStorage, type FormatCuration } from './storage-schema/admin-settings-storage.js';
@@ -140,6 +140,25 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
 
   #installInFlight?: Promise<boolean>;
 
+  /**
+   * Runs the blueprint ownership migration (migrateBlueprintOwnership in blueprints-kv.ts) once,
+   * on the deployment's first /api request after owner subjects shipped. Reading never waits for
+   * it -- a record still carrying a bare `ownerId` parses as a user subject -- so a failure only
+   * leaves the records in their old shape; the flag is written only on success, and the
+   * migration is idempotent, so any retry is safe.
+   */
+  async ensureBlueprintOwnershipMigrated(): Promise<void> {
+    if (this.storage.blueprintOwnershipMigrated.get()) return;
+    let migrated = await migrateBlueprintOwnership(this.env);
+    this.storage.blueprintOwnershipMigrated.put(true);
+    if (migrated > 0) {
+      logger.info("migrated blueprint ownership to owner subjects", {
+        event: "blueprints.ownership.migrated",
+        migratedBlueprintCount: migrated,
+      });
+    }
+  }
+
   // Resolves true once every bundled blueprint is live. A partial install resolves false rather
   // than throwing: the caller has nothing to handle, but it does need to know to ask again.
   async #installBundledBlueprints(): Promise<boolean> {
@@ -250,18 +269,21 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
 
     let kvRecord = parseBlueprintKvRecord(raw);
 
+    let owner = kvRecord.owner?.type === 'user'
+        ? this.users.get(this.users.idFromString(kvRecord.owner.id))
+        : undefined;
     return {
-      owner: kvRecord.ownerId
-          ? this.users.get(this.users.idFromString(kvRecord.ownerId))
-          : undefined,
+      owner,
       publicInfo: {
         id: blueprintId,
         metadata: kvRecord.metadata,
       },
       // A deployment-installed blueprint (see bundled-blueprints.ts) has no owning User DO to hold
       // the authoritative featured bit, so the owner-anchored toggle doesn't apply -- the same
-      // answer as an uploaded blueprint. It reaches users through the deployment's curation.
-      featureable: !!kvRecord.gadgetId && !!kvRecord.ownerId,
+      // answer as an uploaded blueprint. It reaches users through the deployment's curation. An
+      // org-owned blueprint is equally unfeatureable here: the featured set is the deployment's
+      // public curation, and an org's blueprints are private to its members.
+      featureable: !!kvRecord.gadgetId && owner !== undefined,
     };
   }
 

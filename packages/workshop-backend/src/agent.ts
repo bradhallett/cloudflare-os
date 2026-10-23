@@ -649,10 +649,11 @@ export interface AgentHooks {
    * instantiate the blueprint as a new gadget, along with the output format the blueprint declares
    * (if any), which the created gadget inherits. `merge` is the record of the release the files
    * are, for the creation's "changes" message once the gadget has an id (see
-   * AiChatMessageBody.blueprintMerges). Throws an agent-readable error if the blueprint doesn't
-   * exist.
+   * AiChatMessageBody.blueprintMerges). `initiator` is the user the turn runs for, who must be a
+   * member of the org owning an org-owned blueprint to read it. Throws an agent-readable error if
+   * the blueprint doesn't exist.
    */
-  fetchBlueprint(blueprintId: string): Promise<{
+  fetchBlueprint(initiator: AiChatAuthorInfo, blueprintId: string): Promise<{
     files: Record<string, string>, notes: string, output?: BlueprintOutput,
     merge: Omit<BlueprintMerge, "gadgetId">,
   }>;
@@ -3720,7 +3721,7 @@ async function runAgentPass(
           // Fetch the blueprint (if any) before creating anything, so a bad blueprintId fails
           // cleanly without leaving an empty gadget behind.
           let blueprint = blueprintId !== undefined
-              ? await hooks.fetchBlueprint(blueprintId) : undefined;
+              ? await hooks.fetchBlueprint(initiator, blueprintId) : undefined;
 
           // The gadget is created provisional to this chat: it becomes permanent only when the
           // user accepts the chat's changes. The registry record (and its name reservation) is
