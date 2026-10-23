@@ -32,8 +32,10 @@ function generateCapsuleToken(
   }
 }
 
-// A span of a message that renders as an object rather than as text. Capsules and formats share
-// one pipeline; they differ only in what they draw and whether they carry authority.
+/**
+ * A span of a message that renders as an object rather than as text. Capsules and formats share
+ * one pipeline; they differ only in what they draw and whether they carry authority.
+ */
 export type Mention =
   | { kind: "capsule"; capsule: CapsuleSpecifier }
   | { kind: "format"; format: MessageFormatRef };

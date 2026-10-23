@@ -3,18 +3,22 @@ import { ArrowUpRight, GitBranch } from "@phosphor-icons/react";
 import { formatOf } from "../../../components/format/formats";
 import { FormatMiniature } from "../../../components/format/FormatVisuals";
 
-// A workpiece the transcript offers to open: one card per creation recorded on a "changes"
-// message (`createdGadgets` / `createdWorktrees`), so the two kinds can never be confused.
+/**
+ * A workpiece the transcript offers to open: one card per creation recorded on a "changes"
+ * message (`createdGadgets` / `createdWorktrees`), so the two kinds can never be confused.
+ */
 export type CreatedWorkpieceCardInfo = {
   workpieceId: WorkpieceId;
   title: string;
 } & (
   | {
       type: "gadget";
-      // The creation hasn't been accepted yet: the gadget is a draft of this chat until then.
+      /** The creation hasn't been accepted yet: the gadget is a draft of this chat until then. */
       isPending: boolean;
-      // The output format this gadget was built as, inherited from the blueprint it came from.
-      // Absent for a gadget built from scratch, which reads as a generic app.
+      /**
+       * The output format this gadget was built as, inherited from the blueprint it came from.
+       * Absent for a gadget built from scratch, which reads as a generic app.
+       */
       output?: BlueprintOutput;
     }
   // A worktree is private to its chat for life, so its creation is not a draft awaiting

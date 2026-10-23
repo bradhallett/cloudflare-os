@@ -20,10 +20,10 @@ export type CompactionBoundary = NonNullable<AiChatHistoryPage["compacted"]>;
 
 /** Merged/reverted status of a chat's "changes" messages, with the timestamps rows reference. */
 export interface MessageState {
-  // Map from sequence number to status for change messages
+  /** Map from sequence number to status for change messages */
   changeStatus: Map<number, "pending" | "merged" | "reverted">;
 
-  // Map from merge/revert sequence to the timestamp they reference
+  /** Map from merge/revert sequence to the timestamp they reference */
   mergeTimestamps: Map<number, Date>; // sequence -> timestamp of merged-through message
   revertTimestamps: Map<number, Date>; // sequence -> timestamp of reverted-from message
 }
@@ -38,12 +38,14 @@ export type ChatDisplayEntry =
       key: string;
       boundary: CompactionBoundary;
       requestedBy?: AiChatAuthorInfo;
-      // How much of the thread the cut spared, counted in rows between it and this announcement.
+      /** How much of the thread the cut spared, counted in rows between it and this announcement. */
       keptRows?: number;
     }
   | {
-      // Where the messages the agent still holds verbatim begin, for a boundary announced further
-      // down. Shown only while that summary is open, so the two halves are read together.
+      /**
+       * Where the messages the agent still holds verbatim begin, for a boundary announced further
+       * down. Shown only while that summary is open, so the two halves are read together.
+       */
       type: "compactionCut";
       key: string;
       boundary: CompactionBoundary;
@@ -78,10 +80,12 @@ export type ChatDisplayEntry =
       message: ChangeChatMessage;
     }
   | {
-      // Blueprint releases someone proposed merging into gadgets (see
-      // GadgetClient.applyBlueprint()). Unlike saved edits, the row outlives the proposal's
-      // acceptance or discard: the agent's review of a merge follows it with no message from
-      // anyone in between, and would otherwise be answering nothing.
+      /**
+       * Blueprint releases someone proposed merging into gadgets (see
+       * GadgetClient.applyBlueprint()). Unlike saved edits, the row outlives the proposal's
+       * acceptance or discard: the agent's review of a merge follows it with no message from
+       * anyone in between, and would otherwise be answering nothing.
+       */
       type: "blueprintProposal";
       key: string;
       message: ChangeChatMessage;
@@ -432,8 +436,10 @@ export function continuesUserGroup(
   return author !== null && author.id === userMessageAuthor(curr)?.id;
 }
 
-// How close to the top of the transcript pulls in the previous page. Roughly a screenful of slack,
-// so the messages are there by the time the user scrolls to them.
+/**
+ * How close to the top of the transcript pulls in the previous page. Roughly a screenful of slack,
+ * so the messages are there by the time the user scrolls to them.
+ */
 export const EARLIER_PAGE_PREFETCH_PX = 600;
 
 function isPureWorkRowEntry(entry: ChatDisplayEntry): boolean {
@@ -572,8 +578,10 @@ export function computeChatEpochChanges(
   return { epochChange: composeEpochChanges(batches, seed), rowsThrough };
 }
 
-// The agent that last spoke in the chat: the author of the most recent agent message or agent error.
-// A steer was addressed to a running agent, so it never means the chat went on without one.
+/**
+ * The agent that last spoke in the chat: the author of the most recent agent message or agent error.
+ * A steer was addressed to a running agent, so it never means the chat went on without one.
+ */
 export function inferChatAgentFromMessages(messages: AiChatMessage[]): AiChatAuthorInfo | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];

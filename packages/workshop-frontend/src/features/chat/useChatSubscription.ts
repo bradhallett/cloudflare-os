@@ -45,8 +45,10 @@ export type Toasts = ReturnType<typeof useKumoToastManager>;
 export interface ChatCache {
   chats: Map<number, AiChatMetadata>;
   messages: Map<number, AiChatMessage[]>;
-  // Compaction boundaries seen so far for each chat, oldest first. Every loaded page contributes
-  // one, so a thread compacted several times shows a marker at each cut.
+  /**
+   * Compaction boundaries seen so far for each chat, oldest first. Every loaded page contributes
+   * one, so a thread compacted several times shows a marker at each cut.
+   */
   compacted: Map<number, CompactionBoundary[]>;
   actionMessages: Map<number, Map<string, { chatId: number; sequence: number }>>;
   lastMessageTimestamp: Date | null;

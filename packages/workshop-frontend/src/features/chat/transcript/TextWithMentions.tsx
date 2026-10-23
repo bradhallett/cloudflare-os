@@ -1,15 +1,17 @@
 import { Fragment, type ReactNode } from "react";
 
-// Splices inline nodes into plain text at recorded positions, so a slash command and a format each
-// only have to know where they sit.
-//
-// The plain-text counterpart to the markdown path's token substitution (see
-// buildTokenizedCapsuleMessage): markdown needs tokens because it reflows the text it is given,
-// while text rendered as typed can be cut at the offsets directly.
+/**
+ * Splices inline nodes into plain text at recorded positions, so a slash command and a format each
+ * only have to know where they sit.
+ *
+ * The plain-text counterpart to the markdown path's token substitution (see
+ * buildTokenizedCapsuleMessage): markdown needs tokens because it reflows the text it is given,
+ * while text rendered as typed can be cut at the offsets directly.
+ */
 export function TextWithMentions(
   { text, mentions }: {
     text: string;
-    // `length` 0 inserts between characters, for something that was removed from the text.
+    /** `length` 0 inserts between characters, for something that was removed from the text. */
     mentions: { key: string; position: number; length: number; node: ReactNode }[];
   },
 ) {

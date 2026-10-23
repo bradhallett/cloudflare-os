@@ -119,10 +119,12 @@ export type ActiveFileTarget = {
 export type ChatChangeRowBuffer = {
   rows: ChatChangeRow[];
   seen: Set<string>;
-  // For the draft banner, which describes *human* draft edits only (rows carrying a
-  // `submission`, i.e. produced by submitCodeChange -- agent edits flow through the same stream
-  // but have their own streaming UI): when the newest such row arrived (rows don't carry
-  // timestamps on the wire; arrival time is close enough for display).
+  /**
+   * For the draft banner, which describes *human* draft edits only (rows carrying a
+   * `submission`, i.e. produced by submitCodeChange -- agent edits flow through the same stream
+   * but have their own streaming UI): when the newest such row arrived (rows don't carry
+   * timestamps on the wire; arrival time is close enough for display).
+   */
   lastUserEditAt: Date | null;
 };
 

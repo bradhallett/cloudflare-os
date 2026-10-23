@@ -28,9 +28,11 @@ function formatGadgetBindingTarget(
   if (!name) return gadget;
   return gadget ? `${gadget}.${name}` : name;
 }
-// What a `createGadget` call produced. Read from the gadget's own stamped output rather than
-// re-derived from the blueprint, so any blueprint declaring a format counts, not just promoted
-// ones. Undefined for a plain gadget, a still-streaming call, or a log predating formats.
+/**
+ * What a `createGadget` call produced. Read from the gadget's own stamped output rather than
+ * re-derived from the blueprint, so any blueprint declaring a format counts, not just promoted
+ * ones. Undefined for a plain gadget, a still-streaming call, or a log predating formats.
+ */
 export type ToolOutputResolver = (tc: AiToolCall) => BlueprintOutput | undefined;
 
 /**

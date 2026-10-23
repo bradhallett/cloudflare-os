@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-// Build a temporary object URL for inlined attachment bytes, revoking it when no longer needed.
+/** Build a temporary object URL for inlined attachment bytes, revoking it when no longer needed. */
 export function useAttachmentObjectUrl(
   content: Uint8Array | undefined,
   mimeType: string,

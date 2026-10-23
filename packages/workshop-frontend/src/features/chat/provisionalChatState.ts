@@ -8,10 +8,12 @@ import type { ActiveFileTarget } from "./liveCodeStreams";
 export type ProvisionalToolCallState = {
   toolCallId: string;
   toolName: AiToolCall["toolName"] | null;
-  // Human-readable target (e.g. filename) once known from the streaming input.
+  /** Human-readable target (e.g. filename) once known from the streaming input. */
   target?: string;
-  // For createGadget: what it is producing, once the server has resolved the blueprint. Tool inputs
-  // aren't streamed, so this is the only way the row can name a Doc while it is still being made.
+  /**
+   * For createGadget: what it is producing, once the server has resolved the blueprint. Tool inputs
+   * aren't streamed, so this is the only way the row can name a Doc while it is still being made.
+   */
   outputFormat?: BlueprintOutput;
   code: string;
   output: string;
@@ -26,7 +28,7 @@ export type ProvisionalToolCallState = {
 export type ProvisionalChatState = {
   text: string;
   reasoning: string;
-  // The turn is summarizing older context and can't produce output until it finishes.
+  /** The turn is summarizing older context and can't produce output until it finishes. */
   compacting: boolean;
   toolCalls: ProvisionalToolCallState[];
   toolCallsById: Map<string, ProvisionalToolCallState>;

@@ -4,9 +4,11 @@ import { useSlashCommandChoice, type OverseerSource } from "../../../components/
 import { FormatMention } from "../markdown/FormatMention";
 import { TextWithMentions } from "./TextWithMentions";
 
-// Renders a user message that invoked a slash command: their words, with the command shown back
-// where they typed it and any formats they named as chips. What the command expanded into is the
-// agent's context, and isn't shown.
+/**
+ * Renders a user message that invoked a slash command: their words, with the command shown back
+ * where they typed it and any formats they named as chips. What the command expanded into is the
+ * agent's context, and isn't shown.
+ */
 export function SlashCommandMention(
   { name, args, id, commandPosition, formats, getOverseer }: {
     name?: string;

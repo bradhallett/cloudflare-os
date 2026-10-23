@@ -21,11 +21,15 @@ export interface UsePendingTurnChangesArgs {
   currentMessages: AiChatMessage[];
   messageStates: MessageState;
   isAgentActive: boolean;
-  // The current epoch's opening sequence (see ChatCodeBase.epoch), zero when the epoch spans
-  // the whole chat.
+  /**
+   * The current epoch's opening sequence (see ChatCodeBase.epoch), zero when the epoch spans
+   * the whole chat.
+   */
   chatEpoch: number;
-  // The output format a workpiece was built as, so a created-app card can name and draw it as
-  // the Document (or whatever) it is rather than a generic app.
+  /**
+   * The output format a workpiece was built as, so a created-app card can name and draw it as
+   * the Document (or whatever) it is rather than a generic app.
+   */
   outputOfWorkpiece: (gadgetId: WorkpieceId) => BlueprintOutput | undefined;
 }
 
