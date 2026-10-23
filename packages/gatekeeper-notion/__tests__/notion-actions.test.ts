@@ -1,5 +1,11 @@
-import { describe, expect, it } from "vitest";
-import { describeAction, findWorkspaceParentPage, type NotionStore } from "../src/notion-actions";
+import { describe, expect, it, vi } from "vitest";
+import {
+  applyStoredAction,
+  describeAction,
+  findWorkspaceParentPage,
+  type NotionStore,
+  type StoredActionRecord,
+} from "../src/notion-actions";
 
 const databaseRow = (titlePropertyName?: string) => describeAction({
   type: "createPage",
@@ -121,5 +127,41 @@ describe("findWorkspaceParentPage", () => {
       sort: { direction: "descending", timestamp: "last_edited_time" },
       page_size: 1,
     }]);
+  });
+});
+
+describe("applyStoredAction", () => {
+  it("applies once: a replayed apply after the crash window is a no-op", async () => {
+    const records = new Map<number, StoredActionRecord>();
+    const updatePage = vi.fn(async () => ({}));
+    const store = {
+      api: { updatePage },
+      getAction: (id: number) => records.get(id),
+      putAction: (record: StoredActionRecord) => void records.set(record.id, record),
+      invalidatePage: () => {},
+      resolveId: (id: string) => id,
+      getPageResponse: async () => ({ properties: { title: { type: "title" } } }),
+    } as unknown as NotionStore;
+
+    records.set(1, {
+      id: 1,
+      action: { type: "setTitle", pageId: "page-1", title: "New", previousTitle: "Old" },
+      state: "pending",
+      submittedAt: 0,
+    });
+
+    await applyStoredAction(store, 1);
+    expect(updatePage).toHaveBeenCalledTimes(1);
+    expect(records.get(1)?.state).toBe("applied");
+
+    // The Workshop records its approval only after the RPC returns; a restart in that window
+    // replays the apply, which must settle instead of writing the title again.
+    await applyStoredAction(store, 1);
+    expect(updatePage).toHaveBeenCalledTimes(1);
+  });
+
+  it("still throws for an unknown action id", async () => {
+    const store = { getAction: () => undefined } as unknown as NotionStore;
+    await expect(applyStoredAction(store, 4)).rejects.toThrow("Unknown action: 4");
   });
 });

@@ -51,6 +51,7 @@ import {
   fetchDashboardConfig,
   resolveTargets,
 } from "./approvals";
+import { HomeAssistantActionStore } from "./action-store";
 import {
   indexPendingByEntity,
   overlayDashboardConfig,
@@ -1059,29 +1060,20 @@ export type HomeAssistantRevertInfo =
     }
   | { type: "noRevert" };
 
-// Internal storage row for pending (submitted but not yet applied) actions.
-type PendingActionRow = {
-  id: number;
-  action: HomeAssistantAction;
-  submittedAt: number;
-};
-
-// Internal storage row for actions that have been applied. Retained so that revertAction() can
-// look up the information needed to undo the action. The overseer only passes back the action ID,
-// so all revert information lives here in DO storage rather than being round-tripped through the
-// overseer.
-type AppliedActionRow = {
-  id: number;
-  action: HomeAssistantAction;
-  revertInfo: HomeAssistantRevertInfo;
-  appliedAt: number;
-};
-
 @validateRpc()
 export class HomeAssistantGatekeeperImpl
   extends DurableObject<Env, HomeAssistantGatekeeperImplProps>
   implements Gatekeeper<HomeAssistantSession | Area | Label | Device | Entity>
 {
+  // Claim-before-apply lifecycle for device actions, over this object's storage. Credentials are
+  // resolved per dispatch, so a reconnect between approval and apply is picked up.
+  readonly #actions = new HomeAssistantActionStore({
+    kv: this.ctx.storage.kv,
+    dispatch: async action => executeAction(action, await this.#getCreds()),
+    snapshotForRevert: async action => this.#snapshotForRevert(action, await this.#getCreds()),
+    onAuthError: () => this.#userAccount().noteCredentialsExpired(),
+  });
+
   #userAccount() {
     const id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
     return this.ctx.exports.UserAccount.get(id);
@@ -1189,41 +1181,13 @@ export class HomeAssistantGatekeeperImpl
   }
 
   async applyAction(actionId: number): Promise<void> {
-    // The overseer only knows the numeric action ID; the full action lives in DO storage.
-    const pending = this.#getPending(actionId);
-    if (!pending) {
-      throw new Error(`No queued Home Assistant action exists with id ${actionId}.`);
-    }
-    const action = pending.action;
-    const creds = await this.#getCreds();
-
-    let revertInfo: HomeAssistantRevertInfo;
-    try {
-      revertInfo = await this.#snapshotForRevert(action, creds);
-    } catch {
-      // If we can't snapshot, proceed without revert.
-      revertInfo = { type: "noRevert" };
-    }
-
-    try {
-      await executeAction(action, creds);
-    } catch (e) {
-      if (e instanceof HomeAssistantError && e.isAuthError) {
-        await this.#userAccount().noteCredentialsExpired();
-      }
-      throw e;
-    }
-
-    // Action succeeded: move the row from "pending" to "applied", storing the revert info so a
-    // later revertAction() can find it (the overseer passes back only the action ID).
-    this.#storeApplied(action, revertInfo);
-    this.#deletePending(actionId);
+    // The overseer only knows the numeric action ID; the full action and its claim-before-apply
+    // lifecycle live in DO storage, via HomeAssistantActionStore.
+    await this.#actions.apply(actionId);
   }
 
   async rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
-    this.#deletePending(actionId);
-    // No simulation state to clean up yet; once Phase 2 (caching/simulation) lands this may
-    // need to invalidate overlays. For now, rejection is a no-op apart from clearing storage.
+    return await this.#actions.reject(actionId);
   }
 
   async revertAction(
@@ -1232,7 +1196,7 @@ export class HomeAssistantGatekeeperImpl
     // The overseer passes back only the action ID; we stored everything we need (including the
     // original action, inside `stateSnapshot.originalAction` / `dashboardSnapshot`) under
     // `applied:<id>` when the action was applied.
-    const applied = this.#getApplied(actionId);
+    const applied = this.#actions.getApplied(actionId);
     if (!applied) {
       throw new Error(`No applied Home Assistant action exists with id ${actionId}.`);
     }
@@ -1327,10 +1291,7 @@ export class HomeAssistantGatekeeperImpl
         // (rather than ending up in the approval queue or hitting Home Assistant later).
         validateWriteBody(body);
 
-        const id = self.#nextActionId();
-        const action = { ...body, id } as HomeAssistantAction;
-        const row: PendingActionRow = { id, action, submittedAt: Date.now() };
-        self.ctx.storage.kv.put<PendingActionRow>(`pending:${id}`, row);
+        const action = self.#actions.allocate(body);
 
         let description;
         try {
@@ -1350,22 +1311,23 @@ export class HomeAssistantGatekeeperImpl
         }
 
         try {
-          await approvalQueue.submitAction(id, description);
+          await approvalQueue.submitAction(action.id, description);
         } catch (e) {
-          // The submit failed (e.g., the approval queue stub is gone). Drop the pending row.
-          self.#deletePending(id);
+          // The submit failed (e.g., the approval queue stub is gone). Roll the staged record back.
+          self.#actions.rollbackSubmission(action.id);
           throw e;
         }
+        self.#actions.markSubmitted(action.id);
       },
       async registrySnapshot() {
         return await fetchRegistrySnapshot(creds);
       },
       listPendingActions() {
-        return self.#listPendingActions();
+        return self.#actions.pendingActions();
       },
       async registrySnapshotWithOverlay() {
         const snapshot = await fetchRegistrySnapshot(creds);
-        const pending = self.#listPendingActions();
+        const pending = self.#actions.pendingActions();
         if (pending.length === 0) {
           return { snapshot, appliedCount: 0 };
         }
@@ -1409,49 +1371,6 @@ export class HomeAssistantGatekeeperImpl
     return ctx;
   }
 
-  /** List currently-pending actions, in chronological order. Reads from DO storage's KV
-   * `pending:*` rows. */
-  #listPendingActions(): HomeAssistantAction[] {
-    const rows = [...this.ctx.storage.kv.list<PendingActionRow>({ prefix: "pending:" })];
-    return rows
-      .map(([_, row]) => row.action)
-      .toSorted((a, b) => a.id - b.id);
-  }
-
-  // Action storage (KV layout):
-  //   counter:nextActionId  → number
-  //   pending:<id>          → PendingActionRow  (submitted, awaiting approval)
-  //   applied:<id>          → AppliedActionRow  (approved + applied; retains revert info)
-
-  #nextActionId(): number {
-    const v = (this.ctx.storage.kv.get<number>("counter:nextActionId") ?? 0) + 1;
-    this.ctx.storage.kv.put("counter:nextActionId", v);
-    return v;
-  }
-
-  #getPending(id: number): PendingActionRow | undefined {
-    return this.ctx.storage.kv.get<PendingActionRow>(`pending:${id}`);
-  }
-
-  #deletePending(id: number): void {
-    this.ctx.storage.kv.delete(`pending:${id}`);
-  }
-
-  /** Record an applied action along with the info needed to revert it later. Keyed by the
-   * action's numeric ID so revertAction() can look it up (the overseer passes back only the ID). */
-  #storeApplied(action: HomeAssistantAction, revertInfo: HomeAssistantRevertInfo): void {
-    const row: AppliedActionRow = {
-      id: action.id,
-      action,
-      revertInfo,
-      appliedAt: Date.now(),
-    };
-    this.ctx.storage.kv.put<AppliedActionRow>(`applied:${action.id}`, row);
-  }
-
-  #getApplied(id: number): AppliedActionRow | undefined {
-    return this.ctx.storage.kv.get<AppliedActionRow>(`applied:${id}`);
-  }
 
   async #snapshotForRevert(
     action: HomeAssistantAction,
@@ -1557,8 +1476,8 @@ interface SessionContext {
 }
 
 // The fields of a HomeAssistantAction that the caller fills in (everything except `id`, which
-// the gatekeeper assigns).
-type SubmitWriteBody =
+// the gatekeeper assigns). Exported for the action store, which stamps the id in.
+export type SubmitWriteBody =
   | Omit<HomeAssistantAction & { type: "callService" }, "id">
   | Omit<HomeAssistantAction & { type: "fireEvent" }, "id">
   | Omit<HomeAssistantAction & { type: "saveDashboard" }, "id">;

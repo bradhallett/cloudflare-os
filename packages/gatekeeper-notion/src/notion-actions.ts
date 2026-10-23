@@ -1100,6 +1100,9 @@ export async function stageAction(
 export async function applyStoredAction(store: NotionStore, id: number): Promise<void> {
   const record = store.getAction(id);
   if (!record) throw new Error(`Unknown action: ${id}`);
+  // The Workshop records approval only after this RPC returns; a restart in that window replays,
+  // and the work is already done -- the crash window Confluence guards the same way.
+  if (record.state === "applied") return;
   await applyNotionAction(store, record);
 }
 
