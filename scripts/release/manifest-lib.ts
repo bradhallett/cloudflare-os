@@ -353,9 +353,18 @@ export function isGatekeeperPackage(pkgName: string): boolean {
   return pkgName.startsWith(GATEKEEPER_PREFIX);
 }
 
-/** Return a gatekeeper package's vendor id used in its routed URL. */
-export function gatekeeperShortName(pkgName: string): string {
-  return pkgName.slice(GATEKEEPER_PREFIX.length);
+/**
+ * The `GATEKEEPER_*` service-binding name every non-production environment — the dev server
+ * (run-dev-server.ts) and previews (staging-config.ts) — must bind a gatekeeper as. The deploy
+ * service binds customer instances as `GATEKEEPER_<SLUG>` with the release shortName, and both the
+ * router's `/gatekeeper/<slug>` route and the backend's vendor id are derived from that binding
+ * name, so a dev environment that invents its own spelling (the former `GATEKEEPER_MCP_PORTAL`,
+ * routing `/gatekeeper/mcp-portal`) serves URLs production never registered: customer
+ * deployments' OAuth redirect URIs and stored connection keys use the folded slug. Single-sourced
+ * here so the environments cannot drift apart again.
+ */
+export function gatekeeperBindingName(pkgName: string): string {
+  return `GATEKEEPER_${releaseShortName(pkgName).toUpperCase()}`;
 }
 
 /**
@@ -373,8 +382,12 @@ const MAX_SLUG_LEN = 20;
  * the router recovers the path from that binding name, so a slug must survive `toUpperCase()` and
  * back — the deploy wizard restricts it to SLUG_RE and sends the manifest shortName as the install
  * slug verbatim. Package names are not so restricted (gatekeeper-mcp-portal), so fold here.
- * Distinct from gatekeeperShortName(), which staging/preview use with GATEKEEPER_<PKG_NAME>
- * bindings (underscores, router maps _ -> -) where a hyphen does round-trip.
+ *
+ * This is the one spelling of a gatekeeper's URL suffix anywhere: the manifest's BASE_URL template,
+ * the dev server's and previews' BASE_URL, and their `gatekeeperBindingName()` bindings all derive
+ * from it, so a multi-word gatekeeper serves the same path in every environment (the folded
+ * `mcpportal`, never `mcp-portal` — customer deployments registered OAuth redirect URIs against
+ * the folded URLs, so production cannot change without breaking them).
  *
  * The fold only removes characters, so it can leave a remnant the charset still rejects: empty
  * (gatekeeper---), digit-leading (gatekeeper-1password), or over the cap. Throw rather than emit
@@ -383,7 +396,7 @@ const MAX_SLUG_LEN = 20;
  * uninstallable on every customer instance.
  */
 export function releaseShortName(pkgName: string): string {
-  const shortName = gatekeeperShortName(pkgName).replace(/[^a-z0-9]/g, "");
+  const shortName = pkgName.slice(GATEKEEPER_PREFIX.length).replace(/[^a-z0-9]/g, "");
   if (!SLUG_RE.test(shortName) || shortName.length > MAX_SLUG_LEN) {
     throw new Error(`${pkgName} folds to "${shortName}", which is not a legal install slug: ` +
         `it must be 1-${MAX_SLUG_LEN} lowercase letters and digits starting with a letter ` +

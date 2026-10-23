@@ -2,9 +2,31 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+  gatekeeperBaseUrl,
   getDevServerConfig,
   getWranglerPortFromBackendHost,
 } from "./dev-server-config.ts";
+
+describe("gatekeeperBaseUrl", () => {
+  it("mounts a single-word gatekeeper at its own name", () => {
+    assert.equal(gatekeeperBaseUrl("gatekeeper-google", "localhost:8787"),
+        "http://localhost:8787/gatekeeper/google");
+  });
+
+  // The dev router binds gatekeepers as the deploy service does (GATEKEEPER_<folded slug>), so
+  // the URL the gatekeeper is told it serves at has to use the same fold: production serves
+  // gatekeeper-mcp-portal at /gatekeeper/mcpportal, and customer deployments registered their
+  // OAuth redirect URIs against that path — dev must not spell it "mcp-portal".
+  it("folds a multi-word gatekeeper to its production slug", () => {
+    assert.equal(gatekeeperBaseUrl("gatekeeper-mcp-portal", "localhost:8787"),
+        "http://localhost:8787/gatekeeper/mcpportal");
+  });
+
+  it("uses the configured backend host", () => {
+    assert.equal(gatekeeperBaseUrl("gatekeeper-x", "tunnel.example.com:9000"),
+        "http://tunnel.example.com:9000/gatekeeper/x");
+  });
+});
 
 describe("getWranglerPortFromBackendHost", () => {
   it("extracts a port from a localhost backend host", () => {

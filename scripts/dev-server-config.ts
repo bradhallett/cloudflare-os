@@ -1,3 +1,5 @@
+import { releaseShortName } from "./release/manifest-lib.ts";
+
 /**
  * The port a `VITE_BACKEND_HOST` names, as a string, or null when it names no port. Throws on a
  * value that is not a bare `host[:port]`.
@@ -66,4 +68,16 @@ export function getDevServerConfig(args: readonly string[], envBackendHost?: str
     backendHost,
     wranglerPort: getWranglerPortFromBackendHost(backendHost),
   };
+}
+
+/**
+ * The base URL the dev server tells a gatekeeper it is served at, behind the dev router.
+ *
+ * Uses the folded release shortName (`gatekeeperBindingName` in manifest-lib.ts is the matching
+ * binding spelling), because production serves every gatekeeper at that folded path — customer
+ * deployments registered their OAuth redirect URIs against it, so `gatekeeper-mcp-portal` is
+ * `/gatekeeper/mcpportal` in dev too, never `/gatekeeper/mcp-portal`.
+ */
+export function gatekeeperBaseUrl(pkgName: string, backendHost: string): string {
+  return `http://${backendHost}/gatekeeper/${releaseShortName(pkgName)}`;
 }
