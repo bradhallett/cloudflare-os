@@ -19,7 +19,9 @@ import {
 } from "@gadgets/workshop-shared/gatekeeper";
 import { buildDescription, type RenderedDescription } from "@gadgets/gatekeeper-kit/action-description";
 import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
-import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import {
+  clearConnectionSubject, commitReconnect, pinConnectionSubject, stageReconnect,
+} from "@gadgets/gatekeeper-kit/credential-stage";
 import { canTransition, type ActionState } from "./action-state";
 import { type CallbackResult, fetchSubject, type PinnedSubject, pinRefusal } from "./connect-subject";
 import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
@@ -599,23 +601,22 @@ export class UserAccount extends DurableObject<Env> {
       // The connection is pinned to the Spotify user it was made as: a reconnect that comes back
       // as anyone else is refused (Spotify has no token-revocation endpoint, so the refused grant
       // is simply dropped) rather than silently swapping the account every binding reads.
-      const refusal = pinRefusal(this.ctx.storage.kv.get<PinnedSubject>("subject"), subject);
-      if (refusal) return refusal;
+      const staged = stageReconnect(this.ctx.storage.kv, credentials, subject, Date.now(), pinRefusal);
+      if ("refused" in staged) return { refused: staged.refused };
       // The reconnect URL is a bearer capability, so the new grant is only staged until the Workshop
       // has confirmed the browser that finished the flow is the owner's (see commitReconnect). Bound
       // gadgets keep reading the current token meanwhile.
-      const stageId = stageCredentials(this.ctx.storage.kv, { credentials, subject }, Date.now());
-      handoff = await callback.reconnectComplete(stageId);
+      handoff = await callback.reconnectComplete(staged.stageId);
     } else {
       this.#storeCredentials(credentials);
-      this.ctx.storage.kv.put<PinnedSubject>("subject", subject);
+      pinConnectionSubject(this.ctx.storage.kv, subject);
       try {
         const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
         handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
       } catch (err) {
         this.ctx.storage.kv.delete("refreshToken");
         this.ctx.storage.kv.delete("accessToken");
-        this.ctx.storage.kv.delete("subject");
+        clearConnectionSubject(this.ctx.storage.kv);
         throw err;
       }
     }
@@ -624,13 +625,12 @@ export class UserAccount extends DurableObject<Env> {
     return { handoff };
   }
 
-  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
+  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. The kit
+   * re-pins the staged subject, adopting a connection made before the pin existed. */
   async commitReconnect(stageId: string): Promise<void> {
-    const staged = commitStagedCredentials<{ credentials: StoredCredentials; subject: PinnedSubject }>(
-      this.ctx.storage.kv, Date.now(), stageId);
-    if (!staged) throw new Error("No reconnect is awaiting confirmation. Please try again.");
-    this.#storeCredentials(staged.credentials);
-    this.ctx.storage.kv.put<PinnedSubject>("subject", staged.subject);
+    const credentials = commitReconnect<StoredCredentials>(this.ctx.storage.kv, Date.now(), stageId);
+    if (!credentials) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+    this.#storeCredentials(credentials);
   }
 
   #storeCredentials(credentials: StoredCredentials): void {

@@ -170,7 +170,7 @@ export async function seedAccount(
     state.storage.kv.put("accessTokenExpiresAt", Date.now() + 60 * 60 * 1000);
     state.storage.kv.put("scopes", ["user-read-private"]);
     if (options.subject !== false) {
-      state.storage.kv.put("subject", { userId: user.id, displayName: user.displayName });
+      state.storage.kv.put("connectionSubject", { id: user.id, displayName: user.displayName });
     }
   });
   return accountId.toString();
