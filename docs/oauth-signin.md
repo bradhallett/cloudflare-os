@@ -27,10 +27,13 @@ Sign-in requests only the **minimal scopes** needed to verify the user's email (
 `read:user user:email`, Google `openid email profile`, Cloudflare `offline_access user-details.read`),
 and the gatekeeper grant created for login is **transient** — it self-destructs shortly after the
 email is read, so signing in never leaves a broad authorization lying around. The fuller capability
-scopes (repos, Gmail/Docs, AI Gateway billing) are requested only later, when the user explicitly
-**connects the gatekeeper** (`connectAccount(vendorId)` with the default `scopes: "full"`), which is
+scopes (repos, Gmail/Docs) are requested only later, when the user explicitly **connects the
+gatekeeper** (`connectAccount(vendorId)`, which defaults to those full capability scopes), which is
 what persists a usable connected account. `GatekeeperVendor.connectAccount` takes
-`{ scopes: "auth" | "full" }` to choose between the two.
+`{ scopes: "auth" | "billing" }` to deviate from that default: `"auth"` is the transient sign-in
+grant above, `"billing"` is a persisted billing-only grant. Cloudflare sign-in is the billing case:
+it passes `scopes: "billing"` with no resources, so the grant covers exactly the AI Gateway billing
+scopes (`BILLING_SCOPES` in gatekeeper-cloudflare) and is persisted for that purpose.
 
 ## Sign-in flow
 
@@ -59,9 +62,10 @@ what persists a usable connected account. `GatekeeperVendor.connectAccount` take
 5. The client stores the token and authenticates as usual.
 
 Sign-in does **not** persist a connected account: the minimal-scope grant is only used to read the
-email and is then discarded by the gatekeeper. To use a gatekeeper's capabilities (repos, Gmail/Docs)
-or Cloudflare AI Gateway billing, the user explicitly **connects** it afterward (which requests the
-full scopes and persists the connection).
+email and is then discarded by the gatekeeper. To use a gatekeeper's capabilities (repos,
+Gmail/Docs), the user explicitly **connects** it afterward (which requests the full scopes and
+persists the connection). Cloudflare is the exception: its sign-in requests billing scopes
+(`scopes: "billing"`, no resource access) and persists the grant for AI Gateway billing.
 
 ## Native app return after installation sign-in
 
