@@ -1,4 +1,5 @@
-import { CaretLeft, Check, Pencil, Trash, X } from "@phosphor-icons/react";
+import { CaretLeft, Check, Pencil, Robot, Trash, X } from "@phosphor-icons/react";
+import { Tooltip } from "@cloudflare/kumo";
 import { WorkshopIconButton, WorkshopInput } from "../../components/WorkshopControls";
 import { isImeComposing } from "../../keyboardEvent";
 
@@ -16,6 +17,8 @@ export interface ChatHeaderBarProps {
   handleCancelTitleEdit: () => void;
   /** The selected chat's title, undefined while its metadata has not loaded. */
   chatTitle: string | undefined;
+  /** The selected chat's bot name, when it runs as a declared bot (see AiChatMetadata.botName). */
+  botName?: string;
   setIsEditingTitle: (edit: boolean) => void;
   handleDeleteChat: () => void;
 }
@@ -35,6 +38,7 @@ export function ChatHeaderBar({
   handleSaveChatTitle,
   handleCancelTitleEdit,
   chatTitle,
+  botName,
   setIsEditingTitle,
   handleDeleteChat,
 }: ChatHeaderBarProps) {
@@ -83,9 +87,19 @@ export function ChatHeaderBar({
                     </div>
                   ) : (
                     <>
-                      <span className="min-w-0 flex-1 truncate text-[13px] leading-[18px] font-medium tracking-[-0.25px] text-kumo-default">
-                        {chatTitle || "Chat"}
-                      </span>
+                      <div className="flex min-w-0 flex-1 items-center gap-1.5">
+                        <span className="min-w-0 truncate text-[13px] leading-[18px] font-medium tracking-[-0.25px] text-kumo-default">
+                          {chatTitle || "Chat"}
+                        </span>
+                        {botName && (
+                          <Tooltip content={`Bot · ${botName}`} asChild>
+                            <span className="inline-flex flex-shrink-0 items-center gap-1 rounded-full border border-kumo-line bg-kumo-tint px-2 py-0.5 text-[11px] leading-4 font-medium text-kumo-subtle">
+                              <Robot size={11} weight="fill" className="text-kumo-brand" />
+                              {botName}
+                            </span>
+                          </Tooltip>
+                        )}
+                      </div>
                       <WorkshopIconButton
                         onClick={() => setIsEditingTitle(true)}
                         className="!h-8 !w-8 flex-shrink-0 text-kumo-inactive hover:text-kumo-subtle"

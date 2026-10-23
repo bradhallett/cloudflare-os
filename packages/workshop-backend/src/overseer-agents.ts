@@ -1,6 +1,7 @@
 import { RpcStub } from "capnweb";
-import { WorkpieceId, AiChatAuthorInfo, CapsuleSpecifier, CollaboratorRole, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, MessageFormatRef, ChatAttachmentHandle, SlashCommandRequest } from "@gadgets/workshop-shared/api";
+import { WorkpieceId, AiChatAuthorInfo, CapsuleSpecifier, CollaboratorRole, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, MessageFormatRef, ChatAttachmentHandle, SlashCommandRequest, BotSelection } from "@gadgets/workshop-shared/api";
 import type { FileContent } from "@gadgets/workshop-shared/code-change";
+import type { CachedRequest } from "./ai-models";
 import { Gatekeeper, GatekeeperUserVerifier, createObservationRefusedError } from "@gadgets/workshop-shared/gatekeeper";
 import { chatKey, chatKeyPrefix } from "./storage-schema/overseer-storage";
 import type { ActionRecord, ActiveAgentRecord, GatekeeperClass, GatekeeperRecord, ObserverRecord, WorkpieceRecord } from "./storage-schema/overseer-storage";
@@ -112,6 +113,15 @@ export abstract class OverseerAgents extends OverseerMainline {
     if (failure && shouldRetryAfterReset(failure) && resumeAttempts < AGENT_RESUME_MAX_ATTEMPTS) {
       this.resumeErrors.set(record.chatId, failure);
       this.unregisterRunningAgent(record.chatId, true);
+      // A transient prepare failure parks the record silently -- no chat-visible error -- to be
+      // retried by the next sweep. A park from the constructor-initiated sweep is the exact state
+      // a mid-alarm eviction leaves: the alarm that fired was consumed and its success-path
+      // re-arm never ran, so nothing else calls updateAlarm and the retry would never happen;
+      // the chat strands until an unrelated wake. updateAlarm still sees the parked record
+      // (activeAgents row + chatMeta.activeAgent = agent work), so it arms the keep-alive alarm
+      // and the alarm loop's resumeErrors rethrow takes over. Inside the alarm handler this is
+      // the usual no-op: the end-of-run recompute re-arms.
+      this.updateAlarm();
       return;
     }
     this.resumeErrors.delete(record.chatId);
@@ -145,6 +155,10 @@ export abstract class OverseerAgents extends OverseerMainline {
   protected finishAgentTurn(chatId: number, turn?: {
     aiModel: UserAiModelRecord, initiator: AiChatAuthorInfo, initiatorUserId: string,
   }): void {
+    // Release any delegateToBot await on this chat's turn first: whatever follows (a drained
+    // steer's new turn, an approval park) must not leave the parent's tool call hanging.
+    this.settleSubagentWaiters(chatId);
+
     // A turn started by the drain gets a fresh context, and with it a fresh cancel controller --
     // this one may have been aborted.
     this.liveChats.delete(chatId);
@@ -228,17 +242,9 @@ export abstract class OverseerAgents extends OverseerMainline {
       }
     }
 
-    // (Listed after the reaps above, which may have removed a gadget along with its edges.)
-    for (let gadget of Array.from(this.storage.gadgets.list())) {
-      if (gadget.type !== "gadget") continue;  // worktrees have no binding edges
-      let orphanNames = Object.entries(gadget.bindings)
-          .filter(([, edge]) => edge.pending?.chatId === chatId &&
-                                edge.pending.sequence === undefined)
-          .map(([name]) => name);
-      if (orphanNames.length === 0) continue;
-      for (let name of orphanNames) delete gadget.bindings[name];
-      this.storage.gadgets.put(gadget);
-      this.bumpVersion([gadget.id]);
+    // (After the reaps above, which may have removed a gadget along with its edges.)
+    if (this.deleteBindingEdges(edge => edge.pending?.chatId === chatId &&
+                                         edge.pending.sequence === undefined).size > 0) {
       reaped = true;
     }
 
@@ -278,15 +284,17 @@ export abstract class OverseerAgents extends OverseerMainline {
       }
     }
 
-    // These chats stop proposing the workpiece once its record is gone, which no chatMeta write
-    // of theirs reports, so re-put their metadata to re-broadcast it (as reconcilePendingGadgets).
-    let proposingChats = Array.from(this.storage.chatMeta.list())
-        .filter(meta => this.proposedChangeWorkpieceIds(meta.id, meta).includes(id));
+    // (After the reaps above, which may have removed a gadget along with its edges.)
+    let affectedChats = this.chatsProposing(id);
     let facetName = this.gadgetFacetName(id);
     this.storage.gadgets.delete(id);  // notifies workpiece subscribers
     this.runningChatIds.delete(id);
     this.ctx.facets.delete(facetName);
-    for (let meta of proposingChats) this.storage.chatMeta.put(meta);
+    // An agent spawner may bind the gadget (see GatekeeperRecord.bindings).
+    for (let chatId of this.deleteBindingEdges(edge => edge.target === id)) {
+      affectedChats.add(chatId);
+    }
+    this.rebroadcastChatMeta(affectedChats);
   }
 
   /** Disable (if needed) and delete a bound hook, updating its action-log record to match. */
@@ -609,6 +617,7 @@ export abstract class OverseerAgents extends OverseerMainline {
     attachments?: ChatAttachmentHandle[],
     responseTargetRegistration?: ExternalMessageResponseTargetRegistration,
     formats?: MessageFormatRef[],
+    bot?: BotSelection | "none",
   ): Promise<void> {
     if (responseTargetRegistration) {
       let decision = this.prepareExternalMessageResponseTargetRegistration(responseTargetRegistration);
@@ -623,6 +632,12 @@ export abstract class OverseerAgents extends OverseerMainline {
     await this.migrateChatAttachments(chatId);
     let prepared = await this.prepareChatMessage(
         message, (canonicalAttachments?.length ?? 0) > 0);
+
+    // A bot param switches the chat's bot (re-snapshotting, as at start) or, as "none", clears
+    // it. Both ride the next send: this code runs past assertChatNotActive and the message
+    // reservation, so a switch only ever lands on an idle chat. Absent means no change -- the
+    // retries and steers below must not disturb the chat's bot.
+    let botSnapshot = userMeta.bot ? await this.snapshotBotForChat(userMeta.bot) : undefined;
 
     let attachmentFiles = await this.prepareWorkspaceAttachmentFiles(chatId, canonicalAttachments);
     let scratchWorktree = this.scratchWorktree(chatId);
@@ -658,6 +673,20 @@ export abstract class OverseerAgents extends OverseerMainline {
     }
     try {
       this.ctx.storage.transactionSync(() => {
+        let context = this.getChatAgentContext(chatId);
+        if (botSnapshot) {
+          meta.botName = botSnapshot.botConfig.name;
+          meta.bot = botSnapshot.botConfig.selection;
+          context = {...context, ...botSnapshot};
+        } else if (bot === "none") {
+          delete meta.botName;
+          delete meta.bot;
+          delete context.botConfig;
+          delete context.botSkills;
+          delete context.unavailableBotSkills;
+          delete context.botSection;
+        }
+        this.storage.chatContext.put(context);
         this.storage.chatMeta.put(meta);
         let promptSequence = this.commitPreparedChatMessage(
             chatId, meta.lastActive, userMeta.profile, prepared, capsules, canonicalAttachments,
@@ -752,6 +781,8 @@ export abstract class OverseerAgents extends OverseerMainline {
     let finished = false;
     // Why the turn ended early, posted in the `finally`.
     let failure: {message: string, code?: string} | undefined;
+    // The turn's last model request, kept warm while the chat is viewed (see ChatCacheWarmer).
+    let lastRequest: CachedRequest | undefined;
     let startedAt = Date.now();
     const turnLogger = this.logger.with({
       operation: "agent.run",
@@ -823,7 +854,7 @@ export abstract class OverseerAgents extends OverseerMainline {
         controller.signal.throwIfAborted();
 
         await this.migrateChatAttachments(chatId);
-        await runAgent(
+        lastRequest = await runAgent(
             this.self(), chosenModel, chatId, aiModel.profile, controller.signal, initiator, aiModel.config);
         finished = true;
         turnLogger.debug("agent run finished", {
@@ -910,6 +941,9 @@ export abstract class OverseerAgents extends OverseerMainline {
           this.unregisterRunningAgent(chatId,
               finished && !liveChat.cancelController.signal.aborted && !!meta && !!wait && !wait.denied);
 
+          // Without `meta`, the chat was deleted while the turn was ending.
+          if (lastRequest && meta) this.cacheWarmer.start(chatId, lastRequest, aiModel.profile.id);
+
           if (finished && meta) {
             // Classified here, past the turn's last await, so a decision made as it ended counts.
             this.#publishAgentTurnNotification(chatId, initiator, initiatorUserId);
@@ -944,7 +978,12 @@ export abstract class OverseerAgents extends OverseerMainline {
     let drain = this.pendingCallDrains.get(chatId);
     if (!drain) {
       drain = this.#drainPendingAgentCalls(chatId)
-          .finally(() => this.pendingCallDrains.delete(chatId));
+          .finally(() => {
+            this.pendingCallDrains.delete(chatId);
+            // A drain can also settle without starting a turn (its chat was deleted, or its
+            // initiator has no model), which unregistering a running agent never observes.
+            this.wakeIdleWaiters();
+          });
       this.pendingCallDrains.set(chatId, drain);
     }
     return drain;
@@ -1085,6 +1124,10 @@ export abstract class OverseerAgents extends OverseerMainline {
         ? wait.actionIds.includes(decisionId) : wait.requestIds.includes(decisionId))) return;
     if (!meta || !wait || wait.denied) {
       this.storage.activeAgents.delete(chatId);
+      // Dropping the record ends any delegation awaiting this chat's turn: settle its waiter
+      // and mark the delegation done, so a parent re-awaiting after a reset answers from the
+      // log instead of hanging on a turn that will never run.
+      this.settleSubagentWaiters(chatId);
       return;
     }
     if (wait.pending || this.isPreparingChatMessage(chatId)) return;
@@ -1096,7 +1139,13 @@ export abstract class OverseerAgents extends OverseerMainline {
     meta.lastActive = this.getChatTimestamp();
     this.storage.chatMeta.put(meta);
     this.registerRunningAgent(chatId);
-    this.resumeAgent(record, this.getLiveChat(chatId));
+    this.resumeAgent(record, this.getLiveChat(chatId)).catch(error => {
+      // The async resume rejected before any of its own handling surfaced the failure: log it
+      // and leave the record for the next sweep (alarm wake or next construction).
+      this.logger.error("agent resume failed to start", {
+        event: "agent.resume.start.failed", chatId, error,
+      });
+    });
   }
 
   // --- Connection-request hooks ---
@@ -1114,11 +1163,11 @@ export abstract class OverseerAgents extends OverseerMainline {
    * verification scope: everything bound by some non-provisional gadget (the gadget UI they drive
    * can invoke it), plus every connection with an *enabled* hook -- a hook is a live write channel
    * into the gadget it wakes, delivering the connection's data into state that collaborator can
-   * open, regardless of binding edges -- plus, transitively, every env target of a reachable
+   * open, regardless of binding edges -- plus, transitively, every binding target of a reachable
    * agent spawner: connectToGadget mints the bound spawner's loopback with no role filter
-   * (getEnvForLoader), and spawn/spawnCallable seeds the spawned agent's bindings from
-   * config.env (spawnAgent), handing the collaborator an agent that reads those connections
-   * with the creator's authority and returns their data.
+   * (getEnvForLoader), and spawn/spawnCallable seeds the spawned agent's bindings from the
+   * spawner's (AgentSpawnerQueueImpl), handing the collaborator an agent that reads those
+   * connections with the creator's authority and returns their data.
    */
   protected useScopeGatekeeperIds(): Set<WorkpieceId> {
     let ids = new Set<WorkpieceId>();
@@ -1142,24 +1191,24 @@ export abstract class OverseerAgents extends OverseerMainline {
       ids.add(hook.gatekeeperId);
     }
 
-    // Close over agent-spawner envs. The closure roots at the reachable set above because an
-    // *unbound* spawner is unreachable (loopbacks are minted only through gadget binding edges
-    // and chat bindings, and chats are owner/build-only), and a spawner's env is fixed at
-    // creation -- so every widening lands on the diffs around the sites that grow the roots
-    // (bindWorkpiece, mergeChatChanges, enableHookRecord), with no dedicated trigger.
-    // Spawner-to-spawner env edges are legal, hence the worklist; an env target that is a gadget
-    // is skipped -- env gadgets are non-pending, so their bindings are covered by the first loop.
+    // Close over agent spawners' bindings. The closure roots at the reachable set above because
+    // an *unbound* spawner is unreachable (loopbacks are minted only through gadget binding edges
+    // and chat bindings, and chats are owner/build-only), and a spawner's permanent bindings grow
+    // only by promotion -- so every widening lands on the diffs around the sites that grow the
+    // roots or promote (bindWorkpiece, mergeChanges, enableHookRecord), with no dedicated
+    // trigger. Spawner-to-spawner bindings are legal, hence the worklist; a binding target that
+    // is a gadget is skipped -- such gadgets are non-pending, so their bindings are covered by
+    // the first loop.
     //
-    // The env is also the ceiling, not just the seed: a spawned chat's agent has no
-    // requestConnection tool (agent.ts restricts spawned agents to describeBinding/executeCode),
-    // and connection requests are created only by that tool, so no accepted request can ever add
-    // a connection to a spawned chat beyond `config.env`. If spawned agents ever gain that tool,
-    // this closure must learn about accepted requests too.
+    // The bindings are also the ceiling, not just the seed: a spawned chat's agent has neither
+    // the requestConnection tool nor setGadgetBinding (agent.ts restricts spawned agents to
+    // describeBinding/executeCode), and connection requests are created only by the former, so
+    // no accepted request can ever add a connection to a spawned chat beyond the spawner's
+    // bindings. If spawned agents ever gain either tool, this closure must learn about it too.
     let pending = [...ids];
     while (pending.length > 0) {
-      let spec = this.storage.gatekeepers.get(pending.pop()!)?.creationSpec;
-      if (spec?.type !== "agentSpawner") continue;
-      for (let target of Object.values(spec.config.env)) {
+      let spawner = this.storage.gatekeepers.get(pending.pop()!);
+      for (let [, {target}] of this.visibleBindings({bindings: spawner?.bindings ?? {}})) {
         if (ids.has(target) || !this.storage.gatekeepers.get(target)) continue;
         ids.add(target);
         pending.push(target);

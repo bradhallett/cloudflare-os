@@ -1,14 +1,17 @@
-import { WorkpieceId, AiChatMetadata, AiChatAuthorInfo, AiToolCall, CapsuleSpecifier, CollaboratorRole, ObserverBindingNeed, MessageFormatRef, ChatAttachmentHandle, SlashCommandRequest } from "@gadgets/workshop-shared/api";
+import { WorkpieceId, AiChatMetadata, AiChatAuthorInfo, AiToolCall, CapsuleSpecifier, CollaboratorRole, ObserverBindingNeed, MessageFormatRef, ChatAttachmentHandle, SlashCommandRequest, validateBindingName } from "@gadgets/workshop-shared/api";
 import { Gatekeeper, GitPullHints } from "@gadgets/workshop-shared/gatekeeper";
 import { WorkspaceGitCache } from "./git-cache";
-import { migrateToActionIndexes, migrateToBlueprintUpstreams, migrateToGitStorage, migrateToMultiGadget, migrateToWorkpieceTypes } from "./storage-schema/overseer-migrations";
+import { migrateToActionIndexes, migrateToBlueprintUpstreams, migrateToGitStorage, migrateToMultiGadget, migrateToWorkpieceTypes, migrateToSpawnerBindings, migrateToDeclaredBots } from "./storage-schema/overseer-migrations";
 import { AgentHooks, summarizeArgs } from "./agent";
+import { ChatCacheWarmer } from "./chat-cache-warming";
 import { UserDurableObject } from "./user";
 import type { UserChatContext } from "./user";
 import { AutoApprovalDrainer } from "./auto-approval";
 import { OverseerGatekeepers } from "./overseer-gatekeepers";
-import type { ExternalMessageResponseTargetRegistration } from "./overseer-support";
+import { OverseerBots } from "./overseer-bots";
 import { AGENT_KEEPALIVE_ALARM_MS, ALARM_MAX_RETRIES, stringifyError } from "./overseer-support";
+import { GIT_BINDING_NAME } from "./agent";
+import { assertBindingNameFree, type ExternalMessageResponseTargetRegistration } from "./overseer-support";
 import { observerBindingNeed } from "./overseer-binding-info";
 
 /**
@@ -17,7 +20,7 @@ import { observerBindingNeed } from "./overseer-binding-info";
  * Part of the partial-class chain backing OverseerImpl (overseer-impl.ts), split out of
  * the former single-file overseer.ts. This layer only depends on layers before it.
  */
-export class OverseerImpl extends OverseerGatekeepers implements AgentHooks {
+export class OverseerImpl extends OverseerBots implements AgentHooks {
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
     this.gitCache = new WorkspaceGitCache(this.storage, {
@@ -48,11 +51,20 @@ export class OverseerImpl extends OverseerGatekeepers implements AgentHooks {
       remove: () => this.markOutputsDirty(),
     });
 
+    // Keeps a viewed chat's last model request warm between turns (see chat-cache-warming.ts):
+    // the DO id names the warmer's timers, and resent requests bill the chat's cost record
+    // like any turn request (via addChatMessages's addRequestCost tail, mirroring #runAgentTurn).
+    this.cacheWarmer = new ChatCacheWarmer(ctx.id.toString(), (chatId, resent) =>
+        this.addRequestCost(chatId, resent.usage, resent.aiGatewayLogId,
+            resent.aiGatewayLogRoute, false));
+
     this.ctx.blockConcurrencyWhile(async () => {
       if (this.storage.version.get() === 1) await migrateToGitStorage(this);
       migrateToActionIndexes(this);
       migrateToWorkpieceTypes(this);
       migrateToBlueprintUpstreams(this);
+      migrateToSpawnerBindings(this);
+      migrateToDeclaredBots(this);
       // Do not replace an existing alarm during constructor recovery: setAlarm would reset the
       // platform's retry budget. Cache its time before registering any recovered executions.
       this.scheduledAlarm = await this.ctx.storage.getAlarm();
@@ -60,8 +72,13 @@ export class OverseerImpl extends OverseerGatekeepers implements AgentHooks {
         this.agentKeepAliveTime = this.scheduledAlarm ?? undefined;
       }
     // Resume outside the critical section, before blocked events are delivered. On failure,
-    // blockConcurrencyWhile already aborted the object; consume its rejection and retry on wake.
-    }).then(() => this.resumeInterruptedAgents(), () => {});
+    // blockConcurrencyWhile already aborted the object; consume its rejection (logging it: a
+    // swallowed boot failure silently skips every agent resume this restart) and retry on wake.
+    }).then(() => this.resumeInterruptedAgents(), error => {
+      this.logger.error("boot or resume sweep failed; some agents may not have been resumed", {
+        event: "agent.resume.boot.failed", error,
+      });
+    });
   }
   /**
    * The body of the alarm handler: perform every concern the alarm exists for, together, and hold
@@ -112,19 +129,39 @@ export class OverseerImpl extends OverseerGatekeepers implements AgentHooks {
    * it'll recognize that agents are running and wait for them.
    */
   protected resumeInterruptedAgents(): void {
-    for (let record of Array.from(this.storage.activeAgents.list())) {
-      if (this.runningAgents.has(record.chatId)) continue;
-      if (!this.storage.chatMeta.get(record.chatId)?.activeAgent) {
-        this.resumeAgentAfterDecision(record.chatId);
-        continue;
-      }
-      // Register the running agent immediately (see above), and create the LiveChatContext
-      // synchronously, so that cancellations are immediately respected.
-      this.registerRunningAgent(record.chatId);
-      let liveChat = this.getLiveChat(record.chatId);
+    let interrupted = Array.from(this.storage.activeAgents.list());
+    this.logger.debug("agent resume sweep", {
+      event: "agent.resume.sweep", resumeRecords: interrupted.length,
+    });
+    for (let record of interrupted) {
+      // Per-record resilience: a synchronous throw here (alarm re-registration, a storage read,
+      // decision-resume) escapes both boot handlers and would strand every LATER record's chat
+      // mid-sweep with no error anywhere. Log it and keep sweeping; the record stays for the
+      // next sweep (alarm wake or next construction) to retry.
+      try {
+        if (this.runningAgents.has(record.chatId)) continue;
+        if (!this.storage.chatMeta.get(record.chatId)?.activeAgent) {
+          this.resumeAgentAfterDecision(record.chatId);
+          continue;
+        }
+        // Register the running agent immediately (see above), and create the LiveChatContext
+        // synchronously, so that cancellations are immediately respected.
+        this.registerRunningAgent(record.chatId);
+        let liveChat = this.getLiveChat(record.chatId);
 
-      this.resumeErrors.delete(record.chatId);
-      this.resumeAgent(record, liveChat);
+        this.resumeErrors.delete(record.chatId);
+        this.resumeAgent(record, liveChat).catch(error => {
+          // The async resume rejected before any of its own handling surfaced the failure:
+          // log it and leave the record for the next sweep (alarm wake or next construction).
+          this.logger.error("agent resume failed to start", {
+            event: "agent.resume.start.failed", chatId: record.chatId, error,
+          });
+        });
+      } catch (error) {
+        this.logger.error("agent resume sweep failed for one chat", {
+          event: "agent.resume.sweep.failed", chatId: record.chatId, error,
+        });
+      }
     }
 
     // Backwards compatibility: Prior to the introduction of the `activeAgents` table, we could
@@ -213,6 +250,12 @@ export class OverseerImpl extends OverseerGatekeepers implements AgentHooks {
     let prepared = await this.prepareChatMessage(
         initialMessage, (canonicalAttachments?.length ?? 0) > 0);
 
+    // A bot chat snapshots its bot at start (see snapshotBotForChat): the frozen declaration
+    // plus the workspace's skill resolution, stored on the chat's context and never re-resolved
+    // per turn. userMeta.bot is set only when the client passed one; getChatContext has already
+    // validated the bot and put its model in userMeta.aiModel.
+    let botSnapshot = userMeta.bot ? await this.snapshotBotForChat(userMeta.bot) : undefined;
+
     // No code base is established at creation: gadgets pin lazily, when their code is first
     // modified in the chat (see ChatCodeBase). Until then the chat reads committed code live at
     // each gadget's current head.
@@ -228,11 +271,19 @@ export class OverseerImpl extends OverseerGatekeepers implements AgentHooks {
         started: timestamp,
         lastActive: timestamp,
       };
+      if (botSnapshot) {
+        meta.botName = botSnapshot.botConfig.name;
+        meta.bot = botSnapshot.botConfig.selection;
+      }
       if (prepared.message !== undefined && userMeta.aiModel) {
         meta.activeAgent = userMeta.aiModel.profile;
       }
       this.storage.chatMeta.put(meta);
-      this.storage.chatContext.put({...this.getChatAgentContext(chatId), attachmentsMigrated: true});
+      this.storage.chatContext.put({
+        ...this.getChatAgentContext(chatId),
+        attachmentsMigrated: true,
+        ...botSnapshot,
+      });
 
       let promptSequence = this.commitPreparedChatMessage(
           chatId, timestamp, userMeta.profile, prepared, capsules, canonicalAttachments, formats,
@@ -276,41 +327,6 @@ export class OverseerImpl extends OverseerGatekeepers implements AgentHooks {
     return chatId;
   }
 
-  /**
-   * Stops the chat's running agent. Its queued steers are dropped: the client that stops puts them
-   * in its draft (see Overseer.stopAgent).
-   */
-  cancelAgent(chatId: number) {
-    let meta = this.storage.chatMeta.get(chatId);
-    if (meta?.queuedSteers) {
-      delete meta.queuedSteers;
-      meta.lastActive = this.getChatTimestamp();
-      this.storage.chatMeta.put(meta);
-    }
-    // Stop prevents resumption even if the DO disappears before the aborted task's finally runs;
-    // restart recovery clears any busy marker left without an execution row.
-    this.storage.activeAgents.delete(chatId);
-    this.resumeErrors.delete(chatId);
-    let author = this.storage.chatMeta.get(chatId)?.activeAgent ?? this.decisionWait(chatId)?.agent;
-    if (author) this.addChatMessages(chatId, author,
-        [{type: "agentNudge", text: "The user stopped this turn. Wait for a new request."}]);
-    let ctx = this.liveChats.get(chatId);
-    if (ctx) {
-      ctx.cancelController.abort(new Error("User requested to stop agent."));
-    }
-    // A retryable lookup has already released its task to the alarm, so no finally is left to
-    // clear the busy marker. Stop must finish that handoff synchronously too.
-    if (!this.runningAgents.has(chatId)) {
-      let meta = this.storage.chatMeta.get(chatId);
-      if (meta?.activeAgent) {
-        delete meta.activeAgent;
-        meta.lastActive = this.getChatTimestamp();
-        this.storage.chatMeta.put(meta);
-      }
-      this.updateAlarm();
-      this.finishAgentTurn(chatId);
-    }
-  }
 
   /**
    * Add a binding edge to a gadget on behalf of the agent's setGadgetBinding tool. The edge is
@@ -319,6 +335,15 @@ export class OverseerImpl extends OverseerGatekeepers implements AgentHooks {
    */
   addGadgetBinding(gadgetId: WorkpieceId, name: string, target: WorkpieceId,
                    chatId: number): void {
+    let spawner = this.storage.gatekeepers.get(gadgetId);
+    if (spawner?.bindings) {
+      this.validateSpawnerBinding(name, target, chatId);
+      assertBindingNameFree(spawner.bindings, name, chatId);
+      // Pending, so it widens no one's verification scope until mergeChanges promotes it.
+      spawner.bindings[name] = {target, pending: {chatId}};
+      this.storage.gatekeepers.put(spawner);
+      return;
+    }
     if (!this.storage.gatekeepers.get(target)) {
       throw new Error("This resource is no longer available.");
     }
@@ -326,6 +351,30 @@ export class OverseerImpl extends OverseerGatekeepers implements AgentHooks {
     let gadget = this.getGadgetRecord(
         this.resolveWorkpieceRoot(gadgetId, true, chatId).workpieceId);
     this.bindWorkpiece(gadget.id, name, target, chatId);
+  }
+
+  // Throws unless `target` may be bound into an agent spawner as `name`, by chat `chatId` if
+  // given: each agent the spawner starts gets it as `env.<name>` (see GatekeeperRecord.bindings).
+  validateSpawnerBinding(name: string, target: WorkpieceId, chatId?: number): void {
+    validateBindingName(name);
+    if (name === GIT_BINDING_NAME) {
+      // The spawned chat's env already has the automatic env.GIT, which this would shadow.
+      throw new Error(`The binding name \`${name}\` is reserved.`);
+    }
+    let gadget = this.storage.gadgets.get(target);
+    if (gadget?.type === "worktree") {
+      throw new Error(`Binding "${name}" references workpiece ${target}, which is a worktree; ` +
+          `worktrees are chat-private and cannot be given to an agent spawner.`);
+    }
+    // A gadget provisional to another chat belongs to that chat's unaccepted proposal, not (yet)
+    // to the workspace. The chat's own is accepted along with the binding.
+    if (gadget?.pending && gadget.pending.chatId !== chatId) {
+      throw new Error(`Binding "${name}" references gadget ${target}, which is still pending ` +
+          `in a chat.`);
+    }
+    if (!gadget && !this.storage.gatekeepers.get(target)) {
+      throw new Error(`Binding "${name}" references workpiece ${target}, which does not exist.`);
+    }
   }
 
   /**

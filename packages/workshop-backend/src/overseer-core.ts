@@ -17,6 +17,7 @@ import { AutoApprovalDrainer } from "./auto-approval";
 import { createWorkshopLogger } from "./observability";
 import type { LiveChatContext, SessionKind } from "./overseer-support";
 import { AGENT_KEEPALIVE_ALARM_MS, AGENT_RESPONSE_DELIVERED_RETENTION_MS, CHAT_CHANGE_RETIRED_TTL_MS } from "./overseer-support";
+import { ChatCacheWarmer } from "./chat-cache-warming";
 import { CHAT_ATTACHMENT_EXTENSION_BY_MIME } from "./overseer-chat-attachments";
 import type { OverseerImpl } from "./overseer-impl";
 
@@ -123,6 +124,29 @@ export abstract class OverseerCore {
 
   /** Drains of pending agent calls currently in flight, by chat (see drainPendingAgentCalls). */
   protected pendingCallDrains = new Map<number, Promise<void>>();
+
+  // Chats with a delegateToBot call awaiting a subagent's turn (see runBotSubagent), keyed by
+  // the *child* chat: every turn-terminal path calls settleSubagentWaiters(chatId), so however
+  // the child's turn ends -- reply, error, approval park, abort -- the parent's tool call
+  // resolves. Rebuilt from the durable pendingDelegations record when a reset re-executes the
+  // tool call, so the await survives DO restarts.
+  protected subagentWaiters = new Map<number, Set<() => void>>();
+
+  // Resolve however the chat's turn ends: wake every delegateToBot await keyed to it and mark
+  // its delegation records done (the await re-arms if the parent re-executes the tool call).
+  protected settleSubagentWaiters(chatId: number): void {
+    let waiters = this.subagentWaiters.get(chatId);
+    if (waiters) {
+      this.subagentWaiters.delete(chatId);
+      for (let waiter of waiters) waiter();
+    }
+    for (let record of this.storage.pendingDelegations.byChildChatId.get(chatId)) {
+      if (!record.done) this.storage.pendingDelegations.put({...record, done: true});
+    }
+  }
+
+  /** Keeps a viewed chat's last model request warm between turns (see chat-cache-warming.ts). */
+  cacheWarmer!: ChatCacheWarmer;
 
   addChatSubscriber(subscriber: RpcStub<AiChatSubscriber>) {
     this.#chatSubscribers.add(subscriber);
@@ -278,6 +302,8 @@ export abstract class OverseerCore {
   protected registerRunningAgent(chatId: number) {
     this.runningAgents.add(chatId);
     this.updateAlarm();
+    // The turn's own requests keep the cache warm, and its end warms its last request instead.
+    this.cacheWarmer.end(chatId, "turn");
   }
 
   /**
@@ -291,12 +317,18 @@ export abstract class OverseerCore {
     if (!retainRecord) this.storage.activeAgents.delete(chatId);
     this.updateAlarm();
     if (this.runningAgents.size === 0) {
-      // One -> zero running agents: wake any `alarm()` waiter.
-      for (let waiter of this.#allAgentsIdleWaiters) {
-        waiter();
-      }
-      this.#allAgentsIdleWaiters = [];
+      this.wakeIdleWaiters();
     }
+  }
+
+  // Rouses waitForAllAgentsToComplete's waiters to re-check their conditions. Waking is always
+  // safe: a waiter whose condition still holds (an agent still running, a drain still in flight)
+  // re-arms itself.
+  protected wakeIdleWaiters(): void {
+    for (let waiter of this.#allAgentsIdleWaiters) {
+      waiter();
+    }
+    this.#allAgentsIdleWaiters = [];
   }
 
   /**
@@ -362,13 +394,19 @@ export abstract class OverseerCore {
   }
 
   /**
-   * Resolves once no agents are running. Used by `alarm()` to keep the DO alive until all running
-   * agents complete.
+   * Resolves once no agents are running and no drain is mid-flight -- a drain hands a finished
+   * turn's work to the next, so waiting through it is what keeps "all agents complete" true at
+   * the moment this returns. Used by `alarm()` to hold the DO open through whole turn chains.
    */
   async waitForAllAgentsToComplete(): Promise<void> {
-    // Teardown can synchronously hand off to a resumed execution before these waiters run.
-    while (this.runningAgents.size > 0) {
-      await new Promise<void>(resolve => { this.#allAgentsIdleWaiters.push(resolve); });
+    // Teardown can synchronously hand off to a resumed execution before these waiters run. A
+    // drain in flight is that handoff mid-flight -- it starts the next turn after its first
+    // await -- so waiting on it too keeps this wait from resolving between a turn's end and the
+    // turn it hands off to (runAlarmTasks' pass loop checks the same two conditions).
+    while (this.runningAgents.size > 0 || this.pendingCallDrains.size > 0) {
+      let {promise, resolve} = Promise.withResolvers<void>();
+      this.#allAgentsIdleWaiters.push(resolve);
+      await promise;
     }
   }
 
@@ -646,13 +684,14 @@ export abstract class OverseerCore {
   }
 
   /**
-   * The gadget's binding edges visible to the given chat: an edge still provisional to some
-   * *other* chat belongs to that chat's proposed changes and is treated as nonexistent here.
-   * With `forChatId` undefined, only permanent (non-pending) edges are visible (mainline loads,
-   * blueprints, sharing, the Connections UI).
+   * The binding edges visible to the given chat, of a gadget or an agent spawner: an edge still
+   * provisional to some *other* chat belongs to that chat's proposed changes and is treated as
+   * nonexistent here. With `forChatId` undefined, only permanent (non-pending) edges are visible
+   * (mainline loads, spawns, blueprints, sharing, the Connections UI).
    */
-  visibleBindings(gadget: GadgetRecord, forChatId?: number): [string, BindingRecord][] {
-    return Object.entries(gadget.bindings).filter(
+  visibleBindings(holder: {bindings: Record<string, BindingRecord>}, forChatId?: number)
+      : [string, BindingRecord][] {
+    return Object.entries(holder.bindings).filter(
         ([, edge]) => !edge.pending || edge.pending.chatId === forChatId);
   }
 

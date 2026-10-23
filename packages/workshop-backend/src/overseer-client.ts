@@ -2,6 +2,7 @@ import { RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import { Overseer, GadgetMetadata, WorkpieceId, WorkpiecesSubscriber, GadgetClient, GatekeeperClient, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, CodeChangeSubmission, CommitInfo, FileAtCommit, MAX_READ_FILES_PER_CALL, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AgentSpawnerConfig, ConsoleLogSubscriber, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverBindingNeed, MessageFormatRef, BlueprintGadgetSummary, BlueprintScreenshotUpload, blueprintScreenshotUrl, ChatAttachmentHandle, BoundHookInfo, PreApprovableAction, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, modelKind } from "@gadgets/workshop-shared/api";
 import { HookInitiator, ActionKind } from "@gadgets/workshop-shared/gatekeeper";
+import { BotSelection } from "@gadgets/workshop-shared/api";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { keyString } from "@gadgets/typed-storage";
 import type { ListOptions } from "@gadgets/typed-storage";
@@ -470,36 +471,17 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
     return result;
   }
 
-  async newAgentSpawnerGatekeeper(config: AgentSpawnerConfig): Promise<GatekeeperClient<any>> {
-    // Validate the configured env: names must be valid binding names and targets must exist --
-    // and must not be gadgets still provisional to some chat, which belong to that chat's
-    // unaccepted proposal, not (yet) to the workspace. (Spawn-time snapshotting tolerates targets
-    // deleted later; this just catches bad input.)
-    for (let [name, target] of Object.entries(config.env)) {
-      validateBindingName(name);
-      if (name === GIT_BINDING_NAME) {
-        // The spawned chat's env already has the automatic env.GIT, which this would shadow.
-        throw new Error(`Agent spawner env entry "${name}": the binding name \`${name}\` is ` +
-            `reserved.`);
-      }
-      let gadget = this.impl.storage.gadgets.get(target);
-      if (gadget) {
-        if (gadget.type === "worktree") {
-          throw new Error(`Agent spawner env entry "${name}" references workpiece ${target}, ` +
-              `which is a worktree; worktrees are chat-private and cannot be configured.`);
-        }
-        if (gadget.pending) {
-          throw new Error(`Agent spawner env entry "${name}" references gadget ${target}, ` +
-              `which is still pending in a chat.`);
-        }
-      } else if (!this.impl.storage.gatekeepers.get(target)) {
-        throw new Error(`Agent spawner env entry "${name}" references workpiece ${target}, ` +
-            `which does not exist.`);
-      }
+  async newAgentSpawnerGatekeeper({env, ...config}: AgentSpawnerConfig)
+      : Promise<GatekeeperClient<any>> {
+    for (let [name, target] of Object.entries(env)) {
+      this.impl.validateSpawnerBinding(name, target);
     }
+    let bindings = Object.fromEntries(
+        Object.entries(env).map(([name, target]) => [name, {target}]));
+
 
     let props: AgentSpawnerBindingProps = {
-      overseerId: this.impl.ctx.id.toString(),
+
       config,
       creatorUserId: this.#clientUser.id.toString(),
     };
@@ -520,7 +502,7 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
 
     let result = await this.impl.addGatekeeper(
         this.impl.ctx.exports.AgentSpawnerGatekeeper({props}), creationSpec,
-        this.clientUserId, this.#mintedCapabilityKind());
+        this.clientUserId, this.#mintedCapabilityKind(), bindings);
     await this.recordConnectionCreated(result, "agent_spawner");
     return result;
   }
@@ -578,7 +560,11 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
 
     // Clearing this manual gate may unblock later auto-eligible pending actions on the same
     // gatekeeper, so cascade a drain (in-order) once this one is applied.
-    this.impl.ctx.waitUntil(this.#drainAutoApprovalsAndResume(action.gatekeeperId));
+    this.impl.ctx.waitUntil(this.#drainAutoApprovalsAndResume(action.gatekeeperId).catch(error => {
+      this.impl.logger.error("auto-approval drain failed", {
+        event: "auto.approval.drain.failed", gatekeeperId: action.gatekeeperId, error,
+      });
+    }));
   }
 
   // A drain can decide an agent turn's last awaited action, which must resume that turn just as a
@@ -743,7 +729,11 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
     // Deny leaves the turn ended, like denyConnectionRequest. The rejected record also prevents a
     // sibling approval from resuming this turn. Like an approval, though, clearing this manual gate
     // may unblock later auto-eligible pending actions, whose turns do resume.
-    this.impl.ctx.waitUntil(this.#drainAutoApprovalsAndResume(action.gatekeeperId));
+    this.impl.ctx.waitUntil(this.#drainAutoApprovalsAndResume(action.gatekeeperId).catch(error => {
+      this.impl.logger.error("auto-approval drain failed", {
+        event: "auto.approval.drain.failed", gatekeeperId: action.gatekeeperId, error,
+      });
+    }));
   }
 
   /**
@@ -766,7 +756,11 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
       enabledBy: profile,
     });
     // Apply the currently-visible pending action(s) with this tag right away.
-    this.impl.ctx.waitUntil(this.#drainAutoApprovalsAndResume(gatekeeperId));
+    this.impl.ctx.waitUntil(this.#drainAutoApprovalsAndResume(gatekeeperId).catch(error => {
+      this.impl.logger.error("auto-approval drain failed", {
+        event: "auto.approval.drain.failed", gatekeeperId, error,
+      });
+    }));
   }
 
   /**
@@ -1132,11 +1126,22 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
     }));
   }
 
+  async viewChat(chatId: number): Promise<RpcStub<{}>> {
+    this.impl.getChatMetaOrThrow(chatId);
+    let leave = this.impl.cacheWarmer.view(chatId);
+    // @ts-expect-error Bugs in native RPC types make this not work currently.
+    return this.#subscriptionLease(new NativeRpcStub<{}>({
+      [Symbol.dispose]() {
+        leave();
+      }
+    }));
+  }
+
   async newChat(initialMessage: string | SlashCommandRequest, chosenModelId: string | null,
                 capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
-                formats?: MessageFormatRef[]): Promise<number> {
+                formats?: MessageFormatRef[], bot?: BotSelection): Promise<number> {
     let userMeta = await retryOnDoReset(
-        () => this.#clientUser.getChatContext(chosenModelId), this.impl.logger);
+        () => this.#clientUser.getChatContext(chosenModelId, bot), this.impl.logger);
     return this.impl.newChat(this.#clientUser, userMeta, initialMessage, capsules, attachments,
                              undefined, undefined, formats);
   }
@@ -1144,18 +1149,21 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
   async sendChatMessage(
       chatId: number, message: string | SlashCommandRequest, chosenModelId: string | null,
       capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
-      formats?: MessageFormatRef[]): Promise<void> {
+      formats?: MessageFormatRef[], bot?: BotSelection | "none"): Promise<void> {
     // A steer runs on the running turn's model, so it is queued before the sender's model is
-    // looked up: a collaborator need not have that model.
+    // looked up: a collaborator need not have that model. A bot therefore cannot switch on a
+    // steer either -- the param rides the next idle send (see OverseerImpl.sendChatMessage).
     let author = await this.#getClientProfile();
     if (this.impl.steerRunningTurn(
         chatId, this.clientUserId, author, message, capsules, attachments, formats)) {
       return;
     }
     let userMeta = await retryOnDoReset(
-        () => this.#clientUser.getChatContext(chosenModelId), this.impl.logger);
+        () => this.#clientUser.getChatContext(chosenModelId, bot === "none" ? undefined : bot),
+        this.impl.logger);
     return this.impl.sendChatMessage(
-        this.#clientUser, userMeta, chatId, message, capsules, attachments, undefined, formats);
+        this.#clientUser, userMeta, chatId, message, capsules, attachments, undefined, formats,
+        bot);
   }
 
   async setChatTitle(chatId: number, title: string): Promise<void> {
@@ -1243,6 +1251,18 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
       this.impl.storage.pendingAgentCalls.deleteRecord(entry);
     }
 
+    // Bot delegations involving this chat, from either side: a parent's records die with it
+    // (nothing will await the children), and a child's die because its awaiting parent must not
+    // treat a deleted thread as still running.
+    for (let record of Array.from(
+        this.impl.storage.pendingDelegations.byParentChatId.get(chatId))) {
+      this.impl.storage.pendingDelegations.deleteRecord(record);
+    }
+    for (let record of Array.from(
+        this.impl.storage.pendingDelegations.byChildChatId.get(chatId))) {
+      this.impl.storage.pendingDelegations.deleteRecord(record);
+    }
+
     // Clean up the chat's model-facing snapshots.
     for (let entry of this.impl.storage.chatModelData.list(
         {prefix: chatKeyPrefix(chatId)})) {
@@ -1268,7 +1288,10 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async retryAgent(chatId: number, modelId: string): Promise<void> {
     let userMeta = await retryOnDoReset(
-        () => this.#clientUser.getChatContext(modelId), this.impl.logger);
+        () => this.#clientUser.getChatContext(
+            modelId, this.impl.getChatAgentContext(chatId).botConfig?.selection),
+        this.impl.logger);
+
 
     let meta = this.impl.assertChatNotActive(chatId);
     if (!userMeta.aiModel) {

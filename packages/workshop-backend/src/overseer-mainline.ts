@@ -1,5 +1,5 @@
 import { RpcStub, RpcTarget } from "capnweb";
-import { UiBundle, WorkpieceId, ChatGadgetPinRecord, MainlineMergeGadget, ChatGadgetPinState, AiChatAuthorInfo, ConsoleLogSubscriber, ConsoleLogEvent, AffectedCollaborator, BlueprintBinding } from "@gadgets/workshop-shared/api";
+import { UiBundle, WorkpieceId, ChatGadgetPinRecord, MainlineMergeGadget, ChatGadgetPinState, AiChatAuthorInfo, ConsoleLogSubscriber, ConsoleLogEvent, AffectedCollaborator, BlueprintBinding, AGENT_SPAWNER_CONNECTION_ID } from "@gadgets/workshop-shared/api";
 import { requireTextFiles } from "@gadgets/workshop-shared/code-change";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import type { GadgetRecord } from "./storage-schema/overseer-storage";
@@ -353,11 +353,15 @@ export abstract class OverseerMainline extends OverseerChanges {
   }
 
   async listConnectableResources(vendorId: string): Promise<string> {
+    if (vendorId === AGENT_SPAWNER_CONNECTION_ID) {
+      return `"${vendorId}" is an agent spawner, which offers no resources: request one with ` +
+          `requestConnection, passing vendorId="${vendorId}" and no resourceUrl.`;
+    }
     let vendors = await this.listGatekeeperVendorsCached();
     let vendor = vendors.find(v => v.id === vendorId);
     if (!vendor) {
       return `Unknown vendor "${vendorId}". Available vendors: ` +
-          `${vendors.map(v => v.id).join(", ") || "(none)"}.`;
+          `${[...vendors.map(v => v.id), AGENT_SPAWNER_CONNECTION_ID].join(", ")}.`;
     }
     if (vendor.supportedResources.length === 0) {
       return `Vendor "${vendorId}" (${vendor.description.displayName}) offers no connectable ` +

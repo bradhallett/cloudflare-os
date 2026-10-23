@@ -224,12 +224,16 @@ export abstract class OverseerBlueprints extends OverseerBindings {
 
   // The bindings a blueprint declares that the gadget has none named for, in the form a
   // BlueprintMerge records them. `gadget` is absent for a gadget about to be created, which
-  // has no bindings at all.
+  // has no bindings at all. A spawner-only binding has no name in the gadget, so it is listed
+  // only when a missing agent spawner's agents get it.
   #missingBlueprintBindings(metadata: BlueprintMetadata, gadget?: GadgetRecord)
       : Pick<BlueprintMerge, "missingBindings"> {
     let bound = new Set(gadget && this.visibleBindings(gadget).map(([name]) => name));
-    let missing = Object.entries(metadata.bindings)
-        .filter(([name, binding]) => !binding.spawnerOnly && !bound.has(name));
+    let missing = Object.entries(metadata.bindings).filter(([name]) => !bound.has(name));
+    let spawnerFed = new Set(missing.flatMap(([, binding]) => binding.type === "agentSpawner"
+        ? Object.values(binding.env).flatMap(target => target.type === "binding" ? [target.name] : [])
+        : []));
+    missing = missing.filter(([name, binding]) => !binding.spawnerOnly || spawnerFed.has(name));
     return missing.length > 0 ? {missingBindings: Object.fromEntries(missing)} : {};
   }
 
@@ -558,19 +562,16 @@ export abstract class OverseerBlueprints extends OverseerBindings {
     // an edge becomes visible to mainline loads and the derived workspace default binding list.
     // (Reverted additions only survive on a reverted creation's record -- the revert deletes
     // covered edges synchronously otherwise -- but exclude them the same way for coherence.)
-    for (let gadget of this.storage.gadgets.list()) {
-      if (gadget.type !== "gadget") continue;  // worktrees have no binding edges
+    for (let holder of this.bindingHolders()) {
       let promoted = false;
-      for (let edge of Object.values(gadget.bindings)) {
+      for (let edge of Object.values(holder.bindings)) {
         if (edge.pending?.chatId === chatId && edge.pending.sequence !== undefined &&
             edge.pending.sequence <= mergeThrough && !revertedStamp(edge.pending)) {
           delete edge.pending;
           promoted = true;
         }
       }
-      if (promoted) {
-        this.storage.gadgets.put(gadget);
-      }
+      if (promoted) holder.save();
     }
 
     // Fast-forward each committed gadget's head.

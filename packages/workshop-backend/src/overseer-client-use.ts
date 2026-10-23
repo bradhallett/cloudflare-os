@@ -1,6 +1,6 @@
 import { RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
-import { Overseer, GadgetMetadata, WorkpieceId, WorkpiecesSubscriber, GadgetClient, GatekeeperClient, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, CodeChangeSubmission, CommitInfo, FileAtCommit, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AgentSpawnerConfig, ConsoleLogSubscriber, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, ObserverBindingNeed, BlueprintGadgetSummary, BlueprintScreenshotUpload, ChatAttachmentHandle, BoundHookInfo, PreApprovableAction, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest } from "@gadgets/workshop-shared/api";
+import { Overseer, GadgetMetadata, WorkpieceId, WorkpiecesSubscriber, GadgetClient, GatekeeperClient, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, CodeChangeSubmission, CommitInfo, FileAtCommit, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AgentSpawnerConfig, ConsoleLogSubscriber, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, ObserverBindingNeed, MessageFormatRef, BotSelection, BlueprintGadgetSummary, BlueprintScreenshotUpload, ChatAttachmentHandle, BoundHookInfo, PreApprovableAction, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest } from "@gadgets/workshop-shared/api";
 import { ActionKind } from "@gadgets/workshop-shared/gatekeeper";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { UserDurableObject } from "./user";
@@ -241,13 +241,17 @@ export class UseOverseerInterface extends RpcTarget implements Overseer {
       _subscriber: RpcStub<AiChatSubscriber>, _startAfter?: Date): Promise<RpcStub<{}>> {
     this.#deny();
   }
+  async viewChat(_chatId: number): Promise<RpcStub<{}>> { this.#deny(); }
   async newChat(_initialMessage: string | SlashCommandRequest, _modelId: string | null,
-                 _capsules?: CapsuleSpecifier[], _attachments?: ChatAttachmentHandle[]): Promise<number> {
+                 _capsules?: CapsuleSpecifier[], _attachments?: ChatAttachmentHandle[],
+                 _formats?: MessageFormatRef[], _bot?: BotSelection): Promise<number> {
     this.#deny();
   }
   async sendChatMessage(_chatId: number, _message: string | SlashCommandRequest,
                         _modelId: string | null,
-                        _capsules?: CapsuleSpecifier[], _attachments?: ChatAttachmentHandle[]): Promise<void> {
+                        _capsules?: CapsuleSpecifier[], _attachments?: ChatAttachmentHandle[],
+                        _formats?: MessageFormatRef[],
+                        _bot?: BotSelection | "none"): Promise<void> {
     this.#deny();
   }
   async uploadBlob(_content: Uint8Array): Promise<string> { this.#deny(); }

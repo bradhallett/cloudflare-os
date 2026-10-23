@@ -4,7 +4,7 @@ const CAPSULE_LINK_PREFIX = "/__gadgets_capsule__/";
 const CAPSULE_TOKEN_PREFIX = "GADGETS_CAPSULE_";
 const CAPSULE_TOKEN_SUFFIX = "_TOKEN";
 
-type MarkdownAstNode = {
+export type MarkdownAstNode = {
   type: string;
   value?: string;
   url?: string;

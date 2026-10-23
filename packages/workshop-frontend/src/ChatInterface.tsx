@@ -11,16 +11,22 @@ import { useKumoToastManager } from "@cloudflare/kumo";
 
 import { RpcStub } from "capnweb";
 import {
+  getStoredSelectedBot,
   getStoredSelectedModel,
+  sameBotSelection,
 } from "./modelSelection";
 import {
   Overseer,
   AiChatAuthorInfo,
+  AiChatMetadata,
   AiToolCall,
+  BotInfo,
+  BotSelection,
   ChatAttachmentRef,
   WorkpieceId,
   BlueprintOutput,
 } from "@gadgets/workshop-shared/api";
+import { logRpcFailure } from "./rpcErrors";
 import { ChatListPanel, type ChatListScope } from "./features/chat/ChatListPanel";
 import { ChatTranscript } from "./features/chat/ChatTranscript";
 import { ChatDialogs } from "./features/chat/ChatDialogs";
@@ -84,6 +90,19 @@ function fallbackToStoredModelSelection(
   }
 
   return getStoredSelectedModel(availableModels);
+}
+
+/**
+ * The display name of a chat's declared bot when that bot no longer resolves in the merged bot
+ * list (deleted, or a deployment bot that was removed): the picker shows it as a disabled
+ * "no longer available" row while the chat keeps running as a bare-model chat.
+ */
+function staleChatBotName(meta: AiChatMetadata, bots: BotInfo[]): string | undefined {
+  const bot = meta.bot;
+  if (!bot) return undefined;
+  return bots.some((candidate) => sameBotSelection(candidate.selection, bot))
+    ? undefined
+    : meta.botName;
 }
 
 interface ChatInterfaceProps {
@@ -171,7 +190,7 @@ function ChatInterface({
 }: ChatInterfaceProps) {
   // Persistent cache that survives reconnects
   const toasts = useKumoToastManager();
-  const { currentUser } = useAuthenticatedApi();
+  const { currentUser, authenticatedApi } = useAuthenticatedApi();
   const getOverseer = useCallback(() => overseer, [overseer]);
   const {
     cacheRef,
@@ -618,15 +637,44 @@ function ChatInterface({
     }
   }, [currentChatMetadata?.title]);
 
+  // Declared bots for the composer's agent picker, plus its pick (a chat's own bot wins while
+  // that chat is open; Home's stored pick covers the no-chat case).
+  const [bots, setBots] = useState<BotInfo[]>([]);
+  const [selectedBot, setSelectedBot] = useState<BotSelection | null>(null);
+
   // Update selected model when switching chats
   useEffect(() => {
     if (selectedChatId === null) {
       setSelectedModel(getStoredSelectedModel(availableModels));
+      setSelectedBot(getStoredSelectedBot(bots));
     } else {
       // An existing thread takes its active agent's model, else the one that last spoke.
       setSelectedModel(fallbackToStoredModelSelection(chatAgent?.id ?? null, availableModels));
+      // The chat's declared bot initializes the picker — but only while it still resolves and is
+      // usable; a stale or unavailable bot shows as a disabled row instead (staleChatBotName).
+      const metaBot = currentChatMetadata?.bot ?? null;
+      setSelectedBot(
+        metaBot === null || !bots.some((bot) => sameBotSelection(bot.selection, metaBot) && bot.available)
+          ? null
+          : metaBot);
     }
-  }, [selectedChatId, availableModels, chatAgent?.id]);
+  }, [selectedChatId, availableModels, chatAgent?.id, bots, currentChatMetadata?.bot]);
+
+  // Load the declared bots for the agent picker (user's own + deployment-wide). Retried on
+  // reconnect like the models fetch; a failure leaves the picker model-only.
+  useEffect(() => {
+    let cancelled = false;
+    authenticatedApi.listBots()
+      .then((list) => {
+        if (!cancelled) setBots(list);
+      })
+      .catch((err) => {
+        logRpcFailure("Failed to fetch bots:", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authenticatedApi]);
 
   // Reset per-chat UI state when selectedChatId changes
   useEffect(() => {
@@ -637,6 +685,14 @@ function ChatInterface({
     setIsEditingTitle(false);
     setSidebarActiveTab("chat");
   }, [selectedChatId]);
+
+  // While the chat is shown, the workspace keeps the model provider's cache of it warm. Disposing
+  // the call's promise disposes the lease it resolves to, even if it hasn't resolved yet.
+  useEffect(() => {
+    if (selectedChatId === null) return;
+    const lease = overseer.viewChat(selectedChatId);
+    return () => lease[Symbol.dispose]();
+  }, [overseer, selectedChatId]);
 
   // Sequence of the oldest message loaded, or undefined once the thread's start is loaded. Paging
   // asks for what precedes it, so the control disappears exactly when there is nothing earlier.
@@ -687,6 +743,8 @@ function ChatInterface({
     handleSend,
     handleNewChatSend,
     handleModelChange,
+    handleBotChange,
+    retryModelId,
     handleStop,
     handleSaveChatTitle,
     handleCancelTitleEdit,
@@ -713,6 +771,9 @@ function ChatInterface({
     selectedChatId,
     selectedModel,
     setSelectedModel,
+    bots,
+    selectedBot,
+    setSelectedBot,
     selectedChatIdRef,
     onNavigateToChatRef,
     cacheRef,
@@ -852,6 +913,9 @@ function ChatInterface({
       availableModels={availableModels}
       selectedModel={selectedModel}
       handleModelChange={handleModelChange}
+      bots={bots}
+      selectedBot={selectedBot}
+      handleBotChange={handleBotChange}
       showThinkingTraces={showThinkingTraces}
       toggleShowThinkingTraces={toggleShowThinkingTraces}
       handleNewChatSend={handleNewChatSend}
@@ -938,6 +1002,7 @@ function ChatInterface({
                 handleSaveChatTitle={handleSaveChatTitle}
                 handleCancelTitleEdit={handleCancelTitleEdit}
                 chatTitle={currentChatMetadata?.title}
+                botName={currentChatMetadata?.botName}
                 setIsEditingTitle={setIsEditingTitle}
                 handleDeleteChat={() => handleDeleteChat()}
               />
@@ -991,7 +1056,7 @@ function ChatInterface({
                   toggleErrorExpansion={toggleErrorExpansion}
                   setUsageModalOpen={setUsageModalOpen}
                   handleRetry={handleRetry}
-                  selectedModel={selectedModel}
+                  retryModelId={retryModelId}
                   lastMessageSequence={lastMessageSequence}
                   currentRowBuffer={currentRowBuffer}
                   currentHasUserDraftRows={currentHasUserDraftRows}
@@ -1018,6 +1083,12 @@ function ChatInterface({
                 selectedModel={selectedModel}
                 chatAgent={chatAgent}
                 handleModelChange={handleModelChange}
+                bots={bots}
+                selectedBot={selectedBot}
+                handleBotChange={handleBotChange}
+                staleBotName={currentChatMetadata
+                  ? staleChatBotName(currentChatMetadata, bots)
+                  : undefined}
                 pendingConsoleLogCount={pendingConsoleLogCount}
                 consoleLogPreview={consoleLogPreview}
                 consoleLogSeverity={consoleLogSeverity}

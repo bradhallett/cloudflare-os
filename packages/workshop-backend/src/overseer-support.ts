@@ -1,7 +1,7 @@
 import { WorkpieceId, CodeChangeSubmission, CollaboratorRole, SlashCommandRequest } from "@gadgets/workshop-shared/api";
 import { Gatekeeper } from "@gadgets/workshop-shared/gatekeeper";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
-import type { ExternalMessageRecord } from "./storage-schema/overseer-storage";
+import type { BindingRecord, ExternalMessageRecord } from "./storage-schema/overseer-storage";
 import type { ChatGatewayRpcTarget } from "@gadgets/workshop-shared/external-message-gateway";
 
 export const AGENT_RUNNING_ERROR_MESSAGE = "Agent is running, wait for it to finish.";
@@ -58,6 +58,31 @@ export type ExternalMessageSubmitInput = {
   chatGatewayRpcTarget: NativeRpcStub<ChatGatewayRpcTarget>;
   title: string;
 };
+
+// The binding edges one record holds -- a gadget's, or an agent spawner's -- and how to write
+// them back. `save(true)` also reloads a gadget, whose running env the edges are; a spawner
+// needs no reload, since each spawn reads its bindings afresh.
+/** Split out of the former overseer.ts (internal helper). */
+export type BindingHolder = {
+  id: WorkpieceId;
+  bindings: Record<string, BindingRecord>;
+  save(reload?: boolean): void;
+};
+
+// Throws unless `name` is free for a new edge in `bindings`, proposed in `chatId` if given. A
+// pending edge is invisible to other chats for reads but still occupies its name for writes:
+// allowing a second proposal under the same name would mean accepting both silently overwrites
+// one with the other.
+/** Split out of the former overseer.ts (internal helper). */
+export function assertBindingNameFree(
+    bindings: Record<string, BindingRecord>, name: string, chatId?: number): void {
+  let existing = bindings[name];
+  if (existing?.pending && existing.pending.chatId !== chatId) {
+    throw new Error(`The binding name "${name}" is already proposed by another chat. ` +
+        `Accept or revert that chat's changes first, or choose a different name.`);
+  }
+  if (existing) throw new Error(`There is already a binding named "${name}".`);
+}
 
 // If live change rows exist whose newest author differs from a new submission's author and the
 // stream has been idle this long, the older author's rows are materialized into their own

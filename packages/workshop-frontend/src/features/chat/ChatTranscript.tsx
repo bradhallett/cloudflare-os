@@ -124,7 +124,9 @@ export interface ChatTranscriptProps {
   toggleErrorExpansion: (messageKey: string) => void;
   setUsageModalOpen: (open: boolean) => void;
   handleRetry: () => Promise<void>;
-  selectedModel: string | null;
+  /** The model a retry runs on — a bot chat retries on its bot's declared model, not the
+   * composer's current pick (null disables the retry button). */
+  retryModelId: string | null;
   lastMessageSequence: number | undefined;
   currentRowBuffer: ChatChangeRowBuffer | null;
   currentHasUserDraftRows: boolean;
@@ -190,7 +192,7 @@ export function ChatTranscript({
   toggleErrorExpansion,
   setUsageModalOpen,
   handleRetry,
-  selectedModel,
+  retryModelId,
   lastMessageSequence,
   currentRowBuffer,
   currentHasUserDraftRows,
@@ -531,14 +533,12 @@ export function ChatTranscript({
                                     />
                                   </div>
                                 ) : msg.message.trim() && (
-                                  // pre-wrap renders users' single newlines as hard breaks.
-                                  <div className="whitespace-pre-wrap">
-                                    <MarkdownMessage
-                                      message={msg.message}
-                                      capsules={msg.capsules}
-                                      formats={msg.formats}
-                                    />
-                                  </div>
+                                  <MarkdownMessage
+                                    message={msg.message}
+                                    capsules={msg.capsules}
+                                    formats={msg.formats}
+                                    preserveLineBreaks
+                                  />
                                 )}
                               </div>
                               {endsUserGroup && (
@@ -816,7 +816,7 @@ export function ChatTranscript({
                                       <button
                                         type="button"
                                         onClick={() => handleRetry()}
-                                        disabled={selectedModel === null}
+                                        disabled={retryModelId === null}
                                         className="flex flex-shrink-0 cursor-pointer items-center gap-1 rounded-md px-1 py-0.5 text-[13px] leading-4 font-medium text-kumo-default transition-[color,opacity,transform] duration-150 ease-out hover:text-kumo-default-hover focus-visible:text-kumo-default-hover focus-visible:outline-none active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40"
                                       >
                                         <ArrowsClockwise size={12} weight="bold" />
@@ -1055,9 +1055,7 @@ export function ChatTranscript({
                       return (
                         <div key={index} className={`flex flex-col items-end ${sameAuthorAsPrevious ? "mt-2" : "mt-5"}`}>
                           <div className={`${userBubbleClassName} opacity-60`}>
-                            <div className="whitespace-pre-wrap">
-                              <MarkdownMessage message={steer.text} />
-                            </div>
+                            <MarkdownMessage message={steer.text} preserveLineBreaks />
                           </div>
                           {next?.author.id !== steer.author.id && (
                             <div className="mt-1 flex items-center justify-end gap-2 pr-1 text-[11px] leading-4 text-kumo-inactive">

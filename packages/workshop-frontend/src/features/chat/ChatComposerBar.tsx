@@ -5,6 +5,8 @@ import { RpcStub } from "capnweb";
 import {
   AiChatAuthorInfo,
   AiChatMetadata,
+  BotInfo,
+  BotSelection,
   Overseer,
 } from "@gadgets/workshop-shared/api";
 import { WorkshopButton } from "../../components/WorkshopControls";
@@ -31,6 +33,14 @@ export interface ChatComposerBarProps {
   /** The chat's own agent, so the picker can name a model it no longer offers. */
   chatAgent: AiChatAuthorInfo | null;
   handleModelChange: (modelId: string | null) => void;
+  /** Declared bots offered in the in-chat composer's agent picker (see ComposerModelSelector). */
+  bots: BotInfo[];
+  /** The picker's bot selection, or null when a model or "No agent" answers the chat. */
+  selectedBot: BotSelection | null;
+  /** Chooses a bot in the agent picker; null returns to a bare model. */
+  handleBotChange: (bot: BotSelection | null) => void;
+  /** The chat's own bot name when that bot no longer resolves; shown as a disabled picker row. */
+  staleBotName?: string;
   pendingConsoleLogCount: number;
   consoleLogPreview: string;
   consoleLogSeverity: "error" | "warn" | "info";
@@ -72,6 +82,10 @@ export function ChatComposerBar({
   selectedModel,
   chatAgent,
   handleModelChange,
+  bots,
+  selectedBot,
+  handleBotChange,
+  staleBotName,
   pendingConsoleLogCount,
   consoleLogPreview,
   consoleLogSeverity,
@@ -113,6 +127,11 @@ export function ChatComposerBar({
                       name: chatAgent?.id === selectedModel ? chatAgent.name : undefined,
                     }}
                     onModelChange={handleModelChange}
+                    bots={bots}
+                    selectedBot={selectedBot}
+                    onBotChange={handleBotChange}
+                    showModels
+                    staleBotName={staleBotName}
                     pendingConsoleLogCount={pendingConsoleLogCount}
                     consoleLogPreview={consoleLogPreview}
                     consoleLogSeverity={consoleLogSeverity}

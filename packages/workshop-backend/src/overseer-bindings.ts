@@ -10,6 +10,7 @@ import { OverseerAgents } from "./overseer-agents";
 import { stampBindHookAction } from "./overseer-action-log";
 import { fallbackBindingName } from "./overseer-binding-info";
 import type { CatalogGatekeeperFacet } from "./overseer-support";
+import { assertBindingNameFree } from "./overseer-support";
 
 /**
  * OverseerBindings: workpiece binding and chat binding preparation.
@@ -43,17 +44,7 @@ export abstract class OverseerBindings extends OverseerAgents {
       throw new Error(`The binding name \`${name}\` is reserved.`);
     }
     let gadget = this.getGadgetRecord(gadgetId);
-    let existing = gadget.bindings[name];
-    if (existing) {
-      // A pending edge is invisible to other chats for reads but still occupies its name for
-      // writes: allowing a second proposal under the same name would mean accepting both
-      // silently overwrites one with the other.
-      if (existing.pending && existing.pending.chatId !== chatId) {
-        throw new Error(`The binding name "${name}" is already proposed by another chat. ` +
-            `Accept or revert that chat's changes first, or choose a different name.`);
-      }
-      throw new Error(`There is already a binding named "${name}".`);
-    }
+    assertBindingNameFree(gadget.bindings, name, chatId);
     let targetRecord = this.storage.gatekeepers.get(target);
     if (!targetRecord) {
       let record = this.storage.gadgets.get(target);
@@ -98,20 +89,7 @@ export abstract class OverseerBindings extends OverseerAgents {
         await this.removeWorkpiece(record.id);
       }
     }
-    for (let gadget of this.storage.gadgets.list()) {
-      if (gadget.type !== "gadget") continue;  // worktrees have no binding edges
-      let removed = false;
-      for (let [name, edge] of Object.entries(gadget.bindings)) {
-        if (edge.pending?.chatId === chatId) {
-          delete gadget.bindings[name];
-          removed = true;
-        }
-      }
-      if (removed) {
-        this.storage.gadgets.put(gadget);
-        this.bumpVersion([gadget.id]);
-      }
-    }
+    this.deleteBindingEdges(edge => edge.pending?.chatId === chatId);
   }
 
   /**

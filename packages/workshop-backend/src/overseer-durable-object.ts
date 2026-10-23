@@ -1,16 +1,15 @@
 import { RpcStub, RpcTarget } from "capnweb";
-import { Overseer, WorkpieceId, AiChatMetadata, AgentSpawnerConfig, ConsoleLogEvent, CollaboratorRole, ObserverConfigCallback, BlueprintMetadata, BlueprintOutput, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName } from "@gadgets/workshop-shared/api";
+import { Overseer, ConsoleLogEvent, CollaboratorRole, ObserverConfigCallback, BlueprintMetadata, BlueprintOutput, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName } from "@gadgets/workshop-shared/api";
 import { ApprovalQueue } from "@gadgets/workshop-shared/gatekeeper";
 import { DurableObject, RpcStub as NativeRpcStub, restore } from "cloudflare:workers";
 import { chatKeyPrefix } from "./storage-schema/overseer-storage";
-import type { AiChatAgentContext, ExternalChatRecord, GatekeeperCaller } from "./storage-schema/overseer-storage";
+import type { ExternalChatRecord, GatekeeperCaller } from "./storage-schema/overseer-storage";
 import type { WorkspaceOutputEntry } from "./storage-schema/user-storage";
 import { commitIdentityForAuthor } from "./git-store";
 import { OVERSEER_STORAGE_VERSION } from "./storage-schema/overseer-migrations";
 import { readAdminConfig } from "./admin-config";
 import { ambientGatekeeperMode } from "./provisioning-policy";
 import { releaseMergeHeader } from "./blueprint-release";
-import type { CallableAgent, SpawnCallableOptions } from "./agent-spawner-binding";
 import { retryOnDoReset } from "./do-retry";
 import type { SubmitExternalMessageResult } from "@gadgets/workshop-shared/external-message-gateway";
 import { OverseerImpl } from "./overseer-impl";
@@ -515,102 +514,6 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
         chatId, methodName, args, initiatorUserId, initiatorModelId);
   }
 
-  /** Implements AgentSpawnerBinding.spawn(): the agent starts at once on `prompt`. */
-  async spawnAgent(
-      title: string, prompt: string, config: AgentSpawnerConfig,
-      creatorUserId?: string): Promise<void> {
-    let {chatId, meta, userMeta, author, initiatorUserId} =
-        await this.#createSpawnedChat(title, config, creatorUserId);
-
-    if (userMeta.aiModel) {
-      meta.activeAgent = userMeta.aiModel.profile;
-      this.impl.storage.chatMeta.put(meta);
-    }
-
-    this.impl.storage.chats.put({
-      chatId,
-      sequence: this.impl.nextChatSequence(chatId),
-      timestamp: meta.started,
-      author,
-
-      type: "message",
-      message: prompt,
-    });
-
-    if (userMeta.aiModel) {
-      // Fire off the agent (asynchronously).
-      this.impl.startAgent(chatId, userMeta.aiModel, author, initiatorUserId);
-    } else {
-      // TODO: Flag as needing user attention.
-    }
-  }
-
-  /**
-   * Implements AgentSpawnerBinding.spawnCallable(): the chat is created with no messages, and
-   * the agent starts when the first call is made on the returned stub. The declarations the agent
-   * implements are frozen on the chat context, where the system-prompt builder reads them.
-   */
-  async spawnCallableAgent(
-      title: string, options: SpawnCallableOptions, config: AgentSpawnerConfig,
-      creatorUserId?: string): Promise<CallableAgent> {
-    let {chatId, initiatorUserId} =
-        await this.#createSpawnedChat(title, config, creatorUserId, options);
-
-    // A stub that delivers calls to the new chat thread, like the `self` magic object. Each call
-    // is recorded by deliverAgentCallback(), which starts the agent when it is idle; with no
-    // model configured, calls are still appended to the chat, for a human to pick up.
-    return this.impl.ctx.exports.AgentSelfLoopback({props: {
-      overseerId: this.impl.ctx.id.toString(),
-      chatId,
-      initiatorUserId,
-      initiatorModelId: config.modelId,
-    }}) as unknown as CallableAgent;
-  }
-
-  // Creates the chat for a spawned agent: its metadata, and a context carrying the frozen spawner
-  // config (plus, for a callable agent, the interface declarations) and the seed binding layer.
-  // Writes no messages; the caller decides how the chat starts.
-  async #createSpawnedChat(
-      title: string, config: AgentSpawnerConfig, creatorUserId: string | undefined,
-      spawnerTypes?: SpawnCallableOptions) {
-    if (!this.impl.ownerId) throw new Error("Workspace has been deleted.");
-
-    // Resolve the model from the creating user's account (falls back to owner for
-    // bindings created before collaborator support).
-    let resolveUserId = creatorUserId ?? this.impl.ownerId;
-    let initiatorUserId = this.impl.users.idFromString(resolveUserId).toString();
-    let user = this.impl.users.get(this.impl.users.idFromString(resolveUserId));
-    let userMeta = await user.getChatContext(config.modelId);
-
-    let chatId = this.impl.nextChatId();
-    let timestamp = this.impl.getChatTimestamp();
-    let meta: AiChatMetadata = {
-      id: chatId,
-      title,
-      started: timestamp,
-      lastActive: timestamp,
-      spawnerName: config.displayName,
-    };
-    this.impl.storage.chatMeta.put(meta);
-
-    // Snapshot the spawner's configured bindings as the chat's seed binding layer -- the spawned
-    // agent sees only these, never the workspace default list. Entries whose targets no longer
-    // exist are dropped.
-    let bindings: Record<string, WorkpieceId> = Object.create(null);
-    for (let [name, target] of Object.entries(config.env)) {
-      if (this.impl.storage.gadgets.get(target)?.type === "gadget" ||
-          this.impl.storage.gatekeepers.get(target)) {
-        bindings[name] = target;
-      }
-    }
-
-    let context: AiChatAgentContext = {chatId, spawnerConfig: config, bindings};
-    if (spawnerTypes) context.spawnerTypes = spawnerTypes;
-    this.impl.storage.chatContext.put(context);
-
-    let author = this.impl.gadgetAuthorFor(userMeta.profile);
-    return {chatId, meta, userMeta, author, initiatorUserId};
-  }
 
   [restore](params: OverseerRestoreParams): any {
     return this.impl.restore(params);

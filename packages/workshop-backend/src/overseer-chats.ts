@@ -29,6 +29,8 @@ export abstract class OverseerChats extends OverseerCore {
    * removes them itself.)
    */
   destroyLiveChat(chatId: number) {
+    this.settleSubagentWaiters(chatId);
+    this.cacheWarmer.end(chatId, "deleted");
     this.resumeErrors.delete(chatId);
     this.unregisterRunningAgent(chatId);
     let meta = this.storage.chatMeta.get(chatId);
@@ -200,6 +202,11 @@ export abstract class OverseerChats extends OverseerCore {
       if (ids.has(record.id) || record.type !== "gadget") continue;
       if (record.pending?.chatId === chatId ||
           Object.values(record.bindings).some(edge => edge.pending?.chatId === chatId)) {
+        ids.add(record.id);
+      }
+    }
+    for (let record of this.storage.gatekeepers.list()) {
+      if (Object.values(record.bindings ?? {}).some(edge => edge.pending?.chatId === chatId)) {
         ids.add(record.id);
       }
     }

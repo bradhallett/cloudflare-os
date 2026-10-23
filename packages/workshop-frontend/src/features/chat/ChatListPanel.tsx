@@ -5,6 +5,7 @@ import {
   Check,
   DotsThreeVertical,
   Pencil,
+  Robot,
   Trash,
 } from "@phosphor-icons/react";
 import { RpcStub } from "capnweb";
@@ -12,6 +13,8 @@ import {
   Overseer,
   AiChatAuthorInfo,
   AiChatMetadata,
+  BotInfo,
+  BotSelection,
 } from "@gadgets/workshop-shared/api";
 import { WorkshopIconButton } from "../../components/WorkshopControls";
 import { isImeComposing } from "../../keyboardEvent";
@@ -110,6 +113,12 @@ export interface ChatListPanelProps {
   availableModels: AiChatAuthorInfo[];
   selectedModel: string | null;
   handleModelChange: (modelId: string | null) => void;
+  /** Declared bots offered in the intake composer's agent picker (see ComposerModelSelector). */
+  bots: BotInfo[];
+  /** The intake picker's bot selection, or null when a model or "No agent" answers. */
+  selectedBot: BotSelection | null;
+  /** Chooses a bot in the intake picker; null returns to a bare model. */
+  handleBotChange: (bot: BotSelection | null) => void;
   showThinkingTraces: boolean;
   toggleShowThinkingTraces: () => void;
   handleNewChatSend: ChatComposerProps["onSend"];
@@ -143,6 +152,9 @@ export function ChatListPanel({
   availableModels,
   selectedModel,
   handleModelChange,
+  bots,
+  selectedBot,
+  handleBotChange,
   showThinkingTraces,
   toggleShowThinkingTraces,
   handleNewChatSend,
@@ -334,6 +346,15 @@ export function ChatListPanel({
                             <span className="flex-shrink-0" aria-hidden="true">·</span>
                           </>
                         )}
+                        {chat.botName && (
+                          <>
+                            <span className="truncate inline-flex min-w-0 items-center gap-1">
+                              <Robot size={11} weight="fill" className="flex-shrink-0" />
+                              <span className="truncate">{chat.botName}</span>
+                            </span>
+                            <span className="flex-shrink-0" aria-hidden="true">·</span>
+                          </>
+                        )}
                         <span className="flex-shrink-0">
                           {formatChatRowTime(chat.lastActive, bucket, chatListNow)}
                         </span>
@@ -412,6 +433,9 @@ export function ChatListPanel({
             models={availableModels}
             selectedModel={selectedModel === null ? null : { id: selectedModel }}
             onModelChange={handleModelChange}
+            bots={bots}
+            selectedBot={selectedBot}
+            onBotChange={handleBotChange}
             showThinkingTraces={showThinkingTraces}
             onToggleThinkingTraces={toggleShowThinkingTraces}
             minRows={2}

@@ -5,6 +5,10 @@ import type { FileContent, CodeContent } from "@gadgets/workshop-shared/code-cha
 import { Gatekeeper, ObservationAuthorizer } from "@gadgets/workshop-shared/gatekeeper";
 import { DurableObject, RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { chatKeyPrefix } from "./storage-schema/overseer-storage";
+import type { AiChatAgentContext } from "./storage-schema/overseer-storage";
+import { formatBotSection } from "./bot-config";
+import type { ResolvedBotSkill, UnavailableBotSkill } from "./bot-config";
+import type { UserChatContext } from "./user";
 import type { ActionRecord, ChatBindingEntry, GatekeeperClass, GatekeeperRecord } from "./storage-schema/overseer-storage";
 import { GIT_BINDING_NAME } from "./agent";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
@@ -435,22 +439,15 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
 
   /**
    * Destroy a gatekeeper (connection) workpiece. Any binding edges pointing at it are severed so
-   * no gadget's env retains a dangling entry. (This is distinct from merely unbinding it from one
-   * gadget -- GadgetClient.unbind() -- which leaves the gatekeeper alive, possibly orphaned.)
+   * no gadget's or agent spawner's env retains a dangling entry. (This is distinct from merely
+   * unbinding it from one gadget -- GadgetClient.unbind() -- which leaves the gatekeeper alive,
+   * possibly orphaned.)
    */
   removeGatekeeper(id: number) {
-    for (let gadget of Array.from(this.storage.gadgets.list())) {
-      if (gadget.type !== "gadget") continue;  // worktrees have no binding edges
-      let names = Object.entries(gadget.bindings)
-          .filter(([, edge]) => edge.target === id)
-          .map(([name]) => name);
-      if (names.length > 0) {
-        for (let name of names) {
-          delete gadget.bindings[name];
-        }
-        this.storage.gadgets.put(gadget);
-        this.bumpVersion([gadget.id]);
-      }
+    // An agent spawner is proposed by the chats with edges pending on it.
+    let affectedChats = this.chatsProposing(id);
+    for (let chatId of this.deleteBindingEdges(edge => edge.target === id)) {
+      affectedChats.add(chatId);
     }
 
     // Pushes still queued against this gatekeeper can never apply once it is gone; clean up
@@ -485,6 +482,7 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
 
     this.ctx.facets.delete(`gatekeeper${id}`);
     this.storage.gatekeepers.delete(id);
+    this.rebroadcastChatMeta(affectedChats);
   }
 
   protected async prepareWorkspaceAttachmentFiles(
@@ -601,10 +599,10 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
   }
 
   /**
-   * Describe a workpiece -- a gadget or a gatekeeper -- reachable as `envName` in a chat's env,
-   * for the agent's describeBinding tool.
+   * Describe a workpiece -- a gadget or a gatekeeper -- reachable as `envName` in chat `chatId`'s
+   * env, for the agent's describeBinding tool.
    */
-  async describeBinding(envName: string, id: WorkpieceId): Promise<string> {
+  async describeBinding(envName: string, id: WorkpieceId, chatId: number): Promise<string> {
     let gadget = this.storage.gadgets.get(id);
     if (gadget?.type === "worktree") {
       return `Binding: ${envName}\n` +
@@ -639,10 +637,11 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
     if (!gatekeeper) {
       throw new Error(`The resource behind ${envName} no longer exists.`);
     }
-    return this.describeGatekeeper(envName, gatekeeper);
+    return this.describeGatekeeper(envName, gatekeeper, chatId);
   }
 
-  async describeGatekeeper(name: string, gatekeeper: GatekeeperRecord): Promise<string> {
+  async describeGatekeeper(name: string, gatekeeper: GatekeeperRecord, chatId: number)
+      : Promise<string> {
     let facet = await this.getGatekeeperFacet(gatekeeper.id);
 
     let desc = await facet.describe();
@@ -657,10 +656,28 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
             : "") +
         `\n` +
         `The binding comes with the following bundle of TypeScript type definitions:\n` +
-        `\n` +
         `\`\`\`\n` +
         `${types}\n` +
-        `\`\`\`\n`;
+        `\`\`\`\n` +
+        this.#describeSpawnerBindings(gatekeeper, chatId);
+  }
+
+  // An agent spawner's bindings visible to the chat, for describeGatekeeper(); "" for any other
+  // gatekeeper.
+  #describeSpawnerBindings(gatekeeper: GatekeeperRecord, chatId: number): string {
+    let {bindings} = gatekeeper;
+    if (!bindings) return "";
+    let lines = this.visibleBindings({bindings}, chatId).map(([name, edge]) => {
+      let title = this.storage.gadgets.get(edge.target)?.title ??
+          this.storage.gatekeepers.get(edge.target)?.resourceTitle;
+      return `* ${name}: ${title === undefined ? "(title unavailable)" : JSON.stringify(title)}` +
+          (edge.pending ? " (proposed in this chat: spawned agents get it once the user " +
+                          "accepts this chat's changes)" : "");
+    });
+    return `\n` +
+        `Each agent this spawner starts gets the following bindings in its env.\n` +
+        `\n` +
+        `${lines.join("\n") || "(none)"}\n`;
   }
 
   async listSlashCommands(): Promise<SlashCommandChoice[]> {
@@ -766,5 +783,86 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
       default:
         throw new TypeError("Unknown restore params: " + JSON.stringify(params));
     }
+  }
+
+  // =======================================================================================
+  // Declared bots: the chat snapshot and workspace-scoped skill resolution
+  // (see src/bot-config.ts; the bots' runtime -- subagents and DMs -- is overseer-bots.ts)
+  // =======================================================================================
+
+  // The snapshot a bot chat carries (newChat, a mid-chat switch, and every bot child chat):
+  // the frozen declaration as botConfig, this workspace's skill resolution, and the composed
+  // prompt section. One await (the skill resolution); callers persist it in their own storage
+  // transaction so the snapshot lands atomically with what references it.
+  protected async snapshotBotForChat(bot: NonNullable<UserChatContext["bot"]>): Promise<{
+      botConfig: NonNullable<AiChatAgentContext["botConfig"]>;
+      botSkills: ResolvedBotSkill[];
+      unavailableBotSkills: UnavailableBotSkill[];
+      botSection: string;
+  }> {
+    let {resolved, unavailable} = await this.#resolveBotSkills(bot.skills);
+    return {
+      botConfig: {
+        selection: bot.selection,
+        name: bot.name,
+        ...(bot.description !== undefined ? {description: bot.description} : {}),
+        instructions: bot.instructions,
+        modelId: bot.modelId,
+        skills: bot.skills,
+      },
+      botSkills: resolved,
+      unavailableBotSkills: unavailable,
+      botSection: formatBotSection(bot, resolved, unavailable),
+    };
+  }
+
+  // Resolve a bot's declared skills against this workspace's usable connections: a ref matches
+  // a {vendorId, commandId} pair some usable gatekeeper offers (see listSlashCommands for the
+  // same usability rules). Resolution is workspace-scoped -- a collaborator's bot may declare a
+  // skill the workspace cannot resolve, which is recorded, not silent; invoking a workspace
+  // skill grants no authority any chat there lacks. Two same-vendor records offering the same
+  // commandId are ambiguous and resolve to nothing, never first-match.
+  async #resolveBotSkills(skills: {vendorId: string; commandId: string; name: string}[]): Promise<
+      {resolved: ResolvedBotSkill[]; unavailable: UnavailableBotSkill[]}> {
+    let resolved: ResolvedBotSkill[] = [];
+    let unavailable: UnavailableBotSkill[] = [];
+    let providers: {vendorId: string; gatekeeperId: number;
+        commands: {id: string; name: string; description: string}[]}[] = [];
+    for (let record of this.storage.gatekeepers.list()) {
+      if (!record.hasSlashCommands || !this.gatekeeperUsable(record.id)) continue;
+      let vendorId = gatekeeperVendorId(record);
+      if (!vendorId) continue;
+      try {
+        let facet = await this.getGatekeeperFacet(record.id) as Fetcher<Gatekeeper<any> &
+            Required<Pick<Gatekeeper<any>, "getSlashCommandProvider">>>;
+        using provider = await facet.getSlashCommandProvider();
+        providers.push({vendorId, gatekeeperId: record.id, commands: await provider.list()});
+      } catch {
+        // A connection that cannot be driven from here offers nothing; skip it.
+      }
+    }
+    for (let skill of skills) {
+      let matches = providers.flatMap(provider => provider.vendorId !== skill.vendorId ? [] :
+          provider.commands
+              .filter(command => command.id === skill.commandId)
+              .map(command => ({provider, command})));
+      if (matches.length === 1) {
+        let {provider, command} = matches[0]!;
+        resolved.push({
+          gatekeeperId: provider.gatekeeperId,
+          commandId: command.id,
+          title: command.name,
+          description: command.description,
+        });
+      } else {
+        if (matches.length > 1) {
+          this.logger.warn("bot skill is ambiguous across connections", {
+            event: "bot.skill.ambiguous", vendorId: skill.vendorId, commandId: skill.commandId,
+          });
+        }
+        unavailable.push({vendorId: skill.vendorId, commandId: skill.commandId, name: skill.name});
+      }
+    }
+    return {resolved, unavailable};
   }
 }

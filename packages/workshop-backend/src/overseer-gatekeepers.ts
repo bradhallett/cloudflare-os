@@ -1,9 +1,9 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
-import { WorkpieceId, GatekeeperClient, AiChatMessage, AiChatAuthorInfo, AiChatMessageBody, GatekeeperCreationSpec, validateBindingName } from "@gadgets/workshop-shared/api";
+import { WorkpieceId, GatekeeperClient, AiChatMessage, AiChatAuthorInfo, AiChatMessageBody, GatekeeperCreationSpec, validateBindingName, AGENT_SPAWNER_CONNECTION_ID } from "@gadgets/workshop-shared/api";
 import { Gatekeeper, ActionDescription, ObservationDescription, resolveRequestedResource, HookController, HookDescription } from "@gadgets/workshop-shared/gatekeeper";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { chatKeyPrefix } from "./storage-schema/overseer-storage";
-import type { ActionRecord, GatekeeperCaller, GatekeeperClass, GatekeeperRecord } from "./storage-schema/overseer-storage";
+import type { ActionRecord, BindingRecord, GatekeeperCaller, GatekeeperClass, GatekeeperRecord } from "./storage-schema/overseer-storage";
 import { WorktreeSessionImpl } from "./worktree-session";
 import { GitImpl } from "./git-binding";
 import { GadgetExportsImpl } from "./exports-session";
@@ -12,7 +12,7 @@ import { autoApprovalRule } from "./auto-approval";
 import { retryOnDoReset } from "./do-retry";
 import { OverseerBlueprints } from "./overseer-blueprints";
 import type { SessionKind } from "./overseer-support";
-import { ApprovalQueueImpl, GatekeeperClientImpl } from "./overseer-gatekeeper-client";
+import { ApprovalQueueImpl, GatekeeperClientImpl, AgentSpawnerQueueImpl } from "./overseer-gatekeeper-client";
 import type { BindingLoopbackTarget } from "./overseer-loopbacks";
 import { BUILTIN_TOOL_GATEKEEPER_ID } from "./overseer-chat-attachments";
 import { gatekeeperVendorId } from "./overseer-binding-info";
@@ -100,21 +100,9 @@ export abstract class OverseerGatekeepers extends OverseerBlueprints {
     let doomed = this.listPendingGadgets(chatId).filter(gadget =>
         gadget.pending!.sequence !== undefined && gadget.pending!.sequence >= revertFrom);
     let doomedIds = new Set(doomed.map(gadget => gadget.id));
-    for (let gadget of this.storage.gadgets.list()) {
-      if (gadget.type !== "gadget" || doomedIds.has(gadget.id)) continue;
-      let removed = false;
-      for (let [name, edge] of Object.entries(gadget.bindings)) {
-        if (edge.pending?.chatId === chatId && edge.pending.sequence !== undefined &&
-            edge.pending.sequence >= revertFrom) {
-          delete gadget.bindings[name];
-          removed = true;
-        }
-      }
-      if (removed) {
-        this.storage.gadgets.put(gadget);
-        this.bumpVersion([gadget.id]);
-      }
-    }
+    this.deleteBindingEdges((edge, holder) => !doomedIds.has(holder) &&
+        edge.pending?.chatId === chatId && edge.pending.sequence !== undefined &&
+        edge.pending.sequence >= revertFrom);
 
     let timestamp = this.getChatTimestamp();
 
@@ -200,6 +188,9 @@ export abstract class OverseerGatekeepers extends OverseerBlueprints {
     this.refoldChatCompactions(chatId, revertFrom, [...messages, revertMessage]);
     this.storage.chatMeta.put(meta);
     this.proposedChangesChanged(chatId);
+    // Replay hides the results of reads of reverted content (see agent.ts), so the next request
+    // no longer starts with the one being kept warm.
+    this.cacheWarmer.end(chatId, "revert");
 
     // Only now delete the provisional gadgets whose creation the revert rejected -- the revert
     // message is also how the agent learns of the rejection on its next turn (revert messages
@@ -220,7 +211,7 @@ export abstract class OverseerGatekeepers extends OverseerBlueprints {
    */
   async addGatekeeper(
       cls: GatekeeperClass, creationSpec: GatekeeperCreationSpec, actorUserId: string,
-      joinAs?: SessionKind)
+      joinAs?: SessionKind, bindings?: Record<string, BindingRecord>)
       : Promise<GatekeeperClient<any>> {
     let id = this.allocateWorkpieceId();
     let gatekeeperRecord: GatekeeperRecord = {
@@ -228,6 +219,7 @@ export abstract class OverseerGatekeepers extends OverseerBlueprints {
       class: cls,
       creationSpec,
     };
+    if (bindings) gatekeeperRecord.bindings = bindings;
 
     // The record is published only once, below, after describe() resolves -- the facet takes the
     // class directly so it needs no record to exist yet. Publishing it before the await instead
@@ -634,8 +626,11 @@ export abstract class OverseerGatekeepers extends OverseerBlueprints {
       id: number, facet: Fetcher<Gatekeeper<Session>>, caller: GatekeeperCaller)
       : Promise<RpcStub<Session>> {
     this.assertGatekeeperUsable(id);
+    let queue = this.storage.gatekeepers.get(id)?.creationSpec?.type === "agentSpawner"
+        ? new AgentSpawnerQueueImpl(this.self(), id, caller)
+        : new ApprovalQueueImpl(this.self(), id, caller);
     // @ts-expect-error TODO: Remove annotation when Cap'n Web fixes cyclic type issues
-    return facet.startSession(new ApprovalQueueImpl(this, id, caller));
+    return facet.startSession(queue);
   }
 
   consumeCapturedActions(chatId: number)
@@ -671,13 +666,34 @@ export abstract class OverseerGatekeepers extends OverseerBlueprints {
     // its shape here defensively (this is the boundary that persists it).
     validateBindingName(input.bindingName);
 
+    if (input.vendorId === AGENT_SPAWNER_CONNECTION_ID) {
+      if (input.resourceUrl !== undefined) {
+        return { requested: false, message:
+            `Cannot request an agent spawner with a resourceUrl; omit it.` };
+      }
+      this.#captureConnectionRequest(chatId, {
+        type: "connectionRequest",
+        requestId: `${chatId}:${crypto.randomUUID()}`,
+        vendorId: input.vendorId,
+        vendorName: "Agent spawner",
+        reason: input.reason,
+        state: "pending",
+        bindingName: input.bindingName,
+      });
+      return { requested: true, message:
+          `Agent spawner request sent to the user. Awaiting their decision; your turn will end ` +
+          `now. If they accept, you'll be resumed with the spawner in your env; if they deny, ` +
+          `your turn stays ended until the user messages you.` };
+    }
+
     // Resolve the vendor's display name (and validate it exists).
     let vendors = await this.listGatekeeperVendorsCached();
     let vendor = vendors.find(v => v.id === input.vendorId);
     if (!vendor) {
+      let available = [...vendors.map(v => v.id), AGENT_SPAWNER_CONNECTION_ID].join(", ");
       return { requested: false, message:
           `Cannot request a connection: unknown vendor "${input.vendorId}". ` +
-          `Available vendors: ${vendors.map(v => v.id).join(", ") || "(none)"}.` };
+          `Available vendors: ${available}.` };
     }
 
     // Resolve the exact resource this request maps to, using the same precedence the accept modal
@@ -689,10 +705,9 @@ export abstract class OverseerGatekeepers extends OverseerBlueprints {
           `Cannot request a connection for "${vendor.description.displayName}": ${resolved.reason}` };
     }
 
-    let requestId = `${chatId}:${crypto.randomUUID()}`;
-    let body: AiChatMessageBody = {
+    this.#captureConnectionRequest(chatId, {
       type: "connectionRequest",
-      requestId,
+      requestId: `${chatId}:${crypto.randomUUID()}`,
       vendorId: input.vendorId,
       vendorName: vendor.description.displayName,
       vendorLogoUrl: vendor.description.logo?.url,
@@ -704,19 +719,23 @@ export abstract class OverseerGatekeepers extends OverseerBlueprints {
       // Claims the name in the chat's scope from this moment until denial; on acceptance the
       // resource enters the chat's env under it.
       bindingName: input.bindingName,
-    };
+    });
 
+    return { requested: true, message:
+        `Connection request sent to the user for "${vendor.description.displayName}". ` +
+        `Awaiting their decision; your turn will end now. If they accept, you'll be resumed with ` +
+        `access to the resource; if they deny, your turn stays ended until the user messages you.` };
+  }
+
+  // Holds a connection request until the agent loop records it with the step's messages (see
+  // consumeCapturedConnectionRequests).
+  #captureConnectionRequest(chatId: number, body: AiChatMessageBody): void {
     let list = this.#capturedConnectionRequests.get(chatId);
     if (!list) {
       list = [];
       this.#capturedConnectionRequests.set(chatId, list);
     }
     list.push(body);
-
-    return { requested: true, message:
-        `Connection request sent to the user for "${vendor.description.displayName}". ` +
-        `Awaiting their decision; your turn will end now. If they accept, you'll be resumed with ` +
-        `access to the resource; if they deny, your turn stays ended until the user messages you.` };
   }
 
   consumeCapturedConnectionRequests(chatId: number): AiChatMessageBody[] {

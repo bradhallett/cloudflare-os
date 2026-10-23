@@ -3,11 +3,13 @@ import {
   File as FileIcon,
   GitBranch,
   Globe,
+  Lightning,
   LinkSimple,
   MagnifyingGlass,
   PencilSimple,
   Plus,
   Question,
+  Robot,
   Terminal,
 } from "@phosphor-icons/react";
 import type { AiToolCall, BlueprintOutput, WorkpieceId } from "@gadgets/workshop-shared/api";
@@ -138,6 +140,12 @@ export function getToolCallSummary(
       return { verb: "Requested connection", target: tc.input.vendorId };
     case "createExternalResource":
       return { verb: "Created", target: tc.input.title };
+    case "activateSkill":
+      return { verb: "Activated skill", target: tc.input.skill };
+    case "delegateToBot":
+      return { verb: "Delegated to bot", target: tc.input.bot };
+    case "messageBot":
+      return { verb: "Sent direct message", target: tc.input.to };
   }
   // Compile-time exhaustiveness check.
   const _exhaustive: never = tc;
@@ -198,6 +206,12 @@ function describeToolCallCount(toolName: AiToolCall["toolName"], count: number):
       return count === 1 ? "Requested a connection" : `Requested ${count} connections`;
     case "createExternalResource":
       return `Created ${pluralize(count, "external resource")}`;
+    case "activateSkill":
+      return `Activated ${pluralize(count, "skill")}`;
+    case "delegateToBot":
+      return count === 1 ? "Delegated to a bot" : `Delegated ${count} subtasks`;
+    case "messageBot":
+      return `Sent ${pluralize(count, "direct message")}`;
   }
   const _exhaustive: never = toolName;
   return _exhaustive;
@@ -237,6 +251,11 @@ export function getToolIcon(
       return MagnifyingGlass;
     case "giveUp":
       return Question;
+    case "activateSkill":
+      return Lightning;
+    case "delegateToBot":
+    case "messageBot":
+      return Robot;
     default:
       return Question;
   }
@@ -302,6 +321,9 @@ function getProvisionalToolVerb(toolName: AiToolCall["toolName"]): string {
     case "listConnectableResources": return "Listing connectable resources";
     case "requestConnection": return "Requesting a connection";
     case "createExternalResource": return "Creating external resource";
+    case "activateSkill": return "Activating a skill";
+    case "delegateToBot": return "Delegating to a bot";
+    case "messageBot": return "Sending a direct message";
   }
   const _exhaustive: never = toolName;
   return _exhaustive;
@@ -329,6 +351,9 @@ function describeProvisionalToolCount(toolName: AiToolCall["toolName"], count: n
     case "listConnectableResources": return "Listing connectable resources";
     case "requestConnection": return `Requesting ${pluralize(count, "connection")}`;
     case "createExternalResource": return `Creating ${pluralize(count, "external resource")}`;
+    case "activateSkill": return `Activating ${pluralize(count, "skill")}`;
+    case "delegateToBot": return `Delegating ${pluralize(count, "subtask")}`;
+    case "messageBot": return `Sending ${pluralize(count, "direct message")}`;
   }
   const _exhaustive: never = toolName;
   return _exhaustive;

@@ -6,6 +6,8 @@ import {
 import {
   AiChatMessage,
   AiChatMetadata,
+  BotInfo,
+  BotSelection,
   CapsuleSpecifier,
   ChatAttachmentHandle,
   GatekeeperClient,
@@ -18,7 +20,7 @@ import type { ChatContentReader } from "../code/otClient";
 import { commitFileStore, type CommitFileReader } from "../code/commitFileStore";
 import { hookToggleFailureToast } from "../../components/HookToggle";
 import { logRpcFailure, rpcFailureDescription } from "../../rpcErrors";
-import { persistSelectedModel } from "../../modelSelection";
+import { persistSelectedBot, persistSelectedModel, sameBotSelection } from "../../modelSelection";
 import { copyToClipboard } from "../../clipboard";
 import {
   findUnresolvedConflicts,
@@ -45,6 +47,11 @@ export interface UseChatActionsArgs {
   selectedChatId: number | null;
   selectedModel: string | null;
   setSelectedModel: Dispatch<SetStateAction<string | null>>;
+  /** Declared bots offered in the composer's agent picker (see AuthenticatedApi.listBots). */
+  bots: BotInfo[];
+  /** The picker's bot selection, or null when a model or "No agent" answers the chat. */
+  selectedBot: BotSelection | null;
+  setSelectedBot: Dispatch<SetStateAction<BotSelection | null>>;
   /** Mirrors selectedChatId for callbacks that must not capture a stale id. */
   selectedChatIdRef: { current: number | null };
   /** Latest onNavigateToChat, for callbacks built once that must call the current one. */
@@ -99,6 +106,9 @@ export function useChatActions({
   selectedChatId,
   selectedModel,
   setSelectedModel,
+  bots,
+  selectedBot,
+  setSelectedBot,
   selectedChatIdRef,
   onNavigateToChatRef,
   cacheRef,
@@ -139,6 +149,7 @@ export function useChatActions({
     capsules?: CapsuleSpecifier[],
     attachments?: ChatAttachmentHandle[],
     formats?: MessageFormatRef[],
+    bot?: BotSelection | "none",
   ) => {
     const message = typeof messageText === "string" ? messageText.trim() : messageText ?? "";
     if (!message && (!attachments || attachments.length === 0)) return;
@@ -150,7 +161,8 @@ export function useChatActions({
       if (selectedChatId === null) {
         // Create a new chat (with optional capsules).
         const newChatId = await overseer.newChat(
-            message, model, capsules, attachments, formats);
+            message, model, capsules, attachments, formats,
+            bot === "none" ? undefined : bot);
         onNavigateToChatRef.current(newChatId);
       } else {
         // Send message to existing chat.
@@ -161,6 +173,7 @@ export function useChatActions({
           capsules || undefined,
           attachments || undefined,
           formats,
+          bot,
         );
       }
     } catch (err) {
@@ -182,13 +195,15 @@ export function useChatActions({
     capsules?: CapsuleSpecifier[],
     attachments?: ChatAttachmentHandle[],
     formats?: MessageFormatRef[],
+    bot?: BotSelection | "none",
   ) => {
     const message = typeof messageText === "string" ? messageText.trim() : messageText ?? "";
     if (!message && (!attachments || attachments.length === 0)) return;
     const model = modelId !== undefined ? modelId : selectedModel;
     try {
       const newChatId = await overseer.newChat(
-          message, model, capsules, attachments, formats);
+          message, model, capsules, attachments, formats,
+          bot === "none" ? undefined : bot);
       onNavigateToChatRef.current(newChatId);
     } catch (err) {
       if (!logRpcFailure("Failed to create new chat:", err, { reportSite: "chat.new" })) {
@@ -202,10 +217,26 @@ export function useChatActions({
     }
   };
 
-  // Handle model change
+  // Handle model change. Picking a bare model answers "who runs this chat" with the model, so
+  // the composer's bot pick (if any) yields; the change itself rides the next send.
   const handleModelChange = (modelId: string | null) => {
     setSelectedModel(modelId);
     persistSelectedModel(modelId);
+    if (selectedBot !== null) {
+      setSelectedBot(null);
+      persistSelectedBot(null);
+    }
+  };
+
+  // Handle bot change: a bot pick also selects the bot's model for the composer, and persists
+  // the pick as the intake default (Home reuses it).
+  const handleBotChange = (bot: BotSelection | null) => {
+    setSelectedBot(bot);
+    persistSelectedBot(bot);
+    const botModel = bot === null ? null
+      : bots.find((candidate) => sameBotSelection(candidate.selection, bot))?.modelId ?? null;
+    setSelectedModel(botModel);
+    persistSelectedModel(botModel);
   };
 
   // Handle stopping the agent
@@ -583,17 +614,26 @@ export function useChatActions({
       });
     }
   };
+  // A bot chat retries on the bot's declared model — the pick must not swap it for the
+  // composer's current model selection (the backend makes the same preference).
+  const chatBotModelId = (() => {
+    const metaBot = currentChatMetadata?.bot;
+    if (!metaBot) return null;
+    return bots.find((bot) => sameBotSelection(bot.selection, metaBot))?.modelId ?? null;
+  })();
+  const retryModelId = chatBotModelId ?? selectedModel;
+
   // Handle retrying the agent after an error
   const handleRetry = async () => {
     if (
       selectedChatId === null ||
-      selectedModel === null
+      retryModelId === null
     ) {
       return;
     }
 
     try {
-      await overseer.retryAgent(selectedChatId, selectedModel);
+      await overseer.retryAgent(selectedChatId, retryModelId);
     } catch (err) {
       console.error("Failed to retry agent:", err);
       toasts.add({
@@ -615,6 +655,8 @@ export function useChatActions({
     handleSend,
     handleNewChatSend,
     handleModelChange,
+    handleBotChange,
+    retryModelId,
     handleStop,
     handleSaveChatTitle,
     handleCancelTitleEdit,

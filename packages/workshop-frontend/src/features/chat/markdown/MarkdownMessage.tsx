@@ -17,6 +17,7 @@ import styles from "../../../ChatInterface.module.css";
 import {
   buildTokenizedCapsuleMessage,
   createCapsuleRemarkPlugin,
+  type MarkdownAstNode,
   type Mention,
 } from "./capsuleTokenization";
 import { FormatMention } from "./FormatMention";
@@ -107,21 +108,40 @@ function getMarkdownComponents(
     },
   };
 }
+function replaceNewlinesWithBreaks(node: MarkdownAstNode) {
+  if (!node.children) return;
+  node.children = node.children.flatMap((child): MarkdownAstNode[] => {
+    if (child.type === "text" && child.value?.includes("\n")) {
+      return child.value.split(/\r?\n/).flatMap((line, index): MarkdownAstNode[] => [
+        ...(index > 0 ? [{ type: "break" }] : []),
+        ...(line ? [{ type: "text", value: line }] : []),
+      ]);
+    }
+    replaceNewlinesWithBreaks(child);
+    return [child];
+  });
+}
 
-const REMARK_PLUGINS_NO_CAPSULES = [remarkGfm];
+// Renders a user's single newline as a hard break. Done in the tree rather than with
+// `white-space: pre-wrap`, which also shows the newlines Markdown puts between block elements,
+// adding a blank line between every list item.
+function lineBreaksRemarkPlugin() {
+  return replaceNewlinesWithBreaks;
+}
+
 const MARKDOWN_COMPONENTS_NO_CAPSULES = getMarkdownComponents();
 
 /**
  * A message's markdown, with recorded capsule/format mentions substituted back in. Exported for
- * unit testing (see ChatInterface.markdown.test.tsx), which verifies that a single newline in a
- * user message survives to the DOM as a literal "\n" so the `whitespace-pre-wrap` wrapper at the
- * user-message render site renders it as a hard break.
+ * unit testing (see ChatInterface.markdown.test.ts). `preserveLineBreaks` renders
+ * single newlines as hard breaks, for text people typed rather than Markdown a model wrote.
  */
 export const MarkdownMessage = memo(function MarkdownMessage(
-  { message, capsules, formats }: {
+  { message, capsules, formats, preserveLineBreaks }: {
     message: string;
     capsules?: CapsuleSpecifier[];
     formats?: MessageFormatRef[];
+    preserveLineBreaks?: boolean;
   },
 ): ReactNode {
   const tokenizedMessage = useMemo(
@@ -137,10 +157,12 @@ export const MarkdownMessage = memo(function MarkdownMessage(
     [tokenizedMessage],
   );
   const remarkPlugins = useMemo(
-    () => tokenizedMessage
-      ? [remarkGfm, createCapsuleRemarkPlugin(tokenizedMessage.mentionsByToken)]
-      : REMARK_PLUGINS_NO_CAPSULES,
-    [tokenizedMessage],
+    () => [
+      remarkGfm,
+      ...(tokenizedMessage ? [createCapsuleRemarkPlugin(tokenizedMessage.mentionsByToken)] : []),
+      ...(preserveLineBreaks ? [lineBreaksRemarkPlugin] : []),
+    ],
+    [preserveLineBreaks, tokenizedMessage],
   );
 
   return (
