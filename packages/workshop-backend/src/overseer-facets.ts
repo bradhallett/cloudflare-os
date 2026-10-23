@@ -31,9 +31,11 @@ import { RESTORE_FORGER_WORKER } from "./overseer-harness";
  * the former single-file overseer.ts. This layer only depends on layers before it.
  */
 export abstract class OverseerFacets extends OverseerChatRuntime {
-  // Remove the named binding edge from the gadget. The target gatekeeper itself survives,
-  // possibly no longer bound by any gadget. `forChatId` scopes visibility: an edge pending in
-  // some other chat is treated as nonexistent (it isn't this caller's to remove).
+  /**
+   * Remove the named binding edge from the gadget. The target gatekeeper itself survives,
+   * possibly no longer bound by any gadget. `forChatId` scopes visibility: an edge pending in
+   * some other chat is treated as nonexistent (it isn't this caller's to remove).
+   */
   unbindWorkpiece(gadgetId: WorkpieceId, name: string, forChatId?: number): void {
     let gadget = this.getGadgetRecord(gadgetId);
     let edge = gadget.bindings[name];
@@ -46,7 +48,7 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
     this.bumpVersion([gadgetId]);
   }
 
-  // Rename a binding edge atomically, preserving edge metadata and restarting the gadget once.
+  /** Rename a binding edge atomically, preserving edge metadata and restarting the gadget once. */
   renameBinding(gadgetId: WorkpieceId, oldName: string, newName: string): void {
     let gadget = this.getGadgetRecord(gadgetId);
     let edge = gadget.bindings[oldName];
@@ -68,7 +70,7 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
     this.bumpVersion([gadgetId]);
   }
 
-  // The worktree pins of a chat's live code base, as a base-commit map for seedWorktreeEditBases.
+  /** The worktree pins of a chat's live code base, as a base-commit map for seedWorktreeEditBases. */
   worktreePinBases(meta: AiChatMetadata): Map<WorkpieceId, string> {
     let bases = new Map<WorkpieceId, string>();
     for (let pin of meta.codeBase?.pins ?? []) {
@@ -77,12 +79,16 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
     return bases;
   }
 
-  // Live row count that triggers materialization (see submitCodeChange). A field so tests can
-  // reach the trigger without a thousand submissions.
+  /**
+   * Live row count that triggers materialization (see submitCodeChange). A field so tests can
+   * reach the trigger without a thousand submissions.
+   */
   chatChangeMaterializeThreshold = CHAT_CHANGE_MATERIALIZE_THRESHOLD;
 
-  // The chat's current content: what the next change row will apply to. Cached; treat the result as
-  // immutable (it is shared with the cache and with code-change's structure sharing).
+  /**
+   * The chat's current content: what the next change row will apply to. Cached; treat the result as
+   * immutable (it is shared with the cache and with code-change's structure sharing).
+   */
   async getCurrentChatContent(chatId: number, meta: AiChatMetadata): Promise<CodeContent> {
     for (let attempt = 0; ; attempt++) {
       let codeBase = this.chatCodeBase(meta);
@@ -156,7 +162,7 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
     }
   }
 
-  // The body of Overseer.discardChatDraftChanges().
+  /** The body of Overseer.discardChatDraftChanges(). */
   discardChatDraftChanges(chatId: number): void {
     let meta = this.assertChatNotActive(chatId);
     let codeBase = this.chatCodeBase(meta);
@@ -187,12 +193,14 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
     this.proposedChangesChanged(chatId);
   }
 
-  // Load the dynamic worker representing the given gadget's committed (head-commit) code.
-  // Returns the dynamic WorkerStub (which can be used to get any entrypoint).
-  //
-  // If `chatId` is specified, load the worker from that chat's code doc instead, including its
-  // proposed changes. (The caller is presumed to have verified the chat exists and has proposed
-  // changes.)
+  /**
+   * Load the dynamic worker representing the given gadget's committed (head-commit) code.
+   * Returns the dynamic WorkerStub (which can be used to get any entrypoint).
+   *
+   * If `chatId` is specified, load the worker from that chat's code doc instead, including its
+   * proposed changes. (The caller is presumed to have verified the chat exists and has proposed
+   * changes.)
+   */
   loadGadgetWorker(gadgetId: WorkpieceId, chatId?: number): WorkerStub {
     let codeVersion = `${this.storage.codeVersion.get()}`;
     let sequence: number | undefined;
@@ -258,18 +266,20 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
     });
   }
 
-  // Load the given gadget's facet (if it's not running already) and return the stub to it.
-  //
-  // If `chatId` is specified, load the gadget including changes proposed in the given chat
-  // thread.
-  //
-  // The stub is minted through our own ctx.restore() rather than taken from ctx.facets.get()
-  // directly: the runtime only lets a facet call *its* ctx.restore() when the request reached it
-  // through a stub the parent created with ctx.restore() (that stub is what tells the runtime how
-  // to recreate the facet). A bare facet stub carries no such context, so gadget code calling
-  // `this.ctx.restore()` -- to hand a persistent callback to a spawned agent or a hook -- would
-  // throw. Every stub to a gadget facet therefore comes from here; only [restore]() itself, which
-  // is what ctx.restore() invokes, touches the raw facet (see #getGadgetFacetRaw).
+  /**
+   * Load the given gadget's facet (if it's not running already) and return the stub to it.
+   *
+   * If `chatId` is specified, load the gadget including changes proposed in the given chat
+   * thread.
+   *
+   * The stub is minted through our own ctx.restore() rather than taken from ctx.facets.get()
+   * directly: the runtime only lets a facet call *its* ctx.restore() when the request reached it
+   * through a stub the parent created with ctx.restore() (that stub is what tells the runtime how
+   * to recreate the facet). A bare facet stub carries no such context, so gadget code calling
+   * `this.ctx.restore()` -- to hand a persistent callback to a spawned agent or a hook -- would
+   * throw. Every stub to a gadget facet therefore comes from here; only [restore]() itself, which
+   * is what ctx.restore() invokes, touches the raw facet (see #getGadgetFacetRaw).
+   */
   async getGadgetFacetFetcher(gadgetId: WorkpieceId, chatId?: number)
       : Promise<Fetcher<DurableObject>> {
     let params: OverseerRestoreParams = {type: "gadget", gadgetId};
@@ -337,10 +347,12 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
     });
   }
 
-  // The gadget's file tree as seen from `chatId` (its chat content; the caller is presumed to
-  // have materialized live change rows, see checkChatExistsAndMaterializeChanges) or from
-  // mainline. A chat that doesn't own the gadget's code (see chatDocOwnsGadget) reads mainline
-  // too: the gadget's head commit, which a gadget with no commit yet doesn't have -- no files.
+  /**
+   * The gadget's file tree as seen from `chatId` (its chat content; the caller is presumed to
+   * have materialized live change rows, see checkChatExistsAndMaterializeChanges) or from
+   * mainline. A chat that doesn't own the gadget's code (see chatDocOwnsGadget) reads mainline
+   * too: the gadget's head commit, which a gadget with no commit yet doesn't have -- no files.
+   */
   async readGadgetFiles(gadgetId: WorkpieceId, chatId?: number)
       : Promise<ReadonlyMap<string, string>> {
     if (this.storage.gadgets.get(gadgetId)?.type === "worktree") {
@@ -357,11 +369,13 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
     return commitId !== undefined ? await this.gitStore.readCommitFiles(commitId) : new Map();
   }
 
-  // Load a WorkerEntrypoint exported by the gadget, used to implement a hook.
-  //
-  // TODO: There should be a way to simulate hooks within the context of a particular chat thread,
-  //   for testing. But when real-life hooks are delivered they obviously need to go to the
-  //   mainline code.
+  /**
+   * Load a WorkerEntrypoint exported by the gadget, used to implement a hook.
+   *
+   * TODO: There should be a way to simulate hooks within the context of a particular chat thread,
+   *   for testing. But when real-life hooks are delivered they obviously need to go to the
+   *   mainline code.
+   */
   getGadgetHookEntrypoint(id: number): RpcTarget {
     let gk = this.storage.gatekeepers.get(id);
     if (gk && gk.hook) {
@@ -386,11 +400,13 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
     }
   }
 
-  // Every stub to a gatekeeper facet is minted through ctx.restore(), for the reason given at
-  // getGadgetFacetFetcher(): it lets the gatekeeper call its own ctx.restore() to mint persistent
-  // stubs to itself, e.g. a target its push handler delivers events through. The exception is
-  // `cls`, for the one caller that has the class in hand but has deliberately not published the
-  // record yet (`addGatekeeper`): [restore]() would find no record, so it gets the raw facet.
+  /**
+   * Every stub to a gatekeeper facet is minted through ctx.restore(), for the reason given at
+   * getGadgetFacetFetcher(): it lets the gatekeeper call its own ctx.restore() to mint persistent
+   * stubs to itself, e.g. a target its push handler delivers events through. The exception is
+   * `cls`, for the one caller that has the class in hand but has deliberately not published the
+   * record yet (`addGatekeeper`): [restore]() would find no record, so it gets the raw facet.
+   */
   async getGatekeeperFacet(id: number, cls?: GatekeeperClass): Promise<Fetcher<Gatekeeper<any>>> {
     if (cls) return this.#getGatekeeperFacetRaw(id, cls);
     return await this.ctx.restore(  // validates the gatekeeper exists, in [restore]()
@@ -409,7 +425,7 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
     });
   }
 
-  // Traces an approval step for an action an agent turn submitted.
+  /** Traces an approval step for an action an agent turn submitted. */
   traceAgentActionApproval(record: ActionRecord, state: "requested" | "approved" | "denied") {
     if (record.caller.from !== "agent") return;
     let chatId = record.caller.chatId;
@@ -417,9 +433,11 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
         gatekeeperVendorId(this.storage.gatekeepers.get(record.gatekeeperId)), state);
   }
 
-  // Destroy a gatekeeper (connection) workpiece. Any binding edges pointing at it are severed so
-  // no gadget's env retains a dangling entry. (This is distinct from merely unbinding it from one
-  // gadget -- GadgetClient.unbind() -- which leaves the gatekeeper alive, possibly orphaned.)
+  /**
+   * Destroy a gatekeeper (connection) workpiece. Any binding edges pointing at it are severed so
+   * no gadget's env retains a dangling entry. (This is distinct from merely unbinding it from one
+   * gadget -- GadgetClient.unbind() -- which leaves the gatekeeper alive, possibly orphaned.)
+   */
   removeGatekeeper(id: number) {
     for (let gadget of Array.from(this.storage.gadgets.list())) {
       if (gadget.type !== "gadget") continue;  // worktrees have no binding edges
@@ -511,22 +529,26 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
     return files;
   }
 
-  // Whether `id` is NOT blocked pending a scheduled restart (see #gatekeepersPendingRestart).
-  // For callers that enumerate connections (listSlashCommands, prepareChatBindings' ambient
-  // catalogs) and silently skip a blocked one -- it reappears once the reset lands and clients
-  // reconnect. A caller reaching for one specific connection throws via assertGatekeeperUsable
-  // instead.
+  /**
+   * Whether `id` is NOT blocked pending a scheduled restart (see #gatekeepersPendingRestart).
+   * For callers that enumerate connections (listSlashCommands, prepareChatBindings' ambient
+   * catalogs) and silently skip a blocked one -- it reappears once the reset lands and clients
+   * reconnect. A caller reaching for one specific connection throws via assertGatekeeperUsable
+   * instead.
+   */
   gatekeeperUsable(id: number): boolean {
     return !this.gatekeepersPendingRestart.has(id);
   }
 
-  // Throw (retryable) if `id` is blocked pending the scheduled restart; see
-  // #gatekeepersPendingRestart. Called from getGatekeeperById (the mint clients pipeline on),
-  // openGatekeeperSession (the chokepoint every gatekeeper session passes through), the
-  // slash-command invoke in #prepareChatMessage, GadgetClientImpl.bindWithSuggestedName (the
-  // latter two take a client-supplied gatekeeper id and reach the connection outside
-  // openGatekeeperSession), and startHook (the inbound delivery route, whose arming enable may
-  // itself be the widening that scheduled the restart).
+  /**
+   * Throw (retryable) if `id` is blocked pending the scheduled restart; see
+   * #gatekeepersPendingRestart. Called from getGatekeeperById (the mint clients pipeline on),
+   * openGatekeeperSession (the chokepoint every gatekeeper session passes through), the
+   * slash-command invoke in #prepareChatMessage, GadgetClientImpl.bindWithSuggestedName (the
+   * latter two take a client-supplied gatekeeper id and reach the connection outside
+   * openGatekeeperSession), and startHook (the inbound delivery route, whose arming enable may
+   * itself be the widening that scheduled the restart).
+   */
   assertGatekeeperUsable(id: number): void {
     if (!this.gatekeeperUsable(id)) {
       throw new Error(
@@ -534,8 +556,10 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
     }
   }
 
-  // Invoke slash-command requests before committing their visible event and optional generated
-  // message. A result without a message suppresses only the generated message, not the invocation.
+  /**
+   * Invoke slash-command requests before committing their visible event and optional generated
+   * message. A result without a message suppresses only the generated message, not the invocation.
+   */
   protected async prepareChatMessage(
       message: string | SlashCommandRequest,
       hasAttachments: boolean): Promise<PreparedChatMessage> {
@@ -576,8 +600,10 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
     return {message};
   }
 
-  // Describe a workpiece -- a gadget or a gatekeeper -- reachable as `envName` in a chat's env,
-  // for the agent's describeBinding tool.
+  /**
+   * Describe a workpiece -- a gadget or a gatekeeper -- reachable as `envName` in a chat's env,
+   * for the agent's describeBinding tool.
+   */
   async describeBinding(envName: string, id: WorkpieceId): Promise<string> {
     let gadget = this.storage.gadgets.get(id);
     if (gadget?.type === "worktree") {
@@ -662,10 +688,12 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
 
   #codeIdMap = new Map<string, WorkerLoaderWorkerCode>;
 
-  // Forge a persistent stub that restores through the gadget's [restore](params) method. The
-  // executeCode harness routes `env.<bindingName>.rpc[restore](params)` here (via RestoreForgerImpl);
-  // `bindings` is that execution's own binding map, so the name conveys exactly the env the
-  // executed code already holds.
+  /**
+   * Forge a persistent stub that restores through the gadget's [restore](params) method. The
+   * executeCode harness routes `env.<bindingName>.rpc[restore](params)` here (via RestoreForgerImpl);
+   * `bindings` is that execution's own binding map, so the name conveys exactly the env the
+   * executed code already holds.
+   */
   async forgeRestoreStubForBinding(
       chatId: number, bindings: Record<string, ChatBindingEntry>,
       bindingName: string, params: unknown): Promise<unknown> {

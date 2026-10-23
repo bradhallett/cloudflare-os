@@ -24,8 +24,10 @@ import { gatekeeperVendorId } from "./overseer-binding-info";
  * the former single-file overseer.ts. This layer only depends on layers before it.
  */
 export abstract class OverseerGatekeepers extends OverseerBlueprints {
-  // The body of Overseer.revertChanges(), running under the chat's operation lock (callers
-  // hold withChatLock).
+  /**
+   * The body of Overseer.revertChanges(), running under the chat's operation lock (callers
+   * hold withChatLock).
+   */
   async revertChanges(chatId: number, revertFrom: number, author: AiChatAuthorInfo)
       : Promise<void> {
     this.assertChatNotActive(chatId);
@@ -211,9 +213,11 @@ export abstract class OverseerGatekeepers extends OverseerBlueprints {
     await this.reconcilePendingGadgets(chatId);
   }
 
-  // `joinAs` counts the returned client toward #hasCollaboratorSession for its lifetime; passed by
-  // the collaborator-facing mints, omitted for the owner's and for internal callers (see
-  // GadgetClientImpl). `actorUserId` is who the returned client acts for, for analytics only.
+  /**
+   * `joinAs` counts the returned client toward #hasCollaboratorSession for its lifetime; passed by
+   * the collaborator-facing mints, omitted for the owner's and for internal callers (see
+   * GadgetClientImpl). `actorUserId` is who the returned client acts for, for analytics only.
+   */
   async addGatekeeper(
       cls: GatekeeperClass, creationSpec: GatekeeperCreationSpec, actorUserId: string,
       joinAs?: SessionKind)
@@ -271,7 +275,7 @@ export abstract class OverseerGatekeepers extends OverseerBlueprints {
         this.self(), id, await this.getGatekeeperFacet(id), actorUserId, joinAs);
   }
 
-  // Open the session behind a binding loopback.
+  /** Open the session behind a binding loopback. */
   startGatekeeperSession(target: BindingLoopbackTarget, caller: GatekeeperCaller): Promise<any> {
     switch (target.type) {
       case "gadget": {
@@ -448,10 +452,12 @@ export abstract class OverseerGatekeepers extends OverseerBlueprints {
     }
   }
 
-  // Record an observation that originated from a built-in agent tool (not a gatekeeper).
-  // The `gatekeeperId` is set to the BUILTIN_TOOL_GATEKEEPER_ID sentinel so that downstream
-  // code (which expects a gatekeeper to dereference for approve/reject) never touches it —
-  // observations bypass the approve/reject paths anyway.
+  /**
+   * Record an observation that originated from a built-in agent tool (not a gatekeeper).
+   * The `gatekeeperId` is set to the BUILTIN_TOOL_GATEKEEPER_ID sentinel so that downstream
+   * code (which expects a gatekeeper to dereference for approve/reject) never touches it —
+   * observations bypass the approve/reject paths anyway.
+   */
   async recordAgentObservation(
       chatId: number,
       resourceTitle: string,
@@ -619,9 +625,11 @@ export abstract class OverseerGatekeepers extends OverseerBlueprints {
     this.associateAction(caller, actionId);
   }
 
-  // Every gatekeeper session -- GatekeeperClientImpl.openSession and binding loopbacks via
-  // startGatekeeperSession alike -- passes through here, so this is where a connection still
-  // blocked pending a scope-widening restart is refused (see #gatekeepersPendingRestart).
+  /**
+   * Every gatekeeper session -- GatekeeperClientImpl.openSession and binding loopbacks via
+   * startGatekeeperSession alike -- passes through here, so this is where a connection still
+   * blocked pending a scope-widening restart is refused (see #gatekeepersPendingRestart).
+   */
   openGatekeeperSession<Session extends RpcCompatible<Session>>(
       id: number, facet: Fetcher<Gatekeeper<Session>>, caller: GatekeeperCaller)
       : Promise<RpcStub<Session>> {
@@ -647,10 +655,12 @@ export abstract class OverseerGatekeepers extends OverseerBlueprints {
     return result;
   }
 
-  // Records a pending connection request. `requested` is true only when a request was actually
-  // created (and an accept/deny card will appear); when false, the request was rejected for the
-  // reason in `message` and the agent should fix it and retry — the turn must NOT end (see the
-  // `connectionRequested` flag in agent.ts).
+  /**
+   * Records a pending connection request. `requested` is true only when a request was actually
+   * created (and an accept/deny card will appear); when false, the request was rejected for the
+   * reason in `message` and the agent should fix it and retry — the turn must NOT end (see the
+   * `connectionRequested` flag in agent.ts).
+   */
   async requestConnection(chatId: number, input: {
     vendorId: string;
     resourceUrl?: string;

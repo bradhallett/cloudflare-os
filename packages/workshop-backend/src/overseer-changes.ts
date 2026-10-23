@@ -31,30 +31,32 @@ export abstract class OverseerChanges extends OverseerPublishing {
     return undefined;
   }
 
-  // Materialize the chat's live change rows into exactly one durable "changes" message. The
-  // message's `change` is the rows' composition and its `watermark` names the rows it absorbed;
-  // it additionally stamps `pins` for any meta pins not yet declared in the log (closing the
-  // meta/log loop: submitCodeChange and the agent's appends establish pins in codeBase
-  // atomically with the row that needed them, and this is where the establishment becomes
-  // durable log history). The rows are then retired -- kept briefly as a transform window, not
-  // deleted -- so late submissions based inside the materialized range still rebase cleanly.
-  //
-  // One message, always: the composition is kept storable by bounding what accumulates
-  // (submitCodeChange materializes the pending window before a row would push its summed size
-  // past MAX_CODE_CHANGE_SIZE; the agent's step buffer is bounded by the same cap at the write
-  // call), never by splitting the output --
-  // splitting would scatter one batch's extras and edits across messages a suffix revert could
-  // divide, and would break the agent's message-counting change-ID numbering.
-  //
-  // `options.extras` lets the agent's step barrier attach its creations/binding additions,
-  // updateChatFromMainline its `mainlineMerge` record, and applyBlueprint (or the barrier, for
-  // a gadget created from a blueprint) its `blueprintMerges`; a message is written when
-  // there is anything at all to record (rows, undeclared pins, or extras). `options.pins` are
-  // declarations the caller is about to put into the code base, which re-root their gadgets
-  // (see ChatGadgetPinRecord): updateChatFromMainline writes the message that declares them
-  // ahead of the pins themselves, since clients rebuild from the log. `options.author`
-  // overrides the row-derived author (required when there are no rows). The returned
-  // `sequence` is the first written message's.
+  /**
+   * Materialize the chat's live change rows into exactly one durable "changes" message. The
+   * message's `change` is the rows' composition and its `watermark` names the rows it absorbed;
+   * it additionally stamps `pins` for any meta pins not yet declared in the log (closing the
+   * meta/log loop: submitCodeChange and the agent's appends establish pins in codeBase
+   * atomically with the row that needed them, and this is where the establishment becomes
+   * durable log history). The rows are then retired -- kept briefly as a transform window, not
+   * deleted -- so late submissions based inside the materialized range still rebase cleanly.
+   *
+   * One message, always: the composition is kept storable by bounding what accumulates
+   * (submitCodeChange materializes the pending window before a row would push its summed size
+   * past MAX_CODE_CHANGE_SIZE; the agent's step buffer is bounded by the same cap at the write
+   * call), never by splitting the output --
+   * splitting would scatter one batch's extras and edits across messages a suffix revert could
+   * divide, and would break the agent's message-counting change-ID numbering.
+   *
+   * `options.extras` lets the agent's step barrier attach its creations/binding additions,
+   * updateChatFromMainline its `mainlineMerge` record, and applyBlueprint (or the barrier, for
+   * a gadget created from a blueprint) its `blueprintMerges`; a message is written when
+   * there is anything at all to record (rows, undeclared pins, or extras). `options.pins` are
+   * declarations the caller is about to put into the code base, which re-root their gadgets
+   * (see ChatGadgetPinRecord): updateChatFromMainline writes the message that declares them
+   * ahead of the pins themselves, since clients rebuild from the log. `options.author`
+   * overrides the row-derived author (required when there are no rows). The returned
+   * `sequence` is the first written message's.
+   */
   materializeChatChanges(chatId: number, meta?: AiChatMetadata, options?: {
     author?: AiChatAuthorInfo,
     allowDuringTurn?: boolean,
@@ -149,22 +151,24 @@ export abstract class OverseerChanges extends OverseerPublishing {
     }
   }
 
-  // AgentHooks implementation: the agent step's persistence barrier (see the interface doc for
-  // the contract). One storage transaction persists the step's messages (tool-call record
-  // first), appends each buffered change as a row -- broadcast immediately, superseding the
-  // calls' provisional editPreview* streams (see AiChatSubscriber.changeApplied) -- and
-  // materializes them into the step's single "changes" message (tool message first, so a
-  // suffix revert can never erase a call while keeping its edits). Each change's `pin` is
-  // validated against the gadget's *current* head and mirrored into the chat's code base with
-  // its row -- head movement after the barrier merely leaves the chat stale for the accept
-  // gate to catch, never retroactively fails the turn. Worktrees the step first modifies are
-  // pinned here too, derived rather than declared (see below).
-  //
-  // The transaction protects server-side storage only: broadcasts fire on write and ignore
-  // rollback (deliberate -- rerouting the subscription path through commit is out of scope),
-  // so a mid-barrier exception, itself a bug, can leak broadcasts for rolled-back rows. The
-  // in-memory content/byte caches *are* restored on rollback (dropped, to rebuild from
-  // storage), or they would serve content the rows no longer back.
+  /**
+   * AgentHooks implementation: the agent step's persistence barrier (see the interface doc for
+   * the contract). One storage transaction persists the step's messages (tool-call record
+   * first), appends each buffered change as a row -- broadcast immediately, superseding the
+   * calls' provisional editPreview* streams (see AiChatSubscriber.changeApplied) -- and
+   * materializes them into the step's single "changes" message (tool message first, so a
+   * suffix revert can never erase a call while keeping its edits). Each change's `pin` is
+   * validated against the gadget's *current* head and mirrored into the chat's code base with
+   * its row -- head movement after the barrier merely leaves the chat stale for the accept
+   * gate to catch, never retroactively fails the turn. Worktrees the step first modifies are
+   * pinned here too, derived rather than declared (see below).
+   *
+   * The transaction protects server-side storage only: broadcasts fire on write and ignore
+   * rollback (deliberate -- rerouting the subscription path through commit is out of scope),
+   * so a mid-barrier exception, itself a bug, can leak broadcasts for rolled-back rows. The
+   * in-memory content/byte caches *are* restored on rollback (dropped, to rebuild from
+   * storage), or they would serve content the rows no longer back.
+   */
   async commitAgentStep(chatId: number, author: AiChatAuthorInfo,
       msgs: AiChatMessageBodyWithModelData[],
       step: {
@@ -358,11 +362,13 @@ export abstract class OverseerChanges extends OverseerPublishing {
     return undefined;
   }
 
-  // The body of Overseer.submitCodeChange() (see the API doc for the full contract): validate,
-  // dedupe, resolve the claimed stream position (bridging across a content-preserving
-  // generation boundary when needed), transform over the rows accepted since, validate the
-  // transformed change against current content, and append/broadcast -- everything from the final
-  // state re-read through the row write in one synchronous step.
+  /**
+   * The body of Overseer.submitCodeChange() (see the API doc for the full contract): validate,
+   * dedupe, resolve the claimed stream position (bridging across a content-preserving
+   * generation boundary when needed), transform over the rows accepted since, validate the
+   * transformed change against current content, and append/broadcast -- everything from the final
+   * state re-read through the row write in one synchronous step.
+   */
   async submitCodeChange(chatId: number, submission: CodeChangeSubmission,
                          author: AiChatAuthorInfo, userId: string)
       : Promise<{generation: number, revision: number}> {

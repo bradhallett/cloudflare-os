@@ -23,9 +23,11 @@ import { LOOP_LIMIT_RESTART_MIN_AGE_MS } from "./overseer-support";
  * the former single-file overseer.ts. This layer only depends on layers before it.
  */
 export abstract class OverseerChats extends OverseerCore {
-  // Forcefully tear down all live state for a chat (e.g. on deletion). Cancels any running agent.
-  // (Undelivered calls to the agent live in storage -- `pendingAgentCalls` -- not here; deleteChat
-  // removes them itself.)
+  /**
+   * Forcefully tear down all live state for a chat (e.g. on deletion). Cancels any running agent.
+   * (Undelivered calls to the agent live in storage -- `pendingAgentCalls` -- not here; deleteChat
+   * removes them itself.)
+   */
   destroyLiveChat(chatId: number) {
     this.resumeErrors.delete(chatId);
     this.unregisterRunningAgent(chatId);
@@ -45,22 +47,24 @@ export abstract class OverseerChats extends OverseerCore {
     this.invalidateChatContent(chatId);
   }
 
-  // Rebuild a chat's content -- `gadgetId -> (path -> text)` for every gadget whose files live
-  // in the chat's change stream -- from the chat log. Content is epoch-scoped: a merge message with
-  // `epochBoundary` (or a migrated chat's `conversionBoundary` changes message) discards
-  // everything before it (the merged content lives in commits from then on), and within an
-  // epoch each non-reverted "changes" message contributes first the base trees of any pins it
-  // declares, then its change. Commits are immutable, so reconstruction of closed epochs is
-  // deterministic from the log alone.
-  //
-  // With `through`, the content is reconstructed *as the log stood at that sequence*: later
-  // messages -- including epoch boundaries and merge/revert markings -- haven't happened from
-  // the caller's viewpoint, so they are excluded outright (a boundary recorded after `through`
-  // must not wipe the snapshot it postdates).
-  //
-  // Live (unmaterialized) change rows are deliberately NOT included: callers that need them either
-  // materialize first (accept, update-from-mainline, UI bundle loads) or apply them on top
-  // themselves (getCurrentChatContent).
+  /**
+   * Rebuild a chat's content -- `gadgetId -> (path -> text)` for every gadget whose files live
+   * in the chat's change stream -- from the chat log. Content is epoch-scoped: a merge message with
+   * `epochBoundary` (or a migrated chat's `conversionBoundary` changes message) discards
+   * everything before it (the merged content lives in commits from then on), and within an
+   * epoch each non-reverted "changes" message contributes first the base trees of any pins it
+   * declares, then its change. Commits are immutable, so reconstruction of closed epochs is
+   * deterministic from the log alone.
+   *
+   * With `through`, the content is reconstructed *as the log stood at that sequence*: later
+   * messages -- including epoch boundaries and merge/revert markings -- haven't happened from
+   * the caller's viewpoint, so they are excluded outright (a boundary recorded after `through`
+   * must not wipe the snapshot it postdates).
+   *
+   * Live (unmaterialized) change rows are deliberately NOT included: callers that need them either
+   * materialize first (accept, update-from-mainline, UI bundle loads) or apply them on top
+   * themselves (getCurrentChatContent).
+   */
   async buildChatContent(chatId: number, through?: number): Promise<CodeContent> {
     let messages = [...this.storage.chats.list({prefix: chatKeyPrefix(chatId)})];
     if (through !== undefined) {
@@ -114,9 +118,11 @@ export abstract class OverseerChats extends OverseerCore {
     this.chatContentCache.delete(chatId);
   }
 
-  // The live window's summary at the given (generation, revision) -- the caller's current code
-  // base position -- served from #liveWindowCache when it is current for that position and
-  // recomputed from one listing of the live rows otherwise.
+  /**
+   * The live window's summary at the given (generation, revision) -- the caller's current code
+   * base position -- served from #liveWindowCache when it is current for that position and
+   * recomputed from one listing of the live rows otherwise.
+   */
   protected liveWindowSummary(chatId: number, codeBase: {generation: number, revision: number})
       : {bytes: number, count: number} {
     let cached = this.liveWindowCache.get(chatId);
@@ -134,10 +140,12 @@ export abstract class OverseerChats extends OverseerCore {
     return entry;
   }
 
-  // The given generation's rows with revision > afterRevision, in revision order, retired rows
-  // included. This is the transform window: a submission based at `afterRevision` rebases over
-  // exactly these. Returns undefined if the window has a gap (rows expired past the retention
-  // horizon), in which case the submission must be rejected rather than mistransformed.
+  /**
+   * The given generation's rows with revision > afterRevision, in revision order, retired rows
+   * included. This is the transform window: a submission based at `afterRevision` rebases over
+   * exactly these. Returns undefined if the window has a gap (rows expired past the retention
+   * horizon), in which case the submission must be rejected rather than mistransformed.
+   */
   listChatChangesSince(chatId: number, generation: number, afterRevision: number,
                        throughRevision: number): ChatChangeRecord[] | undefined {
     if (afterRevision >= throughRevision) return [];
@@ -153,31 +161,35 @@ export abstract class OverseerChats extends OverseerCore {
     return rows;
   }
 
-  // The generation's live (unretired) rows, in revision order: the rows not yet materialized
-  // into a "changes" message.
+  /**
+   * The generation's live (unretired) rows, in revision order: the rows not yet materialized
+   * into a "changes" message.
+   */
   listLiveChatChanges(chatId: number, generation: number): ChatChangeRecord[] {
     return [...this.storage.chatChanges.list({
       prefix: chatKeyPrefix(chatId, generation),
     })].filter(row => !row.retired);
   }
 
-  // The workpieces this chat currently proposes changes to: pinned in the chat's current epoch
-  // (a gadget or worktree joins the pin stream when its code is first modified -- see
-  // ChatCodeBase), or -- gadgets only -- created provisionally by the chat or targeted by a
-  // provisional binding edge the chat added (which changes the gadget's env even though its code
-  // is untouched). Purely derived: pins and pending records are maintained transactionally with
-  // the changes themselves (established with their rows, rolled back by revert/discard,
-  // evaporated by the accept's epoch reset), so there is no cached flag to drift out of step --
-  // this replaces the stored `hasProposedChanges` bit and the recompute machinery that existed
-  // to fight exactly that. (A chat from before worktree pins meant modification can hold a
-  // worktree pin that proves nothing, which reads as proposed here until its first accept drops
-  // it -- see mergeChanges. Accepted: few such chats exist, and one click clears it.)
-  //
-  // A worktree's *creation* alone proposes nothing, unlike a gadget's: accepting adds a pending
-  // gadget to the workspace, whereas a worktree stays private to its chat either way, so an
-  // agent that checks a repository out only to read it would otherwise raise the pending-changes
-  // banner over a chat with nothing to accept. For the same reason no revert deletes a worktree
-  // (see WorktreeRecord.pending).
+  /**
+   * The workpieces this chat currently proposes changes to: pinned in the chat's current epoch
+   * (a gadget or worktree joins the pin stream when its code is first modified -- see
+   * ChatCodeBase), or -- gadgets only -- created provisionally by the chat or targeted by a
+   * provisional binding edge the chat added (which changes the gadget's env even though its code
+   * is untouched). Purely derived: pins and pending records are maintained transactionally with
+   * the changes themselves (established with their rows, rolled back by revert/discard,
+   * evaporated by the accept's epoch reset), so there is no cached flag to drift out of step --
+   * this replaces the stored `hasProposedChanges` bit and the recompute machinery that existed
+   * to fight exactly that. (A chat from before worktree pins meant modification can hold a
+   * worktree pin that proves nothing, which reads as proposed here until its first accept drops
+   * it -- see mergeChanges. Accepted: few such chats exist, and one click clears it.)
+   *
+   * A worktree's *creation* alone proposes nothing, unlike a gadget's: accepting adds a pending
+   * gadget to the workspace, whereas a worktree stays private to its chat either way, so an
+   * agent that checks a repository out only to read it would otherwise raise the pending-changes
+   * banner over a chat with nothing to accept. For the same reason no revert deletes a worktree
+   * (see WorktreeRecord.pending).
+   */
   proposedChangeWorkpieceIds(chatId: number, meta: AiChatMetadata): WorkpieceId[] {
     let ids = new Set<WorkpieceId>();
     for (let pin of meta.codeBase?.pins ?? []) {
@@ -194,9 +206,11 @@ export abstract class OverseerChats extends OverseerCore {
     return [...ids].toSorted((a, b) => a - b);
   }
 
-  // A chat metadata record as delivered to clients: the stored row with the derived
-  // `proposedChangeWorkpieces` list attached (see proposedChangeWorkpieceIds) and the retired
-  // `hasProposedChanges` flag dropped (see StoredChatMetadata). Never mutates the input.
+  /**
+   * A chat metadata record as delivered to clients: the stored row with the derived
+   * `proposedChangeWorkpieces` list attached (see proposedChangeWorkpieceIds) and the retired
+   * `hasProposedChanges` flag dropped (see StoredChatMetadata). Never mutates the input.
+   */
   chatMetaForClient(stored: StoredChatMetadata): AiChatMetadata {
     let meta: StoredChatMetadata = {...stored};
     delete meta.hasProposedChanges;
@@ -207,8 +221,10 @@ export abstract class OverseerChats extends OverseerCore {
     return meta;
   }
 
-  // Erase every change row of the chat (a destructive bump, or chat deletion): retired rows too,
-  // since a destructively-closed stream is not bridgeable.
+  /**
+   * Erase every change row of the chat (a destructive bump, or chat deletion): retired rows too,
+   * since a destructively-closed stream is not bridgeable.
+   */
   deleteAllChatChanges(chatId: number): void {
     for (let row of Array.from(this.storage.chatChanges.list({prefix: chatKeyPrefix(chatId)}))) {
       this.storage.chatChanges.deleteRecord(row);
@@ -218,11 +234,13 @@ export abstract class OverseerChats extends OverseerCore {
     this.liveWindowCache.delete(chatId);
   }
 
-  // Each gadget's last pin declaration on a surviving (non-reverted) "changes" message in the
-  // chat's current epoch: the one its content is rooted at (see ChatGadgetPinRecord). Meta pins
-  // missing from the map are what materialization must stamp onto its message (see
-  // materializeChatChanges), and what pin rollback removes when the rows that established them
-  // are discarded; a revert also takes each surviving pin's base from here.
+  /**
+   * Each gadget's last pin declaration on a surviving (non-reverted) "changes" message in the
+   * chat's current epoch: the one its content is rooted at (see ChatGadgetPinRecord). Meta pins
+   * missing from the map are what materialization must stamp onto its message (see
+   * materializeChatChanges), and what pin rollback removes when the rows that established them
+   * are discarded; a revert also takes each surviving pin's base from here.
+   */
   declaredPins(chatId: number): Map<WorkpieceId, ChatGadgetPinRecord> {
     let messages = [...this.storage.chats.list({prefix: chatKeyPrefix(chatId)})];
     let statuses = chatChangeStatuses(messages);
@@ -246,10 +264,12 @@ export abstract class OverseerChats extends OverseerCore {
     return declared;
   }
 
-  // Pins in the chat's live state (see ChatGadgetPinState) whose establishment no surviving
-  // current-epoch "changes" message records yet, as the log records them. A pin lands in
-  // `codeBase` atomically with the row that needed it; its durable log declaration lands when
-  // the rows materialize.
+  /**
+   * Pins in the chat's live state (see ChatGadgetPinState) whose establishment no surviving
+   * current-epoch "changes" message records yet, as the log records them. A pin lands in
+   * `codeBase` atomically with the row that needed it; its durable log declaration lands when
+   * the rows materialize.
+   */
   undeclaredMetaPins(chatId: number, meta: AiChatMetadata): ChatGadgetPinRecord[] {
     let pins = meta.codeBase?.pins ?? [];
     if (pins.length === 0) return [];
@@ -269,12 +289,14 @@ export abstract class OverseerChats extends OverseerCore {
     return this.ctx.exports.GatekeeperLoopback({props});
   }
 
-  // Build the flat `env` handed to a gadget's dynamically-loaded worker: the gadget's named
-  // bindings plus `GADGET` (the gadget's self-stub, kept for back-compat with existing gadget
-  // code). `forChatId` scopes visibility of provisional binding edges: an edge pending in that
-  // chat is included (the chat's own preview/test runs see its proposed additions), while edges
-  // pending in other chats -- or in any chat, when loading mainline -- are treated as
-  // nonexistent.
+  /**
+   * Build the flat `env` handed to a gadget's dynamically-loaded worker: the gadget's named
+   * bindings plus `GADGET` (the gadget's self-stub, kept for back-compat with existing gadget
+   * code). `forChatId` scopes visibility of provisional binding edges: an edge pending in that
+   * chat is included (the chat's own preview/test runs see its proposed additions), while edges
+   * pending in other chats -- or in any chat, when loading mainline -- are treated as
+   * nonexistent.
+   */
   getEnvForLoader(gadgetId: WorkpieceId, caller: GatekeeperCaller, forChatId?: number): object {
     let env: Record<string, any> = {}
     let gadget = this.getGadgetRecord(gadgetId);
@@ -289,12 +311,14 @@ export abstract class OverseerChats extends OverseerCore {
     return env;
   }
 
-  // Build the agent's executeCode env from the chat's binding map: each name resolves to a
-  // gadget's `{rpc, exports}` pair, a gatekeeper session stub, or an agent callback's stored
-  // arguments.
-  // Entries whose targets no longer exist are silently skipped, mirroring the deleted-gadget
-  // behavior elsewhere. `executionId` is the calling executeCodeMode run, minted into worktree
-  // loopbacks so they are usable only from within that execution.
+  /**
+   * Build the agent's executeCode env from the chat's binding map: each name resolves to a
+   * gadget's `{rpc, exports}` pair, a gatekeeper session stub, or an agent callback's stored
+   * arguments.
+   * Entries whose targets no longer exist are silently skipped, mirroring the deleted-gadget
+   * behavior elsewhere. `executionId` is the calling executeCodeMode run, minted into worktree
+   * loopbacks so they are usable only from within that execution.
+   */
   getEnvForAgent(chatId: number, bindings: Record<string, ChatBindingEntry>,
                  executionId: string): object {
     let caller: GatekeeperCaller = {from: "agent", chatId};
@@ -370,7 +394,7 @@ export abstract class OverseerChats extends OverseerCore {
     return left.type === right.type && left.id === right.id && left.name === right.name;
   }
 
-  // The display author for a batch of rows: the shared author, or a "Multiple Authors" marker.
+  /** The display author for a batch of rows: the shared author, or a "Multiple Authors" marker. */
   normalizeRowAuthor(rows: ChatChangeRecord[]): AiChatAuthorInfo {
     if (rows.length === 0) {
       throw new Error("Cannot normalize an empty row batch.");
@@ -386,25 +410,29 @@ export abstract class OverseerChats extends OverseerCore {
     };
   }
 
-  // Whether a chat's uncommitted content holds this gadget's files: the gadget is pinned in the
-  // chat, or has no committed code (chat-created gadgets live only in the chat's change stream).
-  // Otherwise the gadget tracks mainline head live, and chat context doesn't change what its
-  // code reads return. This is the one rule behind every chat-context read of gadget code --
-  // previews (loadGadgetWorker), UI bundles, and the agent's file tools all follow the same
-  // split.
+  /**
+   * Whether a chat's uncommitted content holds this gadget's files: the gadget is pinned in the
+   * chat, or has no committed code (chat-created gadgets live only in the chat's change stream).
+   * Otherwise the gadget tracks mainline head live, and chat context doesn't change what its
+   * code reads return. This is the one rule behind every chat-context read of gadget code --
+   * previews (loadGadgetWorker), UI bundles, and the agent's file tools all follow the same
+   * split.
+   */
   chatDocOwnsGadget(meta: AiChatMetadata, gadgetId: WorkpieceId): boolean {
     let record = this.storage.gadgets.get(gadgetId);
     return record?.type !== "gadget" || record.commitId === undefined ||
         (meta.codeBase?.pins ?? []).some(pin => pin.gadgetId === gadgetId);
   }
 
-  // Apply all currently-eligible pending actions of the given gatekeeper, in ascending id order.
-  // Stops at the first pending action that is NOT auto-eligible (i.e. a manual gate) or that throws
-  // while applying -- it is never skipped ahead of. This preserves in-order application and the
-  // invariant that nothing is silently applied past a human gate.
-  //
-  // Delegates to the single-flight drainer, which guards against concurrent drains for the same
-  // gatekeeper double-applying an action (the DO's input gate is open across the apply await).
+  /**
+   * Apply all currently-eligible pending actions of the given gatekeeper, in ascending id order.
+   * Stops at the first pending action that is NOT auto-eligible (i.e. a manual gate) or that throws
+   * while applying -- it is never skipped ahead of. This preserves in-order application and the
+   * invariant that nothing is silently applied past a human gate.
+   *
+   * Delegates to the single-flight drainer, which guards against concurrent drains for the same
+   * gatekeeper double-applying an action (the DO's input gate is open across the apply await).
+   */
   drainAutoApprovals(gatekeeperId: number): Promise<void> {
     return this.autoApprovalDrainer.drain(gatekeeperId);
   }
@@ -417,9 +445,11 @@ export abstract class OverseerChats extends OverseerCore {
     return this.preparingChatMessages.get(chatId);
   }
 
-  // The author of work this workspace's gadgets do on `user`'s behalf -- spawned agent turns,
-  // agent callbacks, gadget code's own calls: accounted to `user`, displayed under the workspace
-  // title, and committing with `user`'s commit email (see AiChatAuthorInfo "gadget").
+  /**
+   * The author of work this workspace's gadgets do on `user`'s behalf -- spawned agent turns,
+   * agent callbacks, gadget code's own calls: accounted to `user`, displayed under the workspace
+   * title, and committing with `user`'s commit email (see AiChatAuthorInfo "gadget").
+   */
   gadgetAuthorFor(user: AiChatAuthorInfo): AiChatAuthorInfo {
     return {
       type: "gadget",
@@ -449,11 +479,13 @@ export abstract class OverseerChats extends OverseerCore {
       {type: "blob", referencedBy: entry.referencedBy})).payload;
   }
 
-  // Prepare a stored chat message for delivery to a client: inline image attachment bytes
-  // (non-image attachments are fetched on demand via getChatAttachmentContent()), strip the
-  // retired Yjs payload from pre-conversion "changes" messages -- it is kept on disk as
-  // rollback insurance (see overseer-git-migration.ts) but nothing can apply it, so it must not
-  // ship as dead weight on the wire (it is not part of the message's API type).
+  /**
+   * Prepare a stored chat message for delivery to a client: inline image attachment bytes
+   * (non-image attachments are fetched on demand via getChatAttachmentContent()), strip the
+   * retired Yjs payload from pre-conversion "changes" messages -- it is kept on disk as
+   * rollback insurance (see overseer-git-migration.ts) but nothing can apply it, so it must not
+   * ship as dead weight on the wire (it is not part of the message's API type).
+   */
   hydrateChatMessageForClient(msg: StoredChatMessage): AiChatMessage {
     if (msg.type === "changes" && "update" in msg) {
       let {update: _, ...rest} = msg;
@@ -475,10 +507,12 @@ export abstract class OverseerChats extends OverseerCore {
     return {...msg, attachments};
   }
 
-  // Look up the attachments that the client wants to send.
-  //
-  // Verify uploaded Git blobs and canonicalize their message metadata before publication.
-  // Legacy staged handles remain readable during client upgrades.
+  /**
+   * Look up the attachments that the client wants to send.
+   *
+   * Verify uploaded Git blobs and canonicalize their message metadata before publication.
+   * Legacy staged handles remain readable during client upgrades.
+   */
   canonicalizeChatAttachmentRefs(
     attachments?: ChatAttachmentHandle[],
   ): ChatAttachmentRef[] | undefined {
@@ -569,8 +603,10 @@ export abstract class OverseerChats extends OverseerCore {
     }
   }
 
-  // Provides web-fetch with the Workers AI binding and AI Gateway config it needs to call
-  // `env.WORKERS_AI.toMarkdown()`. The initiator is needed for AI Gateway metadata.
+  /**
+   * Provides web-fetch with the Workers AI binding and AI Gateway config it needs to call
+   * `env.WORKERS_AI.toMarkdown()`. The initiator is needed for AI Gateway metadata.
+   */
   getWebFetchEnv(): WebFetchEnv {
     if (this.storage.containsRestrictedData.get()) {
       // TODO: Disallwing fetches is a bit draconian. Ideally, we would have some way to detect
@@ -597,7 +633,7 @@ export abstract class OverseerChats extends OverseerCore {
   // Do we currently have a timeout scheduled after which we plan to send a last active update?
   #lastActiveBumpScheduled: boolean = false;
 
-  // Update the last-active time and cost counter as recorded for this gadget in the user-level DO.
+  /** Update the last-active time and cost counter as recorded for this gadget in the user-level DO. */
   bumpLastActive(now: Date = new Date()) {
     if (this.#lastActiveTimeKnownToUs && this.#lastActiveTimeKnownToUs >= now) {
       // Redundant bump.
@@ -663,11 +699,13 @@ export abstract class OverseerChats extends OverseerCore {
   // the Outputs page lists across all of a user's workspaces, so the registry is mirrored into an
   // index in each interested user's DO (see UserDurableObject.syncWorkspaceOutputs()).
 
-  // This workspace's outputs, as pushed to a user's index. Provisional gadgets are excluded: they
-  // are proposals inside a chat, not things the user has made yet.
-  //
-  // Whole-snapshot rather than a delta, so that a user's index can be brought into line with this
-  // workspace in one call from anywhere, without either side reconciling per workpiece.
+  /**
+   * This workspace's outputs, as pushed to a user's index. Provisional gadgets are excluded: they
+   * are proposals inside a chat, not things the user has made yet.
+   *
+   * Whole-snapshot rather than a delta, so that a user's index can be brought into line with this
+   * workspace in one call from anywhere, without either side reconciling per workpiece.
+   */
   outputsSnapshot(): WorkspaceOutputEntry[] {
     let entries: WorkspaceOutputEntry[] = [];
     for (let gadget of this.storage.gadgets.list()) {
@@ -682,12 +720,14 @@ export abstract class OverseerChats extends OverseerCore {
     return entries;
   }
 
-  // Push the current snapshot into one user's index. Best-effort: the index is a denormalized
-  // view, so a failed push costs a stale Outputs page until the next change or open, never
-  // correctness.
-  // Returns whether the index actually took it. Failures are logged rather than thrown -- an index
-  // is a convenience view and the workspace itself is unaffected -- but callers that remember what
-  // they have sent need to know the difference.
+  /**
+   * Push the current snapshot into one user's index. Best-effort: the index is a denormalized
+   * view, so a failed push costs a stale Outputs page until the next change or open, never
+   * correctness.
+   * Returns whether the index actually took it. Failures are logged rather than thrown -- an index
+   * is a convenience view and the workspace itself is unaffected -- but callers that remember what
+   * they have sent need to know the difference.
+   */
   async syncOutputsTo(user: DurableObjectStub<UserDurableObject>,
                       snapshot = this.outputsSnapshot()): Promise<boolean> {
     try {
@@ -702,35 +742,37 @@ export abstract class OverseerChats extends OverseerCore {
     }
   }
 
-  // Force every client to disconnect and re-authenticate, so that no session outlives a change to
-  // what its holder is entitled to. Both checks that gate a session run only at open() (see the
-  // sharing docs), so without this a stale session would survive until something else happened to
-  // disconnect it. Two kinds of change need it:
-  // - Access removed or downgraded (removeCollaborator, revokeShareLink, workspace deletion):
-  //   someone who just lost access could keep using the session they already have.
-  // - Verification scope widened (see #restartIfSessionsAffected): a collaborator's live session
-  //   was verified against a smaller set of gatekeepers than the workspace now holds.
-  //
-  // A third use changes nobody's entitlement (see restartIfLoopLimited): the restart replaces this
-  // instance, and with it the exhausted loop counter that was refusing its calls to user objects.
-  //
-  // We restart by aborting the whole DO. Aborting propagates to clients: the `notifyClosed` stub
-  // handed to each session is disposed without being called, which AuthenticatedApiImpl detects
-  // and reacts to by killing the browser WebSocket, forcing a reconnect that re-runs open() and
-  // re-checks the (now-changed) permission graph. These events are rare, so the disruption is
-  // acceptable -- and DOs restart unpredictably anyway, so reconnects need to be made as painless
-  // as possible regardless.
-  //
-  // Two precautions before the abort:
-  // - `ctx.abort()` does not respect the output gate, so we explicitly flush the triggering change
-  //   to disk with `ctx.storage.sync()`. Otherwise a restart could come back with the change lost,
-  //   leaving the removed user still authorized (or the widened scope unrecorded). By the same
-  //   token, callers must schedule the restart *after* the write that triggered it, never before
-  //   further writes in the same turn -- those would be racing the abort.
-  // - We delay the abort briefly so the triggering RPC's response can reach the caller (typically
-  //   the owner, who is also connected and will be disconnected) before their connection drops.
-  //   Without the delay their own removeCollaborator()/revokeShareLink() call might reject with a
-  //   connection error even though it succeeded.
+  /**
+   * Force every client to disconnect and re-authenticate, so that no session outlives a change to
+   * what its holder is entitled to. Both checks that gate a session run only at open() (see the
+   * sharing docs), so without this a stale session would survive until something else happened to
+   * disconnect it. Two kinds of change need it:
+   * - Access removed or downgraded (removeCollaborator, revokeShareLink, workspace deletion):
+   *   someone who just lost access could keep using the session they already have.
+   * - Verification scope widened (see #restartIfSessionsAffected): a collaborator's live session
+   *   was verified against a smaller set of gatekeepers than the workspace now holds.
+   *
+   * A third use changes nobody's entitlement (see restartIfLoopLimited): the restart replaces this
+   * instance, and with it the exhausted loop counter that was refusing its calls to user objects.
+   *
+   * We restart by aborting the whole DO. Aborting propagates to clients: the `notifyClosed` stub
+   * handed to each session is disposed without being called, which AuthenticatedApiImpl detects
+   * and reacts to by killing the browser WebSocket, forcing a reconnect that re-runs open() and
+   * re-checks the (now-changed) permission graph. These events are rare, so the disruption is
+   * acceptable -- and DOs restart unpredictably anyway, so reconnects need to be made as painless
+   * as possible regardless.
+   *
+   * Two precautions before the abort:
+   * - `ctx.abort()` does not respect the output gate, so we explicitly flush the triggering change
+   *   to disk with `ctx.storage.sync()`. Otherwise a restart could come back with the change lost,
+   *   leaving the removed user still authorized (or the widened scope unrecorded). By the same
+   *   token, callers must schedule the restart *after* the write that triggered it, never before
+   *   further writes in the same turn -- those would be racing the abort.
+   * - We delay the abort briefly so the triggering RPC's response can reach the caller (typically
+   *   the owner, who is also connected and will be disconnected) before their connection drops.
+   *   Without the delay their own removeCollaborator()/revokeShareLink() call might reject with a
+   *   connection error even though it succeeded.
+   */
   async scheduleAccessRestart(reason: string): Promise<void> {
     await this.ctx.storage.sync();
     await scheduler.wait(100);
@@ -740,15 +782,17 @@ export abstract class OverseerChats extends OverseerCore {
   // Whether restartIfLoopLimited has scheduled a restart of this instance.
   #loopLimitRestartScheduled = false;
 
-  // Restart if `err` is the runtime's loop-limit rejection (see isLoopLimitError) of one of this
-  // object's own calls to a user object: once its outgoing channels hold an exhausted counter
-  // every such call is refused until this instance is replaced. Only rejections of those calls are
-  // passed in (wrapUserDo's stubs, the last-active bump and the outputs sync) -- code the workspace
-  // runs or calls (gadgets, agents, gatekeeper facets) can throw the same message at will, and
-  // must not be able to restart a shared workspace. A rejection the user object relays whole from
-  // something it called, such as a connected gatekeeper account, cannot be told apart and counts.
-  // At most one restart per instance, and none while the instance is young: that bounds how often
-  // a restart that did not clear the condition repeats.
+  /**
+   * Restart if `err` is the runtime's loop-limit rejection (see isLoopLimitError) of one of this
+   * object's own calls to a user object: once its outgoing channels hold an exhausted counter
+   * every such call is refused until this instance is replaced. Only rejections of those calls are
+   * passed in (wrapUserDo's stubs, the last-active bump and the outputs sync) -- code the workspace
+   * runs or calls (gadgets, agents, gatekeeper facets) can throw the same message at will, and
+   * must not be able to restart a shared workspace. A rejection the user object relays whole from
+   * something it called, such as a connected gatekeeper account, cannot be told apart and counts.
+   * At most one restart per instance, and none while the instance is young: that bounds how often
+   * a restart that did not clear the condition repeats.
+   */
   restartIfLoopLimited(err: unknown): void {
     if (!isLoopLimitError(err) || this.#loopLimitRestartScheduled) return;
     if (Date.now() - this.streamGeneration < LOOP_LIMIT_RESTART_MIN_AGE_MS) return;
@@ -759,30 +803,32 @@ export abstract class OverseerChats extends OverseerCore {
     this.scheduleAccessRestart("Gadget restarted because its subrequest depth was exhausted.");
   }
 
-  // Sessions are authorized and verified only at open(), so widening what a live session's holder
-  // must be verified against leaves that session holding unverified access. Restart everyone --
-  // the same mechanism used when access is revoked -- so each client's next open() re-runs
-  // authorizeCollaborator/ensureObserver against the new scope.
-  //
-  // The condition is a live *session*, not an entry in the sharing graph: the only thing a restart
-  // achieves is severing sessions that were admitted at the narrower scope, so a workspace where
-  // only the owner is connected has nothing to sever no matter who it is shared with (the owner is
-  // never an observer). Counting sessions rather than consulting the graph also keeps this
-  // synchronous, so a widening cannot be missed because an async lookup failed, and the restart is
-  // scheduled at the moment of the change rather than an RPC round trip later.
-  //
-  // `affectedRole` names whose scope the caller widened, since the two roles widen independently
-  // (#inScopeGatekeepers): a new connection enters every "build" collaborator's scope but no "use"
-  // collaborator's until some gadget binds it, and binding one enters "use" scope having been in
-  // "build" scope since it was created. A session holding the other role therefore has no new
-  // verification requirements, and severing it would buy nothing. Omit the argument for a restart
-  // that isn't a widening at all (one that must sever regardless of role).
-  //
-  // Note that ensureAmbientCapsules() calls addGatekeeper() from inside open(), so on a shared
-  // workspace the first open after an ambient capsule appears bounces itself once; the capsule
-  // exists by then, so the client's retry is clean.
-  // Returns whether a restart was scheduled, so a caller that just published a widened
-  // capability knows to hold it back until the reset lands (see #gatekeepersPendingRestart).
+  /**
+   * Sessions are authorized and verified only at open(), so widening what a live session's holder
+   * must be verified against leaves that session holding unverified access. Restart everyone --
+   * the same mechanism used when access is revoked -- so each client's next open() re-runs
+   * authorizeCollaborator/ensureObserver against the new scope.
+   *
+   * The condition is a live *session*, not an entry in the sharing graph: the only thing a restart
+   * achieves is severing sessions that were admitted at the narrower scope, so a workspace where
+   * only the owner is connected has nothing to sever no matter who it is shared with (the owner is
+   * never an observer). Counting sessions rather than consulting the graph also keeps this
+   * synchronous, so a widening cannot be missed because an async lookup failed, and the restart is
+   * scheduled at the moment of the change rather than an RPC round trip later.
+   *
+   * `affectedRole` names whose scope the caller widened, since the two roles widen independently
+   * (#inScopeGatekeepers): a new connection enters every "build" collaborator's scope but no "use"
+   * collaborator's until some gadget binds it, and binding one enters "use" scope having been in
+   * "build" scope since it was created. A session holding the other role therefore has no new
+   * verification requirements, and severing it would buy nothing. Omit the argument for a restart
+   * that isn't a widening at all (one that must sever regardless of role).
+   *
+   * Note that ensureAmbientCapsules() calls addGatekeeper() from inside open(), so on a shared
+   * workspace the first open after an ambient capsule appears bounces itself once; the capsule
+   * exists by then, so the client's retry is clean.
+   * Returns whether a restart was scheduled, so a caller that just published a widened
+   * capability knows to hold it back until the reset lands (see #gatekeepersPendingRestart).
+   */
   protected restartIfSessionsAffected(reason: string, affectedRole?: CollaboratorRole): boolean {
     if (!this.hasCollaboratorSession(affectedRole)) return false;
     this.scheduleAccessRestart(reason);

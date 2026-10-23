@@ -26,16 +26,18 @@ export type BindingLoopbackTarget = {
   type: "worktree";
   id: WorkpieceId;
 
-  // The executeCodeMode execution this loopback was minted for. A worktree binding resolves
-  // against the turn state registered for exactly that execution (see #activeWorktreeTurns), so
-  // a stub retained past it -- say, stored in a gadget the agent called -- fails closed instead
-  // of coming back to life against a later execution's turn.
+  /**
+   * The executeCodeMode execution this loopback was minted for. A worktree binding resolves
+   * against the turn state registered for exactly that execution (see #activeWorktreeTurns), so
+   * a stub retained past it -- say, stored in a gadget the agent called -- fails closed instead
+   * of coming back to life against a later execution's turn.
+   */
   executionId: string;
 } | {
-  // The `env.GIT` binding (see git-binding.ts).
+  /** The `env.GIT` binding (see git-binding.ts). */
   type: "git";
 } | {
-  // A gadget binding's `exports` in the agent's executeCode env (see exports-session.ts).
+  /** A gadget binding's `exports` in the agent's executeCode env (see exports-session.ts). */
   type: "exports";
   id: WorkpieceId;
 };
@@ -205,7 +207,7 @@ export class AgentSelfLoopback
 export type GadgetTailLoopbackProps = {
   chatId?: number;
 
-  // Which gadget's worker these logs come from.
+  /** Which gadget's worker these logs come from. */
   gadgetId: WorkpieceId;
 
   overseerId: string;

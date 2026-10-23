@@ -142,11 +142,13 @@ export class UseOverseerInterface extends RpcTarget implements Overseer {
     return this.#subscriptionLease(this.impl.addPresenceSubscriber(subscriber));
   }
 
-  // The gadget list is visible to "use" collaborators (v1 shares the whole workspace), and each
-  // gadget is exposed through a restricted UseGadgetClientInterface that only permits rendering
-  // its deployed UI. Gadgets still provisional to a chat are withheld: they are proposals within
-  // the owner's chats, and their mainline code is empty anyway. Worktrees are withheld likewise,
-  // being chat-private (and readable only through the build-only commit reads).
+  /**
+   * The gadget list is visible to "use" collaborators (v1 shares the whole workspace), and each
+   * gadget is exposed through a restricted UseGadgetClientInterface that only permits rendering
+   * its deployed UI. Gadgets still provisional to a chat are withheld: they are proposals within
+   * the owner's chats, and their mainline code is empty anyway. Worktrees are withheld likewise,
+   * being chat-private (and readable only through the build-only commit reads).
+   */
   async subscribeToWorkpieces(subscriber: RpcStub<WorkpiecesSubscriber>): Promise<RpcStub<{}>> {
     return this.#subscriptionLease(this.impl.subscribeToWorkpieces(subscriber, false));
   }
@@ -192,8 +194,10 @@ export class UseOverseerInterface extends RpcTarget implements Overseer {
   async newAgentSpawnerGatekeeper(_config: AgentSpawnerConfig): Promise<GatekeeperClient<any>> {
     this.#deny();
   }
-  // Pending actions are queried eagerly for the badge; resolved history is demand-loaded. Return
-  // an empty terminal page so this speculative read does not fail for "use" collaborators.
+  /**
+   * Pending actions are queried eagerly for the badge; resolved history is demand-loaded. Return
+   * an empty terminal page so this speculative read does not fail for "use" collaborators.
+   */
   async listActions(_options?: {beforeId?: number, filter?: ActionHistoryFilter})
       : Promise<ActionHistoryPage> {
     return {entries: []};

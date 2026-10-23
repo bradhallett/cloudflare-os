@@ -162,12 +162,14 @@ export function makeHookFiringCallback(impl: OverseerImpl, hookId: number): Nati
 @validateRpc()
 /** Split out of the former overseer.ts (internal helper). */
 export class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
-  // `hookId` is set only on the queue startHook returns with each firing: that queue is held by
-  // the gatekeeper across awaits (even other DOs), so like the firing's callback it revalidates
-  // the hook per call -- otherwise a firing raced by a disable/delete could keep authorizing
-  // observations against a scope the shrink already excluded someone from (or set
-  // containsRestrictedData). Session queues (openGatekeeperSession) pass no hookId: they are
-  // bounded by the facet's in-DO lifetime, which the session chokepoints already gate.
+  /**
+   * `hookId` is set only on the queue startHook returns with each firing: that queue is held by
+   * the gatekeeper across awaits (even other DOs), so like the firing's callback it revalidates
+   * the hook per call -- otherwise a firing raced by a disable/delete could keep authorizing
+   * observations against a scope the shrink already excluded someone from (or set
+   * containsRestrictedData). Session queues (openGatekeeperSession) pass no hookId: they are
+   * bounded by the facet's in-DO lifetime, which the session chokepoints already gate.
+   */
   constructor(private impl: OverseerImpl, private gatekeeperId: number,
               private caller: GatekeeperCaller, private hookId?: number) {
     super();

@@ -22,16 +22,18 @@ import { acceptWriteError } from "./overseer-support";
  * the former single-file overseer.ts. This layer only depends on layers before it.
  */
 export abstract class OverseerBlueprints extends OverseerBindings {
-  // The body of GadgetClient.applyBlueprint(): proposes, in a new chat, merging the blueprint's
-  // current release into the gadget. `userMeta` is the chat context of the user applying it,
-  // resolved for the model they named, and `clientUserId` is that user's DO id.
-  //
-  // Modelled on updateChatFromMainline(): the merge is written as a commit, `M = [H, R]`, which
-  // marks the release it merged (see releasesMergedSince), and the new chat is pinned at it,
-  // with the gadget's head `H` as the pin's `mergedCommit`. One "changes" message declares the
-  // pin and records the proposal (see AiChatMessageBody.blueprintMerges); it carries no change.
-  // Nothing here touches the gadget. Accepting the chat is what does, fast-forwarding through
-  // `M` (see mergeChanges).
+  /**
+   * The body of GadgetClient.applyBlueprint(): proposes, in a new chat, merging the blueprint's
+   * current release into the gadget. `userMeta` is the chat context of the user applying it,
+   * resolved for the model they named, and `clientUserId` is that user's DO id.
+   *
+   * Modelled on updateChatFromMainline(): the merge is written as a commit, `M = [H, R]`, which
+   * marks the release it merged (see releasesMergedSince), and the new chat is pinned at it,
+   * with the gadget's head `H` as the pin's `mergedCommit`. One "changes" message declares the
+   * pin and records the proposal (see AiChatMessageBody.blueprintMerges); it carries no change.
+   * Nothing here touches the gadget. Accepting the chat is what does, fast-forwarding through
+   * `M` (see mergeChanges).
+   */
   async applyBlueprint(gadgetId: WorkpieceId, blueprintId: string,
                        options: {allowUnrelated?: boolean}, userMeta: UserChatContext,
                        clientUserId: string)
@@ -231,8 +233,10 @@ export abstract class OverseerBlueprints extends OverseerBindings {
     return missing.length > 0 ? {missingBindings: Object.fromEntries(missing)} : {};
   }
 
-  // The body of Overseer.mergeChanges(), running under the chat's operation lock (callers
-  // hold withChatLock). `clientUserId` feeds analytics only.
+  /**
+   * The body of Overseer.mergeChanges(), running under the chat's operation lock (callers
+   * hold withChatLock). `clientUserId` feeds analytics only.
+   */
   async mergeChanges(chatId: number, userMeta: UserChatContext, clientUserId: string)
                      : Promise<MergeChangesResult> {
     let meta = this.assertChatNotActive(chatId);
@@ -726,12 +730,14 @@ export abstract class OverseerBlueprints extends OverseerBindings {
     return touched;
   }
 
-  // Fetch a blueprint's decoded files, plus formatted notes describing what was copied and which
-  // bindings the blueprint's code expects the agent to wire up, for instantiation as a new gadget
-  // by the agent's createGadget tool, and the record of that for the creation's "changes"
-  // message (see AiChatMessageBody.blueprintMerges). Blueprint ids are bearer capabilities (like
-  // blueprint share links), so possession of the id is sufficient to read it. Throws
-  // agent-readable errors.
+  /**
+   * Fetch a blueprint's decoded files, plus formatted notes describing what was copied and which
+   * bindings the blueprint's code expects the agent to wire up, for instantiation as a new gadget
+   * by the agent's createGadget tool, and the record of that for the creation's "changes"
+   * message (see AiChatMessageBody.blueprintMerges). Blueprint ids are bearer capabilities (like
+   * blueprint share links), so possession of the id is sufficient to read it. Throws
+   * agent-readable errors.
+   */
   async fetchBlueprint(blueprintId: string): Promise<{
     files: Record<string, string>, notes: string, output?: BlueprintOutput,
     merge: Omit<BlueprintMerge, "gadgetId">,

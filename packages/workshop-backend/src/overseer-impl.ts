@@ -63,17 +63,19 @@ export class OverseerImpl extends OverseerGatekeepers implements AgentHooks {
     // blockConcurrencyWhile already aborted the object; consume its rejection and retry on wake.
     }).then(() => this.resumeInterruptedAgents(), () => {});
   }
-  // The body of the alarm handler: perform every concern the alarm exists for, together, and hold
-  // the DO open until all of them are done. They run concurrently so none waits on another -- in
-  // particular a response retry never waits behind an unrelated chat's long turn -- and since work
-  // begets work (a drain starts a turn, a turn's end drains more calls), passes repeat until one
-  // ends with no turn running and no drain in flight. Both checks are needed: between a turn's end
-  // and the next turn's start, the only sign of work in progress is the drain (which the next pass
-  // joins, being single-flight). A drain that fails leaves its calls recorded rather than looping
-  // here; the recompute at the end re-arms the alarm for them, starting a fresh keep-alive period
-  // from now rather than re-firing on the time that has just passed. A delivery failure is
-  // rethrown once everything else has settled, so the platform retries the alarm. After its last
-  // retry, schedule a fresh wake-up: a long response-target outage must not strand durable work.
+  /**
+   * The body of the alarm handler: perform every concern the alarm exists for, together, and hold
+   * the DO open until all of them are done. They run concurrently so none waits on another -- in
+   * particular a response retry never waits behind an unrelated chat's long turn -- and since work
+   * begets work (a drain starts a turn, a turn's end drains more calls), passes repeat until one
+   * ends with no turn running and no drain in flight. Both checks are needed: between a turn's end
+   * and the next turn's start, the only sign of work in progress is the drain (which the next pass
+   * joins, being single-flight). A drain that fails leaves its calls recorded rather than looping
+   * here; the recompute at the end re-arms the alarm for them, starting a fresh keep-alive period
+   * from now rather than re-firing on the time that has just passed. A delivery failure is
+   * rethrown once everything else has settled, so the platform retries the alarm. After its last
+   * retry, schedule a fresh wake-up: a long response-target outage must not strand durable work.
+   */
   async runAlarmTasks(retryCount = 0): Promise<void> {
     this.inAlarmHandler = true;
     this.scheduledAlarm = undefined; // A success recomputes the next alarm from settled state.
@@ -103,10 +105,12 @@ export class OverseerImpl extends OverseerGatekeepers implements AgentHooks {
     }
   }
 
-  // Resume any agent turns that were left running by a previous instance of this DO (i.e. were
-  // interrupted by a server restart). Called as soon as constructor initialization completes,
-  // before any blocked event is delivered, so at the start of the alarm handler
-  // it'll recognize that agents are running and wait for them.
+  /**
+   * Resume any agent turns that were left running by a previous instance of this DO (i.e. were
+   * interrupted by a server restart). Called as soon as constructor initialization completes,
+   * before any blocked event is delivered, so at the start of the alarm handler
+   * it'll recognize that agents are running and wait for them.
+   */
   protected resumeInterruptedAgents(): void {
     for (let record of Array.from(this.storage.activeAgents.list())) {
       if (this.runningAgents.has(record.chatId)) continue;
@@ -272,8 +276,10 @@ export class OverseerImpl extends OverseerGatekeepers implements AgentHooks {
     return chatId;
   }
 
-  // Stops the chat's running agent. Its queued steers are dropped: the client that stops puts them
-  // in its draft (see Overseer.stopAgent).
+  /**
+   * Stops the chat's running agent. Its queued steers are dropped: the client that stops puts them
+   * in its draft (see Overseer.stopAgent).
+   */
   cancelAgent(chatId: number) {
     let meta = this.storage.chatMeta.get(chatId);
     if (meta?.queuedSteers) {
@@ -306,9 +312,11 @@ export class OverseerImpl extends OverseerGatekeepers implements AgentHooks {
     }
   }
 
-  // Add a binding edge to a gadget on behalf of the agent's setGadgetBinding tool. The edge is
-  // provisional to the chat (see BindingRecord.pending); the agent loop records the addition in
-  // the chat log via `addedBindings`, which sequence-stamps it (see addChatMessages()).
+  /**
+   * Add a binding edge to a gadget on behalf of the agent's setGadgetBinding tool. The edge is
+   * provisional to the chat (see BindingRecord.pending); the agent loop records the addition in
+   * the chat log via `addedBindings`, which sequence-stamps it (see addChatMessages()).
+   */
   addGadgetBinding(gadgetId: WorkpieceId, name: string, target: WorkpieceId,
                    chatId: number): void {
     if (!this.storage.gatekeepers.get(target)) {
@@ -320,9 +328,11 @@ export class OverseerImpl extends OverseerGatekeepers implements AgentHooks {
     this.bindWorkpiece(gadget.id, name, target, chatId);
   }
 
-  // Called by AgentSelfLoopback when any method is called on the `self` object or on a
-  // spawnCallable() stub. Resolves once the call is durably recorded; the agent handles it
-  // asynchronously and nothing is returned to the caller.
+  /**
+   * Called by AgentSelfLoopback when any method is called on the `self` object or on a
+   * spawnCallable() stub. Resolves once the call is durably recorded; the agent handles it
+   * asynchronously and nothing is returned to the caller.
+   */
   async deliverAgentCallback(
       chatId: number, methodName: string, args: unknown[],
       initiatorUserId: string, initiatorModelId: string | null): Promise<void> {
@@ -366,9 +376,11 @@ export class OverseerImpl extends OverseerGatekeepers implements AgentHooks {
     }
   }
 
-  // Drain every chat that has pending calls and no running turn (a running turn drains its own
-  // at its end). Called from the constructor (fire-and-forget, for wakes of any kind) and from the
-  // alarm handler (awaited, so the alarm's retry covers a failure).
+  /**
+   * Drain every chat that has pending calls and no running turn (a running turn drains its own
+   * at its end). Called from the constructor (fire-and-forget, for wakes of any kind) and from the
+   * alarm handler (awaited, so the alarm's retry covers a failure).
+   */
   drainAllPendingAgentCalls(): Promise<void> {
     let chatIds = new Set<number>();
     for (let record of this.storage.pendingAgentCalls.list()) {
@@ -379,16 +391,18 @@ export class OverseerImpl extends OverseerGatekeepers implements AgentHooks {
         .map(chatId => this.drainPendingAgentCalls(chatId))).then(() => {});
   }
 
-  // Ensure every singleton account the gadget owner has (e.g. the Context Library) is provisioned
-  // for this gadget as an ambient gatekeeper record, folded into each chat's env (named by the
-  // gatekeeper's suggested binding name; see prepareChatBindings) so the agent can read it in
-  // executeCode — search/list/read recorded as observations — and optionally wire into a gadget
-  // via setGadgetBinding if the gadget's persistent code needs it. (Most gadgets never call the
-  // library programmatically, so a gadget binding would just be noise.) Idempotent:
-  // provisioned once per gadget and re-added if missing. Called on open(), before any agent turn.
-  //
-  // The session is reached through the owner's stored connected account, not by asserting the owner's
-  // identity to the vendor — so the capability is the account the user actually holds.
+  /**
+   * Ensure every singleton account the gadget owner has (e.g. the Context Library) is provisioned
+   * for this gadget as an ambient gatekeeper record, folded into each chat's env (named by the
+   * gatekeeper's suggested binding name; see prepareChatBindings) so the agent can read it in
+   * executeCode — search/list/read recorded as observations — and optionally wire into a gadget
+   * via setGadgetBinding if the gadget's persistent code needs it. (Most gadgets never call the
+   * library programmatically, so a gadget binding would just be noise.) Idempotent:
+   * provisioned once per gadget and re-added if missing. Called on open(), before any agent turn.
+   *
+   * The session is reached through the owner's stored connected account, not by asserting the owner's
+   * identity to the vendor — so the capability is the account the user actually holds.
+   */
   async ensureAmbientCapsules(): Promise<void> {
     let ownerId = this.ownerId;
     if (!ownerId) return;
@@ -447,8 +461,10 @@ export class OverseerImpl extends OverseerGatekeepers implements AgentHooks {
     }));
   }
 
-  // Old paused chats have no execution row. Before applying a decision, adopt the existing
-  // client's authority once, without model/profile I/O. New pauses always retain their row.
+  /**
+   * Old paused chats have no execution row. Before applying a decision, adopt the existing
+   * client's authority once, without model/profile I/O. New pauses always retain their row.
+   */
   rememberDecisionInitiator(chatId: number, userId: string, profile: AiChatAuthorInfo): void {
     if (this.storage.activeAgents.get(chatId) || this.storage.chatMeta.get(chatId)?.activeAgent) return;
     let wait = this.decisionWait(chatId);
@@ -457,12 +473,14 @@ export class OverseerImpl extends OverseerGatekeepers implements AgentHooks {
       initiator: profile, callbackInitiated: false});
   }
 
-  // Mint a gatekeeper simulating a new resource, tied to no account, and queue its creation.
-  // Unlike addGatekeeper(), this publishes without restarting collaborator sessions: a restart now
-  // would abort this turn before its tool call is recorded, and until the creation applies there
-  // is no real resource to verify anyone against -- the simulated one holds only what was written
-  // through this workspace, which no current collaborator is excluded from
-  // (#enforceExcludeObservers). applyPendingAction restarts once the resource is real.
+  /**
+   * Mint a gatekeeper simulating a new resource, tied to no account, and queue its creation.
+   * Unlike addGatekeeper(), this publishes without restarting collaborator sessions: a restart now
+   * would abort this turn before its tool call is recorded, and until the creation applies there
+   * is no real resource to verify anyone against -- the simulated one holds only what was written
+   * through this workspace, which no current collaborator is excluded from
+   * (#enforceExcludeObservers). applyPendingAction restarts once the resource is real.
+   */
   async createExternalResource(
       chatId: number, input: Extract<AiToolCall, {toolName: "createExternalResource"}>["input"])
       : Promise<{gatekeeperId: WorkpieceId}> {

@@ -24,8 +24,10 @@ import { describeBindingKind } from "./overseer-binding-info";
  * the former single-file overseer.ts. This layer only depends on layers before it.
  */
 export abstract class OverseerMainline extends OverseerChanges {
-  // The body of Overseer.updateChatFromMainline(), running under the chat's operation lock
-  // (callers hold withChatLock).
+  /**
+   * The body of Overseer.updateChatFromMainline(), running under the chat's operation lock
+   * (callers hold withChatLock).
+   */
   async updateChatFromMainline(chatId: number, author: AiChatAuthorInfo)
       : Promise<{conflictPaths: string[]}> {
     let meta = this.assertChatNotActive(chatId);
@@ -161,18 +163,20 @@ export abstract class OverseerMainline extends OverseerChanges {
     return {conflictPaths};
   }
 
-  // Get an RpcStub for the gadget facet, which can be returned to the client.
-  //
-  // `joinAs` counts the returned stub toward #hasCollaboratorSession for its own lifetime, like
-  // every other capability minted into a collaborator's session (see GadgetClientImpl): the facet
-  // is a live channel into the gadget's state -- including whatever an enabled hook writes into
-  // it -- and a stub that escaped the count would let a scope widening find no session to sever
-  // while the retained stub kept reading. Passed by the collaborator-facing connectToGadget
-  // mints; omitted for the owner's and for internal callers (binding loopbacks already live
-  // inside a counted session).
-  //
-  // Since facet stubs currently can't be sent over RPC, the stub is wrapped in a Proxy to make it
-  // look like an RpcTarget instead.
+  /**
+   * Get an RpcStub for the gadget facet, which can be returned to the client.
+   *
+   * `joinAs` counts the returned stub toward #hasCollaboratorSession for its own lifetime, like
+   * every other capability minted into a collaborator's session (see GadgetClientImpl): the facet
+   * is a live channel into the gadget's state -- including whatever an enabled hook writes into
+   * it -- and a stub that escaped the count would let a scope widening find no session to sever
+   * while the retained stub kept reading. Passed by the collaborator-facing connectToGadget
+   * mints; omitted for the owner's and for internal callers (binding loopbacks already live
+   * inside a counted session).
+   *
+   * Since facet stubs currently can't be sent over RPC, the stub is wrapped in a Proxy to make it
+   * look like an RpcTarget instead.
+   */
   async getGadgetFacet(gadgetId: WorkpieceId, chatId?: number, joinAs?: SessionKind)
       : Promise<RpcStub<any>> {
     let facet = await this.getGadgetFacetFetcher(gadgetId, chatId);
@@ -370,11 +374,13 @@ export abstract class OverseerMainline extends OverseerChanges {
     return lines.join("\n");
   }
 
-  // List the blueprints the turn's initiator could instantiate with createGadget: their own
-  // published blueprints, their blueprint library, and the deployment's featured set. Blueprint
-  // libraries are per-user, so this lists the initiator's -- a collaborator driving the agent gets
-  // their own library, not the workspace owner's. There is no search index; these corpora are
-  // small, so the formatted text is handed to the model to scan directly.
+  /**
+   * List the blueprints the turn's initiator could instantiate with createGadget: their own
+   * published blueprints, their blueprint library, and the deployment's featured set. Blueprint
+   * libraries are per-user, so this lists the initiator's -- a collaborator driving the agent gets
+   * their own library, not the workspace owner's. There is no search index; these corpora are
+   * small, so the formatted text is handed to the model to scan directly.
+   */
   async listAvailableBlueprints(initiator: AiChatAuthorInfo): Promise<string> {
     // User DOs are named by user identifier, and `initiator.id` is one: the initiating user for
     // "user" turns, the spawning gadget's owner for "gadget" turns (see AiChatAuthorInfo) -- the
@@ -442,8 +448,10 @@ export abstract class OverseerMainline extends OverseerChanges {
     return `${preamble}:\n\n` + sections.join("\n");
   }
 
-  // A short standing note about the deployment's standard formats, for the system prompt. Carried
-  // on every turn because "make me a quick doc" doesn't prompt an agent to call `listBlueprints`.
+  /**
+   * A short standing note about the deployment's standard formats, for the system prompt. Carried
+   * on every turn because "make me a quick doc" doesn't prompt an agent to call `listBlueprints`.
+   */
   async describeStandardFormats(): Promise<string> {
     let formats = await this.#listStandardFormats();
     if (formats.length === 0) return "";
@@ -510,10 +518,12 @@ export abstract class OverseerMainline extends OverseerChanges {
   // calls it orders are themselves re-run/repaired across DO restarts.
   #observerGatekeeperLocks = new Map<string, Promise<void>>();
 
-  // Serialize this DO's addObserver/removeObserver RPCs per (observer, gatekeeper) pair. The
-  // overseer is the only caller of either, so ordering our own calls is enough to close the race
-  // between an exclusion teardown's in-flight removeObserver and a fresh open's addObserver on
-  // the same pair: the add either lands first or waits for the removal and re-registers cleanly.
+  /**
+   * Serialize this DO's addObserver/removeObserver RPCs per (observer, gatekeeper) pair. The
+   * overseer is the only caller of either, so ordering our own calls is enough to close the race
+   * between an exclusion teardown's in-flight removeObserver and a fresh open's addObserver on
+   * the same pair: the add either lands first or waits for the removal and re-registers cleanly.
+   */
   protected async withObserverGatekeeperLock<T>(
       observerId: string, gatekeeperId: number, fn: () => Promise<T>): Promise<T> {
     let key = `${observerId}/${gatekeeperId}`;
@@ -535,10 +545,12 @@ export abstract class OverseerMainline extends OverseerChanges {
     }
   }
 
-  // Best-effort `removeObserver(observerId)` across the given gatekeeper ids. Never throws; logs
-  // and continues on error. An orphaned observer entry only ever causes superfluous future checks,
-  // never a data leak: a registration is what admits an open, and every open re-runs addObserver,
-  // so a stale one grants nothing on its own.
+  /**
+   * Best-effort `removeObserver(observerId)` across the given gatekeeper ids. Never throws; logs
+   * and continues on error. An orphaned observer entry only ever causes superfluous future checks,
+   * never a data leak: a registration is what admits an open, and every open re-runs addObserver,
+   * so a stale one grants nothing on its own.
+   */
   protected async removeObserverFromGatekeepers(observerId: string, gatekeeperIds: number[]): Promise<void> {
     await Promise.all(gatekeeperIds.map(async id => {
       try {
@@ -552,12 +564,14 @@ export abstract class OverseerMainline extends OverseerChanges {
     }));
   }
 
-  // Tear down observer records for collaborators who lost access as a result of a sharing change.
-  // For each affected collaborator who is now fully unauthorized (newRole === null) and has an
-  // observer record: best-effort removeObserver on all gatekeeper facets, then delete the record.
-  // All calls are best-effort -- an orphaned observer entry only causes superfluous future checks,
-  // never a data leak: a registration is what admits an open, and every open re-runs addObserver,
-  // so a stale one grants nothing on its own. See observers-implementation-plan.md §5 Step 6.
+  /**
+   * Tear down observer records for collaborators who lost access as a result of a sharing change.
+   * For each affected collaborator who is now fully unauthorized (newRole === null) and has an
+   * observer record: best-effort removeObserver on all gatekeeper facets, then delete the record.
+   * All calls are best-effort -- an orphaned observer entry only causes superfluous future checks,
+   * never a data leak: a registration is what admits an open, and every open re-runs addObserver,
+   * so a stale one grants nothing on its own. See observers-implementation-plan.md §5 Step 6.
+   */
   async tearDownLostObservers(affected: AffectedCollaborator[]): Promise<void> {
     let gatekeeperIds = [...this.storage.gatekeepers.list()].map(gk => gk.id);
     for (let entry of affected) {
@@ -569,9 +583,11 @@ export abstract class OverseerMainline extends OverseerChanges {
     }
   }
 
-  // Reconcile this workspace's cached listing for collaborators whose access changed: remove it
-  // for those who lost access entirely, and refresh the presentation-only role for those who were
-  // downgraded.
+  /**
+   * Reconcile this workspace's cached listing for collaborators whose access changed: remove it
+   * for those who lost access entirely, and refresh the presentation-only role for those who were
+   * downgraded.
+   */
   async refreshAffectedCollaboratorListings(affected: AffectedCollaborator[]): Promise<void> {
     let gadgetId = this.ctx.id.toString();
 
@@ -597,10 +613,12 @@ export abstract class OverseerMainline extends OverseerChanges {
     }
   }
 
-  // Get the owner's profile ID, using the in-memory cache when available. The owner's
-  // profile ID never changes, so this is safe to cache for the lifetime of the DO instance.
-  // The cache is populated eagerly when the owner calls open(), but if only collaborators
-  // have opened this instance we fetch it via RPC on first use.
+  /**
+   * Get the owner's profile ID, using the in-memory cache when available. The owner's
+   * profile ID never changes, so this is safe to cache for the lifetime of the DO instance.
+   * The cache is populated eagerly when the owner calls open(), but if only collaborators
+   * have opened this instance we fetch it via RPC on first use.
+   */
   async getOwnerProfileId(): Promise<string> {
     const ownerProfileId = this.ownerProfileId;
     if (ownerProfileId !== undefined) {
@@ -616,8 +634,10 @@ export abstract class OverseerMainline extends OverseerChanges {
 
   #sharingManager?: SharingManager;
 
-  // Collaborator authorization / sharing / permission logic. Memoized for the DO instance.
-  // Resolving the owner's profile ID may require an RPC on first use; thereafter it's cached.
+  /**
+   * Collaborator authorization / sharing / permission logic. Memoized for the DO instance.
+   * Resolving the owner's profile ID may require an RPC on first use; thereafter it's cached.
+   */
   async getSharingManager(): Promise<SharingManager> {
     if (!this.#sharingManager) {
       this.#sharingManager = new SharingManager(

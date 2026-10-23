@@ -365,9 +365,11 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
 
   // --- Commit-backed code reads ---
 
-  // The reads go through the git cache and so may fault-pull through a gatekeeper on the
-  // client's behalf -- reaching only commits the workspace's gatekeepers advertised or proved,
-  // nothing an agent couldn't already trigger.
+  /**
+   * The reads go through the git cache and so may fault-pull through a gatekeeper on the
+   * client's behalf -- reaching only commits the workspace's gatekeepers advertised or proved,
+   * nothing an agent couldn't already trigger.
+   */
   async listTree(commitId: string): Promise<TreeNode[]> {
     return await this.impl.gitCache.readCommitTree(validateOid(commitId));
   }
@@ -744,10 +746,12 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
     this.impl.ctx.waitUntil(this.#drainAutoApprovalsAndResume(action.gatekeeperId));
   }
 
-  // Enable auto-approval of actions carrying `actionKind` on the given gatekeeper. Stores the
-  // opt-in rule (one of the two gates required to auto-apply -- the action's own `autoApprovable`
-  // verdict is the other) with the kind's display label, and immediately drains any pending
-  // actions that this newly unblocks. Auto-approval rules are workspace-wide per gatekeeper.
+  /**
+   * Enable auto-approval of actions carrying `actionKind` on the given gatekeeper. Stores the
+   * opt-in rule (one of the two gates required to auto-apply -- the action's own `autoApprovable`
+   * verdict is the other) with the kind's display label, and immediately drains any pending
+   * actions that this newly unblocks. Auto-approval rules are workspace-wide per gatekeeper.
+   */
   async setAutoApprovedActionKind(gatekeeperId: WorkpieceId, actionKind: ActionKind)
       : Promise<void> {
     let gatekeeper = this.impl.storage.gatekeepers.get(gatekeeperId);
@@ -765,13 +769,15 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
     this.impl.ctx.waitUntil(this.#drainAutoApprovalsAndResume(gatekeeperId));
   }
 
-  // Remove the auto-approval rule for `tag` on the given gatekeeper, so future matching actions
-  // require manual approval again.
+  /**
+   * Remove the auto-approval rule for `tag` on the given gatekeeper, so future matching actions
+   * require manual approval again.
+   */
   async removeAutoApprovedActionKind(gatekeeperId: WorkpieceId, tag: string): Promise<void> {
     this.impl.storage.autoApproveTags.delete(`${gatekeeperId}:${tag}`);
   }
 
-  // List the enabled auto-approval rules.
+  /** List the enabled auto-approval rules. */
   async listAutoApprovedActionKinds()
       : Promise<Array<{ gatekeeperId: WorkpieceId; actionKind: ActionKind }>> {
     return [...this.impl.storage.autoApproveTags.list()].map(rule => ({
@@ -972,15 +978,19 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
     return oid;
   }
 
-  // Fetch the bytes of a committed chat attachment over the authenticated RPC connection. The
-  // caller already has its canonical metadata from the ChatAttachmentRef in the message.
+  /**
+   * Fetch the bytes of a committed chat attachment over the authenticated RPC connection. The
+   * caller already has its canonical metadata from the ChatAttachmentRef in the message.
+   */
   async getChatAttachmentContent(chatId: number, id: string): Promise<Uint8Array> {
     return await this.impl.getChatAttachmentData(chatId, id);
   }
 
-  // Compaction boundaries delimit the pages: the newest page is the tail replay still scans, and each
-  // earlier page is the span one checkpoint summarized. A thread that was never compacted has a
-  // single page.
+  /**
+   * Compaction boundaries delimit the pages: the newest page is the tail replay still scans, and each
+   * earlier page is the span one checkpoint summarized. A thread that was never compacted has a
+   * single page.
+   */
   async getChatHistory(chatId: number, beforeSequence?: number): Promise<AiChatHistoryPage> {
     let checkpoint = beforeSequence === undefined
         ? this.impl.getActiveChatCompaction(chatId)

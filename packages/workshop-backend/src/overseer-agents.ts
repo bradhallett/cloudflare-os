@@ -33,9 +33,11 @@ import { callArgsBindingName, fallbackBindingName, gatekeeperVendorId, observerB
  * the former single-file overseer.ts. This layer only depends on layers before it.
  */
 export abstract class OverseerAgents extends OverseerMainline {
-  // Resume a single interrupted agent turn. Re-resolves the model config from the initiator's user
-  // DO (we don't persist the secret API token), then runs the agent loop, which rebuilds its state
-  // by replaying the persisted chat log.
+  /**
+   * Resume a single interrupted agent turn. Re-resolves the model config from the initiator's user
+   * DO (we don't persist the secret API token), then runs the agent loop, which rebuilds its state
+   * by replaying the persisted chat log.
+   */
   protected async resumeAgent(record: ActiveAgentRecord, liveChat: LiveChatContext) {
     let owns = () => this.liveChats.get(record.chatId) === liveChat &&
         this.storage.chatMeta.get(record.chatId)?.activeAgent !== undefined;
@@ -132,12 +134,14 @@ export abstract class OverseerAgents extends OverseerMainline {
         liveChat);
   }
 
-  // The hand-off once a chat's turn is over and its running-agent state has been torn down: drop
-  // the turn's live context, then deliver whatever was waiting for the chat to go idle -- steers
-  // the turn never read, calls to the agent recorded during the turn (which start another turn),
-  // or failing that the response an external message is waiting on. Every path that ends a turn
-  // goes through here, so nothing sent mid-turn is stranded by the way the turn ended. `turn` is
-  // the turn that ended, absent if none ran.
+  /**
+   * The hand-off once a chat's turn is over and its running-agent state has been torn down: drop
+   * the turn's live context, then deliver whatever was waiting for the chat to go idle -- steers
+   * the turn never read, calls to the agent recorded during the turn (which start another turn),
+   * or failing that the response an external message is waiting on. Every path that ends a turn
+   * goes through here, so nothing sent mid-turn is stranded by the way the turn ended. `turn` is
+   * the turn that ended, absent if none ran.
+   */
   protected finishAgentTurn(chatId: number, turn?: {
     aiModel: UserAiModelRecord, initiator: AiChatAuthorInfo, initiatorUserId: string,
   }): void {
@@ -169,23 +173,25 @@ export abstract class OverseerAgents extends OverseerMainline {
     }
   }
 
-  // Reap crash-orphaned provisional gadgets and binding edges for the given chat. A pending
-  // record/edge is sequence-stamped in the same transaction that persists the "changes" message
-  // recording it (the step's barrier; see addChatMessages), so with no turn running:
-  //   - An *unstamped* record/edge is a mid-step crash orphan: its step's message is by
-  //     construction lost, so nothing in the log backs it. Reap it; the resumed turn simply
-  //     re-creates it if the model still wants it (for a gadget, wasting only an ID, which is
-  //     fine -- workpiece IDs are never reused anyway).
-  //   - A *stamped* record is reaped when the log marks its creation reverted: reverts record
-  //     their message before the awaited record deletions (see #revertChanges), so this is both
-  //     the tail of every revert and the recovery from one that crashed partway.
-  //   - A *stamped worktree* was written before recording a worktree creation promoted it (see
-  //     WorktreeRecord.pending). It is promoted here instead, reverted or not.
-  // Called at agent turn start (before history replay) and turn end, plus from merge and revert
-  // (which assert the chat has no active turn) -- never mid-step, when an unstamped record
-  // awaiting its barrier legitimately exists.
-  // Best-effort per gadget: a failure (e.g. a hook controller that can't be reached) leaves the
-  // record for the next reconciliation attempt.
+  /**
+   * Reap crash-orphaned provisional gadgets and binding edges for the given chat. A pending
+   * record/edge is sequence-stamped in the same transaction that persists the "changes" message
+   * recording it (the step's barrier; see addChatMessages), so with no turn running:
+   *   - An *unstamped* record/edge is a mid-step crash orphan: its step's message is by
+   *     construction lost, so nothing in the log backs it. Reap it; the resumed turn simply
+   *     re-creates it if the model still wants it (for a gadget, wasting only an ID, which is
+   *     fine -- workpiece IDs are never reused anyway).
+   *   - A *stamped* record is reaped when the log marks its creation reverted: reverts record
+   *     their message before the awaited record deletions (see #revertChanges), so this is both
+   *     the tail of every revert and the recovery from one that crashed partway.
+   *   - A *stamped worktree* was written before recording a worktree creation promoted it (see
+   *     WorktreeRecord.pending). It is promoted here instead, reverted or not.
+   * Called at agent turn start (before history replay) and turn end, plus from merge and revert
+   * (which assert the chat has no active turn) -- never mid-step, when an unstamped record
+   * awaiting its barrier legitimately exists.
+   * Best-effort per gadget: a failure (e.g. a hook controller that can't be reached) leaves the
+   * record for the next reconciliation attempt.
+   */
   async reconcilePendingGadgets(chatId: number): Promise<void> {
     let pending = this.listPendingGadgets(chatId);
     let unstamped = pending.filter(gadget => gadget.pending!.sequence === undefined);
@@ -248,14 +254,16 @@ export abstract class OverseerAgents extends OverseerMainline {
     }
   }
 
-  // Permanently delete a workpiece: its hooks, its registry entry (which for a gadget carries
-  // its binding map and head commit -- the gadget's only "ref"), and its running facet (a
-  // worktree has no hooks or facet, so those steps are no-ops for one). Gatekeepers a gadget
-  // bound survive, possibly orphaned. The workpiece's commits become dangling objects in the git
-  // store, which is fine: content-addressed objects are cheap, unreachable, and shared with any
-  // related histories. (Chat docs may still hold content in the gadget's files root, and chats
-  // may still pin the gadget; the pins stay because the chat's rows still fold on them. Both are
-  // inert because the registry entry -- the enumeration source of truth -- is gone.)
+  /**
+   * Permanently delete a workpiece: its hooks, its registry entry (which for a gadget carries
+   * its binding map and head commit -- the gadget's only "ref"), and its running facet (a
+   * worktree has no hooks or facet, so those steps are no-ops for one). Gatekeepers a gadget
+   * bound survive, possibly orphaned. The workpiece's commits become dangling objects in the git
+   * store, which is fine: content-addressed objects are cheap, unreachable, and shared with any
+   * related histories. (Chat docs may still hold content in the gadget's files root, and chats
+   * may still pin the gadget; the pins stay because the chat's rows still fold on them. Both are
+   * inert because the registry entry -- the enumeration source of truth -- is gone.)
+   */
   async removeWorkpiece(id: WorkpieceId): Promise<void> {
     let record = this.storage.gadgets.get(id);
     if (!record) {
@@ -281,7 +289,7 @@ export abstract class OverseerAgents extends OverseerMainline {
     for (let meta of proposingChats) this.storage.chatMeta.put(meta);
   }
 
-  // Disable (if needed) and delete a bound hook, updating its action-log record to match.
+  /** Disable (if needed) and delete a bound hook, updating its action-log record to match. */
   async deleteHook(id: number): Promise<void> {
     let record = this.storage.boundHooks.get(id);
     if (!record) return;
@@ -293,17 +301,19 @@ export abstract class OverseerAgents extends OverseerMainline {
     stampBindHookAction(this.storage, record.actionId, false, {clearHookId: true});
   }
 
-  // Apply a single pending action: invoke the gatekeeper, mark it approved, and persist (the put
-  // auto-notifies subscribeToActions). Shared by manual approval (`approveAction`) and the
-  // auto-approval drain (`drainAutoApprovals`). The caller is responsible for validating that the
-  // record is still pending before calling.
-  //
-  // `resolvedBy`/`autoApproved` are required (not defaulted) so that no apply path can omit how the
-  // gate was cleared: this is the single chokepoint where an action transitions to "approved", so
-  // requiring them here guarantees the audit log always records the resolving user and whether it
-  // was applied automatically. For an auto-approval, `resolvedBy` is the user who enabled the rule.
-  // A creation also needs `creation`: the verifier of the account the approver chose to create it
-  // in, and what they chose in that account's creation configurator.
+  /**
+   * Apply a single pending action: invoke the gatekeeper, mark it approved, and persist (the put
+   * auto-notifies subscribeToActions). Shared by manual approval (`approveAction`) and the
+   * auto-approval drain (`drainAutoApprovals`). The caller is responsible for validating that the
+   * record is still pending before calling.
+   *
+   * `resolvedBy`/`autoApproved` are required (not defaulted) so that no apply path can omit how the
+   * gate was cleared: this is the single chokepoint where an action transitions to "approved", so
+   * requiring them here guarantees the audit log always records the resolving user and whether it
+   * was applied automatically. For an auto-approval, `resolvedBy` is the user who enabled the rule.
+   * A creation also needs `creation`: the verifier of the account the approver chose to create it
+   * in, and what they chose in that account's creation configurator.
+   */
   async applyPendingAction(record: ActionRecord & {type: "action"},
                            resolvedBy: AiChatAuthorInfo, autoApproved: boolean,
                            creation?: {creator: Fetcher<GatekeeperUserVerifier>,
@@ -373,7 +383,7 @@ export abstract class OverseerAgents extends OverseerMainline {
     this.traceAgentActionApproval(record, "approved");
   }
 
-  // Blocks other messages and agent turns for this chat until the returned object is disposed.
+  /** Blocks other messages and agent turns for this chat until the returned object is disposed. */
   reserveChatMessagePreparation(chatId: number): Disposable {
     if (this.preparingChatMessages.has(chatId)) {
       throw new Error("A chat message is already being prepared for this chat.");
@@ -400,8 +410,10 @@ export abstract class OverseerAgents extends OverseerMainline {
     };
   }
 
-  // Migrate only the chat being used, one payload at a time. Each file's projection and
-  // original-download reference publish together, so a reset retries without duplicating it.
+  /**
+   * Migrate only the chat being used, one payload at a time. Each file's projection and
+   * original-download reference publish together, so a reset retries without duplicating it.
+   */
   protected async migrateChatAttachments(chatId: number): Promise<void> {
     if (this.getChatAgentContext(chatId).attachmentsMigrated) return;
     let complete = true;
@@ -491,25 +503,27 @@ export abstract class OverseerAgents extends OverseerMainline {
     return {commitId, bindingName};
   }
 
-  // Enforce an observation's `excludeObservers`, named by the gatekeeper `gatekeeperId` produced
-  // it. For each named opaque observerId:
-  //   - Map it back to a profileId via the byObserverId index. An unknown id is not an active
-  //     observer (e.g. already torn down), so it is ignored.
-  //   - If that profileId is still authorized in the sharing graph *and* this gatekeeper is still
-  //     in their role's verification scope, we cannot guarantee they won't see the observation (v1
-  //     has no per-thread hiding), so we throw to block it.
-  //   - If this gatekeeper has left their scope, they cannot reach the observation and must not
-  //     block it. They stay a collaborator with an intact record, so only their registration on
-  //     *this* gatekeeper is dropped -- which is what left them named here after the connection
-  //     was unbound, since a "use" collaborator's open never re-verifies (and so never re-registers
-  //     or removes) a gatekeeper outside their scope. A rebind puts it back in scope and their next
-  //     open registers them again.
-  //   - If that profileId is no longer authorized, we allow the observation for them and delete
-  //     their observer record (best-effort removeObserver on all gatekeepers). They are no longer
-  //     set up to observe; if they regain access they reconfigure from scratch (Step 3).
-  // If no named observer can reach the observation, it is allowed. Every id is classified before
-  // anything is torn down, so a blocked observation leaves no teardown behind it; the removals are
-  // then all issued together and awaited at once.
+  /**
+   * Enforce an observation's `excludeObservers`, named by the gatekeeper `gatekeeperId` produced
+   * it. For each named opaque observerId:
+   *   - Map it back to a profileId via the byObserverId index. An unknown id is not an active
+   *     observer (e.g. already torn down), so it is ignored.
+   *   - If that profileId is still authorized in the sharing graph *and* this gatekeeper is still
+   *     in their role's verification scope, we cannot guarantee they won't see the observation (v1
+   *     has no per-thread hiding), so we throw to block it.
+   *   - If this gatekeeper has left their scope, they cannot reach the observation and must not
+   *     block it. They stay a collaborator with an intact record, so only their registration on
+   *     *this* gatekeeper is dropped -- which is what left them named here after the connection
+   *     was unbound, since a "use" collaborator's open never re-verifies (and so never re-registers
+   *     or removes) a gatekeeper outside their scope. A rebind puts it back in scope and their next
+   *     open registers them again.
+   *   - If that profileId is no longer authorized, we allow the observation for them and delete
+   *     their observer record (best-effort removeObserver on all gatekeepers). They are no longer
+   *     set up to observe; if they regain access they reconfigure from scratch (Step 3).
+   * If no named observer can reach the observation, it is allowed. Every id is classified before
+   * anything is torn down, so a blocked observation leaves no teardown behind it; the removals are
+   * then all issued together and awaited at once.
+   */
   protected async enforceExcludeObservers(gatekeeperId: number, observerIds: string[]): Promise<void> {
     let sharing = await this.getSharingManager();
 
@@ -568,14 +582,16 @@ export abstract class OverseerAgents extends OverseerMainline {
     return this.accountRequiringUseScope().has(gatekeeperId);
   }
 
-  // Diff the account-requiring "use" scope against a snapshot taken just before a mutation, and
-  // when it widened onto a live "use" session, restart -- additionally blocking each widened
-  // connection until the reset lands (see #gatekeepersPendingRestart): the severed sessions stay
-  // live for the reset's ~100ms delay, and a gadget facet reload in that window would otherwise
-  // mint fresh binding loopbacks onto a connection nobody verified the holder against. Marking
-  // the gatekeeper ids suffices as quarantine because every such loopback funnels through
-  // openGatekeeperSession (assertGatekeeperUsable). Shared by every "use"-scope widening site:
-  // bindWorkpiece, mergeChatChanges, enableHookRecord.
+  /**
+   * Diff the account-requiring "use" scope against a snapshot taken just before a mutation, and
+   * when it widened onto a live "use" session, restart -- additionally blocking each widened
+   * connection until the reset lands (see #gatekeepersPendingRestart): the severed sessions stay
+   * live for the reset's ~100ms delay, and a gadget facet reload in that window would otherwise
+   * mint fresh binding loopbacks onto a connection nobody verified the holder against. Marking
+   * the gatekeeper ids suffices as quarantine because every such loopback funnels through
+   * openGatekeeperSession (assertGatekeeperUsable). Shared by every "use"-scope widening site:
+   * bindWorkpiece, mergeChatChanges, enableHookRecord.
+   */
   protected restartIfUseScopeWidened(useScopeBefore: Set<WorkpieceId>, reason: string): void {
     let widened = [...this.accountRequiringUseScope()].filter(id => !useScopeBefore.has(id));
     if (widened.length === 0) return;
@@ -681,10 +697,12 @@ export abstract class OverseerAgents extends OverseerMainline {
     });
   }
 
-  // Start an agent turn for the given chat (fire-and-forget). Persists an `ActiveAgentRecord` so
-  // the turn can be resumed after a server restart, and tracks the turn so the keep-alive alarm is
-  // held while it runs. `initiatorUserId` is the hex DO ID of the user whose model/account is used,
-  // needed to re-resolve the model config on resume.
+  /**
+   * Start an agent turn for the given chat (fire-and-forget). Persists an `ActiveAgentRecord` so
+   * the turn can be resumed after a server restart, and tracks the turn so the keep-alive alarm is
+   * held while it runs. `initiatorUserId` is the hex DO ID of the user whose model/account is used,
+   * needed to re-resolve the model config on resume.
+   */
   startAgent(chatId: number, aiModel: UserAiModelRecord,
              initiator: AiChatAuthorInfo, initiatorUserId: string,
              callbackInitiated: boolean = false,
@@ -905,21 +923,23 @@ export abstract class OverseerAgents extends OverseerMainline {
     }
   }
 
-  // Append the chat's pending agent calls to its chat log as agentCallback messages and, if the
-  // initiator has a model, start the agent. Called whenever the chat may have become idle with
-  // calls pending; a no-op if it hasn't. The callers were answered when their calls were recorded,
-  // so any failure here is surfaced in the chat and the log, never to them.
-  //
-  // Most callers fire and forget, and this may die mid-way (a crash resets the DO). That is safe:
-  // a call stays recorded until the synchronous block below moves it into the log, so nothing is
-  // lost, and a recorded call counts as outstanding agent work for the alarm (see
-  // #agentKeepAliveTime), so the DO is woken to retry rather than waiting on the next event.
-  //
-  // Single-flight per chat: a kick while a drain is already in flight joins it rather than
-  // starting another (the in-flight one re-lists the records after its awaits, so it picks up
-  // anything recorded meanwhile). This is what lets runAlarmTasks see a drain as work in progress,
-  // and it keeps the constructor and the alarm handler, which may both kick the same chat, from
-  // resolving the model twice or reporting a failure twice.
+  /**
+   * Append the chat's pending agent calls to its chat log as agentCallback messages and, if the
+   * initiator has a model, start the agent. Called whenever the chat may have become idle with
+   * calls pending; a no-op if it hasn't. The callers were answered when their calls were recorded,
+   * so any failure here is surfaced in the chat and the log, never to them.
+   *
+   * Most callers fire and forget, and this may die mid-way (a crash resets the DO). That is safe:
+   * a call stays recorded until the synchronous block below moves it into the log, so nothing is
+   * lost, and a recorded call counts as outstanding agent work for the alarm (see
+   * #agentKeepAliveTime), so the DO is woken to retry rather than waiting on the next event.
+   *
+   * Single-flight per chat: a kick while a drain is already in flight joins it rather than
+   * starting another (the in-flight one re-lists the records after its awaits, so it picks up
+   * anything recorded meanwhile). This is what lets runAlarmTasks see a drain as work in progress,
+   * and it keeps the constructor and the alarm handler, which may both kick the same chat, from
+   * resolving the model twice or reporting a failure twice.
+   */
   drainPendingAgentCalls(chatId: number): Promise<void> {
     let drain = this.pendingCallDrains.get(chatId);
     if (!drain) {
@@ -1051,8 +1071,10 @@ export abstract class OverseerAgents extends OverseerMainline {
         }));
   }
 
-  // No await: the decision, its model-visible note, busy state, execution row and alarm all
-  // precede model lookup. Live resumption and restart recovery then use the same #resumeAgent.
+  /**
+   * No await: the decision, its model-visible note, busy state, execution row and alarm all
+   * precede model lookup. Live resumption and restart recovery then use the same #resumeAgent.
+   */
   resumeAgentAfterDecision(chatId: number, decisionId?: number | string): void {
     let meta = this.storage.chatMeta.get(chatId);
     if (meta?.activeAgent) return; // Teardown rechecks after releasing this execution.
@@ -1087,15 +1109,17 @@ export abstract class OverseerAgents extends OverseerMainline {
 
   // --- Blueprint hooks for the agent ---
 
-  // Gatekeeper ids reachable from a "use" collaborator's session, and therefore all of their
-  // verification scope: everything bound by some non-provisional gadget (the gadget UI they drive
-  // can invoke it), plus every connection with an *enabled* hook -- a hook is a live write channel
-  // into the gadget it wakes, delivering the connection's data into state that collaborator can
-  // open, regardless of binding edges -- plus, transitively, every env target of a reachable
-  // agent spawner: connectToGadget mints the bound spawner's loopback with no role filter
-  // (getEnvForLoader), and spawn/spawnCallable seeds the spawned agent's bindings from
-  // config.env (spawnAgent), handing the collaborator an agent that reads those connections
-  // with the creator's authority and returns their data.
+  /**
+   * Gatekeeper ids reachable from a "use" collaborator's session, and therefore all of their
+   * verification scope: everything bound by some non-provisional gadget (the gadget UI they drive
+   * can invoke it), plus every connection with an *enabled* hook -- a hook is a live write channel
+   * into the gadget it wakes, delivering the connection's data into state that collaborator can
+   * open, regardless of binding edges -- plus, transitively, every env target of a reachable
+   * agent spawner: connectToGadget mints the bound spawner's loopback with no role filter
+   * (getEnvForLoader), and spawn/spawnCallable seeds the spawned agent's bindings from
+   * config.env (spawnAgent), handing the collaborator an agent that reads those connections
+   * with the creator's authority and returns their data.
+   */
   protected useScopeGatekeeperIds(): Set<WorkpieceId> {
     let ids = new Set<WorkpieceId>();
     for (let gadget of this.storage.gadgets.list()) {
@@ -1144,17 +1168,19 @@ export abstract class OverseerAgents extends OverseerMainline {
     return ids;
   }
 
-  // The account-requiring subset of #useScopeGatekeeperIds(): exactly what a "use" collaborator
-  // is verified against, as an id set two states can be compared by (see mergeChatChanges).
-  //
-  // Uses the non-throwing gatekeeperVendorId() rather than #inScopeGatekeepers("use"), whose
-  // observerVendorId() throws on a legacy record with no creationSpec: an unrelated legacy
-  // connection must not turn a caller's ordinary bookkeeping into an error.
-  //
-  // A reachable legacy record (no creationSpec) joins the set even though it has no vendor to
-  // verify against: nobody CAN be verified against it, so it becoming reachable must restart
-  // and quarantine -- fresh use opens then fail closed via observerVendorId() -- rather than
-  // vanish from both sides of the widening diff and leave live sessions invoking it.
+  /**
+   * The account-requiring subset of #useScopeGatekeeperIds(): exactly what a "use" collaborator
+   * is verified against, as an id set two states can be compared by (see mergeChatChanges).
+   *
+   * Uses the non-throwing gatekeeperVendorId() rather than #inScopeGatekeepers("use"), whose
+   * observerVendorId() throws on a legacy record with no creationSpec: an unrelated legacy
+   * connection must not turn a caller's ordinary bookkeeping into an error.
+   *
+   * A reachable legacy record (no creationSpec) joins the set even though it has no vendor to
+   * verify against: nobody CAN be verified against it, so it becoming reachable must restart
+   * and quarantine -- fresh use opens then fail closed via observerVendorId() -- rather than
+   * vanish from both sides of the widening diff and leave live sessions invoking it.
+   */
   protected accountRequiringUseScope(): Set<WorkpieceId> {
     let ids = new Set<WorkpieceId>();
     for (let id of this.useScopeGatekeeperIds()) {
@@ -1164,20 +1190,22 @@ export abstract class OverseerAgents extends OverseerMainline {
     return ids;
   }
 
-  // Selects the gatekeepers a non-owner observer with the given `role` must be verified against:
-  //   - "build" collaborators (full access): every account-requiring gatekeeper.
-  //   - "use" collaborators (UI only): only account-requiring gatekeepers some gadget binds or an
-  //     enabled hook feeds, since that is all their sessions can reach.
-  //
-  // The scope filter runs before observerVendorId(), which throws on a legacy record with no
-  // creationSpec: an unrelated legacy connection outside the caller's scope must not block their
-  // open, since nothing they can reach needs verification against it. An in-scope one still
-  // throws, fail-closed (and "build" scope is everything, so it always throws there).
-  //
-  // TODO(known-risk): a "use" collaborator is never verified against a producer outside their
-  //   scope, yet restricted data read from it can reach gadget state they see, because provenance
-  //   is not tracked past the observation. Accepted for v1; see "Known security risk -- never-bound
-  //   producers" in plans/restricted-data-sharing.md.
+  /**
+   * Selects the gatekeepers a non-owner observer with the given `role` must be verified against:
+   *   - "build" collaborators (full access): every account-requiring gatekeeper.
+   *   - "use" collaborators (UI only): only account-requiring gatekeepers some gadget binds or an
+   *     enabled hook feeds, since that is all their sessions can reach.
+   *
+   * The scope filter runs before observerVendorId(), which throws on a legacy record with no
+   * creationSpec: an unrelated legacy connection outside the caller's scope must not block their
+   * open, since nothing they can reach needs verification against it. An in-scope one still
+   * throws, fail-closed (and "build" scope is everything, so it always throws there).
+   *
+   * TODO(known-risk): a "use" collaborator is never verified against a producer outside their
+   *   scope, yet restricted data read from it can reach gadget state they see, because provenance
+   *   is not tracked past the observation. Accepted for v1; see "Known security risk -- never-bound
+   *   producers" in plans/restricted-data-sharing.md.
+   */
   protected inScopeGatekeepers(role: CollaboratorRole): GatekeeperRecord[] {
     let boundIds = role === "use" ? this.useScopeGatekeeperIds() : undefined;
 
@@ -1193,15 +1221,17 @@ export abstract class OverseerAgents extends OverseerMainline {
     return result.filter(gk => !this.#creationPending(gk.id));
   }
 
-  // The authorization gate every non-owner entry point (open(), receiveExternalMessage()) must
-  // pass through: resolve the caller's effective role, then verify them as an observer of
-  // everything this workspace has read. Returns null for no access; verification failures throw.
-  // A caller that requires at least `requireRole` (e.g. receiveExternalMessage needs "build")
-  // passes it so an insufficient role is denied *before* verification runs -- otherwise the caller
-  // would be verified (real addObserver calls, a persisted observer record) only to be turned
-  // away, or worse, told to fix a verification failure that can never grant them access.
-  // `configureCb` is forwarded to ensureObserver to prompt for unconfigured account choices;
-  // without it, verification is non-interactive and an unconfigured binding denies access.
+  /**
+   * The authorization gate every non-owner entry point (open(), receiveExternalMessage()) must
+   * pass through: resolve the caller's effective role, then verify them as an observer of
+   * everything this workspace has read. Returns null for no access; verification failures throw.
+   * A caller that requires at least `requireRole` (e.g. receiveExternalMessage needs "build")
+   * passes it so an insufficient role is denied *before* verification runs -- otherwise the caller
+   * would be verified (real addObserver calls, a persisted observer record) only to be turned
+   * away, or worse, told to fix a verification failure that can never grant them access.
+   * `configureCb` is forwarded to ensureObserver to prompt for unconfigured account choices;
+   * without it, verification is non-interactive and an unconfigured binding denies access.
+   */
   async authorizeCollaborator(
       profileId: string,
       clientUser: DurableObjectStub<UserDurableObject>,
@@ -1230,17 +1260,19 @@ export abstract class OverseerAgents extends OverseerMainline {
     return role;
   }
 
-  // Bring a non-owner `profileId` into compliance as an observer for their `role`, so that they may
-  // open the Gadget. May invoke `configureCb` to ask the user to choose connected accounts for
-  // gatekeeper bindings they haven't configured yet. Re-runs `addObserver` (re-verification) for
-  // already-configured bindings on every open, catching revocation of the user's underlying
-  // resource access promptly. Returns when fully verified; throws to deny access.
-  //
-  // See observers-implementation-plan.md §5 Step 3.
-  //
-  // TODO: Concurrent opens by the same profile race this method -- two calls mint two observerIds
-  //   and the last-written record forgets the other's gatekeeper registrations -- so verification
-  //   needs to be serialized per profile.
+  /**
+   * Bring a non-owner `profileId` into compliance as an observer for their `role`, so that they may
+   * open the Gadget. May invoke `configureCb` to ask the user to choose connected accounts for
+   * gatekeeper bindings they haven't configured yet. Re-runs `addObserver` (re-verification) for
+   * already-configured bindings on every open, catching revocation of the user's underlying
+   * resource access promptly. Returns when fully verified; throws to deny access.
+   *
+   * See observers-implementation-plan.md §5 Step 3.
+   *
+   * TODO: Concurrent opens by the same profile race this method -- two calls mint two observerIds
+   *   and the last-written record forgets the other's gatekeeper registrations -- so verification
+   *   needs to be serialized per profile.
+   */
   async ensureObserver(
       profileId: string,
       clientUser: DurableObjectStub<UserDurableObject>,

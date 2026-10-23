@@ -17,7 +17,6 @@ import { OverseerFacets } from "./overseer-facets";
 import { defaultBlueprintBindingTitle } from "./overseer-binding-info";
 import type { CodeModeEntrypoint } from "./overseer-harness";
 import { CODE_MODE_HARNESS, RestoreForgerImpl } from "./overseer-harness";
-import type { OverseerImpl } from "./overseer-impl";
 import { OverseerCore } from "./overseer-core";
 
 /**
@@ -27,7 +26,7 @@ import { OverseerCore } from "./overseer-core";
  * the former single-file overseer.ts. This layer only depends on layers before it.
  */
 export abstract class OverseerPublishing extends OverseerFacets {
-  // Collect binding metadata from the given gadget's binding edges for blueprint creation/update.
+  /** Collect binding metadata from the given gadget's binding edges for blueprint creation/update. */
   collectBindingMetadata(gadgetId: WorkpieceId): Record<string, BlueprintBinding> {
     let bindings: Record<string, BlueprintBinding> = {};
 
@@ -197,10 +196,12 @@ export abstract class OverseerPublishing extends OverseerFacets {
     return bindings;
   }
 
-  // Validate that a gadget head is publishable to a blueprint, returning it. "No code" means
-  // the head is absent (a permanent gadget created outside any chat, before its first accept)
-  // *or* an empty tree (an accepted creation with no files yet -- a legitimate head, just not a
-  // publishable one): either way the archive would be empty, which instantiation refuses.
+  /**
+   * Validate that a gadget head is publishable to a blueprint, returning it. "No code" means
+   * the head is absent (a permanent gadget created outside any chat, before its first accept)
+   * *or* an empty tree (an accepted creation with no files yet -- a legitimate head, just not a
+   * publishable one): either way the archive would be empty, which instantiation refuses.
+   */
   async assertPublishableCommit(commitId: string | undefined): Promise<string> {
     if (commitId !== undefined &&
         (await this.gitStore.readCommitFiles(commitId)).size > 0) {
@@ -209,21 +210,23 @@ export abstract class OverseerPublishing extends OverseerFacets {
     throw new Error("This gadget has no code to publish. Accept some code first.");
   }
 
-  // Mints the blueprint's next release (see blueprint-release.ts) from the tree of the gadget
-  // commit `sourceCommit`: writes the release commit, records it on `record` -- which the caller
-  // stores by propagating it -- and returns the pack to propagate with it. If that tree is what
-  // the blueprint's latest release already holds, and the gadget has merged no other blueprint
-  // since, there is nothing to release: the record is left alone and undefined is returned.
-  //
-  // The release's first parent is the release before it. For a record last published before
-  // releases were commits, that is the snapshot release of the files it published, which is the
-  // release everyone who reads that content derives from it. Such a record's first release here
-  // is minted even over an unchanged tree, since it is what moves the stored content to a pack.
-  //
-  // Its other parents are the releases of other blueprints that the gadget has merged since, so
-  // that whoever holds this release can find what it has in common with theirs. A first parent
-  // always belongs to the blueprint's own lineage, so a blueprint with no release yet to come
-  // before those gets an empty one: release 0, the root of its lineage.
+  /**
+   * Mints the blueprint's next release (see blueprint-release.ts) from the tree of the gadget
+   * commit `sourceCommit`: writes the release commit, records it on `record` -- which the caller
+   * stores by propagating it -- and returns the pack to propagate with it. If that tree is what
+   * the blueprint's latest release already holds, and the gadget has merged no other blueprint
+   * since, there is nothing to release: the record is left alone and undefined is returned.
+   *
+   * The release's first parent is the release before it. For a record last published before
+   * releases were commits, that is the snapshot release of the files it published, which is the
+   * release everyone who reads that content derives from it. Such a record's first release here
+   * is minted even over an unchanged tree, since it is what moves the stored content to a pack.
+   *
+   * Its other parents are the releases of other blueprints that the gadget has merged since, so
+   * that whoever holds this release can find what it has in common with theirs. A first parent
+   * always belongs to the blueprint's own lineage, so a blueprint with no release yet to come
+   * before those gets an empty one: release 0, the root of its lineage.
+   */
   async mintBlueprintRelease(record: BlueprintGadgetRecord, sourceCommit: string)
       : Promise<Uint8Array | undefined> {
     let tree = await this.gitStore.commitTree(sourceCommit);
@@ -265,19 +268,21 @@ export abstract class OverseerPublishing extends OverseerFacets {
     return await this.buildBlueprintPack(releaseCommit);
   }
 
-  // The blueprint releases merged into a gadget on the way from its commit `since` to its
-  // commit `head`, or in the whole of `head`'s history if `since` is undefined, in the order
-  // they were merged. Those that `previous` (a release, if given) or another of them already
-  // has in its history are left out, as naming them again would say nothing.
-  //
-  // A commit merged a release only if it marks it as one (see releasesMergedBy). Its other
-  // parents are the gadget's own history: its first parent, and any other commit of the
-  // gadget's that it merged, such as a chat's own files. The walk follows all of those, since a
-  // mark can lie off the first-parent chain -- a blueprint proposal's merge, reached through the
-  // files of the chat that held it when the chat was brought up to date. It never enters a
-  // release's history, which holds no commit of the gadget's own, and stops at the history of
-  // `since`. A commit's releases come after those of its first parent's history and then of its
-  // other parents', which makes the order oldest first.
+  /**
+   * The blueprint releases merged into a gadget on the way from its commit `since` to its
+   * commit `head`, or in the whole of `head`'s history if `since` is undefined, in the order
+   * they were merged. Those that `previous` (a release, if given) or another of them already
+   * has in its history are left out, as naming them again would say nothing.
+   *
+   * A commit merged a release only if it marks it as one (see releasesMergedBy). Its other
+   * parents are the gadget's own history: its first parent, and any other commit of the
+   * gadget's that it merged, such as a chat's own files. The walk follows all of those, since a
+   * mark can lie off the first-parent chain -- a blueprint proposal's merge, reached through the
+   * files of the chat that held it when the chat was brought up to date. It never enters a
+   * release's history, which holds no commit of the gadget's own, and stops at the history of
+   * `since`. A commit's releases come after those of its first parent's history and then of its
+   * other parents', which makes the order oldest first.
+   */
   async releasesMergedSince(head: string, since: string | undefined, previous: string | undefined)
       : Promise<string[]> {
     let read = (oid: string) => {
@@ -321,28 +326,32 @@ export abstract class OverseerPublishing extends OverseerFacets {
         !merged.some(other => other !== release && this.gitCache.isAncestor(release, other)));
   }
 
-  // Builds the pack of a release this workspace minted. A release always yields the same bytes.
+  /** Builds the pack of a release this workspace minted. A release always yields the same bytes. */
   async buildBlueprintPack(releaseCommit: string): Promise<Uint8Array> {
     return await buildReleasePack(oid => this.gitCache.readLocalObject(oid), releaseCommit);
   }
 
-  // Loads the release that `metadata` describes into the workspace's git store, returning its
-  // release commit. Throws if its content is missing or invalid, having stored none of it. The
-  // metadata is the caller's to read (see readBlueprintRelease()).
-  //
-  // This is the one way a blueprint's objects enter the workspace, so what
-  // readBlueprintRelease() admits is all that one can add to the store.
+  /**
+   * Loads the release that `metadata` describes into the workspace's git store, returning its
+   * release commit. Throws if its content is missing or invalid, having stored none of it. The
+   * metadata is the caller's to read (see readBlueprintRelease()).
+   *
+   * This is the one way a blueprint's objects enter the workspace, so what
+   * readBlueprintRelease() admits is all that one can add to the store.
+   */
   async loadBlueprint(blueprintId: string, metadata: BlueprintMetadata): Promise<string> {
     let release = await readBlueprintRelease(this.env, blueprintId, metadata);
     await this.gitCache.importObjects(release.objects.values());
     return release.commitId;
   }
 
-  // Propagate a blueprint to User DO, KV, and R2.
-  // If `pack` is provided, it is the pack of the record's latest release, and is uploaded to R2.
-  // If omitted (metadata-only update), the R2 content is left unchanged -- unless the record is
-  // still dirty from an earlier attempt, which may not have got as far as uploading its latest
-  // release. That release is then uploaded again.
+  /**
+   * Propagate a blueprint to User DO, KV, and R2.
+   * If `pack` is provided, it is the pack of the record's latest release, and is uploaded to R2.
+   * If omitted (metadata-only update), the R2 content is left unchanged -- unless the record is
+   * still dirty from an earlier attempt, which may not have got as far as uploading its latest
+   * release. That release is then uploaded again.
+   */
   async propagateBlueprint(
       record: BlueprintGadgetRecord,
       pack?: Uint8Array,
@@ -404,7 +413,7 @@ export abstract class OverseerPublishing extends OverseerFacets {
     this.storage.blueprints.put(record);
   }
 
-  // Delete a blueprint's propagated data (KV, R2, User DO, local).
+  /** Delete a blueprint's propagated data (KV, R2, User DO, local). */
   async deleteBlueprintPropagation(record: BlueprintGadgetRecord): Promise<void> {
     if (!this.ownerId) throw new Error("Workspace not initialized.");
 

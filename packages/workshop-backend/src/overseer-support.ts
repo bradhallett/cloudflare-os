@@ -9,7 +9,7 @@ export const AGENT_RUNNING_ERROR_MESSAGE = "Agent is running, wait for it to fin
 // Per-chat in-memory state, used while an agent is running.
 /** Split out of the former overseer.ts (internal helper). */
 export type LiveChatContext = {
-  // Abort controller for the running agent.
+  /** Abort controller for the running agent. */
   cancelController: AbortController;
 };
 
@@ -181,38 +181,46 @@ export const LISTING_REFRESH_BATCH = 16;
 
 /** Params sealed into persistent stubs that restore to a gadget or gatekeeper facet. */
 export type OverseerRestoreParams = {
-  // This is a stub pointing at the gadget. [restore]() will return the facet stub.
+  /** This is a stub pointing at the gadget. [restore]() will return the facet stub. */
   type: "gadget";
 
-  // Which gadget to restore to. Optional, resolving to `defaultGadgetId` when absent: instances
-  // recorded before multi-gadget support are persisted in the wild, sealed inside hook callback
-  // stubs where a migration cannot rewrite them. If absent and the workspace has no default
-  // gadget (or the default gadget was deleted), restoration fails with an explicit error.
+  /**
+   * Which gadget to restore to. Optional, resolving to `defaultGadgetId` when absent: instances
+   * recorded before multi-gadget support are persisted in the wild, sealed inside hook callback
+   * stubs where a migration cannot rewrite them. If absent and the workspace has no default
+   * gadget (or the default gadget was deleted), restoration fails with an explicit error.
+   */
   gadgetId?: WorkpieceId;
 
-  // Present when the stub was minted to run the gadget with this chat's proposed changes
-  // (getGadgetFacetFetcher only sets it once #resolveGadgetChatId has confirmed the chat really
-  // does propose changes to the gadget). Because the gadget's own ctx.restore() chains off the
-  // stub it was called through, a persistent stub minted by the proposed version carries this
-  // too, and so keeps restoring to that version for as long as the chat still proposes changes
-  // to the gadget -- the code that created the stub is the code that knows what to do with it.
-  // Once the chat is committed, discarded or deleted, the same params resolve to main.
+  /**
+   * Present when the stub was minted to run the gadget with this chat's proposed changes
+   * (getGadgetFacetFetcher only sets it once #resolveGadgetChatId has confirmed the chat really
+   * does propose changes to the gadget). Because the gadget's own ctx.restore() chains off the
+   * stub it was called through, a persistent stub minted by the proposed version carries this
+   * too, and so keeps restoring to that version for as long as the chat still proposes changes
+   * to the gadget -- the code that created the stub is the code that knows what to do with it.
+   * Once the chat is committed, discarded or deleted, the same params resolve to main.
+   */
   chatId?: number;
 
-  // A hack: If present, and if the code injection table currently contains this ID, then
-  // instead of returning the gadget stub, [restore]() loads a dynamic worker.
-  //
-  // This is a super-tricky hack used by forgeRestoreStubForBinding(): to forge a persistent stub
-  // targeting a gadget's [restore]() method, we put the tiny "forger" worker's code into the
-  // table under `codeId`, call ctx.restore() with `codeId` (loading the forger), then clear the
-  // ID from the table. When the forger then calls ctx.restore(P) on our behalf, the resulting
-  // stub is persisted with these params as its self-token -- which, `codeId` no longer matching,
-  // now restores through the gadget's [restore]() method.
+  /**
+   * A hack: If present, and if the code injection table currently contains this ID, then
+   * instead of returning the gadget stub, [restore]() loads a dynamic worker.
+   *
+   * This is a super-tricky hack used by forgeRestoreStubForBinding(): to forge a persistent stub
+   * targeting a gadget's [restore]() method, we put the tiny "forger" worker's code into the
+   * table under `codeId`, call ctx.restore() with `codeId` (loading the forger), then clear the
+   * ID from the table. When the forger then calls ctx.restore(P) on our behalf, the resulting
+   * stub is persisted with these params as its self-token -- which, `codeId` no longer matching,
+   * now restores through the gadget's [restore]() method.
+   */
   codeId?: string;
 } | {
-  // A stub pointing at a gatekeeper (connection) facet, minted by getGatekeeperFacet(). Like a
-  // gadget's, the gatekeeper's own ctx.restore() chains off it, so the persistent stubs it mints
-  // to itself stop restoring once the connection is removed.
+  /**
+   * A stub pointing at a gatekeeper (connection) facet, minted by getGatekeeperFacet(). Like a
+   * gadget's, the gatekeeper's own ctx.restore() chains off it, so the persistent stubs it mints
+   * to itself stop restoring once the connection is removed.
+   */
   type: "gatekeeper";
   gatekeeperId: WorkpieceId;
 };

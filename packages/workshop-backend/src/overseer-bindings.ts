@@ -30,10 +30,12 @@ export abstract class OverseerBindings extends OverseerAgents {
     }
   }
 
-  // Bind `target` (a gatekeeper) into gadget `gadgetId`'s env under `name`. If `chatId` is
-  // given, the edge is provisional to that chat (see BindingRecord.pending); the caller is
-  // responsible for getting the addition recorded in the chat log so the pending edge gets
-  // sequence-stamped (see addChatMessages()).
+  /**
+   * Bind `target` (a gatekeeper) into gadget `gadgetId`'s env under `name`. If `chatId` is
+   * given, the edge is provisional to that chat (see BindingRecord.pending); the caller is
+   * responsible for getting the addition recorded in the chat log so the pending edge gets
+   * sequence-stamped (see addChatMessages()).
+   */
   bindWorkpiece(gadgetId: WorkpieceId, name: string, target: WorkpieceId,
                 chatId?: number): void {
     validateBindingName(name);
@@ -81,10 +83,12 @@ export abstract class OverseerBindings extends OverseerAgents {
         useScopeBefore, "Gadget restarted because a connection was bound to a gadget.");
   }
 
-  // Chat deletion's workpiece cleanup: remove the gadgets and worktrees still provisional to the
-  // chat (stamped or not -- deleting the chat discards its proposed changes, which were never
-  // accepted), every worktree belonging to it (an accepted worktree is still this chat's alone;
-  // chatId is permanent), and any binding edges still provisional to it.
+  /**
+   * Chat deletion's workpiece cleanup: remove the gadgets and worktrees still provisional to the
+   * chat (stamped or not -- deleting the chat discards its proposed changes, which were never
+   * accepted), every worktree belonging to it (an accepted worktree is still this chat's alone;
+   * chatId is permanent), and any binding edges still provisional to it.
+   */
   async removeChatWorkpieces(chatId: number): Promise<void> {
     for (let gadget of this.listPendingGadgets(chatId)) {
       await this.removeWorkpiece(gadget.id);
@@ -110,25 +114,27 @@ export abstract class OverseerBindings extends OverseerAgents {
     }
   }
 
-  // Record a hook as enabled, updating its action-log record to match -- the synchronous state
-  // flip at the heart of OverseerClientInterface.enableHook (the gatekeeper-side
-  // controller.enable() has already succeeded by the time this runs).
-  //
-  // The hook and its connection are re-read rather than trusting the caller's captured record:
-  // the enable() round trip leaves the input gate open, so deleteHook/removeGatekeeper may have
-  // deleted either while it was in flight, and putting the captured record back would silently
-  // resurrect an enabled hook on a connection that no longer exists -- one delivering into the
-  // gadget (startHook accepts via the record's denormalized vendorId) while being invisible to
-  // the widening detector (#accountRequiringUseScope filters on the gatekeeper record). Deleting
-  // the record must stay the authoritative kill, so in that case the goal state is "no hook":
-  // send the compensating gatekeeper-side disable best-effort and refuse the flip.
-  //
-  // Enabling can widen every "use" collaborator's verification scope: the connection becomes
-  // reachable through the gadget the hook wakes even when no binding edge names it (see
-  // #useScopeGatekeeperIds), so the scope is diffed around the flip exactly as bindWorkpiece
-  // does. Disabling or deleting a hook only shrinks scope, which never under-verifies anyone, so
-  // those paths need no counterpart -- capabilities issued to firings already in flight are
-  // revoked by their own per-call revalidation instead (see requireLiveHook).
+  /**
+   * Record a hook as enabled, updating its action-log record to match -- the synchronous state
+   * flip at the heart of OverseerClientInterface.enableHook (the gatekeeper-side
+   * controller.enable() has already succeeded by the time this runs).
+   *
+   * The hook and its connection are re-read rather than trusting the caller's captured record:
+   * the enable() round trip leaves the input gate open, so deleteHook/removeGatekeeper may have
+   * deleted either while it was in flight, and putting the captured record back would silently
+   * resurrect an enabled hook on a connection that no longer exists -- one delivering into the
+   * gadget (startHook accepts via the record's denormalized vendorId) while being invisible to
+   * the widening detector (#accountRequiringUseScope filters on the gatekeeper record). Deleting
+   * the record must stay the authoritative kill, so in that case the goal state is "no hook":
+   * send the compensating gatekeeper-side disable best-effort and refuse the flip.
+   *
+   * Enabling can widen every "use" collaborator's verification scope: the connection becomes
+   * reachable through the gadget the hook wakes even when no binding edge names it (see
+   * #useScopeGatekeeperIds), so the scope is diffed around the flip exactly as bindWorkpiece
+   * does. Disabling or deleting a hook only shrinks scope, which never under-verifies anyone, so
+   * those paths need no counterpart -- capabilities issued to firings already in flight are
+   * revoked by their own per-call revalidation instead (see requireLiveHook).
+   */
   enableHookRecord(record: BoundHookRecord): void {
     let current = this.storage.boundHooks.get(record.id);
     if (!current || !this.storage.gatekeepers.get(current.gatekeeperId)) {
@@ -187,22 +193,24 @@ export abstract class OverseerBindings extends OverseerAgents {
     return fallbackBindingName(suggested || "RESOURCE", isTaken);
   }
 
-  // Prepare and return the chat's seed binding layer, including the always-available (ambient)
-  // resources with their discovery catalogs. Called at agent turn start, before history replay.
-  //
-  // This is the single lazy chokepoint for seeding and naming:
-  //   - The seed map (`chatContext.bindings`) is created on first use: normal chats snapshot the
-  //     workspace default binding list, spawned chats their frozen spawner env (resolving an
-  //     old-style allowlist the same way the storage migration does). Chats created before named
-  //     chat bindings are seeded here on their next turn, with zero upfront migration.
-  //   - The ambient resource set is captured on first use (ordered by gatekeeper id) and folded
-  //     into the seed map, each named by its gatekeeper's suggested binding name. A regular chat
-  //     then takes in each ambient resource the workspace gains later, on its next turn.
-  //   - Persisted messages that introduced resources but carry no binding name yet -- pasted
-  //     resources, plus connection requests from before agents named their own -- are named
-  //     (via the quick model when configured, else the gatekeeper's suggested name) and stamped,
-  //     so history replay always sees named resources. Stamped = permanent; a crash before
-  //     stamping just means naming reruns next turn.
+  /**
+   * Prepare and return the chat's seed binding layer, including the always-available (ambient)
+   * resources with their discovery catalogs. Called at agent turn start, before history replay.
+   *
+   * This is the single lazy chokepoint for seeding and naming:
+   *   - The seed map (`chatContext.bindings`) is created on first use: normal chats snapshot the
+   *     workspace default binding list, spawned chats their frozen spawner env (resolving an
+   *     old-style allowlist the same way the storage migration does). Chats created before named
+   *     chat bindings are seeded here on their next turn, with zero upfront migration.
+   *   - The ambient resource set is captured on first use (ordered by gatekeeper id) and folded
+   *     into the seed map, each named by its gatekeeper's suggested binding name. A regular chat
+   *     then takes in each ambient resource the workspace gains later, on its next turn.
+   *   - Persisted messages that introduced resources but carry no binding name yet -- pasted
+   *     resources, plus connection requests from before agents named their own -- are named
+   *     (via the quick model when configured, else the gatekeeper's suggested name) and stamped,
+   *     so history replay always sees named resources. Stamped = permanent; a crash before
+   *     stamping just means naming reruns next turn.
+   */
   async prepareChatBindings(chatId: number, chatMessages: AiChatMessage[])
       : Promise<SeedBindingInfo[]> {
     let context = this.getChatAgentContext(chatId);
