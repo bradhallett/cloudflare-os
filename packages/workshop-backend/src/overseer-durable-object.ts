@@ -69,6 +69,37 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
+   * Sever every sharing edge granting `profileId` access to this workspace — an owner-style
+   * removal (all incoming edges), without a session, called by the user's Durable Object while
+   * deprovisioning them (UserDurableObject.#severSharedWorkspaceAccess). Like
+   * removeCollaborator, a workspace that actually lost the user is force-restarted
+   * (scheduleAccessRestart), so their live chat sessions die with the restart rather than at
+   * their next re-open, and the best-effort cleanup after the restart (observer teardown,
+   * listing refresh) self-heals lazily if the abort cuts it off. A no-op when `profileId` holds
+   * no collaborator record here (never shared, or the owner themself).
+   */
+  async severCollaboratorAccess(profileId: string): Promise<void> {
+    let sharing = await this.impl.getSharingManager();
+    if (!sharing.isCollaborator(profileId)) return;
+    let affected = sharing.removeCollaborator(
+        { profileId: await this.impl.getOwnerProfileId(), isOwner: true }, profileId, []);
+    if (affected.length > 0) {
+      this.impl.scheduleAccessRestart(
+          "Gadget restarted to revoke access for a deprovisioned user.");
+      // Fire-and-forget, as in the ownerInvitesOnly sweep: awaiting cross-DO cleanup would let
+      // the scheduled abort reject this call (and stall the caller's deprovision) whenever the
+      // cleanup loses the race.
+      this.impl.tearDownLostObservers(affected)
+          .then(() => this.impl.refreshAffectedCollaboratorListings(affected))
+          .catch(err => {
+            this.impl.logger.warn("failed to clean up after deprovisioning removed a collaborator", {
+              event: "deprovision.collaborator.cleanup.failed", error: err,
+            });
+          });
+    }
+  }
+
+  /**
    * `notifyClosed` should be invoked when the return `Overseer` stub is disposed, which is used
    * by AuthenticatedApiImpl.#openGadgetInternal() to detect Durable Object disconnects.
    */

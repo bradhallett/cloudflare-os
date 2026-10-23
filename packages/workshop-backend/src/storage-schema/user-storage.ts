@@ -281,6 +281,11 @@ export function makeUserStorage(storage: DurableObjectStorage) {
       // (-1 = never, which also lazily backfills users created before the
       // directory existed). See #syncDirectory().
       directoryRev: -1,
+
+      // Set by deprovision(): the account is closed. Every authentication path refuses while
+      // this is true (authenticate, password login, and both sign-in creators), so a
+      // deprovisioned user can never mint a new session.
+      deprovisioned: false,
     }
   });
 }

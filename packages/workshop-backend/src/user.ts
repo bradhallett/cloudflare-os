@@ -8,8 +8,9 @@ import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
   makeUserStorage, type BlueprintUserRecord, type CloudflareBilling, type ConnectedAccountRecord,
-  type GadgetRecord, type PendingConnectFlow, type PendingDeviceHandoffRecord,
-  type PendingHandoffRecord, type OrgMembershipRecord, type UserAiModelRecord, type UserStorage,
+  type GadgetRecord, type LoginSessionRecord, type PendingConnectFlow,
+  type PendingDeviceHandoffRecord, type PendingHandoffRecord, type OrgMembershipRecord,
+  type UserAiModelRecord, type UserStorage,
   type WorkspaceOutputEntry,
 } from "./storage-schema/user-storage.js";
 import { recordAnalytics } from "./analytics";
@@ -264,6 +265,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async authenticate(token: string): Promise<void> {
+    // A deprovisioned account is closed: any surviving record (e.g. staged before the flag was
+    // set) must not authenticate. Same failure shape as any other bad token, so the client
+    // simply signs out.
+    if (this.storage.deprovisioned.get()) {
+      throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
+    }
     let tokenBytes: Uint8Array;
     try {
       tokenBytes = Uint8Array.fromBase64(token);
@@ -296,6 +303,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * existing users can still sign in.
    */
   async authenticateFromCfAccess(email: string, allowCreate: boolean): Promise<boolean> {
+    this.#refuseIfDeprovisioned();
     const isNew = !this.storage.created.get();
     if (isNew) {
       if (!allowCreate) {
@@ -311,6 +319,14 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
     this.#syncDirectory();
     return isNew;
+  }
+
+  // Deprovisioning closes the account (see deprovision()): no sign-in path may create it again
+  // or mint a new session afterwards.
+  #refuseIfDeprovisioned(): void {
+    if (this.storage.deprovisioned.get()) {
+      throw new Error("This account has been deprovisioned and can no longer sign in.");
+    }
   }
 
   async #newSessionToken(options: { expiresAt?: Date; pendingUntil?: Date } = {}): Promise<string> {
@@ -455,6 +471,130 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
+   * Deletes every session record — browser and device sessions alike — plus every staged device
+   * handoff and gatekeeper user-selection ticket, and returns how many session records were
+   * deleted. Sessions are validated per request with no cache, so a deleted record fails on the
+   * caller's very next `authenticate()`; a staged handoff's ticket can no longer be consumed
+   * either, and the session it had staged dies with it (see `#dropPendingDeviceHandoff`).
+   */
+  async revokeAllSessions(): Promise<number> {
+    // Snapshot the ids first: the handoff loop below deletes staged sessions itself, and the
+    // loops must not iterate a collection they are mutating.
+    let tokenIds = [...this.storage.sessions.list()].map(session => session.tokenId);
+    for (let pending of this.storage.pendingDeviceHandoffs.list()) {
+      this.#dropPendingDeviceHandoff(pending);
+    }
+    for (let selection of this.storage.pendingUserSelections.list()) {
+      this.storage.pendingUserSelections.delete(selection.ticketHash);
+    }
+    for (let tokenId of tokenIds) {
+      this.storage.sessions.delete(tokenId);
+    }
+    await this.#armExpirySweep();
+    return tokenIds.length;
+  }
+
+  /**
+   * Every current session record, for an admin surface to list "signed-in browsers and devices".
+   * Metadata only: the tokens themselves are unrecoverable by design (only their SHA-256 hash is
+   * stored), so a listing cannot be turned into access. `pendingUntil` marks a device session
+   * staged but not yet activated by its handoff.
+   */
+  async listSessions(): Promise<LoginSessionRecord[]> {
+    return [...this.storage.sessions.list()];
+  }
+
+  /**
+   * Closes the account and severs everything that outlives a session:
+   *
+   * - every session and staged handoff/selection (revokeAllSessions, so the next `authenticate()`
+   *   fails and no staged device handoff can be consumed);
+   * - every connected gatekeeper account, revoked best-effort like `disconnectAccount()` (a
+   *   gatekeeper that throws must not block the rest) and then deleted;
+   * - the password (`passwordHashHash` nulled, so `login()` can never succeed again);
+   * - push subscriptions, AI Gateway billing state and the daily LLM counter;
+   * - the `deprovisioned` flag, set first so every sign-in path (password, gatekeeper, Cloudflare
+   *   Access) refuses even if a later step stalls;
+   * - the deployment-wide directory, where the user is flagged so collaborator search hides them
+   *   (the counterpart of `#syncDirectory()`);
+   * - every workspace shared *with* the user, whose collaborator edges are severed so each
+   *   affected workspace force-restarts and the user's live chat sessions die with it (see
+   *   `#severSharedWorkspaceAccess`).
+   *
+   * Not touched: short-lived connect handoffs and flows (the alarm sweep owns those), and the
+   * user's own workspaces and data — deprovisioning removes access, not content. Idempotent:
+   * a second call finds nothing left to remove.
+   */
+  async deprovision(): Promise<void> {
+    // Flag first, before any await: once set, no authentication path can mint a new session, so a
+    // deprovision that stalls partway still leaves the account closed.
+    this.storage.deprovisioned.put(true);
+    await this.revokeAllSessions();
+    for (let account of this.storage.connectedAccounts.list()) {
+      try {
+        await account.account.revoke();
+      } catch (err) {
+        logger.error("revoke() failed during deprovision", {
+          event: "account.revoke.failed",
+          vendorId: account.vendorId, accountId: account.id, error: err,
+        });
+      }
+      this.storage.connectedAccounts.delete(account.id);
+    }
+    this.storage.passwordHashHash.put(null);
+    this.storage.notificationSubscriptions.put({});
+    this.storage.cloudflareBilling.put(null);
+    this.storage.dailyLlmCount.put(null);
+    if (this.storage.created.get()) {
+      // Only a created account has a directory record (or a real profile id to flag).
+      try {
+        await this.ctx.exports.UserDirectoryDurableObject.getByName("")
+            .markUserDeprovisioned(this.storage.profile.get().id, true);
+      } catch (error) {
+        logger.warn("failed to flag deprovisioned user in the directory", {
+          event: "user.directory.deprovision.failed",
+          error,
+        });
+      }
+    }
+    await this.#severSharedWorkspaceAccess();
+    logger.info("user deprovisioned", { event: "user.deprovisioned" });
+  }
+
+  /**
+   * Removes the user's collaborator edges from every workspace that was shared with them, so each
+   * affected workspace force-restarts (`scheduleAccessRestart`) and the user's live chat sessions
+   * die with the restart rather than at their next re-open. Best-effort per workspace: one that
+   * cannot be reached keeps its stale edge, which grants nothing — the deprovisioned user can no
+   * longer open anything.
+   *
+   * Two lazy residuals are accepted, consistent with the sharing model's revocation contract
+   * (docs/sharing.md, docs/observers.md): only workspaces the user has *opened* are known here
+   * (the gadgets index is written on open), so an edge for a share they never opened lingers
+   * until its owner removes it — inert, for the same reason; and the post-restart cleanup the
+   * restart can cut off (observer teardown, listing refresh) self-heals lazily, exactly as in
+   * `removeCollaborator()`.
+   */
+  async #severSharedWorkspaceAccess(): Promise<void> {
+    let profileId = this.storage.profile.get().id;
+    let shared = [...this.storage.gadgets.list()].filter(record => record.owner);
+    if (shared.length === 0) return;
+    let overseers = this.ctx.exports.OverseerDurableObject;
+    let results = await Promise.allSettled(shared.map(workspace =>
+        overseers.get(overseers.idFromString(workspace.id))
+            .severCollaboratorAccess(profileId)));
+    for (let i = 0; i < results.length; i++) {
+      let result = results[i];
+      if (result.status === "rejected") {
+        logger.warn("failed to sever deprovisioned user's workspace access", {
+          event: "deprovision.workspace.sever.failed",
+          gadgetId: shared[i].id, error: result.reason,
+        });
+      }
+    }
+  }
+
+  /**
    * Log in via an authentication gatekeeper, creating the account on first use. The user DO is keyed
    * by the verified email (this DO's id derives from idFromName(email)), so `email` is also used as
    * the profile id and the initial display name is the email's local-part — consistent with the
@@ -469,6 +609,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * returns null instead of creating one — existing users can still sign in.
    */
   async loginOrCreateViaGatekeeper(email: string, allowCreate: boolean): Promise<string | null> {
+    this.#refuseIfDeprovisioned();
     if (!this.storage.created.get()) {
       if (!allowCreate) return null;
       this.storage.created.put(true);
