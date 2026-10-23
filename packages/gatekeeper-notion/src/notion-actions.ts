@@ -12,6 +12,7 @@ import {
   NotionApi,
   blocksToMarkdown,
   iconInputToNotion,
+  isNotionOutcomeUnknown,
   markdownToBlocks,
   notionUrlFromId,
   databaseSchema,
@@ -32,6 +33,9 @@ import {
   type ActionDescriptionBuilder,
   buildDescription,
 } from "@gadgets/gatekeeper-kit/action-description";
+import {
+  APPLY_OUTCOME_UNKNOWN_MESSAGE, ActionOutcomeUnknownError,
+} from "@gadgets/gatekeeper-kit/actions";
 import type { ActionDescription, ApprovalQueue, ObservationDescription } from "@gadgets/workshop-shared/gatekeeper";
 import type {
   NotionComment,
@@ -84,12 +88,20 @@ export type NotionAction =
 export type StoredActionRecord = {
   id: number;
   action: NotionAction;
-  state: "pending" | "applied" | "reverted";
+  /**
+   * Lifecycle of a stored action. `claimed` marks the window where the Notion call is in
+   * flight: the claim is written before the call, so any later attempt that finds it knows a
+   * previous dispatch may have applied and refuses to run again. `failed` is terminal — its
+   * `failure` explains itself — and is cleared by a rejection.
+   */
+  state: "pending" | "claimed" | "applied" | "failed" | "reverted";
   submittedAt: number;
   /** For appendContent revert: the IDs of the blocks created on apply. */
   appendedBlockIds?: string[];
   /** For createPage: the real Notion page ID assigned on apply. */
   createdPageId?: string;
+  /** For state "failed": why, and what to answer later attempts with. */
+  failure?: string;
 };
 
 // The page (provisional or real) an action targets, or null for actions that don't target a page.
@@ -161,7 +173,7 @@ export class NotionStore {
   }
 
   pendingActions(): StoredActionRecord[] {
-    return this.allActions().filter(r => r.state === "pending");
+    return this.allActions().filter(r => r.state === "pending" || r.state === "claimed");
   }
 
   /**
@@ -1100,15 +1112,55 @@ export async function stageAction(
 export async function applyStoredAction(store: NotionStore, id: number): Promise<void> {
   const record = store.getAction(id);
   if (!record) throw new Error(`Unknown action: ${id}`);
-  // The Workshop records approval only after this RPC returns; a restart in that window replays,
-  // and the work is already done -- the crash window Confluence guards the same way.
-  if (record.state === "applied") return;
-  await applyNotionAction(store, record);
+  // The Workshop marks its side approved only after this RPC returns, so a replayed apply
+  // (restart, retry, duplicate click) settles here instead of dispatching again.
+  if (record.state === "applied" || record.state === "reverted") return;
+  // A terminal failure answers every later attempt with the same message, no Notion call.
+  if (record.state === "failed") throw new Error(record.failure ?? "This action previously failed.");
+  // A claim left behind means a previous dispatch's outcome is unknown: the call may have
+  // reached Notion. Record it terminally and surface it — never silently re-run a write.
+  if (record.state === "claimed") throw failUnknownOutcome(store, record);
+
+  // Claim before the first Notion call: the record durably says a dispatch began, so an
+  // interrupted apply can never be mistaken for never-run. The claim is written on the record
+  // itself so applyNotionAction's intermediate persists (created page / block IDs) carry it too.
+  record.state = "claimed";
+  store.putAction(record);
+  try {
+    await applyNotionAction(store, record);
+  } catch (error) {
+    if (isNotionOutcomeUnknown(error)) {
+      // No definitive answer arrived, so the write may have landed. Record the action terminally
+      // with the reason and surface it; a rejection clears the record after the user checks.
+      const message = `${APPLY_OUTCOME_UNKNOWN_MESSAGE} (${error instanceof Error ? error.message : String(error)})`;
+      store.putAction({ ...record, state: "failed", failure: message });
+      throw new ActionOutcomeUnknownError(message);
+    }
+    // Notion answered with a refusal (or the failure is internal): the write did not land, so
+    // the record goes back to pending and the failure stays retryable, as before.
+    store.putAction({ ...record, state: "pending" });
+    throw error;
+  }
+}
+
+/**
+ * Records that the outcome of a dispatched action cannot be known, and returns the error that
+ * surfaces it. Terminal: only a rejection clears the record.
+ */
+function failUnknownOutcome(store: NotionStore, record: StoredActionRecord): ActionOutcomeUnknownError {
+  store.putAction({ ...record, state: "failed", failure: APPLY_OUTCOME_UNKNOWN_MESSAGE });
+  return new ActionOutcomeUnknownError(APPLY_OUTCOME_UNKNOWN_MESSAGE);
 }
 
 export function rejectStoredAction(store: NotionStore, id: number): void | { restart?: boolean } {
   const record = store.getAction(id);
   if (!record) return;
+  if (record.state === "claimed") {
+    // The Notion call may already have run; deleting the record would discard the only trace
+    // that it might have. The user checks Notion, then rejects again to clear the failure
+    // this records.
+    throw failUnknownOutcome(store, record);
+  }
   store.deleteAction(id);
 
   // Rejecting a page creation invalidates every pending action that targeted that provisional page

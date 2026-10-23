@@ -50,6 +50,26 @@ export class NotionApiError extends Error {
   }
 }
 
+/**
+ * The request never completed — the connection failed or timed out. The call may still have
+ * reached Notion and been applied, which outcome classification treats as unknown.
+ */
+export class NotionTransportError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "NotionTransportError";
+  }
+}
+
+/**
+ * Whether a write's outcome is unknown: Notion may have applied it without a definitive answer
+ * arriving — the connection failed, or Notion answered 5xx after receiving the request.
+ */
+export function isNotionOutcomeUnknown(error: unknown): boolean {
+  return error instanceof NotionTransportError
+    || (error instanceof NotionApiError && error.status >= 500);
+}
+
 // ---------------------------------------------------------------------------------------------
 // OAuth
 
@@ -1065,12 +1085,19 @@ export class NotionApi {
       headers.set("Content-Type", "application/json");
       payload = JSON.stringify(body);
     }
-    return await fetch(`${API_BASE_URL}${path}`, {
-      method,
-      headers,
-      body: payload,
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
+    try {
+      return await fetch(`${API_BASE_URL}${path}`, {
+        method,
+        headers,
+        body: payload,
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (error) {
+      // The call may have reached Notion and been applied, so it surfaces as a transport
+      // error, which outcome classification treats as unknown.
+      throw new NotionTransportError(
+        error instanceof Error ? error.message : String(error), { cause: error });
+    }
   }
 
   // --- Observations ---
