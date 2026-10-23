@@ -8,6 +8,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { RpcStub, RpcTarget } from "cloudflare:workers";
 import { isCredentialsExpired } from "@gadgets/gatekeeper-kit/credentials";
 import type { GatekeeperConnectCallback } from "@gadgets/workshop-shared/gatekeeper";
+import type { UserAccount } from "../../src/github";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   connectCallbackEvents, type MergePullRequestActionData, type PostReviewActionData,
@@ -50,7 +51,7 @@ class FakeGitHub {
   respondToken: (params: Record<string, string>) => Response | Promise<Response> =
     () => json({ error: "unexpected_token_request" }, 500);
   respondApi: (token: string, path: string) => Response | Promise<Response> =
-    () => json({ login: "octocat", name: "Octo Cat", avatar_url: "https://avatars.example/1" });
+    () => json({ id: 583231, login: "octocat", name: "Octo Cat", avatar_url: "https://avatars.example/1" });
   respondWrite: (write: string) => Response | Promise<Response> =
     () => json({ message: "unexpected write" }, 500);
 
@@ -115,6 +116,8 @@ async function connect(github: FakeGitHub, exchange: Record<string, unknown>) {
   const begun = await account.beginOAuthFlow("initiation-nonce");
   expect(await account.acceptAuthCode("code", begun!.oauthNonce)).not.toBeNull();
   github.tokenRequests.length = 0;
+  // The connect-time viewer read is part of the flow, not part of any test's story.
+  github.apiTokens.length = 0;
   return { account, id, events: () => connectCallbackEvents.get(name) ?? [] };
 }
 
@@ -459,5 +462,124 @@ describe("UserAccount with a non-expiring grant", () => {
     expect(github.apiTokens).toEqual(["gho_1"]);
     expect(github.tokenRequests).toEqual([]);
     expect(events()).toEqual(["complete", "credentialsExpired"]);
+  });
+});
+
+describe("reconnecting", () => {
+  const ALICE = { id: 1, login: "alice", name: "Alice", avatar_url: "https://avatars.example/alice" };
+  const BOB = { id: 2, login: "bob", name: "Bob", avatar_url: "https://avatars.example/bob" };
+
+  /** The live grant and the viewer it is pinned to, as plain data. */
+  async function storedConnection(userObjectId: string) {
+    return await runInDurableObject(
+      env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(userObjectId)),
+      async (_instance, state) => ({
+        credentials: await state.storage.kv.get<{ accessToken: string }>("credentials"),
+        pinnedViewer: await state.storage.kv.get<{ id: number; login: string }>("pinnedViewer"),
+      }));
+  }
+
+  /** Runs a reconnect up to the callback, with GitHub authorizing `viewer`. */
+  async function reconnectAs(
+    github: FakeGitHub,
+    account: DurableObjectStub<UserAccount>,
+    viewer: { id: number; login: string; name: string; avatar_url: string },
+  ) {
+    github.respondToken = () => json(tokens(2));
+    github.respondApi = () => json(viewer);
+    await account.prepareReconnect("reconnect-nonce");
+    const begun = await account.beginOAuthFlow("reconnect-nonce");
+    if (!begun) throw new Error("the reconnect did not start");
+    return await account.acceptAuthCode("code-2", begun.oauthNonce);
+  }
+
+  it("refuses a reconnect as another GitHub user, and revokes what GitHub granted it", async () => {
+    const github = new FakeGitHub();
+    github.respondApi = () => json(ALICE);
+    const { account, id, events } = await connect(github, tokens(1));
+    const before = await storedConnection(id.toString());
+    expect(before.pinnedViewer).toEqual({ id: 1, login: "alice" });
+
+    const result = await reconnectAs(github, account, BOB);
+
+    expect(result).toEqual({
+      refused: {
+        title: "That's a different GitHub account",
+        detail: expect.stringContaining("This connection is for @alice, but GitHub authorized @bob"),
+      },
+    });
+    // Bob's new token, and only it; Alice's live grant and pin are untouched.
+    expect(github.revoked).toEqual(["gho_2"]);
+    expect(await storedConnection(id.toString())).toEqual(before);
+    expect(events()).toEqual(["complete"]);
+  });
+
+  it("stages a same-account reconnect, committing it only when the Workshop says so", async () => {
+    const github = new FakeGitHub();
+    github.respondApi = () => json(ALICE);
+    const { account, id, events } = await connect(github, tokens(1));
+    const before = await storedConnection(id.toString());
+
+    // Same account, new login: the pin follows the rename rather than refusing it.
+    const result = await reconnectAs(github, account, { ...ALICE, login: "alice-renamed" });
+
+    if (result === null || !("handoff" in result)) throw new Error("expected a handoff");
+    expect(await storedConnection(id.toString())).toEqual(before);
+    expect(github.revoked).toEqual([]);
+    const stageId = events().at(-1)!.slice("reconnectComplete:".length);
+
+    await account.commitReconnect(stageId);
+
+    const after = await storedConnection(id.toString());
+    expect(after.credentials?.accessToken).toBe("gho_2");
+    expect(after.pinnedViewer).toEqual({ id: 1, login: "alice-renamed" });
+    const failure = await runInDurableObject(account, async instance => {
+      try {
+        await instance.commitReconnect(stageId);
+        return null;
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+      }
+    });
+    expect(failure).toMatch(/No reconnect is awaiting/);
+    expect(github.revoked).toEqual([]);
+  });
+
+  it("admits and pins a reconnect of an account connected before the pin existed", async () => {
+    const github = new FakeGitHub();
+    github.respondApi = () => json(ALICE);
+    const { account, id } = await connect(github, tokens(1));
+    // The account predates pinning: nothing recorded which GitHub user it belongs to.
+    await runInDurableObject(env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(id.toString())),
+      (_instance, state) => {
+        state.storage.kv.delete("pinnedViewer");
+      });
+
+    const result = await reconnectAs(github, account, BOB);
+
+    if (result === null || !("handoff" in result)) throw new Error("expected a handoff");
+    const stageId = (connectCallbackEvents.get(`account-${connections}`) ?? [])
+      .at(-1)!.slice("reconnectComplete:".length);
+    await account.commitReconnect(stageId);
+    expect((await storedConnection(id.toString())).pinnedViewer).toEqual({ id: 2, login: "bob" });
+  });
+
+  it("refuses to finish a connect when GitHub will not say which user authorized", async () => {
+    const github = new FakeGitHub();
+    const id = env.USER_ACCOUNT.newUniqueId();
+    await runInDurableObject(env.USER_ACCOUNT.get(id), async (instance, state) => {
+      await instance.setCallback(
+        exportsOf(state).TestConnectCallback({ props: { name: "unreadable" } }), "initiation-nonce");
+      github.respondToken = () => json(tokens(1));
+      github.respondApi = () => json({ message: "rate limited" }, 403);
+      const begun = await instance.beginOAuthFlow("initiation-nonce");
+
+      await expect(instance.acceptAuthCode("code", begun!.oauthNonce))
+        .rejects.toThrow(/Could not read which GitHub account/);
+      expect(state.storage.kv.get("credentials")).toBeUndefined();
+      expect(state.storage.kv.get("pinnedViewer")).toBeUndefined();
+    });
+    // The grant GitHub issued was revoked rather than left dangling.
+    expect(github.revoked).toEqual(["gho_1"]);
   });
 });

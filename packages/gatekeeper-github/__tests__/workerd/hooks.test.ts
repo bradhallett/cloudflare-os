@@ -1051,19 +1051,23 @@ it.each<[string, (github: FakeGitHub, account: string) => Promise<unknown>]>([
   ["told of the reconnect", async (_github, account) => {
     const userAccount = env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(account));
     const stageId = await runInDurableObject(userAccount, (_instance, state) => stageCredentials(
-      state.storage.kv, { accessToken: "bob-token", scopes: ["repo", "admin:repo_hook", "read:user"] }, Date.now()));
+      state.storage.kv, {
+        grant: { accessToken: "bob-token", scopes: ["repo", "admin:repo_hook", "read:user"] },
+        viewer: { id: 8, login: "bob" },
+      }, Date.now()));
     await userAccount.commitReconnect(stageId);
   }],
   // As when the reconnect's notice to the driver was lost.
   ["at the hourly check", (_github, account) => after(HOUR, account)],
-])("skips the comments of the GitHub user its account is now, after reconnecting as another, %s", async (_case, learn) => {
+])("skips the comments of the GitHub user an account from before the pin reconnected as, %s", async (_case, learn) => {
   const github = new FakeGitHub();
   const account = await connectAccount();
   const triage = binding(account);
   await triage.subscribe({ events: ["comment"] });
   await triage.enable();
 
-  // Reconnected, now as Bob.
+  // Reconnected, now as Bob: only an account predating the pin can become another user (see
+  // credentials.test.ts, "reconnecting").
   github.viewer = BOB;
   await learn(github, account);
   await github.deliver("issue_comment", comment(42, "From Bob, whom the account is now.", { sender: BOB }));
@@ -1089,7 +1093,10 @@ it("skips the comments of the GitHub user its account reconnected as while GitHu
   github.viewer = BOB;
   const userAccount = env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(account));
   const stageId = await runInDurableObject(userAccount, (_instance, state) => stageCredentials(
-    state.storage.kv, { accessToken: "bob-token", scopes: ["repo", "admin:repo_hook", "read:user"] }, Date.now()));
+    state.storage.kv, {
+      grant: { accessToken: "bob-token", scopes: ["repo", "admin:repo_hook", "read:user"] },
+      viewer: { id: 8, login: "bob" },
+    }, Date.now()));
   const reconnecting = userAccount.commitReconnect(stageId);
   // Time for the reconnect's own read to be answered first, were it made alongside the check's.
   await scheduler.wait(300);
@@ -1522,8 +1529,10 @@ it("keeps a disconnecting account connected, with its token, while GitHub refuse
   const account = await connectAccount();
   // Renewable, as a GitHub App's user token is.
   const userAccount = env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(account));
-  const stageId = await runInDurableObject(userAccount, (_instance, state) => stageCredentials(state.storage.kv,
-    { accessToken: "test-token", refreshToken: "ghr_1", scopes: ["repo", "admin:repo_hook", "read:user"] }, Date.now()));
+  const stageId = await runInDurableObject(userAccount, (_instance, state) => stageCredentials(
+    state.storage.kv, {
+      grant: { accessToken: "test-token", refreshToken: "ghr_1", scopes: ["repo", "admin:repo_hook", "read:user"] },
+    }, Date.now()));
   await userAccount.commitReconnect(stageId);
   const triage = binding(account);
   await triage.subscribe();
