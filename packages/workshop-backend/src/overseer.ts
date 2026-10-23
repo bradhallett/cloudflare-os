@@ -7747,6 +7747,7 @@ class OverseerImpl implements AgentHooks {
       subject: string, takenNames: Set<string>,
       quick: {config: AiModelConfig, initiator: AiChatAuthorInfo}): Promise<string | undefined> {
     try {
+      if (!await this.#allowQuickModelCall()) return undefined;
       let model = getModel(this.env, quick.config, quick.initiator);
       let result = await completeText(model, {
         signal: AbortSignal.timeout(10_000),
@@ -7773,6 +7774,17 @@ class OverseerImpl implements AgentHooks {
       });
       return undefined;
     }
+  }
+
+  // Whether a free quick-model call (thread/gadget titles, binding names) may run: the workspace
+  // owner must still be within their LLM allowance (the same checkUsageAndBalance() a chat turn
+  // passes). These calls are cosmetic, so callers skip them when this returns false instead of
+  // surfacing an error; when the limits flow is disabled the checker allows without consuming
+  // anything, so self-hosted deployments are unaffected.
+  async #allowQuickModelCall(): Promise<boolean> {
+    if (!this.ownerId) return false;
+    let ownerStub = this.users.get(this.users.idFromString(this.ownerId));
+    return (await checkUsageAndBalance(this.env, ownerStub)).allowed;
   }
 
   // The quick-model context used for turn-start binding naming, fetched lazily (the naming path
@@ -8624,6 +8636,7 @@ class OverseerImpl implements AgentHooks {
                             modelConfig: AiModelConfig,
                             initiator: AiChatAuthorInfo): Promise<void> {
     try {
+      if (!await this.#allowQuickModelCall()) return;
       let model = getModel(this.env, modelConfig, initiator, {
         metadata: { source: "thread-title", gadgetId: this.ctx.id.toString(), chatId },
       });
@@ -8659,8 +8672,6 @@ class OverseerImpl implements AgentHooks {
         let owner = this.users.get(this.users.idFromString(this.ownerId));
         await owner.updateTitle(this.ctx.id.toString(), result);
       }
-
-      // TODO: Should we track costs for title generation? It's pretty negligible.
     } catch (err) {
       // Oh well, just leave the title as "New Chat".
       this.logger.warn("error generating chat title", {
@@ -8673,6 +8684,7 @@ class OverseerImpl implements AgentHooks {
   async generateGadgetTitle(chatId: number, modelConfig: AiModelConfig,
                             initiator: AiChatAuthorInfo) {
     try {
+      if (!await this.#allowQuickModelCall()) return;
       let parts: string[] = [];
 
       for (let msg of this.storage.chats.list({prefix: chatKeyPrefix(chatId)})) {
