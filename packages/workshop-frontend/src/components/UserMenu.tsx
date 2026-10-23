@@ -44,6 +44,12 @@ export default function UserMenu() {
         >
           Providers
         </DropdownMenu.Item>
+        <DropdownMenu.Item
+          onClick={() => navigate({ to: '/bots' })}
+          className={MENU_ITEM}
+        >
+          Bots
+        </DropdownMenu.Item>
         {isAdmin && (
           <DropdownMenu.Item
             onClick={() => navigate({ to: '/admin' })}

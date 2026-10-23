@@ -11,13 +11,17 @@ import { RpcStub } from "capnweb";
 import {
   Overseer,
   AiChatAuthorInfo,
+  BotInfo,
+  BotSelection,
   CapsuleSpecifier,
   ChatAttachmentHandle,
   MessageFormatRef,
   SlashCommandRequest,
 } from "@gadgets/workshop-shared/api";
 import {
+  getStoredSelectedBot,
   getStoredSelectedModel,
+  persistSelectedBot,
   persistSelectedModel,
 } from "../modelSelection";
 import { useDocumentTitle } from "../useDocumentTitle";
@@ -57,6 +61,9 @@ export function HomePageContent({ prompt }: HomeSearch) {
 
   const [models, setModels] = useState<AiChatAuthorInfo[]>([]);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  // The declared bots the intake picker offers, plus the one it starts on (see modelSelection).
+  const [bots, setBots] = useState<BotInfo[]>([]);
+  const [selectedBot, setSelectedBot] = useState<BotSelection | null>(null);
   // Bumped each time a task suggestion is picked; the composer re-seeds its text off the nonce.
   const [seed, setSeed] = useState<{ text: string; nonce: number } | null>(null);
 
@@ -87,9 +94,38 @@ export function HomePageContent({ prompt }: HomeSearch) {
     };
   }, [authenticatedApi]);
 
+  useEffect(() => {
+    let cancelled = false;
+    authenticatedApi.listBots()
+      .then((list) => {
+        if (cancelled) return;
+        setBots(list);
+        setSelectedBot(getStoredSelectedBot(list));
+      })
+      .catch((err) => {
+        logRpcFailure("Failed to fetch bots:", err);
+        // Bots are an extra choice on top of the models that must load for intake to work, so a
+        // failure here is reported the same way but never blocks the composer.
+        if (classifyRpcError(err) !== "connection") {
+          toasts.add({ title: "Couldn't load bots", variant: "error" });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authenticatedApi]);
+
   const handleModelChange = useCallback((value: string | null) => {
     setSelectedModel(value);
     persistSelectedModel(value);
+    // A model pick answers "who starts this chat" with a bare model, so no bot goes along.
+    setSelectedBot(null);
+    persistSelectedBot(null);
+  }, []);
+
+  const handleBotChange = useCallback((bot: BotSelection | null) => {
+    setSelectedBot(bot);
+    persistSelectedBot(bot);
   }, []);
 
   // Pre-create a provisional gadget as soon as the user starts interacting, so that navigation
@@ -117,13 +153,16 @@ export function HomePageContent({ prompt }: HomeSearch) {
       capsules?: CapsuleSpecifier[],
       attachments?: ChatAttachmentHandle[],
       formats?: MessageFormatRef[],
+      bot?: BotSelection | "none",
     ) => {
       try {
         ensureProvisionalGadget();
         const overseer = provisionalOverseerRef.current!.stub;
         // Pipeline both independent calls in one batch, but settle both before releasing the stub.
         const [chat, {id}] = await Promise.all([
-          overseer.newChat(message, modelId, capsules, attachments, formats),
+          overseer.newChat(
+            message, modelId, capsules, attachments, formats,
+            bot === "none" ? undefined : bot),
           overseer.getMetadata(),
         ]);
         provisionalOverseerRef.current?.stub[Symbol.dispose]();
@@ -203,6 +242,9 @@ export function HomePageContent({ prompt }: HomeSearch) {
           models={models}
           selectedModel={selectedModel === null ? null : { id: selectedModel }}
           onModelChange={handleModelChange}
+          bots={bots}
+          selectedBot={selectedBot}
+          onBotChange={handleBotChange}
           newChat
           offerFormats
           autoFocus

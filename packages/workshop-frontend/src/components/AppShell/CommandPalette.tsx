@@ -4,6 +4,7 @@ import {
   Blueprint,
   MagnifyingGlass,
   Plus,
+  Robot,
   SquaresFour,
 } from '@phosphor-icons/react'
 import { useKumoToastManager } from '@cloudflare/kumo'
@@ -253,6 +254,12 @@ export default function CommandPalette({
         label: 'Blueprints',
         icon: <Blueprint size={15} />,
         run: () => navigate({ to: '/explore' }),
+      },
+      {
+        id: 'nav-bots',
+        label: 'Bots',
+        icon: <Robot size={15} />,
+        run: () => navigate({ to: '/bots' }),
       },
     ]
 

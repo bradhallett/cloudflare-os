@@ -90,6 +90,9 @@ export default defineConfig({
         workerLoaders: { LOADER: {} },
         // Where a blueprint's content is published to and read back from.
         r2Buckets: ['BLUEPRINT_CONTENT'],
+        // The admin-config KV mirror the real worker binds; reads with no written key yield the
+        // default config (an empty deployment-bot list), matching production.
+        kvNamespaces: ['BLUEPRINTS'],
         durableObjects: {
           TEST_OVERSEER: { className: 'OverseerDurableObject', useSQLite: true },
           TEST_USER: { className: 'UserDurableObject', useSQLite: true },

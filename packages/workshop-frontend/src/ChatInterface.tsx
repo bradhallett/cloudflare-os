@@ -53,14 +53,18 @@ import {
   ArrowUpRight,
   Blueprint,
   GitBranch,
+  Robot,
 } from "@phosphor-icons/react";
 import { RpcStub, RpcTarget } from "capnweb";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import styles from "./ChatInterface.module.css";
 import {
+  getStoredSelectedBot,
   getStoredSelectedModel,
+  persistSelectedBot,
   persistSelectedModel,
+  sameBotSelection,
 } from "./modelSelection";
 import {
   Overseer,
@@ -82,6 +86,8 @@ import {
   WorkpieceId,
   BlueprintMerge,
   BlueprintOutput,
+  BotInfo,
+  BotSelection,
   MessageFormatRef,
 } from "@gadgets/workshop-shared/api";
 import { composeEpochChanges, type CodeChange } from "@gadgets/workshop-shared/code-change";
@@ -679,6 +685,12 @@ function getToolCallSummary(
       return { verb: "Requested connection", target: tc.input.vendorId };
     case "createExternalResource":
       return { verb: "Created", target: tc.input.title };
+    case "activateSkill":
+      return { verb: "Activated skill", target: tc.input.skill };
+    case "delegateToBot":
+      return { verb: "Delegated to bot", target: tc.input.bot };
+    case "messageBot":
+      return { verb: "Sent direct message", target: tc.input.to };
   }
   // Compile-time exhaustiveness check.
   const _exhaustive: never = tc;
@@ -780,6 +792,12 @@ function describeToolCallCount(toolName: AiToolCall["toolName"], count: number):
       return count === 1 ? "Requested a connection" : `Requested ${count} connections`;
     case "createExternalResource":
       return `Created ${pluralize(count, "external resource")}`;
+    case "activateSkill":
+      return `Activated ${pluralize(count, "skill")}`;
+    case "delegateToBot":
+      return count === 1 ? "Delegated to a bot" : `Delegated ${count} subtasks`;
+    case "messageBot":
+      return `Sent ${pluralize(count, "direct message")}`;
   }
   const _exhaustive: never = toolName;
   return _exhaustive;
@@ -818,6 +836,11 @@ function getToolIcon(
       return MagnifyingGlass;
     case "giveUp":
       return Question;
+    case "activateSkill":
+      return Lightning;
+    case "delegateToBot":
+    case "messageBot":
+      return Robot;
     default:
       return Question;
   }
@@ -885,6 +908,9 @@ function getProvisionalToolVerb(toolName: AiToolCall["toolName"]): string {
     case "listConnectableResources": return "Listing connectable resources";
     case "requestConnection": return "Requesting a connection";
     case "createExternalResource": return "Creating external resource";
+    case "activateSkill": return "Activating a skill";
+    case "delegateToBot": return "Delegating to a bot";
+    case "messageBot": return "Sending a direct message";
   }
   const _exhaustive: never = toolName;
   return _exhaustive;
@@ -912,6 +938,9 @@ function describeProvisionalToolCount(toolName: AiToolCall["toolName"], count: n
     case "listConnectableResources": return "Listing connectable resources";
     case "requestConnection": return `Requesting ${pluralize(count, "connection")}`;
     case "createExternalResource": return `Creating ${pluralize(count, "external resource")}`;
+    case "activateSkill": return `Activating ${pluralize(count, "skill")}`;
+    case "delegateToBot": return `Delegating ${pluralize(count, "subtask")}`;
+    case "messageBot": return `Sending ${pluralize(count, "direct message")}`;
   }
   const _exhaustive: never = toolName;
   return _exhaustive;
@@ -2543,6 +2572,19 @@ function chatHasProposedChanges(meta: AiChatMetadata): boolean {
   return (meta.proposedChangeWorkpieces?.length ?? 0) > 0;
 }
 
+/**
+ * The display name of a chat's declared bot when that bot no longer resolves in the merged bot
+ * list (deleted, or a deployment bot that was removed): the picker shows it as a disabled
+ * "no longer available" row while the chat keeps running as a bare-model chat.
+ */
+function staleChatBotName(meta: AiChatMetadata, bots: BotInfo[]): string | undefined {
+  const bot = meta.bot;
+  if (!bot) return undefined;
+  return bots.some((candidate) => sameBotSelection(candidate.selection, bot))
+    ? undefined
+    : meta.botName;
+}
+
 // Bucket a chat's lastActive into a time grouping for the chat list.
 type ChatTimeBucket = "today" | "yesterday" | "thisWeek" | "earlier";
 
@@ -2725,7 +2767,7 @@ function ChatInterface({
 }: ChatInterfaceProps) {
   // Persistent cache that survives reconnects
   const toasts = useKumoToastManager();
-  const { currentUser } = useAuthenticatedApi();
+  const { currentUser, authenticatedApi } = useAuthenticatedApi();
   const getOverseer = useCallback(() => overseer, [overseer]);
   const cacheRef = useRef<ChatCache>({
     chats: new Map(),
@@ -2828,6 +2870,10 @@ function ChatInterface({
     [],
   );
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  // Declared bots for the composer's agent picker, plus its pick (a chat's own bot wins while
+  // that chat is open; Home's stored pick covers the no-chat case).
+  const [bots, setBots] = useState<BotInfo[]>([]);
+  const [selectedBot, setSelectedBot] = useState<BotSelection | null>(null);
   const [sidebarActiveTab, setSidebarActiveTab] = useState<
     "chat" | "connections"
   >("chat");
@@ -3400,11 +3446,35 @@ function ChatInterface({
   useEffect(() => {
     if (selectedChatId === null) {
       setSelectedModel(getStoredSelectedModel(availableModels));
+      setSelectedBot(getStoredSelectedBot(bots));
     } else {
       // An existing thread takes its active agent's model, else the one that last spoke.
       setSelectedModel(fallbackToStoredModelSelection(chatAgent?.id ?? null, availableModels));
+      // The chat's declared bot initializes the picker — but only while it still resolves and is
+      // usable; a stale or unavailable bot shows as a disabled row instead (staleChatBotName).
+      const metaBot = currentChatMetadata?.bot ?? null;
+      setSelectedBot(
+        metaBot === null || !bots.some((bot) => sameBotSelection(bot.selection, metaBot) && bot.available)
+          ? null
+          : metaBot);
     }
-  }, [selectedChatId, availableModels, chatAgent?.id]);
+  }, [selectedChatId, availableModels, chatAgent?.id, bots, currentChatMetadata?.bot]);
+
+  // Load the declared bots for the agent picker (user's own + deployment-wide). Retried on
+  // reconnect like the models fetch; a failure leaves the picker model-only.
+  useEffect(() => {
+    let cancelled = false;
+    authenticatedApi.listBots()
+      .then((list) => {
+        if (!cancelled) setBots(list);
+      })
+      .catch((err) => {
+        logRpcFailure("Failed to fetch bots:", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authenticatedApi]);
 
   // Keep the ref in sync with selectedChatId state
   useEffect(() => {
@@ -4044,6 +4114,7 @@ function ChatInterface({
     capsules?: CapsuleSpecifier[],
     attachments?: ChatAttachmentHandle[],
     formats?: MessageFormatRef[],
+    bot?: BotSelection | "none",
   ) => {
     const message = typeof messageText === "string" ? messageText.trim() : messageText ?? "";
     if (!message && (!attachments || attachments.length === 0)) return;
@@ -4055,7 +4126,8 @@ function ChatInterface({
       if (selectedChatId === null) {
         // Create a new chat (with optional capsules).
         const newChatId = await overseer.newChat(
-            message, model, capsules, attachments, formats);
+            message, model, capsules, attachments, formats,
+            bot === "none" ? undefined : bot);
         onNavigateToChatRef.current(newChatId);
       } else {
         // Send message to existing chat.
@@ -4066,6 +4138,7 @@ function ChatInterface({
           capsules || undefined,
           attachments || undefined,
           formats,
+          bot,
         );
       }
     } catch (err) {
@@ -4087,13 +4160,15 @@ function ChatInterface({
     capsules?: CapsuleSpecifier[],
     attachments?: ChatAttachmentHandle[],
     formats?: MessageFormatRef[],
+    bot?: BotSelection | "none",
   ) => {
     const message = typeof messageText === "string" ? messageText.trim() : messageText ?? "";
     if (!message && (!attachments || attachments.length === 0)) return;
     const model = modelId !== undefined ? modelId : selectedModel;
     try {
       const newChatId = await overseer.newChat(
-          message, model, capsules, attachments, formats);
+          message, model, capsules, attachments, formats,
+          bot === "none" ? undefined : bot);
       onNavigateToChatRef.current(newChatId);
     } catch (err) {
       if (!logRpcFailure("Failed to create new chat:", err, { reportSite: "chat.new" })) {
@@ -4107,10 +4182,26 @@ function ChatInterface({
     }
   };
 
-  // Handle model change
+  // Handle model change. Picking a bare model answers "who runs this chat" with the model, so
+  // the composer's bot pick (if any) yields; the change itself rides the next send.
   const handleModelChange = (modelId: string | null) => {
     setSelectedModel(modelId);
     persistSelectedModel(modelId);
+    if (selectedBot !== null) {
+      setSelectedBot(null);
+      persistSelectedBot(null);
+    }
+  };
+
+  // Handle bot change: a bot pick also selects the bot's model for the composer, and persists
+  // the pick as the intake default (Home reuses it).
+  const handleBotChange = (bot: BotSelection | null) => {
+    setSelectedBot(bot);
+    persistSelectedBot(bot);
+    const botModel = bot === null ? null
+      : bots.find((candidate) => sameBotSelection(candidate.selection, bot))?.modelId ?? null;
+    setSelectedModel(botModel);
+    persistSelectedModel(botModel);
   };
 
   // Handle stopping the agent
@@ -4645,17 +4736,26 @@ function ChatInterface({
     });
   };
 
+  // A bot chat retries on the bot's declared model — the pick must not swap it for the
+  // composer's current model selection (the backend makes the same preference).
+  const chatBotModelId = (() => {
+    const metaBot = currentChatMetadata?.bot;
+    if (!metaBot) return null;
+    return bots.find((bot) => sameBotSelection(bot.selection, metaBot))?.modelId ?? null;
+  })();
+  const retryModelId = chatBotModelId ?? selectedModel;
+
   // Handle retrying the agent after an error
   const handleRetry = async () => {
     if (
       selectedChatId === null ||
-      selectedModel === null
+      retryModelId === null
     ) {
       return;
     }
 
     try {
-      await overseer.retryAgent(selectedChatId, selectedModel);
+      await overseer.retryAgent(selectedChatId, retryModelId);
     } catch (err) {
       console.error("Failed to retry agent:", err);
       toasts.add({
@@ -5451,6 +5551,15 @@ function ChatInterface({
                             <span className="flex-shrink-0" aria-hidden="true">·</span>
                           </>
                         )}
+                        {chat.botName && (
+                          <>
+                            <span className="truncate inline-flex min-w-0 items-center gap-1">
+                              <Robot size={11} weight="fill" className="flex-shrink-0" />
+                              <span className="truncate">{chat.botName}</span>
+                            </span>
+                            <span className="flex-shrink-0" aria-hidden="true">·</span>
+                          </>
+                        )}
                         <span className="flex-shrink-0">
                           {formatChatRowTime(chat.lastActive, bucket, chatListNow)}
                         </span>
@@ -5529,6 +5638,9 @@ function ChatInterface({
             models={availableModels}
             selectedModel={selectedModel === null ? null : { id: selectedModel }}
             onModelChange={handleModelChange}
+            bots={bots}
+            selectedBot={selectedBot}
+            onBotChange={handleBotChange}
             showThinkingTraces={showThinkingTraces}
             onToggleThinkingTraces={toggleShowThinkingTraces}
             minRows={2}
@@ -5658,9 +5770,19 @@ function ChatInterface({
                     </div>
                   ) : (
                     <>
-                      <span className="min-w-0 flex-1 truncate text-[13px] leading-[18px] font-medium tracking-[-0.25px] text-kumo-default">
-                        {currentChatMetadata?.title || "Chat"}
-                      </span>
+                      <div className="flex min-w-0 flex-1 items-center gap-1.5">
+                        <span className="min-w-0 truncate text-[13px] leading-[18px] font-medium tracking-[-0.25px] text-kumo-default">
+                          {currentChatMetadata?.title || "Chat"}
+                        </span>
+                        {currentChatMetadata?.botName && (
+                          <Tooltip content={`Bot · ${currentChatMetadata.botName}`} asChild>
+                            <span className="inline-flex flex-shrink-0 items-center gap-1 rounded-full border border-kumo-line bg-kumo-tint px-2 py-0.5 text-[11px] leading-4 font-medium text-kumo-subtle">
+                              <Robot size={11} weight="fill" className="text-kumo-brand" />
+                              {currentChatMetadata.botName}
+                            </span>
+                          </Tooltip>
+                        )}
+                      </div>
                       <WorkshopIconButton
                         onClick={() => setIsEditingTitle(true)}
                         className="!h-8 !w-8 flex-shrink-0 text-kumo-inactive hover:text-kumo-subtle"
@@ -6281,7 +6403,7 @@ function ChatInterface({
                                       <button
                                         type="button"
                                         onClick={() => handleRetry()}
-                                        disabled={selectedModel === null}
+                                        disabled={retryModelId === null}
                                         className="flex flex-shrink-0 cursor-pointer items-center gap-1 rounded-md px-1 py-0.5 text-[13px] leading-4 font-medium text-kumo-default transition-[color,opacity,transform] duration-150 ease-out hover:text-kumo-default-hover focus-visible:text-kumo-default-hover focus-visible:outline-none active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40"
                                       >
                                         <ArrowsClockwise size={12} weight="bold" />
@@ -6556,6 +6678,13 @@ function ChatInterface({
                       name: chatAgent?.id === selectedModel ? chatAgent.name : undefined,
                     }}
                     onModelChange={handleModelChange}
+                    bots={bots}
+                    selectedBot={selectedBot}
+                    onBotChange={handleBotChange}
+                    showModels
+                    staleBotName={currentChatMetadata
+                      ? staleChatBotName(currentChatMetadata, bots)
+                      : undefined}
                     pendingConsoleLogCount={pendingConsoleLogCount}
                     consoleLogPreview={consoleLogPreview}
                     consoleLogSeverity={consoleLogSeverity}

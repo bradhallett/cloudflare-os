@@ -28,7 +28,8 @@ import type {
   AccountDescription, ActionDescription, ActionKind, AgentCatalog, ApprovalQueue, ConnectHandoff,
   Gatekeeper, GatekeeperConnectCallback, GatekeeperUser, GatekeeperUserVerifier, HookController,
   HookInitiator, HookTargetMetadata, ResourceDescription, ResourceConfiguratorFrame,
-  SupportedResource, VendorDescription,
+  SlashCommandDescriptor, SlashCommandProvider, SlashCommandResult, SupportedResource,
+  VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type {
   ChatGatewayRpcTarget, GadgetResponse, SubmitExternalMessageInput, SubmitExternalMessageResult,
@@ -94,6 +95,15 @@ type HookState = {
   disableCount: number;
 };
 
+// One slash command the account's singleton offers, as a test set it: what bots declare as
+// skills. `message` is what invoking the command returns to the agent.
+type TestSlashCommand = {
+  id: string;
+  name: string;
+  description: string;
+  message: string;
+};
+
 function outcomeKey(label: string, resourceUrl?: string): string {
   return resourceUrl ? `outcome:${label}:${resourceUrl}` : `outcome:${label}`;
 }
@@ -143,6 +153,14 @@ export class TestControl extends DurableObject<Cloudflare.Env> {
 
   getAgentCatalog(label: string): AgentCatalog | null {
     return this.ctx.storage.kv.get<AgentCatalog>(`agent-catalog:${label}`) ?? null;
+  }
+
+  setSlashCommands(label: string, commands: TestSlashCommand[]): void {
+    this.ctx.storage.kv.put(`slash-commands:${label}`, commands);
+  }
+
+  getSlashCommands(label: string): TestSlashCommand[] {
+    return this.ctx.storage.kv.get<TestSlashCommand[]>(`slash-commands:${label}`) ?? [];
   }
 
   recordRevocation(label: string): void {
@@ -699,6 +717,24 @@ class ConnectionProbeTarget extends RpcTarget implements ConnectionProbe {
   }
 }
 
+
+/** The slash-command provider the ambient singleton returns: the commands a test configured. */
+class TestSlashCommandProvider extends RpcTarget implements SlashCommandProvider {
+  constructor(private readonly commands: TestSlashCommand[]) {
+    super();
+  }
+
+  async list(): Promise<SlashCommandDescriptor[]> {
+    return this.commands.map(({id, name, description}) => ({id, name, description}));
+  }
+
+  async invoke(id: string, _args: string): Promise<SlashCommandResult> {
+    const command = this.commands.find(candidate => candidate.id === id);
+    if (command === undefined) throw new Error(`Unknown test slash command: ${id}`);
+    return {skillName: command.name, message: command.message};
+  }
+}
+
 @validateRpc()
 export class TestGatekeeper
     extends DurableObject<Cloudflare.Env, BindingProps> implements Gatekeeper<TestSession> {
@@ -710,6 +746,9 @@ export class TestGatekeeper
         snippet: "An automatically-provided test capability.",
         suggestedBindingName: "TEST_AMBIENT",
         tsType: "TestThing",
+        // The ambient singleton also offers the slash commands a test configured for its
+        // account, so a declared bot can resolve skills against it (see getSlashCommandProvider).
+        hasSlashCommands: true,
       };
     }
     const name = decodeURIComponent(new URL(this.ctx.props.resourceUrl).pathname.split("/").pop()!);
@@ -743,6 +782,12 @@ export class TestGatekeeper
   /** The discovery index a test set for this account: none unless it set one. */
   async getAgentCatalog(): Promise<AgentCatalog | null> {
     return control(this.ctx.exports).getAgentCatalog(this.ctx.props.label);
+  }
+
+  /** The slash commands a test set for this account: none unless it set some. */
+  async getSlashCommandProvider(): Promise<TestSlashCommandProvider> {
+    return new TestSlashCommandProvider(
+        await control(this.ctx.exports).getSlashCommands(this.ctx.props.label));
   }
 
   /**
@@ -918,6 +963,24 @@ export default {
       await control(ctx.exports).setAgentCatalog(label, {
         entries: skills.map(title => ({ id: title, title, description: `The ${title} skill.` })),
       });
+      return new Response(null, { status: 204 });
+    }
+
+    // Set the account's slash commands -- the skills a declared bot can resolve against this
+    // connection, each with the message invoking it returns to the agent.
+    // Body: {"label": "...", "commands": [{"id","name","description","message"}, ...]}
+    if (url.pathname === "/control/slash-commands" && req.method === "POST") {
+      const { label, commands } = body as Record<string, unknown>;
+      if (!isNonEmptyString(label)) return badRequest("`label` must be a non-empty string");
+      const isValidCommand = (value: unknown): value is TestSlashCommand =>
+          typeof value === "object" && value !== null &&
+          ["id", "name", "description", "message"].every(field =>
+            typeof (value as Record<string, unknown>)[field] === "string" &&
+            (value as Record<string, unknown>)[field] !== "");
+      if (!Array.isArray(commands) || !commands.every(isValidCommand)) {
+        return badRequest("`commands` must be an array of {id, name, description, message}");
+      }
+      await control(ctx.exports).setSlashCommands(label, commands);
       return new Response(null, { status: 204 });
     }
 

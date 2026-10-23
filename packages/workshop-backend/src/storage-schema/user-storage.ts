@@ -7,7 +7,7 @@
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
 import type {
   AiChatAuthorInfo, AiModelConfig, BlueprintMetadata, BlueprintOutput,
-  GadgetMetadata, WorkpieceId,
+  BotDefinition, GadgetMetadata, WorkpieceId,
 } from "@gadgets/workshop-shared/api";
 import type { AccountDescription, GatekeeperUser } from "@gadgets/workshop-shared/gatekeeper";
 import type { DeviceSessionHandoff } from "../auth/device-session-handoff.js";
@@ -73,6 +73,19 @@ export type UserAiModelRecord = {
   profile: AiChatAuthorInfo;
   config: AiModelConfig;
 }
+
+/**
+ * One of the user's declared bots (see BotDefinition): a named agent with preset instructions,
+ * model and skills, chosen at chat intake instead of a model. `def` is stored already normalized
+ * (normalizeBotDefinition in bot-config.ts); `id` is the user's `nextBotId` at creation, so ids
+ * are stable and never reused. Chats keep their own frozen snapshot, so deleting a record never
+ * rewrites history.
+ */
+export type StoredBotRecord = {
+  id: string;
+  def: BotDefinition;
+  created: Date;
+};
 
 export type LoginSessionRecord = {
   tokenId: string,  // sha256 hash of token, hex-formatted
@@ -160,6 +173,9 @@ export function makeUserStorage(storage: DurableObjectStorage) {
       aiModels: collection<UserAiModelRecord>()({
         primaryKey: record => record.profile.id,
       }),
+      bots: collection<StoredBotRecord>()({
+        primaryKey: "id",
+      }),
       gadgets: collection<GadgetRecord>()({
         primaryKey: "id"
       }),
@@ -227,6 +243,9 @@ export function makeUserStorage(storage: DurableObjectStorage) {
       outputsBackfillCursor: "",
 
       nextAccountId: 0,
+
+      // Next id for the user's declared bots (see StoredBotRecord), mirroring nextAccountId.
+      nextBotId: 0,
       pinnedBlueprints: <string[]>[],
 
       // Per-user free-tier daily LLM-call counter (only used when ENABLE_CLOUDFLARE_LIMITS is on).

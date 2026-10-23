@@ -1,5 +1,5 @@
 /** The admin page's tabs, in display order. */
-export const ADMIN_TABS = ['general', 'gatekeepers', 'formats', 'models', 'access', 'updates'] as const
+export const ADMIN_TABS = ['general', 'gatekeepers', 'formats', 'models', 'bots', 'access', 'updates'] as const
 
 /** One of the admin page's tabs, as named in the URL's `tab` search parameter. */
 export type AdminTab = (typeof ADMIN_TABS)[number]

@@ -12,8 +12,8 @@ import {
   DEFAULT_BANNER_COLOR, DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES, DEFAULT_UPDATE_MINIMUM_AGE_HOURS,
   DEFAULT_UPDATE_NOTICE_SNOOZE_HOURS,
   type AiModelProvider, type AmbientGatekeeperMode, type BannerConfig, type BlueprintOutput,
-  type BlueprintPublicInfo, type GatewayModel, type GatewayModelMode, type GatewayModelSettings,
-  type ReasoningLevel,
+  type BlueprintPublicInfo, type BotDefinition, type GatewayModel, type GatewayModelMode,
+  type GatewayModelSettings, type ReasoningLevel,
 } from "@gadgets/workshop-shared/api";
 
 export type AdminConfig = {
@@ -64,6 +64,14 @@ export type AdminConfig = {
    * the deployment offers.
    */
   formats: FormatCuration[];
+
+  /**
+   * The deployment's declared bots, offered to every user alongside their own (see
+   * AuthenticatedApi.listBots). `id` is the lowercase slug that names the bot in a BotSelection;
+   * definitions are validated like user bots' (normalizeBotDefinition) at write time, and
+   * malformed stored entries are dropped on read (parseDeploymentBots in admin-config.ts).
+   */
+  deploymentBots: {id: string; def: BotDefinition}[];
 
   /**
    * How each AI Gateway model is offered: model id -> mode, for the models an admin changed.
@@ -152,6 +160,7 @@ export const DEFAULT_ADMIN_CONFIG: AdminConfig = {
   disabledGatekeepers: [],
   ambientGatekeeperModes: {},
   formats: [],
+  deploymentBots: [],
   modelModes: {},
   addedProviders: [],
   addedModels: [],

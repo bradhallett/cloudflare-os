@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import {
-  SUGGESTED_MODELS, type GatewayModel, type GatewayModelCapabilities,
+  SUGGESTED_MODELS, type BotDefinition, type GatewayModel, type GatewayModelCapabilities,
 } from "@gadgets/workshop-shared/api";
 import { parseAdminConfig } from "../src/admin-config.js";
 import type { AdminConfig } from "../src/storage-schema/admin-settings-storage.js";
@@ -1690,6 +1690,66 @@ describe("AdminSettings outside AI Gateway mode", () => {
     expect(await stored()).toEqual({ modelModes: {}, addedModels: [ADDED] });
     expect(await inDo(admin => admin.getAdminConfig().userModelsEnabled)).toBe(true);
     expect(await inDo(admin => admin.getAdminConfig().modelsDevSuggestions)).toBe(false);
+    expect(put).not.toHaveBeenCalled();
+  });
+});
+
+describe("AdminSettings deployment bots", () => {
+  const WRITER: BotDefinition = {
+    name: "Writer",
+    description: "Drafts prose",
+    instructions: "Write clearly.",
+    modelId: "claude-fable-5-1",
+    skills: [{vendorId: "context", commandId: "brainstorm", name: "Brainstorm"}],
+  };
+
+  it("adds, updates, and removes bots, mirroring each change to KV", async () => {
+    const { inDo, put, mirror } = adminSettings();
+    await inDo(admin => admin.addDeploymentBot("writer", WRITER));
+    await inDo(admin => admin.addDeploymentBot("reviewer", { ...WRITER, name: "Reviewer" }));
+    await inDo(admin =>
+      admin.updateDeploymentBot("writer", { ...WRITER, instructions: "Write tightly." }));
+    expect(await inDo(admin => admin.listDeploymentBots())).toStrictEqual([
+      { id: "writer", ...WRITER, instructions: "Write tightly." },
+      { id: "reviewer", ...WRITER, name: "Reviewer" },
+    ]);
+    // What the write path stores is what parseDeploymentBots reads back from the mirror.
+    expect(parseAdminConfig(mirror.current).deploymentBots).toStrictEqual([
+      { id: "writer", def: { ...WRITER, instructions: "Write tightly." } },
+      { id: "reviewer", def: { ...WRITER, name: "Reviewer" } },
+    ]);
+    expect(put).toHaveBeenCalledTimes(3);
+    await inDo(admin => admin.removeDeploymentBot("reviewer"));
+    expect(await inDo(admin => admin.listDeploymentBots()))
+        .toStrictEqual([{ id: "writer", ...WRITER, instructions: "Write tightly." }]);
+  });
+
+  it("refuses a repeated id, an unknown id, and an id that is not a slug, storing nothing",
+      async () => {
+    const { inDo, put } = adminSettings();
+    await inDo(admin => admin.addDeploymentBot("writer", WRITER));
+    put.mockClear();
+    await expect(inDo(admin => admin.addDeploymentBot("writer", { ...WRITER, name: "Second" })))
+        .rejects.toThrow('A deployment bot with id "writer" already exists.');
+    await expect(inDo(admin => admin.updateDeploymentBot("nope", WRITER)))
+        .rejects.toThrow("No such deployment bot: nope");
+    await expect(inDo(admin => admin.removeDeploymentBot("nope")))
+        .rejects.toThrow("No such deployment bot: nope");
+    for (let id of ["Writer", "2 writer", "-writer", "writer_2", ""]) {
+      await expect(inDo(admin => admin.addDeploymentBot(id, WRITER)))
+          .rejects.toThrow("must be a lowercase slug");
+      await expect(inDo(admin => admin.updateDeploymentBot(id, WRITER)))
+          .rejects.toThrow("must be a lowercase slug");
+    }
+    expect(await inDo(admin => admin.listDeploymentBots()))
+        .toStrictEqual([{ id: "writer", ...WRITER }]);
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it("refuses a definition a user bot could not be declared with", async () => {
+    const { inDo, put } = adminSettings();
+    await expect(inDo(admin => admin.addDeploymentBot("writer", { ...WRITER, name: "" })))
+        .rejects.toThrow("A bot needs a name.");
     expect(put).not.toHaveBeenCalled();
   });
 });
