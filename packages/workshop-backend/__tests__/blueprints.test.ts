@@ -99,11 +99,16 @@ async function withWorkspace(fn: (workspace: Workspace) => Promise<void>): Promi
       getChatContext: async (modelId: string | null) =>
           ({ profile: OWNER, ...(modelId ? { aiModel: AI_MODEL } : {}) }),
       listGatekeeperVendors: async () => [],  // asked at the start of every agent turn
+      listOrgMemberships: async () => [],  // no orgs own anything in these tests
       updateBlueprint: async () => false,  // not featured
       deleteBlueprint: async () => {},
       setGadgetLastActive: async () => {},
     };
-    impl.users = { idFromString: (id: string) => id, get: () => owner };
+    impl.users = {
+      idFromString: (id: string) => ({ name: OWNER.id, toString: () => id }),
+      idFromName: (name: string) => ({ name }),
+      get: () => owner,
+    };
     // Disposed with the session: the session holds a duplicate of the stub until then.
     using notifyClosed = new NativeRpcStub<() => void>(() => {});
     using client = await instance.open(OWNER_USER_ID, OWNER.id, notifyClosed);
@@ -223,7 +228,7 @@ async function publishVersions(title: string, versions: Record<string, string>[]
 /** Stores a blueprint as publishing or importing would: content first, then metadata. */
 async function storeBlueprint(
     blueprintId: string, metadata: BlueprintMetadata, content: Uint8Array): Promise<void> {
-  await env.BLUEPRINT_CONTENT.put(blueprintContentKey(blueprintId, metadata), content);
+  await env.BLUEPRINT_CONTENT.put(blueprintContentKey(undefined, blueprintId, metadata), content);
   kv.set(blueprintId, JSON.stringify({ metadata }));
 }
 
@@ -542,7 +547,7 @@ describe("publishing a blueprint", () => {
     let stub = env.TEST_USER.getByName(`blueprints-${++counter}`);
     let metadata = metadataFor("Orphan", { version: 2, commitId: "a".repeat(40) });
     await env.BLUEPRINT_CONTENT.put("orphan/1", await snapshotContent(V1));
-    await env.BLUEPRINT_CONTENT.put(blueprintContentKey("orphan", metadata), "pack");
+    await env.BLUEPRINT_CONTENT.put(blueprintContentKey(undefined, "orphan", metadata), "pack");
     kv.set("orphan", JSON.stringify({ metadata, ownerId: stub.id.toString() }));
 
     await runInDurableObject(stub, async (user: UserDurableObject) => {
@@ -574,7 +579,7 @@ describe("instantiating a blueprint", () => {
 
     // The agent's path reads the same release.
     await withWorkspace(async ({ impl }) => {
-      let { files, notes } = await impl.fetchBlueprint(blueprintId);
+      let { files, notes } = await impl.fetchBlueprint(OWNER, blueprintId);
       expect({ ...files }).toEqual(V1);
       expect(notes).toContain(`"Starter" (blueprintId ${blueprintId})`);
       expect(notes).toContain("client.js, lib/util.js");
@@ -676,7 +681,7 @@ describe("instantiating a blueprint", () => {
     });
 
     await withWorkspace(async ({ impl }) => {
-      expect({ ...(await impl.fetchBlueprint("older-content")).files }).toEqual(V1);
+      expect({ ...(await impl.fetchBlueprint(OWNER, "older-content")).files }).toEqual(V1);
     });
   });
 
@@ -769,8 +774,8 @@ describe("instantiating a blueprint", () => {
       ] as const) {
         await expect(instantiate(instance, blueprintId)).rejects.toThrow(error);
       }
-      await expect(impl.fetchBlueprint("invalid-pack")).rejects.toThrow(/unsupported mode 100755/);
-      await expect(impl.fetchBlueprint("no-such-blueprint")).rejects.toThrow(/No such blueprint/);
+      await expect(impl.fetchBlueprint(OWNER, "invalid-pack")).rejects.toThrow(/unsupported mode 100755/);
+      await expect(impl.fetchBlueprint(OWNER, "no-such-blueprint")).rejects.toThrow(/No such blueprint/);
 
       // Nothing was instantiated, and none of the refused objects reached the store.
       expect([...impl.storage.gadgets.list()]).toEqual([]);
@@ -855,7 +860,7 @@ describe("publishing a blueprint built on another", () => {
       // Bob builds on Alice's first release, and takes her second before he publishes.
       await instantiate(instance, alice.blueprintId, alice.published[0]);
       let [gadget] = [...impl.storage.gadgets.list()];
-      await impl.loadBlueprint(alice.blueprintId, alice.published[1]);
+      await impl.loadBlueprint(alice.blueprintId, alice.published[1], undefined);
       await commitToGadget(impl, BOBS, a2);
       let bob = (await createBlueprint(client, "Bob's", gadget.id)).id;
 
@@ -865,7 +870,7 @@ describe("publishing a blueprint built on another", () => {
 
       // Taking her third leaves Bob's files as they were. It is still a release: whoever
       // follows Bob should learn that his blueprint now has her third in it.
-      await impl.loadBlueprint(alice.blueprintId, alice.published[2]);
+      await impl.loadBlueprint(alice.blueprintId, alice.published[2], undefined);
       await commitToGadget(impl, BOBS, a3);
       await client.updateBlueprint(bob, { updateCode: true });
       let second = (await publishedMetadata(bob))!;
@@ -900,7 +905,7 @@ describe("marking the releases a gadget merges", () => {
       let own = await commitFiles(impl, BOBS, [gadget.commitId, chat]);
       // And a release merged by a commit that does not mark it, as this branch wrote them
       // before releases were marked.
-      await impl.loadBlueprint(alice.blueprintId, alice.published[1]);
+      await impl.loadBlueprint(alice.blueprintId, alice.published[1], undefined);
       let unmarked = await commitFiles(impl, { ...BOBS, ...V2 }, [own, a2]);
       impl.storage.gadgets.put({ ...gadget, commitId: unmarked });
       expect(releasesMarkedBy(impl, unmarked)).toEqual([]);
@@ -931,7 +936,7 @@ describe("marking the releases a gadget merges", () => {
       // accepted, mainline moves on to `h2`, and the chat is brought up to date: its files `s`,
       // which have `m` for their parent, merge with mainline as `m2 = [h2, s]`. That is what is
       // accepted. Only `m` marks the release, and it is on no first-parent chain from `m2`.
-      await impl.loadBlueprint(alice.blueprintId, alice.published[1]);
+      await impl.loadBlueprint(alice.blueprintId, alice.published[1], undefined);
       let m = await commitFiles(impl, V2, [h, a2], [releaseMergeHeader(a2)]);
       let s = await commitFiles(impl, { ...V2, "chat.js": "chat\n" }, [m]);
       let h2 = await commitFiles(impl, { ...V1, "main.js": "main\n" }, [h]);
@@ -1575,7 +1580,7 @@ describe("applying a blueprint to a gadget", () => {
       expect(proposal(impl, chatId).merge.missingBindings).toEqual({ LACKS: bindings.LACKS });
 
       // A gadget the agent creates from the blueprint starts with none of them.
-      expect((await impl.fetchBlueprint("bound")).merge.missingBindings).toEqual({
+      expect((await impl.fetchBlueprint(OWNER, "bound")).merge.missingBindings).toEqual({
         HAS: bindings.HAS, LACKS: bindings.LACKS, FEEDS_SPAWNER: bindings.FEEDS_SPAWNER,
         SPAWN: spawner,
       });

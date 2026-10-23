@@ -20,6 +20,7 @@ import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-bi
 import type { AdminSettings } from "./admin-settings.js";
 import { deleteBlueprintContent } from "./blueprint-archive.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./storage-schema/blueprints-kv.js";
+import { resolveBlueprintForUser } from "./blueprint-access.js";
 import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./admin-config.js";
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
 import { CONNECT_FLOW_LIFETIME_MS, handoffTargetOrigin, hashPresentedSecret, hashSecret, newSecretToken, PENDING_HANDOFF_LIFETIME_MS } from "./connect-handoff.js";
@@ -1476,7 +1477,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async addBlueprintToLibrary(id: string): Promise<void> {
-    let kvRecord = await readBlueprintKvRecord(this.env, id);
+    // The blueprint may belong to one of the user's orgs, so this is the member-gated read.
+    let kvRecord = await resolveBlueprintForUser(
+        this.env, this.ctx.exports.OrgDurableObject,
+        [...this.storage.orgMemberships.list()].map(entry => entry.orgId), this.ctx.id.name!, id);
     if (!kvRecord) {
       throw new Error("Blueprint not found.");
     }
@@ -1531,12 +1535,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     if (kvRecord) {
-      if (kvRecord.ownerId !== this.ctx.id.toString()) {
+      if (kvRecord.owner?.type !== "user" || kvRecord.owner.id !== this.ctx.id.toString()) {
         throw new Error("You don't own this blueprint.");
       }
 
       // Delete all R2 objects with the blueprint ID prefix.
-      await deleteBlueprintContent(this.env, id);
+      await deleteBlueprintContent(this.env, kvRecord.owner, id);
       await this.env.BLUEPRINT_CONTENT.delete(`${BLUEPRINT_SCREENSHOT_R2_PREFIX}${id}`);
 
       // Delete from KV.

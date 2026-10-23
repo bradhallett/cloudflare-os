@@ -19,8 +19,9 @@ import { DecisionModelGatekeeper, LanguageModelGatekeeper } from "./ai-models";
 import { getGatewayModels } from "./ai-gateway.js";
 import { AdminSettings, AdminApiImpl } from "./admin-settings.js";
 import { blueprintContentKey, buildBlueprintArchiveStream, sanitizeBlueprintOutput, parseBlueprintArchive, randomBlueprintId } from "./blueprint-archive.js";
-import { BlueprintKvRecord, listFeaturedBlueprintsFromKv, readBlueprintKvRecord } from "./storage-schema/blueprints-kv.js";
+import { BlueprintKvRecord, blueprintKvKey, listFeaturedBlueprintsFromKv, readBlueprintKvRecord } from "./storage-schema/blueprints-kv.js";
 import { GatekeeperConnectCallbackImpl, GatekeeperUserSelectionExchangeImpl, normalizeUsername, UserDurableObject, CLOUDFLARE_VENDOR_ID } from "./user";
+import { resolveBlueprintForUser } from "./blueprint-access.js";
 import { OverseerDurableObject, GatekeeperLoopback, CodeModeTailLoopback, AgentSpawnerGatekeeper, GatekeeperHookLoopback, GadgetTailLoopback, AgentSelfLoopback } from "./overseer";
 import { UserDirectoryDurableObject } from "./user-directory.js";
 import { OrgDurableObject, randomOrgId } from "./org.js";
@@ -41,6 +42,7 @@ const logger = createWorkshopLogger("workshop.server");
 // Set once we've asked the AdminSettings DO to install the bundled blueprints (see the
 // fetch handler), so later requests skip the call. The DO holds the real answer.
 let bundledBlueprintInstallStarted = false;
+let blueprintOwnershipMigrationStarted = false;
 
 // The router version tag this isolate last reported to the AdminSettings DO, when, and the report
 // itself, settling once the DO has recorded it (see the fetch handler), so a request repeating the
@@ -568,7 +570,10 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     let { metadata, contentLength, content } = await parseBlueprintArchive(archive);
     delete metadata.screenshot;
     let blueprintId = randomBlueprintId();
-    let r2Key = blueprintContentKey(blueprintId, metadata);
+    // An imported blueprint belongs to the importing user, as a workspace-published one belongs
+    // to the workspace's owner.
+    let owner = {type: "user", id: this.#userId.toString()} as const;
+    let r2Key = blueprintContentKey(owner, blueprintId, metadata);
 
     try {
       let fixedLengthStream = new FixedLengthStream(contentLength);
@@ -580,10 +585,10 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
       let kvRecord: BlueprintKvRecord = {
         metadata,
-        ownerId: this.#userId.toString(),
+        owner,
       };
 
-      await this.env.BLUEPRINTS.put(blueprintId, JSON.stringify(kvRecord));
+      await this.env.BLUEPRINTS.put(blueprintKvKey(owner, blueprintId), JSON.stringify(kvRecord));
 
       await this.#user.importBlueprint(blueprintId, metadata);
 
@@ -613,8 +618,12 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     blueprintId: string,
     bindings: Record<string, BlueprintBindingAssignment>
   ): Promise<RpcStub<Overseer>> {
-    // 1. Read blueprint from KV.
-    let kvRecord = await readBlueprintKvRecord(this.env, blueprintId);
+    // 1. Read blueprint from KV. The blueprint may belong to one of the user's orgs, so this is
+    //    the member-gated read: an org's blueprint is openable by its members alone.
+    let orgIds = (await retryOnDoReset(() => this.#user.listOrgMemberships()))
+        .map(entry => entry.orgId);
+    let kvRecord = await resolveBlueprintForUser(
+        this.env, this.ctx.exports.OrgDurableObject, orgIds, this.#ownId, blueprintId);
     if (!kvRecord) throw new Error("Blueprint not found.");
 
     // 2. Create new Overseer DO (same as newGadget()).
@@ -627,7 +636,8 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     let overseerDo = this.overseers.get(this.overseers.idFromString(id));
     await overseerDo.initializeFromBlueprint(blueprintId, kvRecord.metadata,
         deploymentOutputForBlueprint(await readAdminConfig(this.env), blueprintId,
-            sanitizeBlueprintOutput(kvRecord.metadata.output)));
+            sanitizeBlueprintOutput(kvRecord.metadata.output)),
+        kvRecord.owner);
 
     // 4. Create gatekeepers from assignments and bind them into the workspace's (only) gadget.
     let metadata = await overseerResult.getMetadata();
@@ -984,7 +994,8 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     let kvRecord = await readBlueprintKvRecord(this.env, id);
     if (!kvRecord) throw new Error("Blueprint not found.");
 
-    let r2Object = await this.env.BLUEPRINT_CONTENT.get(blueprintContentKey(id, kvRecord.metadata));
+    let r2Object = await this.env.BLUEPRINT_CONTENT.get(
+        blueprintContentKey(kvRecord.owner, id, kvRecord.metadata));
     if (!r2Object) throw new Error("Blueprint content not found in R2.");
 
     let metadata = { ...kvRecord.metadata };
@@ -1091,6 +1102,20 @@ export default {
               bundledBlueprintInstallStarted = false;
               logger.warn("failed to install bundled blueprints", {
                 event: "formats.install.trigger.failed", error: err,
+              });
+            }));
+      }
+
+      // Likewise the one-shot rewrite of pre-subject blueprint records: triggered by API
+      // traffic, fire-and-forget, and idempotent (see ensureBlueprintOwnershipMigrated). Reads
+      // never wait for it, so a failure only leaves the old shape in place for the next try.
+      if (!blueprintOwnershipMigrationStarted) {
+        blueprintOwnershipMigrationStarted = true;
+        ctx.waitUntil(ctx.exports.AdminSettings.getByName("").ensureBlueprintOwnershipMigrated()
+            .catch((err: unknown) => {
+              blueprintOwnershipMigrationStarted = false;
+              logger.warn("failed to migrate blueprint ownership", {
+                event: "blueprints.ownership.migrate.failed", error: err,
               });
             }));
       }
