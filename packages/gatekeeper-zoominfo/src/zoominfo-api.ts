@@ -69,6 +69,27 @@ export class ZoomInfoApiError extends Error {
   }
 }
 
+/**
+ * The request may have reached ZoomInfo, but no answer came back: a timeout or a dropped
+ * connection. Whether the call took effect (and spent credits) is unknown.
+ */
+export class ZoomInfoTransportError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "ZoomInfoTransportError";
+  }
+}
+
+/**
+ * Whether an error from a ZoomInfo call has an unknown outcome: the request may have reached
+ * ZoomInfo and been applied (and charged) without the answer coming back. A definitive answer,
+ * including a refusal, means the outcome is known.
+ */
+export function isOutcomeUnknown(error: unknown): boolean {
+  return error instanceof ZoomInfoTransportError
+    || (error instanceof ZoomInfoApiError && error.status >= 500);
+}
+
 // ---------------------------------------------------------------------------
 // PKCE helpers
 
@@ -260,9 +281,17 @@ export class ZoomInfoApi {
       init.body = JSON.stringify(options.body);
     }
 
-    const response = await fetch(url.toString(), init);
-
-    const parsed = await parseBody(response);
+    let response: Response;
+    let parsed: unknown;
+    try {
+      response = await fetch(url.toString(), init);
+      parsed = await parseBody(response);
+    } catch (error) {
+      // The call may have reached ZoomInfo, and an enrichment may have spent credits, so this
+      // class — not the raw TypeError/DOMException — is what outcome classification keys on.
+      throw new ZoomInfoTransportError(
+        error instanceof Error ? error.message : String(error), { cause: error });
+    }
     if (!response.ok) {
       throw new ZoomInfoApiError(response.status, formatApiError(response, parsed), parsed);
     }

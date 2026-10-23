@@ -47,3 +47,7 @@ SUPABASE_CLIENT_SECRET=<oauth app client secret>
 - Mutating SQL is **not** simulated — arbitrary statements cannot be reliably previewed through the
   stateless query endpoint, so a `query()` will not observe an un-approved change. This is
   documented in the API types.
+- **Reconnect pinning.** A connection is pinned to the Supabase account that created it (the
+  `gotrue_id` read from `/v1/profile` after the token exchange). A reconnect authorized as a
+  different account is refused and the newly exchanged grant is revoked; if the profile cannot be
+  read at all, the grant is likewise revoked rather than left unusable but valid.

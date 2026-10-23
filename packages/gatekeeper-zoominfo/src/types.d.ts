@@ -936,12 +936,15 @@ export type EnrichmentReady =
 /**
  * The outcome of an enrichment. `"pending"` while not yet available; `"rejected"` if the
  * enrichment did not run (no credits spent); `"ready"` with the enriched payload (see
- * `EnrichmentReady`); `"failed"` if ZoomInfo returned an error.
+ * `EnrichmentReady`); `"failed"` if ZoomInfo returned an error; `"unknown"` if the approved
+ * request was dispatched but ZoomInfo never confirmed whether it ran — the enrichment is never
+ * replayed after that, since replaying may spend the credits twice.
  */
 export type EnrichmentOutcome =
   | { status: "pending" }
   | { status: "rejected" }
   | { status: "failed"; message: string }
+  | { status: "unknown"; message: string }
   | ({ status: "ready" } & EnrichmentReady);
 
 // ===========================================================================
