@@ -257,8 +257,14 @@ describe("blueprint owner subjects", () => {
     expect(await env.TEST_USER.getByName(member).isBlueprintInLibrary("library-only"))
         .toEqual({ uploaded: false });
 
-    // The outsider's DO, with no membership to answer for, sees no such blueprint.
-    await expect(env.TEST_USER.getByName(outsider).addBlueprintToLibrary("library-only"))
-        .rejects.toThrow(/Blueprint not found/);
+    // The outsider's DO, with no membership to answer for, sees no such blueprint. (Asserted
+    // with try/catch rather than expect().rejects: a remote Durable Object rejection awaited
+    // only through vitest's rejects chain still surfaces as a workerd unhandled error.)
+    try {
+      await env.TEST_USER.getByName(outsider).addBlueprintToLibrary("library-only");
+      expect.unreachable();
+    } catch (err) {
+      expect((err as Error).message).toMatch(/Blueprint not found/);
+    }
   }, 30000);
 });
