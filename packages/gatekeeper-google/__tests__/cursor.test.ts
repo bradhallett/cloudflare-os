@@ -89,7 +89,7 @@ describe("paging", () => {
 
 describe("pages with no usable results", () => {
   it("walks past pages the provider returned empty", async () => {
-    let { pager, requested } = makePager([[], [], ["a"]]);
+    let { pager, requested } = makePager([[], [], ["a"]], { maxProviderPagesPerCall: 3 });
     expect(await pager.next()).toEqual(["a"]);
     expect(requested).toEqual([undefined, "1", "2"]);
   });
@@ -98,6 +98,7 @@ describe("pages with no usable results", () => {
   // That is not the end of the results, and must not be reported as one.
   it("walks past pages that a scope filter emptied", async () => {
     let { pager } = makePager([["skip"], ["skip"], ["keep"]], {
+      maxProviderPagesPerCall: 3,
       buildEntries: async items => items.filter(item => item !== "skip"),
     });
     expect(await pager.next()).toEqual(["keep"]);
@@ -122,11 +123,15 @@ describe("pages with no usable results", () => {
     expect(await pager.next()).toEqual([]);
   });
 
-  it("defaults the budget to DEFAULT_MAX_PROVIDER_PAGES_PER_CALL", async () => {
-    let pages = Array.from({ length: DEFAULT_MAX_PROVIDER_PAGES_PER_CALL + 1 }, () => [] as string[]);
-    let { pager, requested } = makePager(pages.concat([["a"]]));
+  it("bounds one call to the default two provider pages", async () => {
+    let pages = Array.from({ length: DEFAULT_MAX_PROVIDER_PAGES_PER_CALL + 4 }, () => [] as string[]);
+    let { pager, requested, authorized } = makePager(pages.concat([["a"]]));
+    expect(DEFAULT_MAX_PROVIDER_PAGES_PER_CALL).toBe(2);
     expect(await pager.next()).toEqual([]);
-    expect(requested).toHaveLength(DEFAULT_MAX_PROVIDER_PAGES_PER_CALL);
+    // Two provider pages read, one authorized disclosure — the default caps the walk before the
+    // caller sees anything, and the next call resumes where this one stopped.
+    expect(requested).toHaveLength(2);
+    expect(authorized).toEqual([[]]);
   });
 
   it("counts the budget per call, not for the cursor's lifetime", async () => {
@@ -206,7 +211,7 @@ describe("authorization", () => {
   });
 
   it("does not ask about pages it walked past", async () => {
-    let { pager, authorized } = makePager([[], [], ["a"]]);
+    let { pager, authorized } = makePager([[], [], ["a"]], { maxProviderPagesPerCall: 3 });
     await pager.next();
     expect(authorized).toEqual([["a"]]);
   });
