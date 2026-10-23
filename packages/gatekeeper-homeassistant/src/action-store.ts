@@ -62,10 +62,12 @@ export function withActionId(body: SubmitWriteBody, id: number): HomeAssistantAc
   return { ...body, id };
 }
 
-// Internal storage row for actions that have been applied. Retained so that revertAction() can
-// look up the information needed to undo the action. The overseer only passes back the action ID,
-// so all revert information lives here in DO storage rather than being round-tripped through the
-// overseer. Its presence is also the settle marker apply replays against.
+/**
+ * Internal storage row for actions that have been applied. Retained so that revertAction() can
+ * look up the information needed to undo the action. The overseer only passes back the action ID,
+ * so all revert information lives here in DO storage rather than being round-tripped through the
+ * overseer. Its presence is also the settle marker apply replays against.
+ */
 export type AppliedActionRow = {
   id: number;
   action: HomeAssistantAction;

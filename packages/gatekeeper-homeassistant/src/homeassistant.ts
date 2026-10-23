@@ -1475,8 +1475,10 @@ interface SessionContext {
   registrySnapshotWithOverlay(): Promise<{ snapshot: RegistrySnapshot; appliedCount: number }>;
 }
 
-// The fields of a HomeAssistantAction that the caller fills in (everything except `id`, which
-// the gatekeeper assigns). Exported for the action store, which stamps the id in.
+/**
+ * The fields of a HomeAssistantAction that the caller fills in (everything except `id`, which
+ * the gatekeeper assigns). Exported for the action store, which stamps the id in.
+ */
 export type SubmitWriteBody =
   | Omit<HomeAssistantAction & { type: "callService" }, "id">
   | Omit<HomeAssistantAction & { type: "fireEvent" }, "id">

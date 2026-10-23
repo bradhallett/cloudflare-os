@@ -2,7 +2,7 @@ import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint, restore } from "cl
 import { GmailForwardSnapshotStore } from "../../src/gmail-state";
 import { GmailGatekeeperImpl, type GmailGatekeeperImplProps } from "../../src/gmail";
 import { GoogleChatGatekeeperImpl, type GoogleChatGatekeeperImplProps } from "../../src/chat";
-import { GoogleVerifier, UserAccount as GoogleUserAccount, type HookDriverRef } from "../../src/google";
+import { UserAccount as GoogleUserAccount, type HookDriverRef } from "../../src/google";
 import type {
   ActionKind, ConnectHandoff, HookController, ResourceDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
