@@ -148,6 +148,16 @@ export const useComposerAttachments = ({
     }
   };
 
+  const retryAttachment = (id: string) => {
+    const attachment = attachmentsRef.current.find((item) => item.id === id);
+    // Only a failed upload can be retried: the blob is kept on the attachment precisely so an
+    // error does not strand the file. Anything else (uploading, ready, gone) has no retry.
+    if (!attachment || attachment.uploadState !== "error") return;
+    updateAttachments((current) => current.map((item) =>
+      item.id === id ? {...item, uploadState: "uploading", error: undefined} : item));
+    void uploadAttachment(id, attachment.blob, attachment.mimeType, attachment.name);
+  };
+
   const removeAttachment = (id: string) => {
     const attachment = attachmentsRef.current.find((item) => item.id === id);
     if (attachment?.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
@@ -167,5 +177,6 @@ export const useComposerAttachments = ({
     addFiles,
     clearSentAttachments,
     removeAttachment,
+    retryAttachment,
   };
 };

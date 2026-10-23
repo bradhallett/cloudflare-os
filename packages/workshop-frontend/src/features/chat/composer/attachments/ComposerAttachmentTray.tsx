@@ -16,10 +16,12 @@ export const ComposerAttachmentTray = ({
   attachments,
   disabled = false,
   onRemove,
+  onRetry,
 }: {
   attachments: readonly ComposerAttachment[];
   disabled?: boolean;
   onRemove: (attachmentId: string) => void;
+  onRetry: (attachmentId: string) => void;
 }) => {
   const open = attachments.length > 0;
 
@@ -54,6 +56,7 @@ export const ComposerAttachmentTray = ({
                   attachment={attachment}
                   disabled={disabled}
                   onRemove={() => onRemove(attachment.id)}
+                  onRetry={() => onRetry(attachment.id)}
                 />
               </motion.li>
             ))}
