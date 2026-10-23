@@ -3289,8 +3289,10 @@ async function runAgentPass(
   // when the initiator has bots to talk to. None is offered to gadget-spawned agents (they are
   // excluded by SPAWNED_AGENT_TOOLS below): no user is present to review what a bot-driven
   // turn might do. Bot tools are for interactive chats, where the human watches the threads.
+  // The bot list is tool-advertising, not turn-critical: a user-DO or KV hiccup must not fail
+  // the pass, so it degrades to an empty list (the tools are simply omitted this turn).
   let delegatableBots = agentContext.spawnerConfig ? []
-      : await hooks.listDelegatableBots(chatId);
+      : await hooks.listDelegatableBots(chatId).catch(() => []);
   let delegatableBotsList = delegatableBots.length === 0 ? ""
       : delegatableBots.map(bot =>
             `- ${bot.name} (${bot.key})${bot.description ? `: ${bot.description}` : ""}`)

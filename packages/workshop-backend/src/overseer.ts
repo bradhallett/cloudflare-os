@@ -8456,9 +8456,10 @@ class OverseerImpl implements AgentHooks {
       }
     }
     for (let skill of skills) {
-      let matches = providers.flatMap(provider => provider.commands
-          .filter(command => command.id === skill.commandId)
-          .map(command => ({provider, command})));
+      let matches = providers.flatMap(provider => provider.vendorId !== skill.vendorId ? [] :
+          provider.commands
+              .filter(command => command.id === skill.commandId)
+              .map(command => ({provider, command})));
       if (matches.length === 1) {
         let {provider, command} = matches[0]!;
         resolved.push({
@@ -8557,8 +8558,13 @@ class OverseerImpl implements AgentHooks {
   #chargeBotDmBudget(chatId: number, rootChatId: number, botKeyForLog: string): void {
     let context = this.getChatAgentContext(chatId);
     let rootContext = rootChatId === chatId ? context : this.getChatAgentContext(rootChatId);
+    // A deleted root leaves its tree's children pointing at a chat that no longer exists;
+    // reading the tree budget through a fresh default row would reset it, so a tree whose
+    // root is gone spends its budget (the per-chat cap still bounds each thread).
+    let rootDeleted = rootChatId !== chatId && !this.storage.chatMeta.get(rootChatId);
     let dmCount = (context.inboundBotMessages ?? 0) + 1;
-    let treeDmCount = (rootContext.treeInboundBotMessages ?? 0) + 1;
+    let treeDmCount = rootDeleted ? MAX_BOT_DMS_PER_TREE + 1
+        : (rootContext.treeInboundBotMessages ?? 0) + 1;
     if (dmCount > MAX_BOT_DMS_PER_CHAT || treeDmCount > MAX_BOT_DMS_PER_TREE) {
       this.logger.warn("bot DM budget exhausted", {
         event: "bot.budget.exhausted", chatId, botKey: botKeyForLog, dmCount, treeDmCount,
@@ -8570,7 +8576,7 @@ class OverseerImpl implements AgentHooks {
     context.inboundBotMessages = dmCount;
     rootContext.treeInboundBotMessages = treeDmCount;
     this.storage.chatContext.put(context);
-    if (rootChatId !== chatId) this.storage.chatContext.put(rootContext);
+    if (rootChatId !== chatId && !rootDeleted) this.storage.chatContext.put(rootContext);
   }
 
   // Create a bot's thread: resolve the bot against the initiator's account (a refusal throws
@@ -8836,9 +8842,17 @@ class OverseerImpl implements AgentHooks {
       targetChatId = senderContext.parentChatId;
     }
 
-    // No thread: auto-spawn one whose first message is the DM (same framing and budget as a
-    // delegation; the sender's chat is the parent, so the tree stays one).
+    // No thread: auto-spawn one whose first message is the DM (same framing, budget and depth
+    // guard as a delegation; the sender's chat is the parent, so the tree stays one).
     if (targetChatId === undefined && targetSelection) {
+      let chain = senderContext.delegationChain ?? [];
+      if (chain.includes(targetKey)) {
+        throw new Error(`That bot already delegated to this chat (cycle); refusing: ${targetKey}.`);
+      }
+      if (chain.length >= MAX_DELEGATION_DEPTH) {
+        throw new Error(
+            `Delegation is capped at ${MAX_DELEGATION_DEPTH} levels; this chat is at the limit.`);
+      }
       let spawned = await this.#createBotChildChat(
           initiatorUserId, targetSelection, fromChatId, senderContext,
           text, senderLabel, undefined, {header, author});
