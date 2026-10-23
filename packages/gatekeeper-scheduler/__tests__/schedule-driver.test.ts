@@ -149,6 +149,15 @@ async function revokeWhileDeliveryIsBlocked(
   }
   await alarm;
 
+  // revoke() and the revoked exit of the driver's replanning both arm an immediate alarm. Drive
+  // the revocation cleanup to quiescence here so the runtime delivers it inside the test instead
+  // of at an arbitrary moment near pool teardown -- the hang these tests were born skipped over
+  // (cloudflare/workers-sdk#14180). A cleaned-up account must end with no alarm armed, so a
+  // cleanup that never converges fails the test instead of papering over the residue.
+  for (let attempt = 0; await runDurableObjectAlarm(driver); attempt++) {
+    if (attempt === 3) throw new Error("Revocation cleanup did not reach a quiescent alarm.");
+  }
+
   expect(await driver.getSchedule("workspace-a", "schedule-a")).toBeUndefined();
   return (await testEnv.TEST_HOOKS.read()).events;
 }
@@ -669,19 +678,17 @@ describe("ScheduleDriver", () => {
     expect((await testEnv.TEST_HOOKS.read()).events).toEqual([]);
   });
 
-  // These input-gate interruption tests can deadlock `@cloudflare/vitest-plugin` during teardown.
-  // See https://github.com/cloudflare/workers-sdk/issues/14180.
-  it.skip("stops before authorization when revoked during startHook", async () => {
+  it("stops before authorization when revoked during startHook", async () => {
     const events = await revokeWhileDeliveryIsBlocked("revoke-start", "start");
     expect(events).toEqual(["start", "blocked:start"]);
   });
 
-  it.skip("stops before callback when revoked during authorization", async () => {
+  it("stops before callback when revoked during authorization", async () => {
     const events = await revokeWhileDeliveryIsBlocked("revoke-authorization", "authorization");
     expect(events).toEqual(["start", "authorize", "blocked:authorization"]);
   });
 
-  it.skip("does not persist completion when revoked during callback", async () => {
+  it("does not persist completion when revoked during callback", async () => {
     const events = await revokeWhileDeliveryIsBlocked("revoke-callback", "callback");
     expect(events).toHaveLength(4);
     expect(events.slice(0, 3)).toEqual(["start", "authorize", expect.stringMatching(/^callback:/)]);
