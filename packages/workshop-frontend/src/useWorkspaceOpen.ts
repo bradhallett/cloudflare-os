@@ -33,7 +33,6 @@ type Options = {
   authenticatedApi: RpcStub<AuthenticatedApi>
   onMetadata: (metadata: GadgetMetadata) => void
   onShareKeyConsumed: () => void
-  onInvalidShareKey: () => void
 }
 
 export function useWorkspaceOpen({
@@ -41,7 +40,6 @@ export function useWorkspaceOpen({
   authenticatedApi,
   onMetadata,
   onShareKeyConsumed,
-  onInvalidShareKey,
 }: Options) {
   const [overseer, setOverseer] = useState<{ stub: RpcStub<Overseer> } | null>(null)
   const [metadata, setMetadata] = useState<GadgetMetadata | null>(null)
@@ -51,8 +49,8 @@ export function useWorkspaceOpen({
   const [reloadNonce, setReloadNonce] = useState(0)
   const openWorkspaceIdRef = useRef<string | undefined>(undefined)
   const pendingObserverRejectRef = useRef<((error: unknown) => void) | null>(null)
-  const callbacksRef = useRef({ onMetadata, onShareKeyConsumed, onInvalidShareKey })
-  callbacksRef.current = { onMetadata, onShareKeyConsumed, onInvalidShareKey }
+  const callbacksRef = useRef({ onMetadata, onShareKeyConsumed })
+  callbacksRef.current = { onMetadata, onShareKeyConsumed }
 
   useDocumentTitle(error ? '' : metadata?.title)
 
@@ -138,12 +136,9 @@ export function useWorkspaceOpen({
         if (cancelled) return
         console.error('Failed to load gadget:', caught)
 
-        // TODO: Give invalid-share-key and observer failures stable codes so this remaining legacy
-        // message classification can be removed.
+        // TODO: Give observer failures stable codes so this remaining legacy message
+        // classification can be removed.
         const message = caught instanceof Error ? caught.message : ''
-        if (message.includes('Invalid or expired share key')) {
-          callbacksRef.current.onInvalidShareKey()
-        }
         if (message.includes(OBSERVER_CANCELLED)) {
           showTerminalError({
             kind: 'message',
