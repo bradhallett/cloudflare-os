@@ -18,7 +18,9 @@ import {
 } from "@gadgets/workshop-shared/gatekeeper";
 import { buildDescription, codeSpan } from "@gadgets/gatekeeper-kit/action-description";
 import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
-import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import {
+  clearConnectionSubject, commitReconnect, ConnectionSubject, pinConnectionSubject, stageReconnect,
+} from "@gadgets/gatekeeper-kit/credential-stage";
 import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
 import {
   SupabaseApi,
@@ -100,11 +102,10 @@ type StoredToken = {
 
 /**
  * The connected account's identity, read from `/v1/profile` right after the token exchange. The
- * GoTrue user id is the stable property a reconnect pins against; email and username are for
- * display and refusal messages.
+ * GoTrue user id is the stable property the kit's reconnect fence pins against; email and
+ * username are for display and refusal messages.
  */
-type StoredIdentity = {
-  id: string;
+type StoredIdentity = ConnectionSubject & {
   email?: string;
   username?: string;
 };
@@ -112,25 +113,28 @@ type StoredIdentity = {
 /**
  * A grant as persisted (or staged for a reconnect): the expiry is absolute, since the provider's
  * relative `expiresIn` counts from the exchange, not from whenever the grant is later made live.
+ * Which account a grant belongs to travels separately, as the connection's subject.
  */
 type StoredGrant = {
   accessToken: string;
   refreshToken: string;
   accessTokenExpiresAt: number;
-  /** Present on grants from an exchange (which reads the profile); a refresh keeps the stored one. */
-  identity?: StoredIdentity;
 };
 
-function toStoredGrant(grant: SupabaseOAuthGrant, profile: SupabaseProfile, now: number): StoredGrant {
+function toStoredGrant(grant: SupabaseOAuthGrant, now: number): StoredGrant {
   return {
     accessToken: grant.accessToken,
     refreshToken: grant.refreshToken,
     accessTokenExpiresAt: now + grant.expiresIn * 1000,
-    identity: {
-      id: profile.gotrueId,
-      email: profile.primaryEmail,
-      username: profile.username,
-    },
+  };
+}
+
+/** The account a freshly exchanged grant belongs to, as the connection's subject. */
+function profileSubject(profile: SupabaseProfile): StoredIdentity {
+  return {
+    id: profile.gotrueId,
+    email: profile.primaryEmail,
+    username: profile.username,
   };
 }
 
@@ -500,33 +504,33 @@ export class UserAccount extends DurableObject<Env> {
         "Could not read which Supabase account authorized the connection, so it was not " +
           "connected. Please try again.", { cause: error });
     }
-    const grant = toStoredGrant(exchanged, profile, Date.now());
+    const grant = toStoredGrant(exchanged, Date.now());
+    const subject = profileSubject(profile);
 
     let handoff: ConnectHandoff;
     if (stored.reconnect) {
-      // A reconnect only ever reconnects the account it was made for: the profile's GoTrue id must
-      // be the one this connection is pinned to. A different account's grant is revoked outright.
-      const pinned = this.ctx.storage.kv.get<StoredIdentity>("identity");
-      const granted = grant.identity;
-      if (pinned !== undefined && granted !== undefined && pinned.id !== granted.id) {
+      // A reconnect only ever reconnects the account it was made for: the profile's GoTrue id
+      // must be the one this connection is pinned to. A different account's grant is revoked
+      // outright.
+      const staged = stageReconnect(this.ctx.storage.kv, grant, subject, Date.now(),
+        (pinned, granted) => ({
+          title: "That's a different Supabase account",
+          detail: `This connection is for ${describeSupabaseAccount(pinned)}, but Supabase ` +
+            `authorized ${describeSupabaseAccount(granted)}. Sign in to Supabase as ` +
+            `${describeSupabaseAccount(pinned)} and reconnect, or connect ` +
+            `${describeSupabaseAccount(granted)} as a separate account.`,
+        }));
+      if ("refused" in staged) {
         await this.#revokeExchangedGrant(grant.refreshToken, clientId, clientSecret);
-        return {
-          refused: {
-            title: "That's a different Supabase account",
-            detail: `This connection is for ${describeSupabaseAccount(pinned)}, but Supabase ` +
-              `authorized ${describeSupabaseAccount(granted)}. Sign in to Supabase as ` +
-              `${describeSupabaseAccount(pinned)} and reconnect, or connect ` +
-              `${describeSupabaseAccount(granted)} as a separate account.`,
-          },
-        };
+        return { refused: staged.refused };
       }
       // The reconnect URL is a bearer capability, so the new grant is only staged until the Workshop
       // has confirmed the browser that finished the flow is the owner's (see commitReconnect). Bound
       // gadgets keep reading the current token meanwhile.
-      const stageId = stageCredentials(this.ctx.storage.kv, grant, Date.now());
-      handoff = await callback.reconnectComplete(stageId);
+      handoff = await callback.reconnectComplete(staged.stageId);
     } else {
       this.#storeGrant(grant);
+      pinConnectionSubject(this.ctx.storage.kv, subject);
       clearCredentialExpiryLatch(this.ctx.storage.kv);
       try {
         const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
@@ -535,7 +539,7 @@ export class UserAccount extends DurableObject<Env> {
         this.ctx.storage.kv.delete("accessToken");
         this.ctx.storage.kv.delete("refreshToken");
         this.ctx.storage.kv.delete("accessTokenExpiresAt");
-        this.ctx.storage.kv.delete("identity");
+        clearConnectionSubject(this.ctx.storage.kv);
         throw error;
       }
     }
@@ -544,9 +548,10 @@ export class UserAccount extends DurableObject<Env> {
     return { handoff };
   }
 
-  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
+  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. The kit
+   * re-pins the staged subject, adopting a connection made before the pin existed. */
   async commitReconnect(stageId: string): Promise<void> {
-    const grant = commitStagedCredentials<StoredGrant>(this.ctx.storage.kv, Date.now(), stageId);
+    const grant = commitReconnect<StoredGrant>(this.ctx.storage.kv, Date.now(), stageId);
     if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
     this.#storeGrant(grant);
     clearCredentialExpiryLatch(this.ctx.storage.kv);
@@ -556,7 +561,6 @@ export class UserAccount extends DurableObject<Env> {
     this.ctx.storage.kv.put("accessToken", grant.accessToken);
     this.ctx.storage.kv.put("refreshToken", grant.refreshToken);
     this.ctx.storage.kv.put<number>("accessTokenExpiresAt", grant.accessTokenExpiresAt);
-    if (grant.identity !== undefined) this.ctx.storage.kv.put<StoredIdentity>("identity", grant.identity);
   }
 
   /**
@@ -613,8 +617,6 @@ export class UserAccount extends DurableObject<Env> {
         accessToken: refreshed.accessToken,
         refreshToken: refreshed.refreshToken,
         accessTokenExpiresAt: Date.now() + refreshed.expiresIn * 1000,
-        // A refresh does not change which account the token belongs to; keep the stored identity.
-        identity: this.ctx.storage.kv.get<StoredIdentity>("identity"),
       };
       this.#storeGrant(grant);
       return { token: grant.accessToken, expiresAt: grant.accessTokenExpiresAt };

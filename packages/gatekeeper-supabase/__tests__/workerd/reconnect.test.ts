@@ -23,7 +23,7 @@ function ctx() {
 
 async function storedIdentity(userObjectId: string): Promise<StoredIdentity | undefined> {
   return await runInDurableObject(accountStub(userObjectId), async (_instance, state) =>
-    state.storage.kv.get<StoredIdentity>("identity"));
+    state.storage.kv.get<StoredIdentity>("connectionSubject"));
 }
 
 async function storedToken(userObjectId: string): Promise<string | undefined> {

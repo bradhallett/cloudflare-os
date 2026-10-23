@@ -87,7 +87,7 @@ export async function seedAccount(sb: FakeSupabase, user: FakeSupabaseUser = ALI
     state.storage.kv.put("accessToken", accessToken);
     state.storage.kv.put("refreshToken", refreshToken);
     state.storage.kv.put("accessTokenExpiresAt", Date.now() + 60 * 60 * 1000);
-    state.storage.kv.put("identity", { id: user.gotrueId, email: user.email, username: user.username });
+    state.storage.kv.put("connectionSubject", { id: user.gotrueId, email: user.email, username: user.username });
   });
   return accountId.toString();
 }
