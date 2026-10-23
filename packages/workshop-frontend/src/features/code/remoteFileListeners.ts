@@ -1,8 +1,10 @@
 import type { WorkpieceId } from '@gadgets/workshop-shared/api'
 import type { FileChange } from '@gadgets/workshop-shared/code-change'
 
-// The listener and preview maps of the code view are keyed by file: the workpiece id and the
-// path joined by a NUL (a character neither can contain).
+/**
+ * The listener and preview maps of the code view are keyed by file: the workpiece id and the
+ * path joined by a NUL (a character neither can contain).
+ */
 export function fileKey(gadgetId: WorkpieceId, path: string): string {
   return `${gadgetId}\u0000${path}`
 }
