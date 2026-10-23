@@ -15,11 +15,8 @@ import {
 } from "@cloudflare/kumo";
 
 import {
-  CaretLeft,
   Check,
   X,
-  Pencil,
-  Trash,
 } from "@phosphor-icons/react";
 import { RpcStub } from "capnweb";
 import {
@@ -42,19 +39,19 @@ import {
 } from "@gadgets/workshop-shared/api";
 import { ChatListPanel, type ChatListScope } from "./features/chat/ChatListPanel";
 import { ChatTranscript } from "./features/chat/ChatTranscript";
+import { ChatHeaderBar } from "./features/chat/ChatHeaderBar";
 import type { ChatContentReader } from "./features/code/otClient";
 import { commitFileStore, type CommitFileReader } from "./features/code/commitFileStore";
 import GatekeeperModal from "./GatekeeperModal";
 import { hookToggleFailureToast } from "./components/HookToggle";
 import DeleteConfirmationDialog from "./components/DeleteConfirmationDialog";
 import AutoApproveConfirmDialog from "./components/AutoApproveConfirmDialog";
-import { WorkshopButton, WorkshopIconButton, WorkshopInput } from "./components/WorkshopControls";
+import { WorkshopButton, WorkshopIconButton } from "./components/WorkshopControls";
 import { useAlwaysApproveTag } from "./useAlwaysApproveTag";
 import { useResolveAction } from "./useResolveAction";
 import { useAuthenticatedApi } from "./AuthContext";
 import OutOfCreditsModal from "./components/billing/OutOfCreditsModal";
 import { copyToClipboard } from "./clipboard";
-import { isImeComposing } from "./keyboardEvent";
 import { ChatComposer } from "./features/chat/composer/ChatComposer";
 import { composerDraftStorageKey } from "./features/chat/composer/draft/composerDraft";
 import {
@@ -1373,75 +1370,18 @@ function ChatInterface({
           {(!sidebarMode || sidebarActiveTab === "chat") && (
             <>
               {/* Chat sub-header — hidden in sidebar mode (list is always visible) */}
-              {!sidebarMode && (
-                <div className="flex h-12 flex-shrink-0 items-center justify-between gap-2 border-b border-kumo-line px-4">
-                  <WorkshopIconButton
-                    onClick={() => onNavigateToChat(null)}
-                    className="!h-8 !w-8 flex-shrink-0"
-                    title="Back to conversations"
-                    aria-label="Back to conversations"
-                  >
-                    <CaretLeft size={14} />
-                  </WorkshopIconButton>
-
-                  {isEditingTitle ? (
-                    <div className="flex items-center gap-1 flex-1 min-w-0">
-                      <WorkshopInput
-                        type="text"
-                        value={titleInput}
-                        onChange={(e) => setTitleInput(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (isImeComposing(e)) return;
-                          if (e.key === "Enter") handleSaveChatTitle();
-                          if (e.key === "Escape") handleCancelTitleEdit();
-                        }}
-                        autoFocus
-                        className="!h-8 min-w-0 flex-1 bg-kumo-tint text-[13px] font-medium"
-                      />
-                      <WorkshopIconButton
-                        onClick={handleSaveChatTitle}
-                        disabled={!titleInput.trim()}
-                        className="!h-8 !w-8 hover:text-kumo-brand disabled:opacity-30"
-                        aria-label="Save chat title"
-                      >
-                        <Check size={13} />
-                      </WorkshopIconButton>
-                      <WorkshopIconButton
-                        onClick={handleCancelTitleEdit}
-                        className="!h-8 !w-8"
-                        aria-label="Cancel title edit"
-                      >
-                        <X size={13} />
-                      </WorkshopIconButton>
-                    </div>
-                  ) : (
-                    <>
-                      <span className="min-w-0 flex-1 truncate text-[13px] leading-[18px] font-medium tracking-[-0.25px] text-kumo-default">
-                        {currentChatMetadata?.title || "Chat"}
-                      </span>
-                      <WorkshopIconButton
-                        onClick={() => setIsEditingTitle(true)}
-                        className="!h-8 !w-8 flex-shrink-0 text-kumo-inactive hover:text-kumo-subtle"
-                        title="Rename chat"
-                        aria-label="Rename chat"
-                      >
-                        <Pencil size={11} />
-                      </WorkshopIconButton>
-                    </>
-                  )}
-
-                  <WorkshopIconButton
-                    onClick={() => handleDeleteChat()}
-                    danger
-                    className="!h-8 !w-8 flex-shrink-0 text-kumo-inactive"
-                    title="Delete chat"
-                    aria-label="Delete chat"
-                  >
-                    <Trash size={14} />
-                  </WorkshopIconButton>
-                </div>
-              )}
-
+              <ChatHeaderBar
+                sidebarMode={sidebarMode}
+                onNavigateToChat={onNavigateToChat}
+                isEditingTitle={isEditingTitle}
+                titleInput={titleInput}
+                setTitleInput={setTitleInput}
+                handleSaveChatTitle={handleSaveChatTitle}
+                handleCancelTitleEdit={handleCancelTitleEdit}
+                chatTitle={currentChatMetadata?.title}
+                setIsEditingTitle={setIsEditingTitle}
+                handleDeleteChat={() => handleDeleteChat()}
+              />
               {/* Messages */}
               <div
                 ref={messagesContainerRef}
