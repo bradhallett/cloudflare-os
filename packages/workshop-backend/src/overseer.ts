@@ -71,7 +71,7 @@ import type { AgentSpawnerBinding, CallableAgent, SpawnCallableOptions } from ".
 import { recordAnalytics } from "./analytics";
 import { reportIssue } from "@gadgets/observability/error-reporting";
 import type { ProductAnalyticsConnectionType, ProductAnalyticsGadgetInput } from "./analytics";
-import { checkUsageAndBalance } from "./ai-gateway-billing/limits/usage-checker";
+import { checkOwnerUsage, checkUsageAndBalance } from "./ai-gateway-billing/limits/usage-checker";
 import { normalizeAgentCatalog } from "./agent-catalog";
 import { refreshCachedBalance } from "./ai-gateway-billing/cloudflare/connection-service";
 import { SharingManager, SharingCaller, roleRank } from "./sharing";
@@ -7747,6 +7747,7 @@ class OverseerImpl implements AgentHooks {
       subject: string, takenNames: Set<string>,
       quick: {config: AiModelConfig, initiator: AiChatAuthorInfo}): Promise<string | undefined> {
     try {
+      if (!await this.#allowQuickModelCall()) return undefined;
       let model = getModel(this.env, quick.config, quick.initiator);
       let result = await completeText(model, {
         signal: AbortSignal.timeout(10_000),
@@ -7773,6 +7774,14 @@ class OverseerImpl implements AgentHooks {
       });
       return undefined;
     }
+  }
+
+  // Whether a quick-model side call (thread/gadget titles, binding names) may run: cosmetic, so
+  // callers skip it when the owner's allowance is spent instead of surfacing an error. The checker
+  // allows without consuming anything when the limits flow is disabled (self-hosted default).
+  async #allowQuickModelCall(): Promise<boolean> {
+    if (!this.ownerId) return false;
+    return (await checkOwnerUsage(this.env, this.ownerId, this.users)).allowed;
   }
 
   // The quick-model context used for turn-start binding naming, fetched lazily (the naming path
@@ -8624,6 +8633,7 @@ class OverseerImpl implements AgentHooks {
                             modelConfig: AiModelConfig,
                             initiator: AiChatAuthorInfo): Promise<void> {
     try {
+      if (!await this.#allowQuickModelCall()) return;
       let model = getModel(this.env, modelConfig, initiator, {
         metadata: { source: "thread-title", gadgetId: this.ctx.id.toString(), chatId },
       });
@@ -8659,8 +8669,6 @@ class OverseerImpl implements AgentHooks {
         let owner = this.users.get(this.users.idFromString(this.ownerId));
         await owner.updateTitle(this.ctx.id.toString(), result);
       }
-
-      // TODO: Should we track costs for title generation? It's pretty negligible.
     } catch (err) {
       // Oh well, just leave the title as "New Chat".
       this.logger.warn("error generating chat title", {
@@ -8673,6 +8681,7 @@ class OverseerImpl implements AgentHooks {
   async generateGadgetTitle(chatId: number, modelConfig: AiModelConfig,
                             initiator: AiChatAuthorInfo) {
     try {
+      if (!await this.#allowQuickModelCall()) return;
       let parts: string[] = [];
 
       for (let msg of this.storage.chats.list({prefix: chatKeyPrefix(chatId)})) {
@@ -11455,6 +11464,9 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       config: chatMeta.aiModel!.config,
       initiator: this.impl.gadgetAuthorFor(chatMeta.profile),
       metadata: { source: "model-binding", gadgetId: this.impl.ctx.id.toString() },
+      // Spend gating: the binding's calls draw on the workspace owner's allowance (whoever
+      // mints it); see bindingUsageGate in ai-models.ts.
+      ownerUserId: this.impl.ownerId,
     }
 
     let creationSpec: GatekeeperCreationSpec = {

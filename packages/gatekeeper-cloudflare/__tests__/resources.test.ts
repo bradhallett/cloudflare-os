@@ -57,6 +57,12 @@ describe("Cloudflare observability resources", () => {
 
 describe("Cloudflare observability OAuth scopes", () => {
   it("keeps billing-only connections free of observability access", () => {
+    // Spelled out, not just against the constant: this is the exact grant a Cloudflare sign-in
+    // (scopes: "billing", no resources) persists, and aig.run is what lets inference be billed
+    // to the user's own gateway.
+    expect(persistentScopesForResources([])).toEqual([
+      "offline_access", "aig.read", "aig.run", "user-details.read", "account-settings.read",
+    ]);
     expect(persistentScopesForResources([])).toEqual(BILLING_SCOPES);
     expect(persistentScopesForResources()).toContain("workers-observability.read");
   });

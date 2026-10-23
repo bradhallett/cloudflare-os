@@ -579,7 +579,7 @@ export type ResourceConfiguratorFrame = GatekeeperUiFrame;
  * purpose (e.g. billing) without asking the user to grant data access it will never use.
  */
 export type GatekeeperConnectOptions = {
-  scopes?: "auth" | "full";
+  scopes?: "auth" | "billing";
   resourceUrlPatterns?: string[];
 };
 
@@ -633,9 +633,12 @@ export interface GatekeeperVendor extends WorkerEntrypoint {
    * include a cryptographic nonce (in addition to the DO ID), stored in the DO and verified when the
    * user visits the URL, to prevent replay. See gatekeeper-github for a reference implementation.
    *
-   * `options.scopes` selects how much access to request (default "full"):
-   *   - "full": the gatekeeper's full capability scopes (repos, docs, etc.). The resulting
-   *     connection is persisted as a usable connected account.
+   * `options.scopes` selects how much access to request (default: the gatekeeper's full
+   * capability scopes, e.g. repos and docs, persisted as a usable connected account):
+   *   - "billing": a persisted grant for billing only, not data access -- paired with
+   *     `resourceUrlPatterns: []` it requests no resource authorization at all (Cloudflare uses
+   *     this at sign-in to link AI Gateway billing). Vendors without a separate billing tier
+   *     treat it as the default full-capability request.
    *   - "auth": only the minimal scopes needed to verify the user's email for sign-in. The grant is
    *     transient — after `complete()` lets the caller read getAuthenticatedEmail(), the gatekeeper
    *     discards it. Vendors without `providesAuth` ignore this and always use their full scopes.

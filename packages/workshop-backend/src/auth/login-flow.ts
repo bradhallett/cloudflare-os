@@ -228,7 +228,7 @@ export class LoginConnectCallbackImpl
         return;
       }
       // For Cloudflare, signing in also links the account for AI Gateway billing: startGatekeeperLogin
-      // requested full (non-transient) scopes, so persist the grant as a connected account before
+      // requested billing (non-transient) scopes, so persist the grant as a connected account before
       // handing back the session. Other providers use minimal, transient sign-in grants (no persist).
       if (this.ctx.props.vendorId === CLOUDFLARE_VENDOR_ID) {
         const accountId = await userStub.linkConnectedAccountFromLogin(
