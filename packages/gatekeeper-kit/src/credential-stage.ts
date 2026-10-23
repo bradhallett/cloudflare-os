@@ -208,7 +208,9 @@ export function clearConnectionSubject(kv: KvMutable): void {
  * (and staging nothing) when the connection is pinned to a different subject: a reconnect URL is a
  * bearer capability, so anyone can finish one, and only the pinned account's grant may take the
  * stage a Workshop ticket could commit. An unpinned connection — one made before its gatekeeper
- * pinned — stages anything, and its commit adopts the subject it came with.
+ * pinned — stages anything, and its commit adopts the subject it came with. A connector that
+ * could not read a subject from the grant passes `undefined`, which stages subjectless: no fence
+ * compares it, and committing leaves the pin as it is.
  *
  * The refusal's words are the connector's: `refused` receives both subjects and returns the page
  * to show. The caller keeps ownership of disposing the refused grant, since whether a provider can
@@ -235,13 +237,15 @@ export function clearConnectionSubject(kv: KvMutable): void {
 export function stageReconnect<T, S extends ConnectionSubject>(
   kv: KvMutable,
   creds: T,
-  subject: S,
+  subject: S | undefined,
   now: number,
   refused: (pinned: S, granted: S) => { title: string; detail: string },
   ttlMs: number = OAUTH_NONCE_LIFETIME_MS,
 ): { stageId: string } | { refused: { title: string; detail: string } } {
   const pinned = pinnedConnectionSubject<S>(kv);
-  if (pinned !== undefined && pinned.id !== subject.id) {
+  // A grant the connector could not read a subject from cannot be told from any other account's,
+  // so it is staged subjectless and neither fence compares it.
+  if (pinned !== undefined && subject !== undefined && pinned.id !== subject.id) {
     return { refused: refused(pinned, subject) };
   }
   const stageId = generateNonce();

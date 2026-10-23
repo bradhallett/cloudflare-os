@@ -209,6 +209,18 @@ describe("connection subject pin", () => {
     expect(pinnedConnectionSubject<User>(kv)).toEqual(ALICE);
   });
 
+  it("stages a reconnect with no subject rather than refusing it, pin or no pin", () => {
+    const kv = fakeKv();
+    pinConnectionSubject(kv, ALICE);
+    // A grant the connector could not read a subject from cannot be pinned to anyone, so it is
+    // neither refused nor allowed to move the pin.
+    const staged = stageReconnect(kv, GRANT, undefined, 1_000, () => ({ title: "", detail: "" }));
+    if (!("stageId" in staged)) throw new Error("expected the subjectless grant to stage");
+
+    expect(commitReconnect<Grant>(kv, 1_100, staged.stageId)).toEqual(GRANT);
+    expect(pinnedConnectionSubject<User>(kv)).toEqual(ALICE);
+  });
+
   it("drops a corrupt pin rather than pinning to garbage", () => {
     const kv = fakeKv();
     kv.put(CONNECTION_SUBJECT_KEY, { login: "no-id" });
