@@ -920,8 +920,10 @@ function validateSearchQuery(query: string): void {
 // per page — before the caller sees a single result.
 const DEFAULT_MAX_PROVIDER_PAGES_PER_CALL = 2;
 
-// Each page is authorized by loadPage before it can reach the caller, and the position advances
-// only past pages that authorization accepted.
+/**
+ * Each page is authorized by loadPage before it can reach the caller, and the position advances
+ * only past pages that authorization accepted.
+ */
 export class SlackCursor<T> extends RpcTarget implements Cursor<T> {
   #ctx: SlackSessionContext;
   #loadPage: (
