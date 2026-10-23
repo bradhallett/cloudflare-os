@@ -86,6 +86,20 @@ describe("schedule state", () => {
     });
   });
 
+  it("mints a fresh attempt token for every delivery attempt of the same run", () => {
+    // A retry reuses the logical runId, but its pending state must never match the abandoned
+    // attempt's late settlement, so each beginDueRun mints a new attempt token.
+    const first = beginDueRun(createSchedule(recurring, 0), 60_000, "run-1", 360_000);
+    const admitted = admitRun(first, "run-1", 66_000, 366_000);
+    const retrying = failRun(admitted, "run-1", "callback_failed", 72_000);
+    const retry = beginDueRun(retrying, 72_000 + retryDelay(1), "ignored", 400_000);
+    const firstAttempt = first.status === "pending" ? first.attempt : "";
+    const retryAttempt = retry.status === "pending" ? retry.attempt : "";
+    expect(retryAttempt).toBeTruthy();
+    expect(retryAttempt).not.toEqual(firstAttempt);
+    expect(admitRun(retry, "run-1", 80_000, 460_000)).toMatchObject({ attempt: retryAttempt });
+  });
+
   it("uses eight attempts with exponential backoff capped at one hour", () => {
     expect(Array.from({ length: 7 }, (_, index) => retryDelay(index + 1))).toEqual([
       60_000, 120_000, 240_000, 480_000, 960_000, 1_920_000, 3_600_000,

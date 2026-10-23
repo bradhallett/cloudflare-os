@@ -41,6 +41,11 @@ export type PendingSchedule = ScheduleProgress & {
   status: "pending";
   stage: "admission" | "delivery";
   runId: string;
+  /**
+   * Token unique to this delivery attempt (a retry reuses `runId`), fencing the pending-run
+   * compare-and-set: an abandoned attempt's late settlement can never match the retry's run.
+   */
+  attempt: string;
   scheduledTime: number;
   attempts: number;
   leaseExpiresAt: number;
@@ -110,6 +115,7 @@ export function beginDueRun(
       status: "pending",
       stage: "admission",
       runId,
+      attempt: crypto.randomUUID(),
       scheduledTime: schedule.nextFire,
       attempts: 0,
       occurrenceCount: schedule.occurrences ? (schedule.occurrenceCount ?? 0) + 1 : undefined,
@@ -123,6 +129,7 @@ export function beginDueRun(
     status: "pending",
     stage: "admission",
     runId: schedule.runId,
+    attempt: crypto.randomUUID(),
     scheduledTime: schedule.scheduledTime,
     attempts: schedule.attempts,
     leaseExpiresAt,

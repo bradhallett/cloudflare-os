@@ -73,6 +73,8 @@ type PreparedRun = {
   workspaceId: string;
   scheduleId: string;
   runId: string;
+  /** Fences this delivery attempt: the retry reuses `runId` but never this token. */
+  attempt: string;
   scheduledTime: number;
 };
 
@@ -542,6 +544,7 @@ export class ScheduleDriver extends DurableObject {
         workspaceId: state.workspaceId,
         scheduleId: state.scheduleId,
         runId: state.runId,
+        attempt: state.attempt,
         scheduledTime: state.scheduledTime,
       };
     });
@@ -682,7 +685,8 @@ function matchesPending(
   stored: StoredSchedule | undefined,
   prepared: PreparedRun,
 ): stored is StoredSchedule & { state: Extract<EnabledSchedule, { status: "pending" }> } {
-  return stored?.state.status === "pending" && stored.state.runId === prepared.runId;
+  return stored?.state.status === "pending" && stored.state.runId === prepared.runId &&
+      stored.state.attempt === prepared.attempt;
 }
 
 function isDue(schedule: StoredSchedule, now: number): boolean {
