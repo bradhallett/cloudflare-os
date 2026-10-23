@@ -16,11 +16,22 @@ export class HomeAssistantError extends Error {
   readonly status?: number;
   /** When true, this error indicates the LLAT is invalid or revoked. */
   readonly isAuthError: boolean;
+  /** When true, the request may have reached the instance but no response came back, so whether
+   * the device ran it is unknowable. Exactly the failures a caller with side effects must treat
+   * as an unknown outcome rather than a retryable one: a fetch that never returned (timeout,
+   * unreachable) or a WebSocket command lost to a dropped connection. An answer from the
+   * instance -- any HTTP status, a WS command error result, an auth rejection -- left nothing
+   * undelivered, so those stay retryable. */
+  readonly outcomeUnknown: boolean;
 
-  constructor(message: string, opts: { status?: number; isAuthError?: boolean } = {}) {
+  constructor(
+    message: string,
+    opts: { status?: number; isAuthError?: boolean; outcomeUnknown?: boolean } = {},
+  ) {
     super(message);
     this.status = opts.status;
     this.isAuthError = opts.isAuthError ?? false;
+    this.outcomeUnknown = opts.outcomeUnknown ?? false;
   }
 }
 
@@ -96,10 +107,12 @@ async function fetchJson<T>(
     if (controller.signal.aborted && e?.name === "AbortError") {
       throw new HomeAssistantError(
         `Home Assistant did not respond within ${HA_REST_TIMEOUT_MS}ms (${creds.baseUrl}).`,
+        { outcomeUnknown: true },
       );
     }
     throw new HomeAssistantError(
       `Failed to reach Home Assistant at ${creds.baseUrl}: ${e?.message ?? e}`,
+      { outcomeUnknown: true },
     );
   } finally {
     clearTimeout(timeoutHandle);
@@ -241,7 +254,9 @@ export class HomeAssistantWebSocket {
       ws.addEventListener("close", () => {
         this.#closed = true;
         for (const { reject } of this.#pending.values()) {
-          reject(new HomeAssistantError("Home Assistant WebSocket closed unexpectedly."));
+          reject(new HomeAssistantError("Home Assistant WebSocket closed unexpectedly.", {
+            outcomeUnknown: true,
+          }));
         }
         this.#pending.clear();
         resolve();
@@ -249,7 +264,9 @@ export class HomeAssistantWebSocket {
       ws.addEventListener("error", () => {
         this.#closed = true;
         for (const { reject } of this.#pending.values()) {
-          reject(new HomeAssistantError("Home Assistant WebSocket error."));
+          reject(new HomeAssistantError("Home Assistant WebSocket error.", {
+            outcomeUnknown: true,
+          }));
         }
         this.#pending.clear();
       });
