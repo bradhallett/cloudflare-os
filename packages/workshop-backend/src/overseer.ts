@@ -1272,8 +1272,8 @@ class OverseerImpl implements AgentHooks {
     // Resume outside the critical section, before blocked events are delivered. On failure,
     // blockConcurrencyWhile already aborted the object; consume its rejection and retry on wake.
     }).then(() => this.#resumeInterruptedAgents(), error => {
-      this.logger.error("boot failed; interrupted agents were not resumed", {
-        event: "agents.resume.boot.failed", error,
+      this.logger.error("boot or resume sweep failed; some agents may not have been resumed", {
+        event: "agent.resume.boot.failed", error,
       });
     });
   }
@@ -1302,12 +1302,12 @@ class OverseerImpl implements AgentHooks {
           // The async resume rejected before any of its own handling surfaced the failure:
           // log it and leave the record for the next sweep (alarm wake or next construction).
           this.logger.error("agent resume failed to start", {
-            event: "agents.resume.agent.start.failed", chatId: record.chatId, error,
+            event: "agent.resume.start.failed", chatId: record.chatId, error,
           });
         });
       } catch (error) {
         this.logger.error("agent resume sweep failed for one chat", {
-          event: "agents.resume.sweep.failed", chatId: record.chatId, error,
+          event: "agent.resume.sweep.failed", chatId: record.chatId, error,
         });
       }
     }
@@ -9268,7 +9268,7 @@ class OverseerImpl implements AgentHooks {
       // The async resume rejected before any of its own handling surfaced the failure: log it
       // and leave the record for the next sweep (alarm wake or next construction).
       this.logger.error("agent resume failed to start", {
-        event: "agents.resume.agent.start.failed", chatId, error,
+        event: "agent.resume.start.failed", chatId, error,
       });
     });
   }
