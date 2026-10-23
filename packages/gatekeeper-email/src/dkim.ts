@@ -180,9 +180,7 @@ function fromDomainOf(instances: HeaderInstance[]): string | null {
 // ---------------------------------------------------------------------------------------------
 // Key records (RFC 6376 section 3.6.1).
 
-type KeyMaterial = { algorithm: string, key: CryptoKey };
-
-async function importKeyRecord(record: string, signatureAlgorithm: string): Promise<KeyMaterial | null> {
+async function importKeyRecord(record: string, signatureAlgorithm: string): Promise<CryptoKey | null> {
   let tags = parseTags(record);
   let version = tags.get("v");
   if (version != null && version.split(" ")[0] !== "DKIM1") return null;
@@ -194,17 +192,11 @@ async function importKeyRecord(record: string, signatureAlgorithm: string): Prom
 
   let der = b64decode(publicKey);
   if (signatureAlgorithm === "rsa-sha256" && keyType === "rsa") {
-    return {
-      algorithm: signatureAlgorithm,
-      key: await crypto.subtle.importKey(
-          "spki", der, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]),
-    };
+    return crypto.subtle.importKey(
+        "spki", der, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
   }
   if (signatureAlgorithm === "ed25519-sha256" && keyType === "ed25519") {
-    return {
-      algorithm: signatureAlgorithm,
-      key: await crypto.subtle.importKey("raw", der, { name: "Ed25519" }, false, ["verify"]),
-    };
+    return crypto.subtle.importKey("raw", der, { name: "Ed25519" }, false, ["verify"]);
   }
   return null;
 }
@@ -218,8 +210,8 @@ async function lookupKey(dns: DkimDns, selector: string, domain: string,
     return null;  // fail-closed: DNS failure means the signature cannot be trusted
   }
   for (let record of records) {
-    let material = await importKeyRecord(record, signatureAlgorithm).catch(() => null);
-    if (material) return material.key;
+    let key = await importKeyRecord(record, signatureAlgorithm).catch(() => null);
+    if (key) return key;
   }
   return null;
 }
