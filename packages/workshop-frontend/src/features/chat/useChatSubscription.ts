@@ -37,7 +37,7 @@ import {
 } from "./provisionalChatState";
 import { computeChatEpochChanges, type CompactionBoundary } from "./transcript/chatDisplayEntries";
 
-type Toasts = ReturnType<typeof useKumoToastManager>;
+export type Toasts = ReturnType<typeof useKumoToastManager>;
 
 /**
  * Client-side cache for chats and messages (survives reconnects).
