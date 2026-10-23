@@ -17,18 +17,21 @@ import {
   type VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { buildDescription, codeSpan } from "@gadgets/gatekeeper-kit/action-description";
-import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
+import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
 import {
   SupabaseApi,
   SupabaseApiError,
   exchangeAuthCode,
+  fetchProfile,
   refreshAccessToken,
   revokeRefreshToken,
   type ProjectResponse,
   type SupabaseOAuthGrant,
+  type SupabaseProfile,
 } from "./supabase-api";
+import { PendingActionStore, SupabaseCache, type StoredExecuteAction } from "./supabase-storage";
 import { describeTable, listSchemas, listTables } from "./supabase-introspection";
 import {
   SupabaseOrganizationConfiguratorUI,
@@ -96,6 +99,17 @@ type StoredToken = {
 };
 
 /**
+ * The connected account's identity, read from `/v1/profile` right after the token exchange. The
+ * GoTrue user id is the stable property a reconnect pins against; email and username are for
+ * display and refusal messages.
+ */
+type StoredIdentity = {
+  id: string;
+  email?: string;
+  username?: string;
+};
+
+/**
  * A grant as persisted (or staged for a reconnect): the expiry is absolute, since the provider's
  * relative `expiresIn` counts from the exchange, not from whenever the grant is later made live.
  */
@@ -103,29 +117,31 @@ type StoredGrant = {
   accessToken: string;
   refreshToken: string;
   accessTokenExpiresAt: number;
+  /** Present on grants from an exchange (which reads the profile); a refresh keeps the stored one. */
+  identity?: StoredIdentity;
 };
 
-function toStoredGrant(grant: SupabaseOAuthGrant, now: number): StoredGrant {
+function toStoredGrant(grant: SupabaseOAuthGrant, profile: SupabaseProfile, now: number): StoredGrant {
   return {
     accessToken: grant.accessToken,
     refreshToken: grant.refreshToken,
     accessTokenExpiresAt: now + grant.expiresIn * 1000,
+    identity: {
+      id: profile.gotrueId,
+      email: profile.primaryEmail,
+      username: profile.username,
+    },
   };
 }
 
-// A mutating SQL statement queued for human approval and applied once approved.
-type StoredExecuteAction = {
-  ref: string;
-  sql: string;
-  params?: SupabaseValue[];
-  submittedAt: number;
-};
+/** How an identity is named in user-facing reconnect refusals. */
+function describeSupabaseAccount(identity: StoredIdentity): string {
+  return identity.email || identity.username || "the original account";
+}
 
-type Cached<T> = {
-  fetchedAt: number;
-  value: T;
-  generation: number;
-};
+/** What finishing an OAuth flow yields: a handoff page, or a refusal to show. */
+type CallbackResult = { handoff: ConnectHandoff } | { refused: { title: string; detail: string } };
+
 
 // Cache TTLs. Project/org metadata and service lists change rarely; schema introspection can shift
 // after DDL, so it gets a shorter TTL and is invalidated entirely when an action is applied.
@@ -344,12 +360,14 @@ export default {
       const stub: DurableObjectStub<UserAccount> = ctx.exports.UserAccount.get(
         ctx.exports.UserAccount.idFromString(doId),
       );
-      const handoff = await stub.acceptAuthCode(code, oauthNonce);
-      if (!handoff) {
+      const result = await stub.acceptAuthCode(code, oauthNonce);
+      if (result === null) {
         return new Response(INVALID_LINK_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
       }
-
-      return htmlResponse(connectHandoffPageHtml(handoff));
+      if ("refused" in result) {
+        return htmlResponse(errorPageHtml(result.refused.title, result.refused.detail), 409);
+      }
+      return htmlResponse(connectHandoffPageHtml(result.handoff));
     }
 
     return new Response("Not Found", { status: 404 });
@@ -445,10 +463,11 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   /**
-   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on, or
-   * null when the callback's nonce doesn't match.
+   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on:
+   * a handoff, a refusal to show (never the page for a reconnect that pinned a different
+   * account), or null when the callback's nonce doesn't match.
    */
-  async acceptAuthCode(code: string, oauthNonce: string): Promise<ConnectHandoff | null> {
+  async acceptAuthCode(code: string, oauthNonce: string): Promise<CallbackResult | null> {
     const stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
     if (!stored || stored.stage !== "oauth" || Date.now() >= stored.expiresAt
         || !constantTimeEqual(stored.value, oauthNonce)) {
@@ -467,13 +486,40 @@ export class UserAccount extends DurableObject<Env> {
       throw new Error("Took too long to complete authorization. Please try again.");
     }
 
-    const grant = toStoredGrant(
-      await exchangeAuthCode(code, clientId, clientSecret, `${getBaseUrl(this.env)}/oauth`),
-      Date.now(),
-    );
+    const exchanged = await exchangeAuthCode(code, clientId, clientSecret, `${getBaseUrl(this.env)}/oauth`);
+
+    // Read which account just authorized before the grant is trusted anywhere: the profile's
+    // GoTrue id is what a reconnect pins against. Without it the grant is unusable — a reconnect
+    // could not be told from an account swap — so it is retired and the flow fails.
+    let profile: SupabaseProfile;
+    try {
+      profile = await fetchProfile(exchanged.accessToken);
+    } catch (error) {
+      await this.#revokeExchangedGrant(exchanged.refreshToken, clientId, clientSecret);
+      throw new Error(
+        "Could not read which Supabase account authorized the connection, so it was not " +
+          "connected. Please try again.", { cause: error });
+    }
+    const grant = toStoredGrant(exchanged, profile, Date.now());
 
     let handoff: ConnectHandoff;
     if (stored.reconnect) {
+      // A reconnect only ever reconnects the account it was made for: the profile's GoTrue id must
+      // be the one this connection is pinned to. A different account's grant is revoked outright.
+      const pinned = this.ctx.storage.kv.get<StoredIdentity>("identity");
+      const granted = grant.identity;
+      if (pinned !== undefined && granted !== undefined && pinned.id !== granted.id) {
+        await this.#revokeExchangedGrant(grant.refreshToken, clientId, clientSecret);
+        return {
+          refused: {
+            title: "That's a different Supabase account",
+            detail: `This connection is for ${describeSupabaseAccount(pinned)}, but Supabase ` +
+              `authorized ${describeSupabaseAccount(granted)}. Sign in to Supabase as ` +
+              `${describeSupabaseAccount(pinned)} and reconnect, or connect ` +
+              `${describeSupabaseAccount(granted)} as a separate account.`,
+          },
+        };
+      }
       // The reconnect URL is a bearer capability, so the new grant is only staged until the Workshop
       // has confirmed the browser that finished the flow is the owner's (see commitReconnect). Bound
       // gadgets keep reading the current token meanwhile.
@@ -489,12 +535,13 @@ export class UserAccount extends DurableObject<Env> {
         this.ctx.storage.kv.delete("accessToken");
         this.ctx.storage.kv.delete("refreshToken");
         this.ctx.storage.kv.delete("accessTokenExpiresAt");
+        this.ctx.storage.kv.delete("identity");
         throw error;
       }
     }
 
     await this.ctx.storage.deleteAlarm();
-    return handoff;
+    return { handoff };
   }
 
   /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
@@ -509,6 +556,22 @@ export class UserAccount extends DurableObject<Env> {
     this.ctx.storage.kv.put("accessToken", grant.accessToken);
     this.ctx.storage.kv.put("refreshToken", grant.refreshToken);
     this.ctx.storage.kv.put<number>("accessTokenExpiresAt", grant.accessTokenExpiresAt);
+    if (grant.identity !== undefined) this.ctx.storage.kv.put<StoredIdentity>("identity", grant.identity);
+  }
+
+  /**
+   * Best-effort revocation of a grant whose exchange completed but which must not be kept: the
+   * account could not be identified, or it is not the one this connection is pinned to. Logged,
+   * never thrown — the refusal or failure already carries the user-facing outcome.
+   */
+  async #revokeExchangedGrant(refreshToken: string, clientId: string, clientSecret: string): Promise<void> {
+    try {
+      await revokeRefreshToken(refreshToken, clientId, clientSecret);
+    } catch (error) {
+      logger.error("failed to revoke an unusable Supabase OAuth grant", {
+        event: "oauth.grant.usable-revoke.failed", error,
+      });
+    }
   }
 
   /** Returns a valid access token (and its expiry), transparently refreshing when close to expiry. */
@@ -545,8 +608,14 @@ export class UserAccount extends DurableObject<Env> {
     }
 
     try {
-      const grant = toStoredGrant(
-        await refreshAccessToken(refreshToken, clientId, clientSecret), Date.now());
+      const refreshed = await refreshAccessToken(refreshToken, clientId, clientSecret);
+      const grant: StoredGrant = {
+        accessToken: refreshed.accessToken,
+        refreshToken: refreshed.refreshToken,
+        accessTokenExpiresAt: Date.now() + refreshed.expiresIn * 1000,
+        // A refresh does not change which account the token belongs to; keep the stored identity.
+        identity: this.ctx.storage.kv.get<StoredIdentity>("identity"),
+      };
       this.#storeGrant(grant);
       return { token: grant.accessToken, expiresAt: grant.accessTokenExpiresAt };
     } catch (error) {
@@ -785,72 +854,6 @@ export class SupabaseVerifier extends WorkerEntrypoint<Env, SupabaseVerifierProp
   }
 }
 
-// ---------------------------------------------------------------------------
-// Action queue storage. Mutating SQL statements are stored here when submitted for approval and
-// removed once applied or rejected.
-
-class PendingActionStore {
-  #kv: DurableObjectStorage["kv"];
-
-  constructor(kv: DurableObjectStorage["kv"]) {
-    this.#kv = kv;
-  }
-
-  #key(id: number): string {
-    return `pending:action:${id}`;
-  }
-
-  submit(action: StoredExecuteAction): number {
-    const id = this.#kv.get<number>("pending:nextActionId") ?? 1;
-    this.#kv.put("pending:nextActionId", id + 1);
-    this.#kv.put(this.#key(id), action);
-    return id;
-  }
-
-  get(id: number): StoredExecuteAction | undefined {
-    return this.#kv.get<StoredExecuteAction>(this.#key(id));
-  }
-
-  remove(id: number): void {
-    this.#kv.delete(this.#key(id));
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Cache for stable, read-only metadata (project info, schema introspection, etc.). Backed by the
-// gatekeeper DO's KV storage and keyed within a "generation" that is bumped when an action is
-// applied, so structural changes invalidate cached schema in one stroke.
-
-class SupabaseCache {
-  #kv: DurableObjectStorage["kv"];
-
-  constructor(kv: DurableObjectStorage["kv"]) {
-    this.#kv = kv;
-  }
-
-  #generation(): number {
-    return this.#kv.get<number>("cache:generation") ?? 0;
-  }
-
-  bumpGeneration(): void {
-    this.#kv.put("cache:generation", this.#generation() + 1);
-  }
-
-  get<T>(key: string, ttlMs: number): T | undefined {
-    const cached = this.#kv.get<Cached<T>>(`cache:entry:${key}`);
-    if (!cached || cached.generation !== this.#generation()) return undefined;
-    if (Date.now() - cached.fetchedAt >= ttlMs) return undefined;
-    return cached.value;
-  }
-
-  put<T>(key: string, value: T): void {
-    this.#kv.put<Cached<T>>(`cache:entry:${key}`, {
-      fetchedAt: Date.now(),
-      value,
-      generation: this.#generation(),
-    });
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Session context shared by a session's RpcTargets.
