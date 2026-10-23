@@ -3,7 +3,7 @@
 // fetch mock below, and its signed webhook deliveries arrive through the worker's own fetch handler.
 
 import { SELF, env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
-import { stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import { stageCredentials, stageReconnect } from "@gadgets/gatekeeper-kit/credential-stage";
 import type { HookDescription } from "@gadgets/workshop-shared/gatekeeper";
 import { afterEach, expect, it, vi } from "vitest";
 import type { GitHubSubscribeOptions } from "../../src/types";
@@ -1050,11 +1050,13 @@ it("restores its webhook's payload encoding, and has GitHub redeliver what it re
 it.each<[string, (github: FakeGitHub, account: string) => Promise<unknown>]>([
   ["told of the reconnect", async (_github, account) => {
     const userAccount = env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(account));
-    const stageId = await runInDurableObject(userAccount, (_instance, state) => stageCredentials(
-      state.storage.kv, {
-        grant: { accessToken: "bob-token", scopes: ["repo", "admin:repo_hook", "read:user"] },
-        viewer: { id: 8, login: "bob" },
-      }, Date.now()));
+    const stageId = await runInDurableObject(userAccount, (_instance, state) => {
+      const staged = stageReconnect(state.storage.kv,
+        { accessToken: "bob-token", scopes: ["repo", "admin:repo_hook", "read:user"] },
+        { id: "8", login: "bob" }, Date.now(), () => ({ title: "", detail: "" }));
+      if (!("stageId" in staged)) throw new Error("the stage was refused");
+      return staged.stageId;
+    });
     await userAccount.commitReconnect(stageId);
   }],
   // As when the reconnect's notice to the driver was lost.
@@ -1092,11 +1094,13 @@ it("skips the comments of the GitHub user its account reconnected as while GitHu
   // ...until the account has reconnected as Bob.
   github.viewer = BOB;
   const userAccount = env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(account));
-  const stageId = await runInDurableObject(userAccount, (_instance, state) => stageCredentials(
-    state.storage.kv, {
-      grant: { accessToken: "bob-token", scopes: ["repo", "admin:repo_hook", "read:user"] },
-      viewer: { id: 8, login: "bob" },
-    }, Date.now()));
+  const stageId = await runInDurableObject(userAccount, (_instance, state) => {
+    const staged = stageReconnect(state.storage.kv,
+      { accessToken: "bob-token", scopes: ["repo", "admin:repo_hook", "read:user"] },
+      { id: "8", login: "bob" }, Date.now(), () => ({ title: "", detail: "" }));
+    if (!("stageId" in staged)) throw new Error("the stage was refused");
+    return staged.stageId;
+  });
   const reconnecting = userAccount.commitReconnect(stageId);
   // Time for the reconnect's own read to be answered first, were it made alongside the check's.
   await scheduler.wait(300);
@@ -1530,9 +1534,9 @@ it("keeps a disconnecting account connected, with its token, while GitHub refuse
   // Renewable, as a GitHub App's user token is.
   const userAccount = env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(account));
   const stageId = await runInDurableObject(userAccount, (_instance, state) => stageCredentials(
-    state.storage.kv, {
-      grant: { accessToken: "test-token", refreshToken: "ghr_1", scopes: ["repo", "admin:repo_hook", "read:user"] },
-    }, Date.now()));
+    state.storage.kv,
+    { accessToken: "test-token", refreshToken: "ghr_1", scopes: ["repo", "admin:repo_hook", "read:user"] },
+    Date.now()));
   await userAccount.commitReconnect(stageId);
   const triage = binding(account);
   await triage.subscribe();

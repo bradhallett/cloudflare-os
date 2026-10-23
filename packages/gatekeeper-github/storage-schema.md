@@ -18,10 +18,11 @@ Keys:
 - `callback` -> stored `GatekeeperConnectCallback` fetcher for the connected Workshop account.
 - `nonce` -> `{ value: string, expiresAt: number, stage: "initiation" | "oauth" }`.
 - `credentials` -> the live `GitHubOAuthGrant`, `{ accessToken, scopes, refreshToken?, expiresAt? }`, owned by the kit's `CredentialCoordinator` along with its `credentials:*` fence keys. `refreshToken` and `expiresAt` are present only for an expiring grant (GitHub's default for OAuth apps since August 2026): its access token lasts eight hours and is refreshed shortly before it expires, and each refresh rotates both tokens.
-- `pinnedViewer` -> `{ id: number; login: string }`, the GitHub user the connection is pinned to.
-  Read as the new grant's viewer at connect, checked at reconnect (a different user's grant is
-  refused and its token revoked), and rewritten at `commitReconnect` so a rename is followed.
-  `id` is the stable subject; `login` is for messages. Cleared with everything else on disconnect.
+- `connectionSubject` -> the kit-owned pin, `{ id: string; login: string }`: the GitHub user the
+  connection is pinned to. Read as the new grant's viewer at connect, checked at reconnect by the
+  kit's `stageReconnect` (a different user's grant is refused and its token revoked), and rewritten
+  at `commitReconnect` so a rename is followed. `id` is the stable subject; `login` is for messages.
+  Cleared with everything else on disconnect.
 - `accessToken`, `scopes` -> the layout from before expiring grants were supported, migrated into `credentials` on first read and then deleted.
 - `expiredNotified`, `expiredNotifiedArm` -> the kit's expiry latch, so `credentialsExpired()` is only sent once per dead grant. Every credential replacement re-arms it.
 - `reconnecting` -> boolean flag indicating an in-progress reconnect flow.
