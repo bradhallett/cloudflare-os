@@ -10879,12 +10879,17 @@ type GatekeeperHookLoopbackProps = {
 };
 
 /**
- * When a gatekeeper's hook is connected, it receives a Fetcher to this class, which implements
- * the HookInitiator interface. When the gatekeeper wants to invoke the hook, it calls
- * startHook(), which returns both the actual hook RpcStub and an ApprovalQueue for logging
- * observations and actions.
+ * The per-hook WorkerEntrypoint a gatekeeper's HookInitiator binding resolves to (see
+ * bindHook in workshop-shared/gatekeeper.ts): it hands each firing the callback and the
+ * ApprovalQueue for logging observations and actions, both straight from the Overseer.
+ *
+ * Deliberately NOT @validateRpc()-decorated, unlike the other loopback surfaces: the decorator's
+ * transform breaks the workerd stub this entrypoint returns for startHook()'s ApprovalQueue --
+ * the receiving gatekeeper's authorizeObservation() call then dies with "The RPC receiver does
+ * not implement the method" (pinned by the integration suite's hook tests). There is nothing to
+ * validate anyway: startHook() takes no arguments, and capnweb-validate 0.3.0 does not validate
+ * server-side return values.
  */
-@validateRpc()
 export class GatekeeperHookLoopback
     extends WorkerEntrypoint<Cloudflare.Env, GatekeeperHookLoopbackProps>
     implements HookInitiator<RpcTarget> {
