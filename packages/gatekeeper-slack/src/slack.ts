@@ -913,12 +913,21 @@ function validateSearchQuery(query: string): void {
 
 // ── Cursor ──────────────────────────────────────────────────────────
 
-// Each page is authorized before it can reach the caller.
-class SlackCursor<T> extends RpcTarget implements Cursor<T> {
+// Provider pages one next() may walk past when they keep coming back empty, matching the
+// gatekeeper-kit cursors' default. SlackCursor authorizes every page as it reads it (inside
+// loadPage), so the bound's job is spend, not disclosure: without it a listing whose pages come
+// back empty walks the workspace until something matches — one provider read and one observation
+// per page — before the caller sees a single result.
+const DEFAULT_MAX_PROVIDER_PAGES_PER_CALL = 2;
+
+// Each page is authorized by loadPage before it can reach the caller, and the position advances
+// only past pages that authorization accepted.
+export class SlackCursor<T> extends RpcTarget implements Cursor<T> {
   #ctx: SlackSessionContext;
   #loadPage: (
     ctx: SlackSessionContext, cursor: string | undefined,
   ) => Promise<{ items: T[]; nextCursor?: string }>;
+  #maxProviderPages: number;
   #cursor: string | undefined;
   #exhausted = false;
   // Serialize concurrent next() calls so each consumes a distinct page.
@@ -928,10 +937,13 @@ class SlackCursor<T> extends RpcTarget implements Cursor<T> {
       ctx: SlackSessionContext,
       loadPage: (
         ctx: SlackSessionContext, cursor: string | undefined,
-      ) => Promise<{ items: T[]; nextCursor?: string }>) {
+      ) => Promise<{ items: T[]; nextCursor?: string }>,
+      options?: { maxProviderPagesPerCall?: number }) {
     super();
     this.#ctx = dupSessionContext(ctx);
     this.#loadPage = loadPage;
+    this.#maxProviderPages =
+        options?.maxProviderPagesPerCall ?? DEFAULT_MAX_PROVIDER_PAGES_PER_CALL;
   }
 
   [Symbol.dispose]() {
@@ -945,13 +957,18 @@ class SlackCursor<T> extends RpcTarget implements Cursor<T> {
   }
 
   async #nextPage(): Promise<T[] | null> {
-    while (!this.#exhausted) {
+    let items: T[] = [];
+    for (let fetched = 1; !this.#exhausted; fetched++) {
       let page = await this.#loadPage(this.#ctx, this.#cursor);
       this.#cursor = page.nextCursor;
       this.#exhausted = !page.nextCursor;
-      if (page.items.length > 0) return page.items;
+      items = page.items;
+      if (items.length > 0 || this.#exhausted) break;
+      // Out of budget with pages still ahead. An empty page is not the end of the results: the
+      // caller drains, and the next call resumes where this one stopped.
+      if (fetched >= this.#maxProviderPages) break;
     }
-    return null;
+    return items.length === 0 && this.#exhausted ? null : items;
   }
 }
 

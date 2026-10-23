@@ -23,7 +23,7 @@ vi.mock("./generated/thread-configurator-ui.txt", () => ({ default: "" }));
 
 const {
   SlackUserImpl, SlackWorkspaceGatekeeperImpl, SlackConversationGatekeeperImpl,
-  SlackThreadGatekeeperImpl, SlackVerifier, UserAccount,
+  SlackThreadGatekeeperImpl, SlackVerifier, UserAccount, SlackCursor,
 } = await import("./slack");
 
 class MemoryKv {
@@ -243,5 +243,92 @@ describe("Slack org observer isolation", () => {
     expect(await verifier.hasConversationAccess("CTWO", "TTWO")).toBe(false);
     vi.spyOn(SlackApi.prototype, "listWorkspaces").mockRejectedValue(new SlackApiError("ratelimited", 429));
     await expect(verifier.hasWorkspaceAccess("TONE")).rejects.toMatchObject({ code: "ratelimited" });
+  });
+});
+
+describe("Slack cursor page budget", () => {
+  // The script these tests walk: pages that come back empty but keep promising more, then one
+  // with results — the shape that used to walk the whole workspace inside a single next().
+  function emptyUntilFound(): Array<{ items: string[]; nextCursor?: string }> {
+    return [
+      { items: [], nextCursor: "p2" },
+      { items: [], nextCursor: "p3" },
+      { items: [], nextCursor: "p4" },
+      { items: [], nextCursor: "p5" },
+      { items: ["found"] },
+    ];
+  }
+
+  function scriptedCursor(
+      pages: Array<{ items: string[]; nextCursor?: string }>,
+      options?: { maxProviderPagesPerCall?: number }) {
+    let queue = { dup() { return this; }, [Symbol.dispose]() {} };
+    let requested: (string | undefined)[] = [];
+    let cursor = new SlackCursor<string>(
+        { approvalQueue: queue } as never,
+        async (_ctx, current) => {
+          requested.push(current);
+          return pages[requested.length - 1];
+        },
+        options);
+    return { cursor, requested };
+  }
+
+  it("surfaces after the default two provider pages instead of fetching the world", async () => {
+    let { cursor, requested } = scriptedCursor(emptyUntilFound());
+    expect(await cursor.next()).toEqual([]);
+    expect(requested).toEqual([undefined, "p2"]);
+    // The budget is per call: draining still reaches every page that has results.
+    expect(await cursor.next()).toEqual([]);
+    expect(requested).toEqual([undefined, "p2", "p3", "p4"]);
+    expect(await cursor.next()).toEqual(["found"]);
+    expect(requested).toHaveLength(5);
+    await expect(cursor.next()).resolves.toBeNull();
+  });
+
+  it("reports null, not an empty page, when the walk ends on empty pages", async () => {
+    let { cursor, requested } = scriptedCursor([
+      { items: [], nextCursor: "p2" },
+      { items: [], nextCursor: "p3" },
+      { items: [] },
+    ]);
+    expect(await cursor.next()).toEqual([]);
+    expect(requested).toEqual([undefined, "p2"]);
+    await expect(cursor.next()).resolves.toBeNull();
+  });
+
+  it("opts in to a deeper window with maxProviderPagesPerCall", async () => {
+    let { cursor, requested } =
+        scriptedCursor(emptyUntilFound(), { maxProviderPagesPerCall: 4 });
+    expect(await cursor.next()).toEqual([]);
+    expect(requested).toEqual([undefined, "p2", "p3", "p4"]);
+    expect(await cursor.next()).toEqual(["found"]);
+    expect(requested).toHaveLength(5);
+  });
+
+  it("bounds a workspace member listing to two provider pages per next()", async () => {
+    let ctx = context({ userObjectId: "account", teamId: "TONE" });
+    let read = vi.fn(async (input: string | URL) => {
+      let cursor = new URL(String(input)).searchParams.get("cursor");
+      if (cursor === null) {
+        return Response.json({ ok: true, members: [], response_metadata: { next_cursor: "p2" } });
+      }
+      if (cursor === "p2") {
+        return Response.json({ ok: true, members: [], response_metadata: { next_cursor: "p3" } });
+      }
+      return Response.json({ ok: true, members: [{ id: "WSELF", name: "ddr" }] });
+    });
+    vi.stubGlobal("fetch", read);
+    let queue = { dup() { return this; }, authorizeObservation: vi.fn(async () => undefined) };
+    let session = await new SlackWorkspaceGatekeeperImpl(ctx as never, {} as never)
+        .startSession(queue as never);
+    let members = await session.listUsers();
+    expect(await members.next()).toEqual([]);
+    expect(read).toHaveBeenCalledTimes(2);
+    // Each provider page is authorized as it is read; the bound caps how many that can be.
+    expect(queue.authorizeObservation).toHaveBeenCalledTimes(2);
+    expect(await members.next()).toMatchObject([{ id: "WSELF" }]);
+    expect(read).toHaveBeenCalledTimes(3);
+    await expect(members.next()).resolves.toBeNull();
   });
 });
