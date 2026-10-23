@@ -28,6 +28,13 @@ let disposedApprovalQueues = 0;
 let disposedCallbacks = 0;
 let blockPoint: BlockPoint | null = null;
 let blockedPoint: BlockPoint | null = null;
+// Parked stages for the lease-deadline tests. Unlike blockAt's polling park, these hold the RPC
+// open without any timer, and release() lets a parked call continue, so a late settlement can be
+// observed against the run the driver already fenced.
+let hangPoint: BlockPoint | null = null;
+let hangScheduleId: string | null = null;
+let hangGate: Promise<void> = Promise.resolve();
+let releaseHang: () => void = () => {};
 // Bumped by reset(). A capability minted under an earlier generation belongs to a previous test, so
 // its disposer, which runs asynchronously and may land after the reset, is not counted.
 let generation = 0;
@@ -85,6 +92,14 @@ async function pauseIfBlocked(point: BlockPoint): Promise<void> {
   while (blockPoint === point) await new Promise((resolve) => setTimeout(resolve, 1));
 }
 
+async function pauseIfHung(point: BlockPoint, scheduleId?: string): Promise<void> {
+  if (hangPoint !== point) return;
+  if (scheduleId !== undefined && hangScheduleId !== null && scheduleId !== hangScheduleId) {
+    return;
+  }
+  await hangGate;
+}
+
 async function waitForCallbackConcurrency(): Promise<void> {
   const deadline = Date.now() + CALLBACK_CONCURRENCY_WAIT_MS;
   // eslint-disable-next-line no-unmodified-loop-condition -- sibling callbacks raise this.
@@ -102,6 +117,7 @@ class TestApprovalQueue extends RpcTarget {
 
   async authorizeObservation(): Promise<void> {
     events.push("authorize");
+    await pauseIfHung("authorization");
     await pauseIfBlocked("authorization");
     if (mode === "authorization-reject") throw new Error("authorization rejected");
   }
@@ -125,6 +141,7 @@ class TestCallback extends RpcTarget {
   async onSchedule(firing: { runId: string; scheduleId: string }): Promise<void> {
     events.push(`callback:${firing.runId}`);
     callbackScheduleIds.push(firing.scheduleId);
+    await pauseIfHung("callback", firing.scheduleId);
     activeCallbacks++;
     maxActiveCallbacks = Math.max(maxActiveCallbacks, activeCallbacks);
     try {
@@ -152,6 +169,7 @@ export class TestHooks extends WorkerEntrypoint {
   async startHook(): Promise<{ callback: TestCallback; approvalQueue: TestApprovalQueue }> {
     events.push("start");
     mark("start");
+    await pauseIfHung("start");
     await pauseIfBlocked("start");
     if (mode === "start-reject") throw new Error("opaque admission rejection");
     const callback = new TestCallback();
@@ -169,6 +187,14 @@ export class TestHooks extends WorkerEntrypoint {
     blockedPoint = null;
   }
 
+  hang(point: BlockPoint, scheduleId?: string): void {
+    hangPoint = point;
+    hangScheduleId = scheduleId ?? null;
+    const gate = Promise.withResolvers<void>();
+    hangGate = gate.promise;
+    releaseHang = gate.resolve;
+  }
+
   async waitUntilBlocked(): Promise<void> {
     // eslint-disable-next-line no-unmodified-loop-condition -- pauseIfBlocked() mutates this via RPC.
     while (blockedPoint === null) await new Promise((resolve) => setTimeout(resolve, 1));
@@ -180,6 +206,9 @@ export class TestHooks extends WorkerEntrypoint {
 
   release(): void {
     blockPoint = null;
+    hangPoint = null;
+    hangScheduleId = null;
+    releaseHang();
   }
 
   /**

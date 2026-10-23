@@ -6,89 +6,27 @@ import {
   runInDurableObject,
 } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { HookInitiator } from "@gadgets/workshop-shared/gatekeeper";
 import { reportIssue } from "@gadgets/observability/error-reporting";
-import type { ScheduledTaskHook } from "../src/types.js";
 import { ScheduleDriver } from "../src/schedule-driver.js";
-import type { ScheduleActivation, StoredSchedule } from "../src/schedule-driver.js";
+import type { StoredSchedule } from "../src/schedule-driver.js";
+import {
+  enableSchedule,
+  gadgetId,
+  makeActiveScheduleDue,
+  testInitiator,
+  updateSchedule,
+} from "./driver-harness.js";
+import type { TestHooks } from "./driver-harness.js";
 
 vi.mock("@gadgets/observability/error-reporting", () => ({ reportIssue: vi.fn() }));
-
-type ScheduleHookTarget = RpcTarget & ScheduledTaskHook;
-
-type TestHooks = HookInitiator<ScheduleHookTarget> & {
-  configure(
-    mode: "success" | "start-reject" | "authorization-reject" | "callback-reject",
-  ): Promise<void>;
-  blockAt(point: "start" | "authorization" | "callback"): Promise<void>;
-  holdCallbacksUntilConcurrent(count: number): Promise<void>;
-  read(): Promise<{
-    events: string[];
-    callbackScheduleIds: string[];
-    maxActiveCallbacks: number;
-    disposedApprovalQueues: number;
-    disposedCallbacks: number;
-  }>;
-  release(): Promise<void>;
-  reset(): Promise<void>;
-  waitForDisposals(
-    target: { approvalQueues: number; callbacks: number },
-    budgetMs: number,
-  ): Promise<void>;
-  waitUntilBlocked(): Promise<void>;
-};
 
 const testEnv = env as unknown as {
   SCHEDULE_DRIVER: DurableObjectNamespace<ScheduleDriver>;
   TEST_HOOKS: Fetcher<TestHooks>;
 };
 
-const gadgetId = 3;
 const MAX_ENABLED_SCHEDULES_PER_ACCOUNT = 500;
 const MAX_ENABLED_SCHEDULES_PER_WORKSPACE = 100;
-
-function testInitiator(driver: ScheduleDriver): Fetcher<TestHooks> {
-  // The pool wraps env capabilities, so mint the persistable entrypoint inside the Worker.
-  const exports = driver.ctx.exports as unknown as {
-    TestHooks(options: object): Fetcher<TestHooks>;
-  };
-  return exports.TestHooks({});
-}
-
-function enableSchedule(
-  driver: DurableObjectStub<ScheduleDriver>,
-  activation: ScheduleActivation,
-  now = Date.now(),
-): Promise<void> {
-  return runInDurableObject(driver, (instance) =>
-    instance.enable(activation, testInitiator(instance), now),
-  );
-}
-
-async function updateSchedule(
-  driver: DurableObjectStub<ScheduleDriver>,
-  workspaceId: string,
-  scheduleId: string,
-  update: (stored: StoredSchedule) => StoredSchedule,
-): Promise<void> {
-  await runInDurableObject(driver, (_instance, state) => {
-    const key = `schedule:${workspaceId}:${scheduleId}`;
-    const stored = state.storage.kv.get<StoredSchedule>(key);
-    if (!stored) throw new Error(`Missing test schedule: ${key}`);
-    state.storage.kv.put(key, update(stored));
-  });
-}
-
-async function makeActiveScheduleDue(
-  driver: DurableObjectStub<ScheduleDriver>,
-  workspaceId: string,
-  scheduleId: string,
-): Promise<void> {
-  await updateSchedule(driver, workspaceId, scheduleId, (stored) => {
-    if (stored.state.status !== "active") throw new Error("Expected active schedule");
-    return { ...stored, state: { ...stored.state, nextFire: 1 } };
-  });
-}
 
 async function putScheduleRows(
   driver: DurableObjectStub<ScheduleDriver>,
