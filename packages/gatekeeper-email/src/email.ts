@@ -24,11 +24,8 @@ import {
   EmailSession,
   EmailHook,
   IncomingEmail,
-  EmailAddress as EmailAddressType,
-  EmailAttachment,
 } from "./types";
-import PostalMime from "postal-mime";
-import type { Email } from "postal-mime";
+import { buildIncomingEmail, observationForEmail } from "./incoming.js";
 import TYPES_CODE from "./types.txt";
 import EMAIL_CONFIGURATOR_HTML from "./generated/email-configurator-ui.txt";
 import type { EmailMailboxConfiguratorRpc } from "./configurator/email-configurator-types";
@@ -193,41 +190,19 @@ export default {
     let stub: DurableObjectStub<EmailAddress> =
         ctx.exports.EmailAddress.getByName(name);
 
-    // Parse the email using postal-mime.
-    let parsed: Email = await PostalMime.parse(message.raw);
-
-    // Build the structured IncomingEmail.
-    let from: EmailAddressType = parsed.from
-        ? { name: parsed.from.name || "", address: parsed.from.address || "" }
-        : { name: "", address: message.from };
-
-    let to: EmailAddressType[] = (parsed.to || []).map(addr => ({
-      name: addr.name || "",
-      address: addr.address || "",
-    }));
-
-    let cc: EmailAddressType[] = (parsed.cc || []).map(addr => ({
-      name: addr.name || "",
-      address: addr.address || "",
-    }));
-
-    let attachments: EmailAttachment[] = (parsed.attachments || []).map(att => ({
-      filename: att.filename || null,
-      mimeType: att.mimeType,
-      disposition: att.disposition || null,
-      content: att.content as ArrayBuffer,
-    }));
-
-    let incomingEmail: IncomingEmail = {
-      from,
-      to,
-      cc,
-      subject: parsed.subject || "",
-      date: parsed.date || new Date().toISOString(),
-      text: parsed.text || null,
-      html: parsed.html || null,
-      attachments,
-    };
+    // Buffer the raw message once: parsing and DKIM verification both need the full bytes
+    // (DKIM hashes the exact message text, so it cannot run on a re-serialized parse).
+    let raw = new Uint8Array(await new Response(message.raw).arrayBuffer());
+    let incomingEmail: IncomingEmail;
+    try {
+      incomingEmail = await buildIncomingEmail(raw, { from: message.from, to: message.to });
+    } catch (err) {
+      logger.error("email parse failed", {
+        event: "email.parse.failed", error: err,
+      });
+      message.setReject("Message could not be processed");
+      return;
+    }
 
     try {
       await stub.receiveEmail(incomingEmail);
@@ -676,22 +651,9 @@ export class EmailAddress extends DurableObject<Env> {
     // @ts-ignore TODO: TS doesn't understand that the returned promise is disposable?
     using startHookResult = hookInitiator.startHook();
 
-    // Pipeline: access approvalQueue on the not-yet-resolved promise and call through it.
-    let sender = email.from.name
-        ? `${email.from.name} <${email.from.address}>`
-        : email.from.address;
-    await startHookResult.approvalQueue.authorizeObservation({
-      title: `Email from ${email.from.address}: ${email.subject}`,
-      description: `Received email from ${sender}\n\n`
-          + `**Subject:** ${email.subject}\n`
-          + `**Date:** ${email.date}\n`
-          + (email.to.length > 0
-              ? `**To:** ${email.to.map(a => a.address).join(", ")}\n`
-              : "")
-          + (email.cc.length > 0
-              ? `**CC:** ${email.cc.map(a => a.address).join(", ")}\n`
-              : ""),
-    });
+    // The observation carries the sender-authentication verdict in its title, so an
+    // unauthenticated From can never enter the trusted observation stream looking like fact.
+    await startHookResult.approvalQueue.authorizeObservation(observationForEmail(email));
 
     // Deliver the email to the gadget's hook entrypoint.
     await startHookResult.callback.receiveEmail(email);

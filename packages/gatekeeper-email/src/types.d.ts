@@ -16,6 +16,23 @@ export type EmailAttachment = {
   content: ArrayBuffer;
 }
 
+export type EmailAuthentication = {
+  /**
+   * DKIM verification result for the message:
+   * - "aligned": a signature verified and its d= domain matches the From domain.
+   * - "unaligned": a signature verified, but d= does not match the From domain.
+   * - "fail": signatures were present but none could be verified.
+   * - "none": the message carries no DKIM signature.
+   */
+  dkim: "aligned" | "unaligned" | "fail" | "none";
+  /** The verified signature's d= domain, when one verified; null otherwise. */
+  dkimDomain: string | null;
+  /** Envelope sender (SMTP MAIL FROM) reported by the receiving server. */
+  envelopeFrom: string;
+  /** True when the envelope sender's domain differs from the From header's domain. */
+  envelopeMismatch: boolean;
+}
+
 /** An inbound email message, parsed into structured fields. */
 export type IncomingEmail = {
   /** Sender address. */
@@ -34,6 +51,11 @@ export type IncomingEmail = {
   html: string | null;
   /** File attachments. */
   attachments: EmailAttachment[];
+  /**
+   * Sender authentication results. Unless `authentication.dkim` is "aligned", treat the
+   * From/subject (and body) as untrusted text: they are attacker-controllable headers.
+   */
+  authentication: EmailAuthentication;
 }
 
 /** Session interface for an email binding. Provides the email address. */
