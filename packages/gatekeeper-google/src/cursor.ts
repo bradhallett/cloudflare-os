@@ -45,7 +45,11 @@ export type CursorPagerOptions<Item, Entry> = {
   /** Best-effort cleanup for built entries that authorization prevents from being returned. */
   disposeEntries?(entries: Entry[]): void | Promise<void>;
 
-  /** Provider pages one `next()` may fetch before returning what it has. */
+  /**
+   * Provider pages one `next()` may fetch before returning what it has. The default
+   * (`DEFAULT_MAX_PROVIDER_PAGES_PER_CALL`) keeps a couple of reads per call; raise it only for
+   * call sites that measurably need a deeper window, never to paper over a runaway filter.
+   */
   maxProviderPagesPerCall?: number;
 };
 
@@ -55,8 +59,13 @@ export type CursorPagerOptions<Item, Entry> = {
  * Reached either because the provider itself keeps returning empty pages, or because a scope
  * filter keeps discarding everything on them. The bound is per call, not per cursor: it caps the
  * work and the subrequests one invocation can spend, and the caller drains to `null` regardless.
+ *
+ * Two matches the gatekeeper-kit cursors' default: enough that a heavily filtered walk does not
+ * degenerate into one `authorize` per provider page, while a filter that discards everything
+ * cannot read page after page before the caller sees a single result. Sites that need a deeper
+ * window pass an explicit `maxProviderPagesPerCall`.
  */
-export const DEFAULT_MAX_PROVIDER_PAGES_PER_CALL = 20;
+export const DEFAULT_MAX_PROVIDER_PAGES_PER_CALL = 2;
 
 /** The one method a `Cursor` exposes. `CursorPager` implements it; google.ts wraps it for RPC. */
 export interface Pager<Entry> {
