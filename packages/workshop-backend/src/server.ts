@@ -501,10 +501,16 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
       return blueprintId;
     } catch (err) {
-      // Try to delete what we uploaded, but don't wait for results becasue there's nothing we
-      // can do if they fail, and we already have an error to throw.
-      this.env.BLUEPRINTS.delete(blueprintId);
-      this.env.BLUEPRINT_CONTENT.delete(r2Key);
+      // Try to delete what we uploaded. The deletions must not delay or replace the error we
+      // throw, but a failure leaves orphaned records nobody sweeps, so it is logged.
+      this.env.BLUEPRINTS.delete(blueprintId).catch(cleanupErr =>
+          logger.warn("failed to clean up aborted blueprint import", {
+            event: "blueprint.import.cleanup.failed", error: cleanupErr, blueprintId,
+          }));
+      this.env.BLUEPRINT_CONTENT.delete(r2Key).catch(cleanupErr =>
+          logger.warn("failed to clean up aborted blueprint content", {
+            event: "blueprint.import.cleanup.failed", error: cleanupErr, blueprintId,
+          }));
       throw err;
     }
   }

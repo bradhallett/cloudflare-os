@@ -1271,7 +1271,11 @@ class OverseerImpl implements AgentHooks {
       }
     // Resume outside the critical section, before blocked events are delivered. On failure,
     // blockConcurrencyWhile already aborted the object; consume its rejection and retry on wake.
-    }).then(() => this.#resumeInterruptedAgents(), () => {});
+    }).then(() => this.#resumeInterruptedAgents(), error => {
+      this.logger.error("boot failed; interrupted agents were not resumed", {
+        event: "agents.resume.boot.failed", error,
+      });
+    });
   }
 
   // Resume any agent turns that were left running by a previous instance of this DO (i.e. were
@@ -1280,18 +1284,32 @@ class OverseerImpl implements AgentHooks {
   // it'll recognize that agents are running and wait for them.
   #resumeInterruptedAgents(): void {
     for (let record of Array.from(this.storage.activeAgents.list())) {
-      if (this.#runningAgents.has(record.chatId)) continue;
-      if (!this.storage.chatMeta.get(record.chatId)?.activeAgent) {
-        this.resumeAgentAfterDecision(record.chatId);
-        continue;
-      }
-      // Register the running agent immediately (see above), and create the LiveChatContext
-      // synchronously, so that cancellations are immediately respected.
-      this.#registerRunningAgent(record.chatId);
-      let liveChat = this.#getLiveChat(record.chatId);
+      // A throw for one record (e.g. a corrupt row) must not strand every later record's chat
+      // mid-sweep with no error anywhere, so each record's synchronous work is guarded.
+      try {
+        if (this.#runningAgents.has(record.chatId)) continue;
+        if (!this.storage.chatMeta.get(record.chatId)?.activeAgent) {
+          this.resumeAgentAfterDecision(record.chatId);
+          continue;
+        }
+        // Register the running agent immediately (see above), and create the LiveChatContext
+        // synchronously, so that cancellations are immediately respected.
+        this.#registerRunningAgent(record.chatId);
+        let liveChat = this.#getLiveChat(record.chatId);
 
-      this.#resumeErrors.delete(record.chatId);
-      this.#resumeAgent(record, liveChat);
+        this.#resumeErrors.delete(record.chatId);
+        this.#resumeAgent(record, liveChat).catch(error => {
+          // The async resume rejected before any of its own handling surfaced the failure:
+          // log it and leave the record for the next sweep (alarm wake or next construction).
+          this.logger.error("agent resume failed to start", {
+            event: "agents.resume.agent.start.failed", chatId: record.chatId, error,
+          });
+        });
+      } catch (error) {
+        this.logger.error("agent resume sweep failed for one chat", {
+          event: "agents.resume.sweep.failed", chatId: record.chatId, error,
+        });
+      }
     }
 
     // Backwards compatibility: Prior to the introduction of the `activeAgents` table, we could
@@ -5950,7 +5968,11 @@ class OverseerImpl implements AgentHooks {
     }
 
     if (willAutoApprove) {
-      this.ctx.waitUntil(this.drainAutoApprovals(gatekeeperId));
+      this.ctx.waitUntil(this.drainAutoApprovals(gatekeeperId).catch(error => {
+        this.logger.error("auto-approval drain failed", {
+          event: "auto.approval.drain.failed", gatekeeperId, error,
+        });
+      }));
     }
   }
 
@@ -9242,7 +9264,13 @@ class OverseerImpl implements AgentHooks {
     meta.lastActive = this.getChatTimestamp();
     this.storage.chatMeta.put(meta);
     this.#registerRunningAgent(chatId);
-    this.#resumeAgent(record, this.#getLiveChat(chatId));
+    this.#resumeAgent(record, this.#getLiveChat(chatId)).catch(error => {
+      // The async resume rejected before any of its own handling surfaced the failure: log it
+      // and leave the record for the next sweep (alarm wake or next construction).
+      this.logger.error("agent resume failed to start", {
+        event: "agents.resume.agent.start.failed", chatId, error,
+      });
+    });
   }
 
   // --- Connection-request hooks ---
@@ -11618,7 +11646,11 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
     // Clearing this manual gate may unblock later auto-eligible pending actions on the same
     // gatekeeper, so cascade a drain (in-order) once this one is applied.
-    this.impl.ctx.waitUntil(this.#drainAutoApprovalsAndResume(action.gatekeeperId));
+    this.impl.ctx.waitUntil(this.#drainAutoApprovalsAndResume(action.gatekeeperId).catch(error => {
+      this.impl.logger.error("auto-approval drain failed", {
+        event: "auto.approval.drain.failed", gatekeeperId: action.gatekeeperId, error,
+      });
+    }));
   }
 
   // A drain can decide an agent turn's last awaited action, which must resume that turn just as a
@@ -11783,7 +11815,11 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // Deny leaves the turn ended, like denyConnectionRequest. The rejected record also prevents a
     // sibling approval from resuming this turn. Like an approval, though, clearing this manual gate
     // may unblock later auto-eligible pending actions, whose turns do resume.
-    this.impl.ctx.waitUntil(this.#drainAutoApprovalsAndResume(action.gatekeeperId));
+    this.impl.ctx.waitUntil(this.#drainAutoApprovalsAndResume(action.gatekeeperId).catch(error => {
+      this.impl.logger.error("auto-approval drain failed", {
+        event: "auto.approval.drain.failed", gatekeeperId: action.gatekeeperId, error,
+      });
+    }));
   }
 
   // Enable auto-approval of actions carrying `actionKind` on the given gatekeeper. Stores the
@@ -11804,7 +11840,11 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       enabledBy: profile,
     });
     // Apply the currently-visible pending action(s) with this tag right away.
-    this.impl.ctx.waitUntil(this.#drainAutoApprovalsAndResume(gatekeeperId));
+    this.impl.ctx.waitUntil(this.#drainAutoApprovalsAndResume(gatekeeperId).catch(error => {
+      this.impl.logger.error("auto-approval drain failed", {
+        event: "auto.approval.drain.failed", gatekeeperId, error,
+      });
+    }));
   }
 
   // Remove the auto-approval rule for `tag` on the given gatekeeper, so future matching actions
