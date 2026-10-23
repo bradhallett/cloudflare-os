@@ -1,0 +1,19 @@
+# EXECUTION: fork fire-and-forget PR (cloudflare-os) — mesh mode
+
+## Directives
+- Fork-only (bradhallett/cloudflare-os), never push origin. CLA = non-issue (user: fork is the target; upstream #873 closed-CLA is moot).
+- User: deploy parallel agents + IRC collaboration/deconfliction → mesh running; lead = sole edit owner.
+- User: verify no work lost + resolve PR rejection issues → DONE (ledger delivered): #18-20 merged into fork integration/waves-1-2 (local gate1/integration = 461cb4c8); #8-17 closed but ALL absorbed (DKIM via 8319e263/1609bc0c; outcome-unknown superseded by fleet-pinning d246ad31); unlanded tips: 6d0da0c3 (email CryptoKey refactor), f9946c41 (superseded). #21 spend-gates + #22 declare-bots OPEN. Only leftover rejection issue: PR #14 Bugbot on-demand usage (user-only billing toggle, likely irrelevant).
+
+## Current state
+- Branch: fix/fire-and-forget-resume off main ec22b002 (fork/main == ec22b002; origin/main +1 = 03cf8766).
+- MAIN-side findings: TWO bare #resumeAgent sites — :1294 (constructor sweep; PR #22 fixed its equivalent on declare-bots) and :9245 (resumeAgentAfterDecision). Both to fix.
+- SAFE (verified on declare-bots, same on main unless noted): :7015 #deliverExternalMessageResponseToTarget (self-logs+rethrows, alarm redrains ready), :5257 (returns promise), :5430 (.catch), :6122→#bumpLastActiveImpl (internal catch), :6238 (.catch), :6535 lock chain (settled never rejects), :7636+drainPendingAgentCalls (full internal try/catch), :8390 (rejection→null), :10453 tail (resolve-only), :11750 (.catch), :1389 constructor drain (drain has internal catch → Promise.all never rejects).
+- Pending scout verdicts: drainAutoApprovals (:6024-equiv) + publishNotification (:9796-equiv) on main.
+- Mesh: ResumeSemantics (overseer.ts @main) + KernelAudit (rest of backend src) — spawned, running. Deconflict: file ownership split; scouts read-only.
+
+## Plan
+1. Await scout reports; classify all sites.
+2. Edit overseer.ts (+ other files per KernelAudit): .catch mirroring declare-bots :1354 wording (event agents.resume.*-style) at :1294/:9245 + verified-unsafe sites. PR bases off main; note trivial overlap w/ PR #22 sweep fix in body.
+3. Verify: tsc + full backend suite + nearest tests (durable-decision-resume / workshop-agent; resume-retry-alarm.test.ts is declare-bots-only). Scouts told NOT to run vitest (serial pools).
+4. Commit, push fork, PR. 5. Update handoff local://declare-bots-handoff.md item 2.
