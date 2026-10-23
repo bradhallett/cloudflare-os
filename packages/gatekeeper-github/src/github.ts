@@ -32,7 +32,13 @@ import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/ga
 import {
   clearCredentialExpiryLatch, notifyCredentialsExpiredOnce,
 } from "@gadgets/gatekeeper-kit/credential-expiry";
-import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import {
+  clearConnectionSubject,
+  commitReconnect,
+  type ConnectionSubject,
+  pinConnectionSubject,
+  stageReconnect,
+} from "@gadgets/gatekeeper-kit/credential-stage";
 import { CredentialCoordinator, type RejectionVerdict } from "@gadgets/gatekeeper-kit/credentials";
 import {
   CREDENTIALS_EXPIRED_MESSAGE,
@@ -1385,11 +1391,8 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
  */
 const REPLACED_TOKEN_IDENTITY = "replaced-token";
 
-/** The GitHub user a connection is pinned to. `id` is the stable subject; a login can be renamed. */
-type PinnedViewer = { id: number; login: string };
-
-/** A reconnect's grant, with the viewer it was verified as, staged until the Workshop commits it. */
-type ReconnectStage = { grant: GitHubOAuthGrant; viewer?: PinnedViewer };
+/** The GitHub user a connection's subject is: `id` is the stable identity; a login can be renamed. */
+type ViewerSubject = ConnectionSubject & { login: string };
 
 /** How the callback ended: a handoff for the browser, or a refusal to show it. */
 type CallbackResult = { handoff: ConnectHandoff } | { refused: { title: string; detail: string } };
@@ -1496,13 +1499,13 @@ export class UserAccount extends DurableObject<Env> {
 
     // The connection is pinned to the GitHub user it was made as: the viewer is read now, from the
     // new grant itself, so a reconnect as anyone else is refused before anything is staged.
-    let viewer: PinnedViewer;
+    let viewer: ViewerSubject;
     try {
       const { user } = await new GitHubApi(async () => grant.accessToken).getViewer();
       if (!Number.isFinite(user.id) || !user.login) {
         throw new Error("GitHub did not say which account authorized this connection.");
       }
-      viewer = { id: user.id, login: user.login };
+      viewer = { id: String(user.id), login: user.login };
     } catch (error) {
       if (!stored.reconnect) await this.#revokeToken(grant.accessToken);
       throw new Error("Could not read which GitHub account authorized this connection. Please try again.",
@@ -1511,34 +1514,33 @@ export class UserAccount extends DurableObject<Env> {
 
     let handoff: ConnectHandoff;
     if (stored.reconnect) {
-      const pinned = this.ctx.storage.kv.get<PinnedViewer>("pinnedViewer");
-      if (pinned !== undefined && pinned.id !== viewer.id) {
-        // Another user's grant, which can never share an authorization with the live one.
+      const staged = stageReconnect(this.ctx.storage.kv, grant, viewer, Date.now(),
+        (pinned, authorized) => ({
+          title: "That's a different GitHub account",
+          // Another user's grant, which can never share an authorization with the live one; the
+          // revoked token is the connector's to dispose below.
+          detail: `This connection is for @${pinned.login}, but GitHub authorized @${authorized.login}. ` +
+            `Sign in to GitHub as @${pinned.login} and reconnect, or connect @${authorized.login} as a ` +
+            "separate account.",
+        }));
+      if ("refused" in staged) {
         await this.#revokeToken(grant.accessToken);
-        return {
-          refused: {
-            title: "That's a different GitHub account",
-            detail: `This connection is for @${pinned.login}, but GitHub authorized @${viewer.login}. ` +
-              `Sign in to GitHub as @${pinned.login} and reconnect, or connect @${viewer.login} as a ` +
-              "separate account.",
-          },
-        };
+        return staged;
       }
       // The reconnect URL is a bearer capability, so the new grant is only staged until the Workshop
       // has confirmed the browser that finished the flow is the owner's (see commitReconnect). Bound
       // gadgets keep reading the current token meanwhile. The stage id ties the Workshop's ticket to
       // this grant, so an overlapping reconnect cannot be committed by it.
-      const stageId = stageCredentials(this.ctx.storage.kv, { grant, viewer }, Date.now());
-      handoff = await callback.reconnectComplete(stageId);
+      handoff = await callback.reconnectComplete(staged.stageId);
     } else {
       this.#creds.connect(grant);
-      this.ctx.storage.kv.put<PinnedViewer>("pinnedViewer", viewer);
+      pinConnectionSubject(this.ctx.storage.kv, viewer);
       try {
         const props = { userObjectId: this.ctx.id.toString() };
         handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
       } catch (error) {
         this.#creds.clear();
-        this.ctx.storage.kv.delete("pinnedViewer");
+        clearConnectionSubject(this.ctx.storage.kv);
         throw error;
       }
       // Auth-only sign-in grants are transient: the caller read the email via complete(), so
@@ -1555,15 +1557,15 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   /**
-   * Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. The
-   * connection stays pinned to the user it was verified as: writing the staged viewer back pins a
-   * connection made before the pin existed, and follows a same-user rename.
+   * Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. The kit's
+   * commit is fenced on the connection's pinned subject and re-pins the staged viewer, so a
+   * connection made before the pin existed adopts its first reconnect's user, and a same-user
+   * rename is followed.
    */
   async commitReconnect(stageId: string): Promise<void> {
-    const staged = commitStagedCredentials<ReconnectStage>(this.ctx.storage.kv, Date.now(), stageId);
-    if (!staged) throw new Error("No reconnect is awaiting confirmation. Please try again.");
-    this.#creds.connect(staged.grant);
-    if (staged.viewer !== undefined) this.ctx.storage.kv.put<PinnedViewer>("pinnedViewer", staged.viewer);
+    const grant = commitReconnect<GitHubOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
+    if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+    this.#creds.connect(grant);
     // The same user, perhaps renamed, whose own comments and reviews are then the ones its hooks
     // skip (a reconnect as anyone else is refused above). Should this be lost, the driver's hourly
     // check reads it too.
@@ -1572,6 +1574,7 @@ export class UserAccount extends DurableObject<Env> {
         logger.warn("failed to tell the hook driver of a reconnect", { event: "hooks.account.reconnect.failed", error });
       });
   }
+
 
   /**
    * @returns The current access token, refreshing an expiring grant shortly before it expires.

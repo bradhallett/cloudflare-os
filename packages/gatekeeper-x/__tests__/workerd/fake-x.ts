@@ -447,7 +447,9 @@ export async function seedAccount(x: FakeX, user: WireUser = ALICE, options: {
       expiresAt: Date.now() + (options.expiresInMs ?? 60 * 60 * 1000),
       scopes: options.scopes ?? grant.scope.split(" "),
     });
-    state.storage.kv.put("identity", identityOf(user, options.identity));
+    const identity = identityOf(user, options.identity);
+    state.storage.kv.put("identity", identity);
+    state.storage.kv.put("connectionSubject", { id: identity.id, username: identity.username });
   });
   return accountId.toString();
 }

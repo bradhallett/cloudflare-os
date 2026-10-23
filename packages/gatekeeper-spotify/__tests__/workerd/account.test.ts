@@ -10,7 +10,7 @@ import { TestCallback } from "./worker";
 import worker from "../../src/spotify";
 import { ALICE, BOB, FakeSpotify, accountStub, failure, hooks, reconnectAs, seedAccount, unwrap } from "./fake-spotify";
 
-type Subject = { userId: string; displayName: string | null };
+type Subject = { id: string; displayName: string | null };
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -24,7 +24,7 @@ async function storedRefreshToken(userObjectId: string): Promise<string | undefi
 
 async function storedSubject(userObjectId: string): Promise<Subject | undefined> {
   return await runInDurableObject(accountStub(userObjectId), (_instance, state) =>
-    state.storage.kv.get<Subject>("subject"));
+    state.storage.kv.get<Subject>("connectionSubject"));
 }
 
 function ctx() {
@@ -64,7 +64,7 @@ describe("reconnecting", () => {
       },
     });
     expect(await storedRefreshToken(id)).toBe(before);
-    expect(await storedSubject(id)).toMatchObject({ userId: ALICE.id });
+    expect(await storedSubject(id)).toMatchObject({ id: ALICE.id });
     // Nothing was staged: no commit is awaiting confirmation.
     expect(failure(await hooks().account(id, "commitReconnect", "not-a-stage")))
       .toMatch(/No reconnect is awaiting/);
@@ -79,7 +79,7 @@ describe("reconnecting", () => {
     expect(await storedRefreshToken(id)).toBe(before);
     unwrap(await hooks().account(id, "commitReconnect", result.handoff.ticket));
     expect(await storedRefreshToken(id)).toMatch(/^refresh-alice-user-\d+$/);
-    expect(await storedSubject(id)).toMatchObject({ userId: ALICE.id });
+    expect(await storedSubject(id)).toMatchObject({ id: ALICE.id });
     // The stage is spent: a second commit of the same stage is refused.
     expect(failure(await hooks().account(id, "commitReconnect", result.handoff.ticket)))
       .toMatch(/No reconnect is awaiting/);
@@ -92,7 +92,7 @@ describe("reconnecting", () => {
     // No stored subject means nothing to compare against, so the reconnect lands — and pins.
     const landed = await reconnectAs(x, id, BOB) as { handoff: { ticket: string } };
     unwrap(await hooks().account(id, "commitReconnect", landed.handoff.ticket));
-    expect(await storedSubject(id)).toMatchObject({ userId: BOB.id });
+    expect(await storedSubject(id)).toMatchObject({ id: BOB.id });
     // From then on the connection refuses anyone else, its original user included.
     const result = await reconnectAs(x, id, ALICE);
     expect(result).toEqual({
@@ -110,7 +110,7 @@ describe("connecting", () => {
     const id = env.USER_ACCOUNT.newUniqueId().toString();
     const result = await firstConnectAs(x, id, ALICE) as { handoff: unknown };
     expect(result.handoff).toBeDefined();
-    expect(await storedSubject(id)).toMatchObject({ userId: ALICE.id });
+    expect(await storedSubject(id)).toMatchObject({ id: ALICE.id });
   });
 
   it("drops the recorded user when the Workshop never takes the connection", async () => {

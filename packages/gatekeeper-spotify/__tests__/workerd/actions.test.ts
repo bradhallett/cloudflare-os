@@ -23,7 +23,7 @@ async function connectedProps(x: FakeSpotify): Promise<GatekeeperProps> {
     state.storage.kv.put("accessToken", accessToken);
     state.storage.kv.put("accessTokenExpiresAt", Date.now() + 60 * 60 * 1000);
     state.storage.kv.put("scopes", ["user-library-modify"]);
-    state.storage.kv.put("subject", { userId: "alice-user", displayName: "Alice" });
+    state.storage.kv.put("connectionSubject", { id: "alice-user", displayName: "Alice" });
   });
   return { userObjectId: accountId.toString(), resourceKind: "account" };
 }

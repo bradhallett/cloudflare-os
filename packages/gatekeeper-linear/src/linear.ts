@@ -22,7 +22,9 @@ import {
   type ActionDescriptionBuilder, buildDescription, plainInline, type RenderedDescription,
 } from "@gadgets/gatekeeper-kit/action-description";
 import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
-import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import {
+  clearConnectionSubject, commitReconnect, ConnectionSubject, pinConnectionSubject, stageReconnect,
+} from "@gadgets/gatekeeper-kit/credential-stage";
 import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
 import type {
   Cursor,
@@ -535,8 +537,10 @@ type StoredNonce = {
 /**
  * The Linear account a connection is pinned to: one user in one workspace. A reconnect that
  * comes back as anyone else, or into any other workspace, is refused and its grant revoked.
+ * `id` is what the kit's fence compares, the `${userId}:${orgId}` pair; the names are for the
+ * refusal's words.
  */
-type PinnedSubject = {
+type PinnedSubject = ConnectionSubject & {
   userId: string;
   userName: string;
   orgId: string;
@@ -551,6 +555,7 @@ type CallbackResult = { handoff: ConnectHandoff } | { refused: { title: string; 
 async function fetchSubject(accessToken: string): Promise<PinnedSubject> {
   const { user, organization } = await new LinearApi(async () => accessToken).getViewer();
   return {
+    id: `${user.id}:${organization.id}`,
     userId: user.id,
     userName: user.displayName ?? user.name,
     orgId: organization.id,
@@ -643,33 +648,31 @@ export class UserAccount extends DurableObject<Env> {
       // The connection is pinned to the Linear user and workspace it was made as: a reconnect
       // that comes back as anyone else, or into any other workspace, is refused and its grant
       // revoked, rather than silently swapping the account every binding reads.
-      const pinned = this.ctx.storage.kv.get<PinnedSubject>("subject");
-      if (pinned !== undefined && (pinned.userId !== subject.userId || pinned.orgId !== subject.orgId)) {
+      const staged = stageReconnect(this.ctx.storage.kv, grant, subject, Date.now(),
+        (pinned, granted) => ({
+          title: "That's a different Linear account",
+          detail: `This connection is for ${pinned.userName} in the ${pinned.orgName} workspace, but ` +
+            `Linear authorized ${granted.userName} in the ${granted.orgName} workspace. Sign in to ` +
+            `Linear as ${pinned.userName} and reconnect, or connect the other account separately.`,
+        }));
+      if ("refused" in staged) {
         await this.#revokeGrant(grant);
-        return {
-          refused: {
-            title: "That's a different Linear account",
-            detail: `This connection is for ${pinned.userName} in the ${pinned.orgName} workspace, but Linear ` +
-              `authorized ${subject.userName} in the ${subject.orgName} workspace. Sign in to Linear as ` +
-              `${pinned.userName} and reconnect, or connect the other account separately.`,
-          },
-        };
+        return { refused: staged.refused };
       }
       // The reconnect URL is a bearer capability, so the new grant is only staged until the Workshop
       // has confirmed the browser that finished the flow is the owner's (see commitReconnect). Bound
       // gadgets keep reading the current token meanwhile.
-      const stageId = stageCredentials(this.ctx.storage.kv, { grant, subject }, Date.now());
-      handoff = await callback.reconnectComplete(stageId);
+      handoff = await callback.reconnectComplete(staged.stageId);
     } else {
       this.ctx.storage.kv.put<LinearOAuthGrant>("grant", grant);
-      this.ctx.storage.kv.put<PinnedSubject>("subject", subject);
+      pinConnectionSubject(this.ctx.storage.kv, subject);
       clearCredentialExpiryLatch(this.ctx.storage.kv);
       try {
         const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
         handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
       } catch (err) {
         this.ctx.storage.kv.delete("grant");
-        this.ctx.storage.kv.delete("subject");
+        clearConnectionSubject(this.ctx.storage.kv);
         throw err;
       }
     }
@@ -678,13 +681,12 @@ export class UserAccount extends DurableObject<Env> {
     return { handoff };
   }
 
-  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
+  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. The kit
+   * re-pins the staged subject, adopting a connection made before the pin existed. */
   async commitReconnect(stageId: string): Promise<void> {
-    const staged = commitStagedCredentials<{ grant: LinearOAuthGrant; subject: PinnedSubject }>(
-      this.ctx.storage.kv, Date.now(), stageId);
-    if (!staged) throw new Error("No reconnect is awaiting confirmation. Please try again.");
-    this.ctx.storage.kv.put<LinearOAuthGrant>("grant", staged.grant);
-    this.ctx.storage.kv.put<PinnedSubject>("subject", staged.subject);
+    const grant = commitReconnect<LinearOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
+    if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+    this.ctx.storage.kv.put<LinearOAuthGrant>("grant", grant);
     clearCredentialExpiryLatch(this.ctx.storage.kv);
   }
 

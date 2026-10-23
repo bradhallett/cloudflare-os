@@ -469,13 +469,13 @@ describe("reconnecting", () => {
   const ALICE = { id: 1, login: "alice", name: "Alice", avatar_url: "https://avatars.example/alice" };
   const BOB = { id: 2, login: "bob", name: "Bob", avatar_url: "https://avatars.example/bob" };
 
-  /** The live grant and the viewer it is pinned to, as plain data. */
+  /** The live grant and the subject it is pinned to, as plain data. */
   async function storedConnection(userObjectId: string) {
     return await runInDurableObject(
       env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(userObjectId)),
       async (_instance, state) => ({
         credentials: await state.storage.kv.get<{ accessToken: string }>("credentials"),
-        pinnedViewer: await state.storage.kv.get<{ id: number; login: string }>("pinnedViewer"),
+        pinnedSubject: await state.storage.kv.get<{ id: string; login: string }>("connectionSubject"),
       }));
   }
 
@@ -498,7 +498,7 @@ describe("reconnecting", () => {
     github.respondApi = () => json(ALICE);
     const { account, id, events } = await connect(github, tokens(1));
     const before = await storedConnection(id.toString());
-    expect(before.pinnedViewer).toEqual({ id: 1, login: "alice" });
+    expect(before.pinnedSubject).toEqual({ id: "1", login: "alice" });
 
     const result = await reconnectAs(github, account, BOB);
 
@@ -532,7 +532,7 @@ describe("reconnecting", () => {
 
     const after = await storedConnection(id.toString());
     expect(after.credentials?.accessToken).toBe("gho_2");
-    expect(after.pinnedViewer).toEqual({ id: 1, login: "alice-renamed" });
+    expect(after.pinnedSubject).toEqual({ id: "1", login: "alice-renamed" });
     const failure = await runInDurableObject(account, async instance => {
       try {
         await instance.commitReconnect(stageId);
@@ -552,7 +552,7 @@ describe("reconnecting", () => {
     // The account predates pinning: nothing recorded which GitHub user it belongs to.
     await runInDurableObject(env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(id.toString())),
       (_instance, state) => {
-        state.storage.kv.delete("pinnedViewer");
+        state.storage.kv.delete("connectionSubject");
       });
 
     const result = await reconnectAs(github, account, BOB);
@@ -561,7 +561,7 @@ describe("reconnecting", () => {
     const stageId = (connectCallbackEvents.get(`account-${connections}`) ?? [])
       .at(-1)!.slice("reconnectComplete:".length);
     await account.commitReconnect(stageId);
-    expect((await storedConnection(id.toString())).pinnedViewer).toEqual({ id: 2, login: "bob" });
+    expect((await storedConnection(id.toString())).pinnedSubject).toEqual({ id: "2", login: "bob" });
   });
 
   it("refuses to finish a connect when GitHub will not say which user authorized", async () => {
@@ -577,7 +577,7 @@ describe("reconnecting", () => {
       await expect(instance.acceptAuthCode("code", begun!.oauthNonce))
         .rejects.toThrow(/Could not read which GitHub account/);
       expect(state.storage.kv.get("credentials")).toBeUndefined();
-      expect(state.storage.kv.get("pinnedViewer")).toBeUndefined();
+      expect(state.storage.kv.get("connectionSubject")).toBeUndefined();
     });
     // The grant GitHub issued was revoked rather than left dangling.
     expect(github.revoked).toEqual(["gho_1"]);

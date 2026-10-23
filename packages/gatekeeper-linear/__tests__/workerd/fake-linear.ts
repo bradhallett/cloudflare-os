@@ -7,6 +7,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { vi } from "vitest";
 import { generateNonce } from "@gadgets/gatekeeper-kit/connect-nonce";
+import type { ConnectionSubject } from "@gadgets/gatekeeper-kit/credential-stage";
 
 const API = "https://api.linear.app";
 
@@ -123,7 +124,9 @@ export function accountStub(userObjectId: string) {
 }
 
 type StoredGrant = { accessToken: string; refreshToken?: string; expiresAt: number; scopes: string[] };
-type StoredSubject = { userId: string; userName: string; orgId: string; orgName: string; orgUrlKey: string };
+type StoredSubject = ConnectionSubject & {
+  userId: string; userName: string; orgId: string; orgName: string; orgUrlKey: string;
+};
 
 export async function storedGrant(userObjectId: string): Promise<StoredGrant | undefined> {
   return await runInDurableObject(accountStub(userObjectId), (_instance, state) =>
@@ -132,7 +135,7 @@ export async function storedGrant(userObjectId: string): Promise<StoredGrant | u
 
 export async function storedSubject(userObjectId: string): Promise<StoredSubject | undefined> {
   return await runInDurableObject(accountStub(userObjectId), (_instance, state) =>
-    state.storage.kv.get<StoredSubject>("subject"));
+    state.storage.kv.get<StoredSubject>("connectionSubject"));
 }
 
 /**
@@ -154,13 +157,14 @@ export async function seedAccount(
       scopes: ["read", "write"],
     });
     if (options.subject !== false) {
-      state.storage.kv.put("subject", {
+      state.storage.kv.put("connectionSubject", {
+        id: `${user.id}:${workspace.id}`,
         userId: user.id,
         userName: user.displayName ?? user.name,
         orgId: workspace.id,
         orgName: workspace.name,
         orgUrlKey: workspace.urlKey,
-      });
+      } satisfies StoredSubject);
     }
   });
   return accountId.toString();
