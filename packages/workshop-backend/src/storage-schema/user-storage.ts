@@ -66,6 +66,12 @@ type PendingGatekeeperUserSelection = {
   appAccountId: number;
   vendorId: string;
   selectedUserId: string;
+  /**
+   * The orgs that justified the pick (selector and selected both active members at minting);
+   * empty when a workspace share justified it instead. Redemption re-checks whichever it is,
+   * live, so the ticket dies with the relationship that authorized it.
+   */
+  orgIds: string[];
   expiresAt: Date;
 };
 

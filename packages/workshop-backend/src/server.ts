@@ -1,7 +1,7 @@
 import { RpcStub, RpcTarget, newHttpBatchRpcResponse, newWebSocketRpcSession, RpcSessionOptions } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type { JWTPayload } from "jose";
-import { PublicApi, ROUTER_TAG_PROBE_PATH, VERSION_PATH, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, RedactedAiModelConfig, AiGatewayInfo, AiModelProvider, ModelKind, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, UserDirectoryRecord, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, NotificationSubscriber, NotificationMute, type BotDefinition, type BotInfo, type BotSkillChoice, type OrgInvitePolicy, type OrgMember, type OrgRole, type OrgSummary } from '@gadgets/workshop-shared/api';
+import { PublicApi, ROUTER_TAG_PROBE_PATH, VERSION_PATH, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, RedactedAiModelConfig, AiGatewayInfo, AiModelProvider, ModelKind, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, UserDirectoryRecord, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, NotificationSubscriber, NotificationMute, type BotDefinition, type BotInfo, type BotSkillChoice, type OrgInvitePolicy, type OrgMember, type OrgRole, type OrgSummary, type WhoamiInfo } from '@gadgets/workshop-shared/api';
 import type { UiFeatureFlags } from "@gadgets/workshop-shared/feature-flags";
 import { backendVersion, getServerConfig } from "./deployment-config.js";
 import { isPasswordAuthEnabled, getAuthGatekeeperAllowlist } from "./auth/config.js";
@@ -153,9 +153,16 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return admins.includes(name);
   }
 
-  whoami(): Promise<AiChatAuthorInfo> {
+  async whoami(): Promise<WhoamiInfo> {
     // Pure-read delegations retry once across a user-DO reset (see retryOnDoReset); writes never do.
-    return retryOnDoReset(() => this.#user.whoami());
+    // The memberships come from the user's mirrored index — a display snapshot for the client;
+    // every org-derived authority (search scoping, picker tickets) re-checks the org live.
+    return retryOnDoReset(async () => {
+      let [profile, memberships] = await Promise.all([
+        this.#user.whoami(), this.#user.listOrgMemberships(),
+      ]);
+      return { ...profile, orgs: memberships };
+    });
   }
   async beginDeviceSessionHandoff(publicKey: string, state: string) {
     if (this.accessSession?.expiresAt !== undefined &&
@@ -174,8 +181,16 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
   async searchUsers(query: string, excludeIds: string[]): Promise<UserDirectoryRecord[]> {
     if (!(await this.#userSearchEnabled())) return [];
+    // The directory holds profiles only; who may be found is this caller's scope (see
+    // UserDirectoryScope), computed live from the orgs that still hold them. An org that cannot
+    // be read contributes nothing, so the scope can only shrink on failure — never widen.
+    let scope = await retryOnDoReset(() => this.#user.getDirectoryScope());
+    let allowed = new Set(scope.partnerIds);
+    for (let org of scope.orgs) {
+      for (let memberId of org.memberIds) allowed.add(memberId);
+    }
     return retryOnDoReset(() => this.ctx.exports.UserDirectoryDurableObject.getByName("")
-        .searchUsers(query, [this.#userId.name!, ...excludeIds]));
+        .searchUsers(query, [this.#ownId, ...excludeIds], [...allowed]));
   }
   changePassword(oldHash: Uint8Array, newHash: Uint8Array): Promise<void> {
     return this.#user.changePassword(oldHash, newHash);

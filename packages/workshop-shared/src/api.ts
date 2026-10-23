@@ -460,8 +460,12 @@ export type DeviceSessionHandoffStart = {
 
 /** Top-level API exposed to the user after they have authenticated. */
 export interface AuthenticatedApi extends RpcTarget {
-  /** Get profile info for the user who is logged in. */
-  whoami(): Promise<AiChatAuthorInfo>;
+  /**
+   * Get profile info for the user who is logged in, plus their organization memberships
+   * (see `WhoamiInfo`). The memberships are the user's mirrored index — a display snapshot;
+   * every org-derived authority re-checks membership where it matters.
+   */
+  whoami(): Promise<WhoamiInfo>;
 
   /**
    * Stage a two-minute, single-use device-session transfer for a native app. The state is an
@@ -487,6 +491,11 @@ export interface AuthenticatedApi extends RpcTarget {
    * their display name or id, for inviting collaborators. Excludes the caller
    * and every user named by `excludeIds`. Returns at most 10 records, earliest
    * substring match first.
+   *
+   * Scoped to the caller's directory scope — the active co-members of every org they belong to,
+   * plus the owners of workspaces shared with them — so one org's members are never enumerable
+   * from another. Adding an out-of-scope collaborator by exact id
+   * (`Overseer.addCollaborator()`) still works; the directory is discovery, not authority.
    *
    * Rejects a `query` longer than 1000 characters or containing a line break,
    * and more than 1000 distinct ids to exclude, the caller's own included.
@@ -952,8 +961,11 @@ export interface AuthenticatedApi extends RpcTarget {
   /**
    * Mint a single-use ticket for a user selected on behalf of a gatekeeper app,
    * redeemable through that gatekeeper app's exchange capability (see
-   * GatekeeperUserSelectionExchangeImpl). Returns null if the selected user is
-   * this user or does not exist.
+   * this user, does not exist, or is outside the caller's directory scope (the
+   * active co-members of their orgs, plus owners of workspaces shared with
+   * them) — the same scope `searchUsers()` covers. The ticket records the orgs
+   * that justified the pick, and redemption re-checks them live, so a pick dies
+   * with the membership it was justified by.
    */
   createGatekeeperUserSelection(
       vendorId: string, selectedUserId: string,
@@ -1110,6 +1122,28 @@ export type OrgSummary = {
   role: OrgRole;
   /** The caller's membership status in this org. */
   status: OrgMemberStatus;
+};
+
+/**
+ * One of the signed-in user's organization memberships, as `whoami()` reports it. Read from the
+ * user's mirrored membership index, so it is a snapshot for display: the org re-checks membership
+ * live wherever it carries authority (search scoping, picker tickets, org methods).
+ */
+export type OrgMembership = {
+  /** The org's random id, as in `OrgSummary.id`. */
+  orgId: string;
+  role: OrgRole;
+  status: OrgMemberStatus;
+};
+
+/**
+ * The signed-in user's own profile and organization memberships, as returned by
+ * `AuthenticatedApi.whoami()`. A wider view of `AiChatAuthorInfo` for the user themself; other
+ * users' profiles never carry memberships.
+ */
+export type WhoamiInfo = AiChatAuthorInfo & {
+  /** The user's org memberships at the time of the call (see `OrgMembership`). */
+  orgs: OrgMembership[];
 };
 
 // ---------------------------------------------------------------------------
