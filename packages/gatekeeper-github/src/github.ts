@@ -28,11 +28,17 @@ import {
 import {
   ActionDescriptionBuilder, buildDescription, codeSpan, sanitizeTitle, type RenderedDescription,
 } from "@gadgets/gatekeeper-kit/action-description";
-import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
+import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import {
   clearCredentialExpiryLatch, notifyCredentialsExpiredOnce,
 } from "@gadgets/gatekeeper-kit/credential-expiry";
-import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import {
+  clearConnectionSubject,
+  commitReconnect,
+  type ConnectionSubject,
+  pinConnectionSubject,
+  stageReconnect,
+} from "@gadgets/gatekeeper-kit/credential-stage";
 import { CredentialCoordinator, type RejectionVerdict } from "@gadgets/gatekeeper-kit/credentials";
 import {
   CREDENTIALS_EXPIRED_MESSAGE,
@@ -84,6 +90,7 @@ import {
   simulateBranchHead,
   validateBranchName,
 } from "@gadgets/gatekeeper-kit/git-transport";
+import { desiredStateReached } from "@gadgets/gatekeeper-kit/outcome-unknown";
 import {
   actorFromUser,
   commitDetailsFromGitObject,
@@ -1320,14 +1327,16 @@ export default {
       const stub: DurableObjectStub<UserAccount> = ctx.exports.UserAccount.get(
         ctx.exports.UserAccount.idFromString(doId),
       );
-      const handoff = await stub.acceptAuthCode(code, oauthNonce);
-      if (!handoff) {
+      const result = await stub.acceptAuthCode(code, oauthNonce);
+      if (!result) {
         return new Response(INVALID_LINK_HTML, {
           headers: { "Content-Type": "text/html; charset=utf-8" },
         });
       }
-
-      return htmlResponse(connectHandoffPageHtml(handoff));
+      if ("refused" in result) {
+        return htmlResponse(errorPageHtml(result.refused.title, result.refused.detail), 409);
+      }
+      return htmlResponse(connectHandoffPageHtml(result.handoff));
     }
 
     return new Response("Not Found", { status: 404 });
@@ -1382,6 +1391,12 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
  * moved-past gate adjudicates it. Never equal to a real identity, which is a hex nonce.
  */
 const REPLACED_TOKEN_IDENTITY = "replaced-token";
+
+/** The GitHub user a connection's subject is: `id` is the stable identity; a login can be renamed. */
+type ViewerSubject = ConnectionSubject & { login: string };
+
+/** How the callback ended: a handoff for the browser, or a refusal to show it. */
+type CallbackResult = { handoff: ConnectHandoff } | { refused: { title: string; detail: string } };
 
 export class UserAccount extends DurableObject<Env> {
   readonly #creds = new CredentialCoordinator<GitHubOAuthGrant>(this.ctx.storage.kv, {
@@ -1459,10 +1474,10 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   /**
-   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on, or
-   * null when the callback's nonce doesn't match.
+   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on, a
+   * refusal to show there instead, or null when the callback's nonce doesn't match.
    */
-  async acceptAuthCode(code: string, oauthNonce: string): Promise<ConnectHandoff | null> {
+  async acceptAuthCode(code: string, oauthNonce: string): Promise<CallbackResult | null> {
     const stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
     if (!stored || stored.stage !== "oauth" || Date.now() >= stored.expiresAt || !constantTimeEqual(stored.value, oauthNonce)) {
       return null;
@@ -1483,21 +1498,50 @@ export class UserAccount extends DurableObject<Env> {
 
     const grant = await exchangeAuthCode(code, clientId, clientSecret, `${getBaseUrl(this.env)}/oauth`);
 
+    // The connection is pinned to the GitHub user it was made as: the viewer is read now, from the
+    // new grant itself, so a reconnect as anyone else is refused before anything is staged.
+    let viewer: ViewerSubject;
+    try {
+      const { user } = await new GitHubApi(async () => grant.accessToken).getViewer();
+      if (!Number.isFinite(user.id) || !user.login) {
+        throw new Error("GitHub did not say which account authorized this connection.");
+      }
+      viewer = { id: String(user.id), login: user.login };
+    } catch (error) {
+      if (!stored.reconnect) await this.#revokeToken(grant.accessToken);
+      throw new Error("Could not read which GitHub account authorized this connection. Please try again.",
+        { cause: error });
+    }
+
     let handoff: ConnectHandoff;
     if (stored.reconnect) {
+      const staged = stageReconnect(this.ctx.storage.kv, grant, viewer, Date.now(),
+        (pinned, authorized) => ({
+          title: "That's a different GitHub account",
+          // Another user's grant, which can never share an authorization with the live one; the
+          // revoked token is the connector's to dispose below.
+          detail: `This connection is for @${pinned.login}, but GitHub authorized @${authorized.login}. ` +
+            `Sign in to GitHub as @${pinned.login} and reconnect, or connect @${authorized.login} as a ` +
+            "separate account.",
+        }));
+      if ("refused" in staged) {
+        await this.#revokeToken(grant.accessToken);
+        return staged;
+      }
       // The reconnect URL is a bearer capability, so the new grant is only staged until the Workshop
       // has confirmed the browser that finished the flow is the owner's (see commitReconnect). Bound
       // gadgets keep reading the current token meanwhile. The stage id ties the Workshop's ticket to
       // this grant, so an overlapping reconnect cannot be committed by it.
-      const stageId = stageCredentials(this.ctx.storage.kv, grant, Date.now());
-      handoff = await callback.reconnectComplete(stageId);
+      handoff = await callback.reconnectComplete(staged.stageId);
     } else {
       this.#creds.connect(grant);
+      pinConnectionSubject(this.ctx.storage.kv, viewer);
       try {
         const props = { userObjectId: this.ctx.id.toString() };
         handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
       } catch (error) {
         this.#creds.clear();
+        clearConnectionSubject(this.ctx.storage.kv);
         throw error;
       }
       // Auth-only sign-in grants are transient: the caller read the email via complete(), so
@@ -1505,26 +1549,33 @@ export class UserAccount extends DurableObject<Env> {
       // call: the token grants nothing worth revoking, and this is the sign-in path.
       if (this.ctx.storage.kv.get<boolean>("ephemeral")) {
         await this.ctx.storage.setAlarm(Date.now() + 2 * 60 * 1000);
-        return handoff;
+        return { handoff };
       }
     }
 
     await this.ctx.storage.deleteAlarm();
-    return handoff;
+    return { handoff };
   }
 
-  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
+  /**
+   * Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. The kit's
+   * commit is fenced on the connection's pinned subject and re-pins the staged viewer, so a
+   * connection made before the pin existed adopts its first reconnect's user, and a same-user
+   * rename is followed.
+   */
   async commitReconnect(stageId: string): Promise<void> {
-    const grant = commitStagedCredentials<GitHubOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
+    const grant = commitReconnect<GitHubOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
     if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
     this.#creds.connect(grant);
-    // Perhaps as another GitHub user, whose own comments and reviews the account's hooks then
-    // skip. Should this be lost, the driver's hourly check reads it too.
+    // The same user, perhaps renamed, whose own comments and reviews are then the ones its hooks
+    // skip (a reconnect as anyone else is refused above). Should this be lost, the driver's hourly
+    // check reads it too.
     await this.ctx.exports.GitHubHookDriver.getByName(this.ctx.id.toString()).reconnected()
       .catch((error: unknown) => {
         logger.warn("failed to tell the hook driver of a reconnect", { event: "hooks.account.reconnect.failed", error });
       });
   }
+
 
   /**
    * @returns The current access token, refreshing an expiring grant shortly before it expires.
@@ -4186,14 +4237,12 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
             pack));
         } catch (error) {
           if (!(error instanceof GitRefUpdateRejectedError)) throw error;
-          // Desired-state semantics: apply succeeds iff the branch ends up at newSha -- by our
-          // CAS'd push, or by finding it already there (a retried apply whose first attempt
-          // landed but crashed before this record was persisted, or a third party's
-          // byte-identical push -- indistinguishable, and the approved end state holds either
-          // way).
-          const head = await this.#withApi(api =>
-            api.getBranchHead(action.owner, action.repo, action.branch));
-          if (head !== action.newSha) throw this.#pushRefusal(action, head, error);
+          // Desired-state semantics live in the kit: a head already at `newSha` settles the apply.
+          const head = await desiredStateReached(
+            () => this.#withApi(api => api.getBranchHead(action.owner, action.repo, action.branch)),
+            action.newSha,
+          );
+          if (head !== undefined) throw this.#pushRefusal(action, head, error);
         }
         this.#markActionApproved(action);
         this.#clearCaches();

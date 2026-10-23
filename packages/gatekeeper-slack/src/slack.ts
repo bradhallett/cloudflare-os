@@ -7,8 +7,11 @@ import {
   GatekeeperUserVerifier, ObservationDescription,
   stripTrailingSlashes, workerVersionTag, type ConnectHandoff,
 } from "@gadgets/workshop-shared/gatekeeper";
-import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
-import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
+import {
+  clearConnectionSubject, commitReconnect, ConnectionSubject, pinConnectionSubject,
+  stageReconnect,
+} from "@gadgets/gatekeeper-kit/credential-stage";
 import {
   SlackApi, SlackApiError, SlackAccessToken, SlackConversationTypeFilter, SlackOAuthGrant,
   exchangeAuthCode, refreshAccessToken, revokeToken, isWorkspaceId, type SlackInstallation,
@@ -40,6 +43,32 @@ type StoredNonce = {
    */
   reconnect?: true;
 };
+
+/** What finishing an OAuth flow yields: a handoff page, or a refusal to show. */
+type CallbackResult = { handoff: ConnectHandoff } | { refused: { title: string; detail: string } };
+
+/** What the locked credential exchange produced: a refusal, a stage to hand off, or a live grant. */
+type ExchangeOutcome =
+    | { refused: { title: string; detail: string } }
+    | { callback: Fetcher<GatekeeperConnectCallback>; grant: SlackOAuthGrant; stageId: string }
+    | { callback: Fetcher<GatekeeperConnectCallback>; grant: SlackOAuthGrant };
+
+/**
+ * The subject a grant pins the connection to: the Slack installation it was made as, spelled
+ * `teamId:userId` — a reconnect into another workspace, or as another user, is a different
+ * account. The names are for display and refusal messages.
+ */
+type SlackSubject = ConnectionSubject & {
+  teamId: string;
+  userId: string;
+  teamName?: string;
+};
+
+/** How a pinned subject is named in a reconnect refusal. */
+function describeSlackAccount(subject: SlackSubject): string {
+  const where = subject.teamName ?? `workspace ${subject.teamId}`;
+  return `user ${subject.userId} in ${where}`;
+}
 
 const NONCE_BYTES = 32;
 const INITIATION_NONCE_LIFETIME_MS = 10 * 60 * 1000;
@@ -272,12 +301,15 @@ export default {
       if (!code) return new Response("Error: no 'code' provided");
 
       let stub = ctx.exports.UserAccount.get(ctx.exports.UserAccount.idFromString(doId));
-      let handoff = await stub.acceptAuthCode(code, oauthNonce);
-      if (!handoff) {
+      let result = await stub.acceptAuthCode(code, oauthNonce);
+      if (!result) {
         return new Response(INVALID_LINK_HTML,
             { headers: { "Content-Type": "text/html; charset=utf-8" } });
       }
-      return htmlResponse(connectHandoffPageHtml(handoff));
+      if ("refused" in result) {
+        return htmlResponse(errorPageHtml(result.refused.title, result.refused.detail), 409);
+      }
+      return htmlResponse(connectHandoffPageHtml(result.handoff));
     } else {
       return new Response("Not Found", { status: 404 });
     }
@@ -405,10 +437,11 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   /**
-   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on, or
-   * null when the callback's nonce doesn't match.
+   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on: a
+   * handoff, a refusal to show (a reconnect that authorized a different Slack account), or null
+   * when the callback's nonce doesn't match.
    */
-  async acceptAuthCode(code: string, oauthNonce: string): Promise<ConnectHandoff | null> {
+  async acceptAuthCode(code: string, oauthNonce: string): Promise<CallbackResult | null> {
     let stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
     if (!stored || stored.stage !== "oauth" ||
         Date.now() >= stored.expiresAt || !constantTimeEqual(stored.value, oauthNonce)) {
@@ -418,7 +451,7 @@ export class UserAccount extends DurableObject<Env> {
     this.ctx.storage.kv.delete("nonce");
     let reconnect = stored.reconnect;
 
-    let completion = await this.#updateCredentials(async () => {
+    let completion = await this.#updateCredentials(async (): Promise<ExchangeOutcome> => {
       if (!this.env.CLIENT_ID || !this.env.CLIENT_SECRET) {
         throw new Error("The Slack Gatekeeper is not configured.");
       }
@@ -430,20 +463,47 @@ export class UserAccount extends DurableObject<Env> {
 
       let grant = await exchangeAuthCode(
           code, this.env.CLIENT_ID, this.env.CLIENT_SECRET, getBaseUrl(this.env) + "/oauth");
+      const subject: SlackSubject = {
+        id: `${grant.teamId}:${grant.userId}`,
+        teamId: grant.teamId,
+        userId: grant.userId,
+        teamName: grant.teamName,
+      };
 
-      // The reconnect URL is a bearer capability, so the new grant is only staged until the Workshop
-      // has confirmed the browser that finished the flow is the owner's (see commitReconnect). Bound
-      // gadgets keep reading the current token meanwhile.
-      let stageId = reconnect
-          ? stageCredentials(this.ctx.storage.kv, grant, Date.now())
-          : undefined;
-      if (stageId === undefined) this.#writeGrant(grant);
+      // The connection is pinned to the Slack installation it was made as: a reconnect that
+      // comes back as another user, or into another workspace, is refused and its grant
+      // revoked, rather than silently swapping the account every binding reads.
+      if (reconnect) {
+        const staged = stageReconnect(this.ctx.storage.kv, grant, subject, Date.now(),
+          (pinned, authorized) => ({
+            title: "That's a different Slack account",
+            detail: `This connection is for ${describeSlackAccount(pinned)}, but Slack authorized ` +
+              `${describeSlackAccount(authorized)}. Sign in to Slack as ${describeSlackAccount(pinned)} ` +
+              `and reconnect, or connect ${describeSlackAccount(authorized)} as a separate account.`,
+          }));
+        if ("refused" in staged) {
+          if (grant.refreshToken) await revokeToken(grant.refreshToken);
+          await revokeToken(grant.accessToken.token);
+          this.ctx.storage.kv.delete("requestedScopes");
+          return { refused: staged.refused };
+        }
+        this.ctx.storage.kv.delete("requestedScopes");
+        // The reconnect URL is a bearer capability, so the new grant is only staged until the
+        // Workshop has confirmed the browser that finished the flow is the owner's (see
+        // commitReconnect). Bound gadgets keep reading the current token meanwhile.
+        return { callback, grant, stageId: staged.stageId };
+      }
+
+      this.#writeGrant(grant);
+      pinConnectionSubject(this.ctx.storage.kv, subject);
       this.ctx.storage.kv.delete("requestedScopes");
-      return { callback, grant, stageId };
+      return { callback, grant };
     });
 
+    if ("refused" in completion) return { refused: completion.refused };
+
     let handoff: ConnectHandoff;
-    if (completion.stageId !== undefined) {
+    if ("stageId" in completion) {
       handoff = await completion.callback.reconnectComplete(
           completion.stageId, completion.grant.accessToken.expires);
     } else {
@@ -457,22 +517,26 @@ export class UserAccount extends DurableObject<Env> {
           if (storedToken?.token === completion.grant.accessToken.token) {
             this.ctx.storage.kv.delete("accessToken");
             this.ctx.storage.kv.delete("refreshToken");
+            clearConnectionSubject(this.ctx.storage.kv);
           }
         });
         throw err;
       }
     }
-    return handoff;
+    return { handoff };
   }
 
-  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
+  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. The kit's
+   * commit is fenced on the connection's pinned subject and re-pins the staged subject, so a
+   * connection made before the pin existed adopts its first reconnect's account. */
   async commitReconnect(stageId: string): Promise<void> {
     await this.#updateCredentials(async () => {
-      let grant = commitStagedCredentials<SlackOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
+      let grant = commitReconnect<SlackOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
       if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
       this.#writeGrant(grant);
     });
   }
+
 
   #writeGrant(grant: SlackOAuthGrant) {
     this.ctx.storage.kv.put<SlackAccessToken>("accessToken", grant.accessToken);
@@ -913,12 +977,23 @@ function validateSearchQuery(query: string): void {
 
 // ── Cursor ──────────────────────────────────────────────────────────
 
-// Each page is authorized before it can reach the caller.
-class SlackCursor<T> extends RpcTarget implements Cursor<T> {
+// Provider pages one next() may walk past when they keep coming back empty, matching the
+// gatekeeper-kit cursors' default. SlackCursor authorizes every page as it reads it (inside
+// loadPage), so the bound's job is spend, not disclosure: without it a listing whose pages come
+// back empty walks the workspace until something matches — one provider read and one observation
+// per page — before the caller sees a single result.
+const DEFAULT_MAX_PROVIDER_PAGES_PER_CALL = 2;
+
+/**
+ * Each page is authorized by loadPage before it can reach the caller, and the position advances
+ * only past pages that authorization accepted.
+ */
+export class SlackCursor<T> extends RpcTarget implements Cursor<T> {
   #ctx: SlackSessionContext;
   #loadPage: (
     ctx: SlackSessionContext, cursor: string | undefined,
   ) => Promise<{ items: T[]; nextCursor?: string }>;
+  #maxProviderPages: number;
   #cursor: string | undefined;
   #exhausted = false;
   // Serialize concurrent next() calls so each consumes a distinct page.
@@ -928,10 +1003,13 @@ class SlackCursor<T> extends RpcTarget implements Cursor<T> {
       ctx: SlackSessionContext,
       loadPage: (
         ctx: SlackSessionContext, cursor: string | undefined,
-      ) => Promise<{ items: T[]; nextCursor?: string }>) {
+      ) => Promise<{ items: T[]; nextCursor?: string }>,
+      options?: { maxProviderPagesPerCall?: number }) {
     super();
     this.#ctx = dupSessionContext(ctx);
     this.#loadPage = loadPage;
+    this.#maxProviderPages =
+        options?.maxProviderPagesPerCall ?? DEFAULT_MAX_PROVIDER_PAGES_PER_CALL;
   }
 
   [Symbol.dispose]() {
@@ -945,13 +1023,18 @@ class SlackCursor<T> extends RpcTarget implements Cursor<T> {
   }
 
   async #nextPage(): Promise<T[] | null> {
-    while (!this.#exhausted) {
+    let items: T[] = [];
+    for (let fetched = 1; !this.#exhausted; fetched++) {
       let page = await this.#loadPage(this.#ctx, this.#cursor);
       this.#cursor = page.nextCursor;
       this.#exhausted = !page.nextCursor;
-      if (page.items.length > 0) return page.items;
+      items = page.items;
+      if (items.length > 0 || this.#exhausted) break;
+      // Out of budget with pages still ahead. An empty page is not the end of the results: the
+      // caller drains, and the next call resumes where this one stopped.
+      if (fetched >= this.#maxProviderPages) break;
     }
-    return null;
+    return items.length === 0 && this.#exhausted ? null : items;
   }
 }
 

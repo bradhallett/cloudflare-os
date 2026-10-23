@@ -42,6 +42,62 @@ export class SupabaseApiError extends Error {
   }
 }
 
+
+/**
+ * A Supabase request that never produced an HTTP answer (network failure, timeout). The call may
+ * still have reached Supabase and been applied, so this class — not the raw TypeError/
+ * DOMException — is what outcome classification keys on.
+ */
+export class SupabaseTransportError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "SupabaseTransportError";
+  }
+}
+
+/**
+ * Whether an error from a Supabase call has an unknown outcome: the request may have reached
+ * Supabase and been applied without the answer coming back. A definitive answer, including a
+ * refusal, means the outcome is known.
+ */
+export function isSupabaseOutcomeUnknown(error: unknown): boolean {
+  return error instanceof SupabaseTransportError
+    || (error instanceof SupabaseApiError && error.status >= 500);
+}
+/** The connected Supabase account, read from `/v1/profile` with the OAuth access token. */
+export type SupabaseProfile = {
+  /** The GoTrue user id: the stable property a reconnect pins against. */
+  gotrueId: string;
+  primaryEmail?: string;
+  username?: string;
+};
+
+/**
+ * Reads the profile of the account an OAuth access token belongs to, immediately after the token
+ * exchange. Unlike every other call here, it is a module function over a raw token: it identifies
+ * a *newly exchanged* grant before any `SupabaseApi` exists to refresh it.
+ * @throws SupabaseApiError when the profile cannot be read.
+ */
+export async function fetchProfile(accessToken: string): Promise<SupabaseProfile> {
+  const response = await fetch(`${API_BASE_URL}/v1/profile`, {
+    headers: { Authorization: `Bearer ${accessToken}`, "User-Agent": USER_AGENT },
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  const parsed = await parseBody(response);
+  if (!response.ok) {
+    throw new SupabaseApiError(
+      response.status, errorMessage(response.status, response.statusText, parsed), parsed);
+  }
+  const profile = parsed as { gotrue_id?: unknown; primary_email?: unknown; username?: unknown };
+  if (typeof profile.gotrue_id !== "string" || profile.gotrue_id === "") {
+    throw new SupabaseApiError(502, "Supabase profile response was missing a gotrue_id.", parsed);
+  }
+  return {
+    gotrueId: profile.gotrue_id,
+    primaryEmail: typeof profile.primary_email === "string" ? profile.primary_email : undefined,
+    username: typeof profile.username === "string" ? profile.username : undefined,
+  };
+}
 // ---------------------------------------------------------------------------
 // Raw Management API response shapes (only the fields we consume).
 
@@ -263,12 +319,20 @@ export class SupabaseApi {
       body = JSON.stringify(options.body);
     }
 
-    const response = await fetch(url.toString(), {
-      method,
-      headers,
-      body,
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
+    let response: Response;
+    try {
+      response = await fetch(url.toString(), {
+        method,
+        headers,
+        body,
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (error) {
+      // The call may have reached Supabase and been applied, so it surfaces as a transport error,
+      // which outcome classification treats as unknown.
+      throw new SupabaseTransportError(
+        error instanceof Error ? error.message : String(error), { cause: error });
+    }
 
     if (!response.ok) {
       const parsed = await parseBody(response);

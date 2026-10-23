@@ -15,6 +15,8 @@ import {
   DecisionModelGatekeeper, gatewayBuiltInReasoning, gatewayReasoningLevels, getDecisionModel,
   getModel, isRuntimeModel, LanguageModelGatekeeper, type ModelHandle,
 } from "../src/ai-models.js";
+import { LIMIT_ERROR_MESSAGES } from "@gadgets/workshop-shared/limits";
+import type { UserDurableObject } from "../src/user.js";
 
 // These tests exercise the real pi-ai stack: no module mocks. Routing decisions are asserted on
 // the returned handle's model descriptor (baseUrl/id/api) and log route, and request-level
@@ -1420,7 +1422,11 @@ describe("LanguageModelGatekeeper.startSession", () => {
     const gatekeeper = Object.create(LanguageModelGatekeeper.prototype) as LanguageModelGatekeeper;
     Object.assign(gatekeeper, {
       env: env({ BLUEPRINTS: { get: getConfig } as unknown as KVNamespace, ...overrides }),
-      ctx: { props: { displayName: "Model", config, initiator: GADGET_INITIATOR } },
+      ctx: {
+        props: { displayName: "Model", config, initiator: GADGET_INITIATOR },
+        // No ownerUserId in props, so the usage gate is a no-op and never touches this.
+        exports: {},
+      },
     });
     // The binding implements no actions, so a session never touches its approval queue.
     return { session: gatekeeper.startSession(undefined as never), getConfig };
@@ -1535,6 +1541,129 @@ describe("DecisionModelGatekeeper.startSession", () => {
     });
     await expect(gatekeeper.startSession(undefined as never)).rejects.toThrow(new Error(
         'The "Clef (Workers AI)" model is disabled on this deployment by an administrator.'));
+  });
+});
+
+// Every binding call passes the same usage gate a chat turn does (see bindingUsageGate): it draws
+// one call on the workspace owner's allowance and refuses with the checker's reason once that
+// allowance is exhausted.
+describe("model binding usage gate", () => {
+  const OWNER_ID = "owner-789";
+  const LIMITS_ENV = { ENABLE_CLOUDFLARE_LIMITS: "true" };
+  const DECISION_REQUEST = {
+    state: { color: "blue" },
+    questions: { sky: {
+      type: "bool", instructions: "Is the sky blue?",
+      criteria: { true: "The sky is blue", false: "The sky is not blue" },
+    } },
+  } as const;
+
+  // A users namespace with exactly one user: connected to no Cloudflare account, whose next
+  // consumeDailyLlmCall() reports whether the free tier is spent. Records consumed limits.
+  function usersNamespace(withinLimits: boolean) {
+    const consumed: number[] = [];
+    const stub = {
+      getCloudflareGatekeeperAccount: async () => null,
+      consumeDailyLlmCall: async (limit: number) => {
+        consumed.push(limit);
+        const used = withinLimits ? limit - 1 : limit;
+        return { withinLimits, remaining: limit - used, limit, used, resetAt: "..." };
+      },
+    };
+    const namespace = {
+      idFromString: (id: string) => id,
+      get: (id: string) => (id === OWNER_ID ? stub : null),
+    };
+    return { consumed, namespace: namespace as unknown as DurableObjectNamespace<UserDurableObject> };
+  }
+
+  function gatekeeperProps(
+      users: DurableObjectNamespace<UserDurableObject>, ownerUserId?: string,
+      envOverrides: Partial<Cloudflare.Env> = {}) {
+    const props: Record<string, unknown> = {
+      displayName: "Model",
+      config: ANTHROPIC_CONFIG,
+      initiator: GADGET_INITIATOR,
+    };
+    if (ownerUserId !== undefined) props.ownerUserId = ownerUserId;
+    return {
+      env: env({ ...LIMITS_ENV, ...envOverrides, BLUEPRINTS: {
+        get: async () => serializeAdminConfig(DEFAULT_ADMIN_CONFIG),
+      } as unknown as KVNamespace }),
+      ctx: { props, exports: { UserDurableObject: users } },
+    };
+  }
+
+  function languageBinding(
+      users: DurableObjectNamespace<UserDurableObject>, ownerUserId?: string,
+      envOverrides: Partial<Cloudflare.Env> = {}) {
+    const gatekeeper = Object.create(LanguageModelGatekeeper.prototype) as LanguageModelGatekeeper;
+    Object.assign(gatekeeper, gatekeeperProps(users, ownerUserId, envOverrides));
+    return gatekeeper.startSession(undefined as never);
+  }
+
+  function decisionBinding(users: DurableObjectNamespace<UserDurableObject>, ownerUserId?: string) {
+    const gatekeeper = Object.create(DecisionModelGatekeeper.prototype) as DecisionModelGatekeeper;
+    const props = gatekeeperProps(users, ownerUserId);
+    Object.assign(gatekeeper, {
+      ...props,
+      ctx: { ...props.ctx, props: { ...props.ctx.props, config: {
+        provider: "cloudflare", model: "@cf/cloudflare/clef", apiToken: "",
+      } } },
+    });
+    return gatekeeper.startSession(undefined as never);
+  }
+
+  beforeEach(() => {
+    capturedRequests.length = 0;
+    vi.stubGlobal("fetch", fetchStub);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("refuses a call once the owner's free tier is spent, without reaching the model", async () => {
+    const { consumed, namespace } = usersNamespace(false);
+    const binding = await languageBinding(namespace, OWNER_ID);
+    await expect(binding.run({ prompt: "hello" }))
+        .rejects.toThrow(LIMIT_ERROR_MESSAGES.NO_CLOUDFLARE_TOKEN);
+    expect(consumed).toHaveLength(1);
+    expect(capturedRequests).toHaveLength(0);
+  });
+
+  it("consumes one free-tier call when allowed, then reaches the model", async () => {
+    const { consumed, namespace } = usersNamespace(true);
+    const binding = await languageBinding(namespace, OWNER_ID);
+    // The stubbed provider 400s, so run() rejects -- after the gate let it through.
+    await expect(binding.run({ prompt: "hello" })).rejects.toThrow();
+    expect(consumed).toHaveLength(1);
+    expect(capturedRequests).toHaveLength(1);
+  });
+
+  it("refuses a decision call once the owner's free tier is spent", async () => {
+    const { consumed, namespace } = usersNamespace(false);
+    const binding = await decisionBinding(namespace, OWNER_ID);
+    await expect(binding.decide(DECISION_REQUEST))
+        .rejects.toThrow(LIMIT_ERROR_MESSAGES.NO_CLOUDFLARE_TOKEN);
+    expect(consumed).toHaveLength(1);
+    expect(capturedRequests).toHaveLength(0);
+  });
+
+  it("runs ungated when the binding predates spend gating (no ownerUserId)", async () => {
+    const { consumed, namespace } = usersNamespace(false);
+    const binding = await languageBinding(namespace, undefined);
+    await expect(binding.run({ prompt: "hello" })).rejects.toThrow();
+    expect(consumed).toHaveLength(0);
+    expect(capturedRequests).toHaveLength(1);
+  });
+
+  it("runs ungated when the limits flow is disabled (self-hosted default)", async () => {
+    const { consumed, namespace } = usersNamespace(false);
+    const binding = await languageBinding(namespace, OWNER_ID, { ENABLE_CLOUDFLARE_LIMITS: undefined });
+    await expect(binding.run({ prompt: "hello" })).rejects.toThrow();
+    expect(consumed).toHaveLength(0);
+    expect(capturedRequests).toHaveLength(1);
   });
 });
 

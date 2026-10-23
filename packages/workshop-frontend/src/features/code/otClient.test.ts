@@ -371,6 +371,133 @@ describe('ChatOtClient', () => {
     expect(h.client.hasGadget(1)).toBe(false)
   })
 
+  it('ignores a durable snapshot from a generation older than the folded one', async () => {
+    const h = new TestHarness()
+    h.commits.set('h1', new Map([['a.txt', 'one']]))
+    h.commits.set('h2', new Map([['b.txt', 'two']]))
+    h.client.setDurableState({
+      codeBase: { pins: [{ gadgetId: 1, baseCommit: 'h2', mergedCommit: 'h2' }],
+        generation: 1, revision: 0 },
+      rowsThrough: 0,
+    })
+    await flush()
+    expect(h.client.isReady()).toBe(true)
+    expect(h.remoteEvents).toEqual([[]])
+
+    // A late recomputation of the previous generation's metadata must not displace the folded
+    // snapshot, so row seeding still resolves the pin from generation 1 -- whereas displacing
+    // it would seed the edit from the stale pin, whose commit lacks the path (a fatal fetch).
+    h.client.setDurableState({
+      codeBase: { pins: [{ gadgetId: 1, baseCommit: 'h1', mergedCommit: 'h1' }],
+        generation: 0, revision: 0 },
+      rowsThrough: 0,
+    })
+    h.client.pushRow(row(1, 1, { 1: [['b.txt', { edit: [3, [0, '!']] }]] }))
+    await flush()
+
+    expect(h.fetches).toEqual([{ commitId: 'h2', paths: ['b.txt'] }])
+    expect(filesOf(h.client.getContent(), 1)).toEqual({ 'b.txt': 'two!' })
+    expect(h.remoteEvents).toEqual([[], [{
+      gadgetId: 1, path: 'b.txt', change: { edit: [3, [0, '!']] },
+    }]])
+    expect(h.discards).toBe(0)
+    expect(h.fatal).toBeNull()
+  })
+
+  it('ignores a same-generation snapshot whose watermark regressed', async () => {
+    const h = new TestHarness()
+    h.client.setDurableState({
+      codeBase: { pins: [], generation: 0, revision: 1 },
+      epochChange: { 1: [['a.txt', { set: 'one' }]] },
+      rowsThrough: 1,
+    })
+    await flush()
+    expect(filesOf(h.client.getContent(), 1)).toEqual({ 'a.txt': 'one' })
+
+    // A regressed recomputation (the watermark moving backwards) must not displace the folded
+    // snapshot, so the rebuild a hard rejection triggers still folds the newest one -- whereas
+    // displacing it would resurrect the pre-watermark content.
+    h.client.setDurableState({
+      codeBase: { pins: [], generation: 0, revision: 0 },
+      rowsThrough: 0,
+    })
+    await flush()
+    h.submitResult = async () => { throw new Error('rejected') }
+    h.client.applyLocalChange({ 1: [['a.txt', { edit: [3, [0, 'd']] }]] })
+    await flush()
+
+    expect(h.discards).toBe(1)
+    expect(filesOf(h.client.getContent(), 1)).toEqual({ 'a.txt': 'one' })
+    expect(h.client.hasLocalEdits()).toBe(false)
+  })
+
+  it('folds the newest snapshot when one lands while a rebuild\'s base fetch is out', async () => {
+    const h = new TestHarness()
+    h.commits.set('h1', new Map([['a.txt', 'one']]))
+    h.commits.set('h2', new Map([['a.txt', 'two']]))
+    let releaseFetch!: () => void
+    const fetchHeld = new Promise<void>(resolve => { releaseFetch = resolve })
+    const underlying = h.delegate.fetchFilesAtCommit
+    h.delegate.fetchFilesAtCommit = async (commitId, paths) => {
+      if (commitId === 'h1') await fetchHeld
+      return underlying(commitId, paths)
+    }
+
+    // The first snapshot's rebuild stalls on its base fetch; the second (a destructive bump)
+    // is delivered before that fetch completes.
+    h.client.setDurableState({
+      codeBase: { pins: [{ gadgetId: 1, baseCommit: 'h1', mergedCommit: 'h1' }],
+        generation: 0, revision: 1 },
+      epochChange: { 1: [['a.txt', { edit: [3, [0, '!']] }]] },
+      rowsThrough: 1,
+    })
+    h.client.setDurableState({
+      codeBase: { pins: [{ gadgetId: 1, baseCommit: 'h2', mergedCommit: 'h2' }],
+        generation: 1, revision: 1 },
+      epochChange: { 1: [['a.txt', { edit: [3, [0, '?']] }]] },
+      rowsThrough: 1,
+    })
+    releaseFetch()
+    await flush()
+
+    // The queued tasks run in order: the first rebuild completes (its snapshot was still the
+    // folded one throughout its fetch), then the bump rebuilds from the newer snapshot. Either
+    // way the client converges on the newest knowledge -- the superseded check never mis-fires.
+    expect(filesOf(h.client.getContent(), 1)).toEqual({ 'a.txt': 'two?' })
+    expect(h.fetches).toEqual([
+      { commitId: 'h1', paths: ['a.txt'] }, { commitId: 'h2', paths: ['a.txt'] },
+    ])
+    expect(h.remoteEvents).toEqual([[], []])
+    expect(h.discards).toBe(0)
+    expect(h.fatal).toBeNull()
+  })
+
+  it('delivers rows drained right after a destructive bump\'s coarse reset', async () => {
+    const h = new TestHarness()
+    h.client.setDurableState({ rowsThrough: 0 })
+    await flush()
+    // A row of the next generation arrives before its metadata does (gadget 1 is chat-created,
+    // so its rows apply without a pin).
+    h.client.setPendingCreations(new Set([1]))
+    h.client.pushRow(row(1, 1, { 1: [['a.txt', { set: 'x' }]] }))
+    await flush()
+    expect(filesOf(h.client.getContent(), 1)).toEqual({})
+
+    // The bump lands: the rebuild's coarse reset is followed, within the same drain, by the
+    // held row's delta -- the interleaving wholesale-reload implementors must tolerate (see
+    // ChatOtClientDelegate.onRemoteChange).
+    h.client.setDurableState({
+      codeBase: { pins: [], generation: 1, revision: 0 },
+      rowsThrough: 0,
+    })
+    await flush()
+
+    expect(filesOf(h.client.getContent(), 1)).toEqual({ 'a.txt': 'x' })
+    expect(h.remoteEvents).toEqual([[], [], [{
+      gadgetId: 1, path: 'a.txt', change: { set: 'x' },
+    }]])
+  })
+
   it('rides a content-preserving epoch reset, bridging the pending buffer', async () => {
     const h = new TestHarness()
     h.commits.set('head', new Map([['a.txt', 'abc']]))

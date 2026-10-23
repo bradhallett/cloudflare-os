@@ -791,7 +791,7 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     // the exception: signing in with Cloudflare also links AI Gateway billing, so it requests and
     // persists the billing-only scope set up front.
     const options = vendorId === CLOUDFLARE_VENDOR_ID
-      ? { scopes: "full" as const, resourceUrlPatterns: [] }
+      ? { scopes: "billing" as const, resourceUrlPatterns: [] }
       : { scopes: "auth" as const };
     const { url } = await vendor.connectAccount(callback, options);
     // @ts-expect-error Cap'n Web RPC stubs and native RPC targets are compatible but the type

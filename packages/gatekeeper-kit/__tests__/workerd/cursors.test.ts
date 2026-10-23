@@ -62,6 +62,16 @@ function tokenApi(pages: TokenPage<Issue>[]) {
     pages[index++] ?? { items: [] });
 }
 
+/** Five four-row token pages ending without a token, so a full page takes several fetches. */
+function fourRowTokenApi() {
+  const page = (ids: number[], nextToken?: string): TokenPage<Issue> =>
+    ({ items: ids.map(id => ({ id, open: true })), nextToken });
+  return tokenApi([
+    page([1, 2, 3, 4], "a"), page([5, 6, 7, 8], "b"), page([9, 10, 11, 12], "c"),
+    page([13, 14, 15, 16], "d"), page([17, 18, 19, 20]),
+  ]);
+}
+
 // Cursors must authorize the exact page they return; tests that assert on it pass their own.
 const authorizePage = async () => {};
 
@@ -118,8 +128,9 @@ describe("PageNumberCursor", () => {
     const items = Array.from({ length: 45 }, (_, index) => ({ id: index + 1, open: true }));
     // Answers 20 to a request for 100, as Cloudflare's own /accounts endpoint does.
     const fetchPage = vi.fn(async (page: number) => items.slice((page - 1) * 20, page * 20));
+    // The whole list is three provider pages, so the window must be deep enough to read them all.
     const cursor = new PageNumberCursor<Issue>(
-      { fetchPage, authorizePage, pageSize: 100, remotePageSize: 100 });
+      { fetchPage, authorizePage, pageSize: 100, remotePageSize: 100, maxProviderPagesPerCall: 3 });
 
     // Stopping at the first short page would have returned only the first 20.
     expect((await cursor.next())?.length).toBe(45);
@@ -203,7 +214,7 @@ describe("PageNumberCursor", () => {
 
     // `[]` invites another call, where null would claim the list had ended.
     expect(await cursor.next()).toEqual([]);
-    expect(fetchPage).toHaveBeenCalledTimes(10);
+    expect(fetchPage).toHaveBeenCalledTimes(2);
   });
 
   it("bounds one call when retained rows keep arriving too, not just empty pages", async () => {
@@ -216,6 +227,7 @@ describe("PageNumberCursor", () => {
       authorizePage,
       pageSize: 100,
       remotePageSize: 1,
+      maxProviderPagesPerCall: 10,
     });
 
     expect((await cursor.next())?.map(issue => issue.id)).toEqual([3, 6, 9]);
@@ -254,8 +266,9 @@ describe("OffsetCursor", () => {
     // Answers 20 to a request for 100, as jira's silent `maxResults` clamp does. Page arithmetic
     // over this shape would request offsets 0, 100, ... and lose rows 20-99 without an error.
     const fetchPage = vi.fn(async (offset: number) => items.slice(offset, offset + 20));
+    // The whole list is four provider pages, so the window must be deep enough to read them all.
     const cursor = new OffsetCursor<Issue>(
-      { fetchPage, authorizePage, pageSize: 100, remotePageSize: 100 });
+      { fetchPage, authorizePage, pageSize: 100, remotePageSize: 100, maxProviderPagesPerCall: 4 });
 
     expect((await cursor.next())?.length).toBe(45);
     expect(await cursor.next()).toBeNull();
@@ -309,8 +322,9 @@ describe("TokenCursor", () => {
       { items: [{ id: 3, open: true }], nextToken: "" },
       { items: [{ id: 4, open: true }] },
     ]);
+    // The whole walk is four provider pages, so the window must be deep enough to read them all.
     const cursor = new TokenCursor<Issue>(
-      { fetchPage, authorizePage, pageSize: 10, remotePageSize: 25 });
+      { fetchPage, authorizePage, pageSize: 10, remotePageSize: 25, maxProviderPagesPerCall: 4 });
 
     expect(ids(await cursor.next())).toEqual([1, 2, 3, 4]);
     expect(await cursor.next()).toBeNull();
@@ -325,7 +339,8 @@ describe("TokenCursor", () => {
       ...Array.from({ length: 12 }, (_, index) => ({ items: [], nextToken: `w${index}` })),
       { items: [{ id: 1, open: true }] },
     ]);
-    const cursor = new TokenCursor<Issue>({ fetchPage, authorizePage, pageSize: 2 });
+    const cursor = new TokenCursor<Issue>(
+      { fetchPage, authorizePage, pageSize: 2, maxProviderPagesPerCall: 10 });
 
     // `[]` is a legal non-terminal page: only `null` ends a cursor, so the walk survives the cap.
     expect(await cursor.next()).toEqual([]);
@@ -449,6 +464,7 @@ describe("TokenCursor", () => {
       retain: rows => rows.filter(issue => issue.open),
       pageSize: 100,
       remotePageSize: 1,
+      maxProviderPagesPerCall: 10,
       authorizePage: async items => {
         offered.push(items.map(issue => issue.id));
         if (++call === 1) throw new Error("authorization unavailable");
@@ -487,6 +503,7 @@ describe("TokenCursor", () => {
         { items: [] },
       ]),
       pageSize: 2,
+      maxProviderPagesPerCall: 10,
       authorizePage: async (items, { terminal }) =>
         void seen.push(`${terminal ? "terminal" : "window"}:${items.length}`),
     });
@@ -676,6 +693,45 @@ describe("TokenCursor", () => {
     expect(ids(await cursor.next())).toEqual([2]);
     expect(await cursor.next()).toBeNull();
     expect(fetchPage).toHaveBeenCalledTimes(3);
+  });
+
+  it("authorizes each page before reading past the default two-page refill", async () => {
+    // Rows fetched beyond the page a `next()` returns are provider data nothing has approved
+    // yet, so the default window stays small: the cursor answers for eight rows before it
+    // fetches a third page that a refusal would have made too late to stop.
+    const fetchPage = fourRowTokenApi();
+    const fetchesWhenAuthorized: number[] = [];
+    const cursor = new TokenCursor<Issue>({
+      fetchPage,
+      // Filling this page takes three four-row provider pages, more than the default window.
+      pageSize: 10,
+      remotePageSize: 4,
+      authorizePage: async () => void fetchesWhenAuthorized.push(fetchPage.mock.calls.length),
+    });
+
+    expect(ids(await cursor.next())).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+    // No fetch happened beyond the bound before the page it paid for was authorized.
+    expect(fetchesWhenAuthorized).toEqual([2]);
+
+    expect(ids(await cursor.next())).toEqual([9, 10, 11, 12, 13, 14, 15, 16]);
+    expect(fetchesWhenAuthorized).toEqual([2, 4]);
+
+    expect(ids(await cursor.next())).toEqual([17, 18, 19, 20]);
+    expect(fetchesWhenAuthorized).toEqual([2, 4, 5]);
+    expect(await cursor.next()).toBeNull();
+  });
+
+  it("refills a page fully only when the caller opts into a deeper window", async () => {
+    const fetchPage = fourRowTokenApi();
+    const cursor = new TokenCursor<Issue>(
+      { fetchPage, authorizePage, pageSize: 10, remotePageSize: 4, maxProviderPagesPerCall: 10 });
+
+    // The explicit budget fills the page: three four-row pages reach ten rows in one call.
+    expect(ids(await cursor.next())).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    expect(fetchPage).toHaveBeenCalledTimes(3);
+    expect(ids(await cursor.next())).toEqual([11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+    expect(await cursor.next()).toBeNull();
   });
 });
 

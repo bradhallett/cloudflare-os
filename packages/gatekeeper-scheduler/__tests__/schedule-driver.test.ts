@@ -6,89 +6,27 @@ import {
   runInDurableObject,
 } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { HookInitiator } from "@gadgets/workshop-shared/gatekeeper";
 import { reportIssue } from "@gadgets/observability/error-reporting";
-import type { ScheduledTaskHook } from "../src/types.js";
 import { ScheduleDriver } from "../src/schedule-driver.js";
-import type { ScheduleActivation, StoredSchedule } from "../src/schedule-driver.js";
+import type { StoredSchedule } from "../src/schedule-driver.js";
+import {
+  enableSchedule,
+  gadgetId,
+  makeActiveScheduleDue,
+  testInitiator,
+  updateSchedule,
+} from "./driver-harness.js";
+import type { TestHooks } from "./driver-harness.js";
 
 vi.mock("@gadgets/observability/error-reporting", () => ({ reportIssue: vi.fn() }));
-
-type ScheduleHookTarget = RpcTarget & ScheduledTaskHook;
-
-type TestHooks = HookInitiator<ScheduleHookTarget> & {
-  configure(
-    mode: "success" | "start-reject" | "authorization-reject" | "callback-reject",
-  ): Promise<void>;
-  blockAt(point: "start" | "authorization" | "callback"): Promise<void>;
-  holdCallbacksUntilConcurrent(count: number): Promise<void>;
-  read(): Promise<{
-    events: string[];
-    callbackScheduleIds: string[];
-    maxActiveCallbacks: number;
-    disposedApprovalQueues: number;
-    disposedCallbacks: number;
-  }>;
-  release(): Promise<void>;
-  reset(): Promise<void>;
-  waitForDisposals(
-    target: { approvalQueues: number; callbacks: number },
-    budgetMs: number,
-  ): Promise<void>;
-  waitUntilBlocked(): Promise<void>;
-};
 
 const testEnv = env as unknown as {
   SCHEDULE_DRIVER: DurableObjectNamespace<ScheduleDriver>;
   TEST_HOOKS: Fetcher<TestHooks>;
 };
 
-const gadgetId = 3;
 const MAX_ENABLED_SCHEDULES_PER_ACCOUNT = 500;
 const MAX_ENABLED_SCHEDULES_PER_WORKSPACE = 100;
-
-function testInitiator(driver: ScheduleDriver): Fetcher<TestHooks> {
-  // The pool wraps env capabilities, so mint the persistable entrypoint inside the Worker.
-  const exports = driver.ctx.exports as unknown as {
-    TestHooks(options: object): Fetcher<TestHooks>;
-  };
-  return exports.TestHooks({});
-}
-
-function enableSchedule(
-  driver: DurableObjectStub<ScheduleDriver>,
-  activation: ScheduleActivation,
-  now = Date.now(),
-): Promise<void> {
-  return runInDurableObject(driver, (instance) =>
-    instance.enable(activation, testInitiator(instance), now),
-  );
-}
-
-async function updateSchedule(
-  driver: DurableObjectStub<ScheduleDriver>,
-  workspaceId: string,
-  scheduleId: string,
-  update: (stored: StoredSchedule) => StoredSchedule,
-): Promise<void> {
-  await runInDurableObject(driver, (_instance, state) => {
-    const key = `schedule:${workspaceId}:${scheduleId}`;
-    const stored = state.storage.kv.get<StoredSchedule>(key);
-    if (!stored) throw new Error(`Missing test schedule: ${key}`);
-    state.storage.kv.put(key, update(stored));
-  });
-}
-
-async function makeActiveScheduleDue(
-  driver: DurableObjectStub<ScheduleDriver>,
-  workspaceId: string,
-  scheduleId: string,
-): Promise<void> {
-  await updateSchedule(driver, workspaceId, scheduleId, (stored) => {
-    if (stored.state.status !== "active") throw new Error("Expected active schedule");
-    return { ...stored, state: { ...stored.state, nextFire: 1 } };
-  });
-}
 
 async function putScheduleRows(
   driver: DurableObjectStub<ScheduleDriver>,
@@ -148,6 +86,15 @@ async function revokeWhileDeliveryIsBlocked(
     await testEnv.TEST_HOOKS.release();
   }
   await alarm;
+
+  // revoke() and the revoked exit of the driver's replanning both arm an immediate alarm. Drive
+  // the revocation cleanup to quiescence here so the runtime delivers it inside the test instead
+  // of at an arbitrary moment near pool teardown -- the hang these tests were born skipped over
+  // (cloudflare/workers-sdk#14180). A cleaned-up account must end with no alarm armed, so a
+  // cleanup that never converges fails the test instead of papering over the residue.
+  for (let attempt = 0; await runDurableObjectAlarm(driver); attempt++) {
+    if (attempt === 3) throw new Error("Revocation cleanup did not reach a quiescent alarm.");
+  }
 
   expect(await driver.getSchedule("workspace-a", "schedule-a")).toBeUndefined();
   return (await testEnv.TEST_HOOKS.read()).events;
@@ -669,19 +616,17 @@ describe("ScheduleDriver", () => {
     expect((await testEnv.TEST_HOOKS.read()).events).toEqual([]);
   });
 
-  // These input-gate interruption tests can deadlock `@cloudflare/vitest-plugin` during teardown.
-  // See https://github.com/cloudflare/workers-sdk/issues/14180.
-  it.skip("stops before authorization when revoked during startHook", async () => {
+  it("stops before authorization when revoked during startHook", async () => {
     const events = await revokeWhileDeliveryIsBlocked("revoke-start", "start");
     expect(events).toEqual(["start", "blocked:start"]);
   });
 
-  it.skip("stops before callback when revoked during authorization", async () => {
+  it("stops before callback when revoked during authorization", async () => {
     const events = await revokeWhileDeliveryIsBlocked("revoke-authorization", "authorization");
     expect(events).toEqual(["start", "authorize", "blocked:authorization"]);
   });
 
-  it.skip("does not persist completion when revoked during callback", async () => {
+  it("does not persist completion when revoked during callback", async () => {
     const events = await revokeWhileDeliveryIsBlocked("revoke-callback", "callback");
     expect(events).toHaveLength(4);
     expect(events.slice(0, 3)).toEqual(["start", "authorize", expect.stringMatching(/^callback:/)]);

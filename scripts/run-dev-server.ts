@@ -21,11 +21,11 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse } from "jsonc-parser";
 import { resolveBinEntry } from "./bin-entry.ts";
-import { getDevServerConfig } from "./dev-server-config.ts";
+import { gatekeeperBaseUrl, getDevServerConfig } from "./dev-server-config.ts";
 import { generateWorkerConfigs } from "./generate-worker-configs.ts";
 import { killProcessTree } from "./kill-process-tree.ts";
 import { pnpmCommand } from "./pnpm-command.ts";
-import type { ServiceBinding, WranglerBuild } from "./release/manifest-lib.ts";
+import { gatekeeperBindingName, type ServiceBinding, type WranglerBuild } from "./release/manifest-lib.ts";
 import { vpRunEnv } from "./vp/concurrency.ts";
 
 const SCRIPTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -397,10 +397,6 @@ for (const gk of gatekeepers) {
   }
 }
 
-// Helper: "gatekeeper-github" -> "GATEKEEPER_GITHUB"
-function bindingName(gk: Gatekeeper): string {
-  return gk.name.toUpperCase().replaceAll("-", "_");
-}
 
 // ---------------------------------------------------------------------------
 // Speed up wrangler's per-worker `build.command`.
@@ -465,7 +461,9 @@ function devBuildConfig(build: WranglerBuild | undefined, pkgDir: string): Wrang
 
   config.services = config.services || [];
   for (const gk of gatekeepers) {
-    config.services.push({ binding: bindingName(gk), service: gk.name });
+    // The same GATEKEEPER_<SLUG> spelling the deploy service binds in production (see
+    // gatekeeperBindingName), so the dev router's /gatekeeper/<slug> routes match production's.
+    config.services.push({ binding: gatekeeperBindingName(gk.name), service: gk.name });
   }
 
   const outPath = join(ROOT, "wrangler.dev.jsonc");
@@ -525,7 +523,9 @@ for (const gk of gatekeepers) {
   const config = parse(readFileSync(srcPath, "utf8"));
   config.build = devBuildConfig(config.build, gk.dir);
   config.vars = config.vars || {};
-  config.vars.BASE_URL = `http://${backendHost}/gatekeeper/${gk.name.slice("gatekeeper-".length)}`;
+  // The folded production path (see gatekeeperBaseUrl): the dev router binds
+  // GATEKEEPER_<SLUG> like the deploy service, so BASE_URL must use the same fold.
+  config.vars.BASE_URL = gatekeeperBaseUrl(gk.name, backendHost);
 
   const shared = SHARED_GATEKEEPER_CREDS[gk.name];
   if (shared && process.env[shared.id] && process.env[shared.secret]) {
@@ -603,7 +603,7 @@ for (const gk of gatekeepers) {
 
   for (const gk of gatekeepers) {
     const binding: ServiceBinding = {
-      binding: bindingName(gk),
+      binding: gatekeeperBindingName(gk.name),
       service: gk.name,
       entrypoint: "GatekeeperVendor",
     };

@@ -21,8 +21,13 @@ import {
 import {
   type ActionDescriptionBuilder, buildDescription, plainInline, type RenderedDescription,
 } from "@gadgets/gatekeeper-kit/action-description";
-import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
-import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import {
+  APPLY_OUTCOME_UNKNOWN_MESSAGE, ActionOutcomeUnknownError,
+} from "@gadgets/gatekeeper-kit/actions";
+import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
+import {
+  clearConnectionSubject, commitReconnect, ConnectionSubject, pinConnectionSubject, stageReconnect,
+} from "@gadgets/gatekeeper-kit/credential-stage";
 import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
 import type {
   Cursor,
@@ -57,6 +62,7 @@ import {
   LinearApiError,
   buildAuthorizeUrl,
   exchangeAuthCode,
+  isLinearOutcomeUnknown,
   refreshAccessToken,
   revokeToken,
   type LinearOAuthGrant,
@@ -461,12 +467,15 @@ export default {
       }
 
       const stub = ctx.exports.UserAccount.get(ctx.exports.UserAccount.idFromString(doId));
-      const handoff = await stub.acceptAuthCode(code, oauthNonce);
-      if (!handoff) {
+      const result = await stub.acceptAuthCode(code, oauthNonce);
+      if (!result) {
         return new Response(INVALID_LINK_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
       }
+      if ("refused" in result) {
+        return htmlResponse(errorPageHtml(result.refused.title, result.refused.detail), 409);
+      }
 
-      return htmlResponse(connectHandoffPageHtml(handoff));
+      return htmlResponse(connectHandoffPageHtml(result.handoff));
     }
 
     return new Response("Not Found", { status: 404 });
@@ -529,6 +538,36 @@ type StoredNonce = {
   reconnect?: true;
 };
 
+/**
+ * The Linear account a connection is pinned to: one user in one workspace. A reconnect that
+ * comes back as anyone else, or into any other workspace, is refused and its grant revoked.
+ * `id` is what the kit's fence compares, the `${userId}:${orgId}` pair; the names are for the
+ * refusal's words.
+ */
+type PinnedSubject = ConnectionSubject & {
+  userId: string;
+  userName: string;
+  orgId: string;
+  orgName: string;
+  orgUrlKey: string;
+};
+
+/** How the callback ended: a handoff for the browser, or a refusal to show it. */
+type CallbackResult = { handoff: ConnectHandoff } | { refused: { title: string; detail: string } };
+
+/** Reads the Linear user and workspace an access token belongs to. */
+async function fetchSubject(accessToken: string): Promise<PinnedSubject> {
+  const { user, organization } = await new LinearApi(async () => accessToken).getViewer();
+  return {
+    id: `${user.id}:${organization.id}`,
+    userId: user.id,
+    userName: user.displayName ?? user.name,
+    orgId: organization.id,
+    orgName: organization.name,
+    orgUrlKey: organization.urlKey,
+  };
+}
+
 export class UserAccount extends DurableObject<Env> {
   async setCallback(callback: Fetcher<GatekeeperConnectCallback>, initiationNonce: string): Promise<void> {
     if (!this.ctx.storage.kv.get<LinearOAuthGrant>("grant")) {
@@ -569,10 +608,11 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   /**
-   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on, or
-   * null when the callback's nonce doesn't match.
+   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on,
+   * null when the callback's nonce doesn't match, or a refusal when the grant came back as a
+   * different Linear user or workspace than the connection is pinned to.
    */
-  async acceptAuthCode(code: string, oauthNonce: string): Promise<ConnectHandoff | null> {
+  async acceptAuthCode(code: string, oauthNonce: string): Promise<CallbackResult | null> {
     const stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
     if (!stored || stored.stage !== "oauth" || Date.now() >= stored.expiresAt ||
         !constantTimeEqual(stored.value, oauthNonce)) {
@@ -596,32 +636,59 @@ export class UserAccount extends DurableObject<Env> {
       redirectUri: `${getBaseUrl(this.env)}/oauth`,
     });
 
+    let subject: PinnedSubject;
+    try {
+      subject = await fetchSubject(grant.accessToken);
+    } catch (error) {
+      // A first connect's unreadable grant leaves tokens nobody owns, so revoke it; a
+      // reconnect's is just dropped, keeping the live grant as it is.
+      if (!stored.reconnect) await this.#revokeGrant(grant);
+      throw new Error("Could not read which Linear account authorized this connection. Please try again.",
+        { cause: error });
+    }
+
     let handoff: ConnectHandoff;
     if (stored.reconnect) {
+      // The connection is pinned to the Linear user and workspace it was made as: a reconnect
+      // that comes back as anyone else, or into any other workspace, is refused and its grant
+      // revoked, rather than silently swapping the account every binding reads.
+      const staged = stageReconnect(this.ctx.storage.kv, grant, subject, Date.now(),
+        (pinned, granted) => ({
+          title: "That's a different Linear account",
+          detail: `This connection is for ${pinned.userName} in the ${pinned.orgName} workspace, but ` +
+            `Linear authorized ${granted.userName} in the ${granted.orgName} workspace. Sign in to ` +
+            `Linear as ${pinned.userName} and reconnect, or connect the other account separately.`,
+        }));
+      if ("refused" in staged) {
+        await this.#revokeGrant(grant);
+        return { refused: staged.refused };
+      }
       // The reconnect URL is a bearer capability, so the new grant is only staged until the Workshop
       // has confirmed the browser that finished the flow is the owner's (see commitReconnect). Bound
       // gadgets keep reading the current token meanwhile.
-      const stageId = stageCredentials(this.ctx.storage.kv, grant, Date.now());
-      handoff = await callback.reconnectComplete(stageId);
+      handoff = await callback.reconnectComplete(staged.stageId);
     } else {
       this.ctx.storage.kv.put<LinearOAuthGrant>("grant", grant);
+      pinConnectionSubject(this.ctx.storage.kv, subject);
       clearCredentialExpiryLatch(this.ctx.storage.kv);
       try {
         const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
         handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
       } catch (err) {
         this.ctx.storage.kv.delete("grant");
+        clearConnectionSubject(this.ctx.storage.kv);
         throw err;
       }
     }
 
     await this.ctx.storage.deleteAlarm();
-    return handoff;
+    return { handoff };
   }
 
-  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
+  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. The kit
+   * re-pins the staged subject, adopting a connection made before the pin existed. */
   async commitReconnect(stageId: string): Promise<void> {
-    const grant = commitStagedCredentials<LinearOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
+    const grant = commitReconnect<LinearOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
     if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
     this.ctx.storage.kv.put<LinearOAuthGrant>("grant", grant);
     clearCredentialExpiryLatch(this.ctx.storage.kv);
@@ -671,18 +738,21 @@ export class UserAccount extends DurableObject<Env> {
 
   async revoke(): Promise<void> {
     const grant = this.ctx.storage.kv.get<LinearOAuthGrant>("grant");
-    if (grant) {
-      try {
-        await revokeToken(grant.accessToken);
-        if (grant.refreshToken) await revokeToken(grant.refreshToken);
-      } catch (err) {
-        logger.error("failed to revoke Linear token", {
-          event: "oauth.token.revoke.failed", error: err,
-        });
-      }
-    }
+    if (grant) await this.#revokeGrant(grant);
     await this.ctx.storage.deleteAlarm();
     await this.ctx.storage.deleteAll();
+  }
+
+  /** Revokes a grant's tokens, best-effort: a token Linear already refuses is not worth failing over. */
+  async #revokeGrant(grant: LinearOAuthGrant): Promise<void> {
+    try {
+      await revokeToken(grant.accessToken);
+      if (grant.refreshToken) await revokeToken(grant.refreshToken);
+    } catch (err) {
+      logger.error("failed to revoke Linear token", {
+        event: "oauth.token.revoke.failed", error: err,
+      });
+    }
   }
 }
 
@@ -924,7 +994,7 @@ export class LinearVerifier extends WorkerEntrypoint<Env, LinearVerifierProps>
 // ---------------------------------------------------------------------------
 // Action records — stored in the gatekeeper DO and applied/reverted on approval.
 
-type ActionStatus = "pending" | "applied";
+type ActionStatus = "pending" | "claimed" | "applied" | "failed";
 
 // A display-level patch merged into a RawIssue when simulating a pending updateIssue action.
 // Captured at submit time (with resolved display objects) so reads need no extra lookups.
@@ -939,20 +1009,21 @@ type IssueOverlayPatch = {
   parent?: RawIssue["parent"];
 };
 
-type StoredAction =
-  | { id: number; status: ActionStatus; kind: "createIssue"; input: IssueCreateInput;
+type StoredAction = { id: number; status: ActionStatus; failure?: string } & (
+  | { kind: "createIssue"; input: IssueCreateInput;
       provisionalId: string; createdIssueId?: string; synthetic: RawIssue; title: string }
-  | { id: number; status: ActionStatus; kind: "updateIssue"; issueRef: string;
+  | { kind: "updateIssue"; issueRef: string;
       input: IssueUpdateInput; previous: IssueUpdateInput; patch: IssueOverlayPatch; title: string }
-  | { id: number; status: ActionStatus; kind: "addLabels"; issueRef: string;
+  | { kind: "addLabels"; issueRef: string;
       labelIds: string[]; labels: RawLabel[]; title: string }
-  | { id: number; status: ActionStatus; kind: "removeLabels"; issueRef: string;
+  | { kind: "removeLabels"; issueRef: string;
       labelIds: string[]; title: string }
-  | { id: number; status: ActionStatus; kind: "postComment"; issueRef: string; body: string;
+  | { kind: "postComment"; issueRef: string; body: string;
       createdCommentId?: string; synthetic: RawComment; title: string }
-  | { id: number; status: ActionStatus; kind: "createLabel"; teamId: string; name: string;
+  | { kind: "createLabel"; teamId: string; name: string;
       color?: string; description?: string; createdLabelId?: string; synthetic: RawLabel; title: string }
-  | { id: number; status: ActionStatus; kind: "archive"; issueRef: string; archived: boolean; title: string };
+  | { kind: "archive"; issueRef: string; archived: boolean; title: string }
+);
 
 // Distributive Omit so the union's variant-specific fields survive; enqueue assigns id + status.
 type StoredActionDraft = StoredAction extends infer T
@@ -963,7 +1034,8 @@ type StoredActionDraft = StoredAction extends infer T
 // supplied is shown in full and the completeness claim is the builder's, never hand-set.
 type ActionDescriptionDraft = { title: string; implementsRevert: boolean } & RenderedDescription;
 
-type LinearGatekeeperImplProps = {
+/** Props the Overseer instantiates the gatekeeper facet with: the account and resource it serves. */
+export type LinearGatekeeperImplProps = {
   userObjectId: string;
   workspaceUrlKey: string;
   resourceKind: "workspace" | "team" | "issue";
@@ -1145,9 +1217,11 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
     } catch (err) {
       // An auto-approval can apply the action mid-flight, which proves the overseer received it --
       // only the reply was lost, and reporting failure would invite a repeated provider write. A
-      // missing record proves nothing: a dependency's rejection cascade deletes it too.
+      // missing record proves nothing: a dependency's rejection cascade deletes it too. Any
+      // non-pending status (applied, or claimed/failed by a racing approval's apply) proves the
+      // same: the overseer holds the id, so leave its record to its own lifecycle.
       const current = this.ctx.storage.kv.get<StoredAction>(`action:${id}`);
-      if (current?.status === "applied") return;
+      if (current && current.status !== "pending") return;
       if (current) {
         // Drop the record so simulated reads don't show an action no approver can resolve.
         this.ctx.storage.kv.delete(`action:${id}`);
@@ -1167,7 +1241,7 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
     if (!this.#pendingActionsCache) {
       this.#pendingActionsCache = [...this.ctx.storage.kv.list<StoredAction>({ prefix: "action:" })]
         .map(([, value]) => value)
-        .filter(a => a.status === "pending")
+        .filter(a => a.status === "pending" || a.status === "claimed")
         .toSorted((a, b) => a.id - b.id);
     }
     return this.#pendingActionsCache;
@@ -1566,73 +1640,114 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
   async applyAction(actionId: number): Promise<void> {
     const action = this.ctx.storage.kv.get<StoredAction>(`action:${actionId}`);
     if (!action) throw new Error(`Unknown action: ${actionId}`);
+    // The Workshop marks its side approved only after this RPC returns, so a replayed apply
+    // (restart, retry, duplicate click) settles here instead of dispatching again.
+    if (action.status === "applied") return;
+    // A terminal failure answers every later attempt with the same message, no Linear call.
+    if (action.status === "failed") throw new Error(action.failure ?? "This action previously failed.");
+    // A claim left behind means a previous dispatch's outcome is unknown: the call may have
+    // reached Linear. Record it terminally and surface it — never silently re-run a write.
+    if (action.status === "claimed") throw this.#failUnknownOutcome(action);
 
-    await this.#run(async api => {
-      switch (action.kind) {
-        case "createIssue": {
-          // A parent that was itself a pending create may now be real — resolve its provisional id.
-          if (action.input.parentId) action.input.parentId = this.resolveIssueRef(action.input.parentId);
-          // Resolve any provisional `~label:` ids (labels created earlier in the batch).
-          if (action.input.labelIds) action.input.labelIds = action.input.labelIds.map(id => this.#requireLabelId(id));
-          const issue = await api.createIssue(action.input);
-          action.createdIssueId = issue.id;
-          this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, action);
-          this.ctx.storage.kv.put<string>(`provisional:${action.provisionalId}`, issue.id);
-          break;
+    // Claim before the first Linear call: the record durably says a dispatch began, so an
+    // interrupted apply can never be mistaken for never-run. The claim is written onto the same
+    // object the dispatch's own mid-flight puts reuse, so those carry it too.
+    action.status = "claimed";
+    this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, action);
+    this.#invalidatePendingActions();
+    try {
+      await this.#run(async api => {
+        switch (action.kind) {
+          case "createIssue": {
+            // A parent that was itself a pending create may now be real — resolve its provisional id.
+            if (action.input.parentId) action.input.parentId = this.resolveIssueRef(action.input.parentId);
+            // Resolve any provisional `~label:` ids (labels created earlier in the batch).
+            if (action.input.labelIds) action.input.labelIds = action.input.labelIds.map(id => this.#requireLabelId(id));
+            const issue = await api.createIssue(action.input);
+            action.createdIssueId = issue.id;
+            this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, action);
+            this.ctx.storage.kv.put<string>(`provisional:${action.provisionalId}`, issue.id);
+            break;
+          }
+          case "updateIssue": {
+            // Resolve a provisional parent id (set via setParent against a pending-created issue).
+            if (action.input.parentId) action.input.parentId = this.resolveIssueRef(action.input.parentId);
+            await api.updateIssue(this.resolveIssueRef(action.issueRef), action.input);
+            break;
+          }
+          case "addLabels": {
+            const issue = await api.getIssue(this.resolveIssueRef(action.issueRef));
+            if (!issue) break;
+            // Resolve any provisional `~label:` ids to the real labels their create actions produced.
+            const add = action.labelIds.map(id => this.#requireLabelId(id));
+            const current = (issue.labels?.nodes ?? []).map(l => l.id);
+            await api.updateIssue(issue.id, { labelIds: [...new Set([...current, ...add])] });
+            break;
+          }
+          case "removeLabels": {
+            const issue = await api.getIssue(this.resolveIssueRef(action.issueRef));
+            if (!issue) break;
+            // Skip unresolved provisional labels: they were never really attached, so nothing to remove.
+            const remove = new Set(action.labelIds.map(id => this.#resolveLabelId(id)).filter((id): id is string => !!id));
+            const next = (issue.labels?.nodes ?? []).map(l => l.id).filter(id => !remove.has(id));
+            await api.updateIssue(issue.id, { labelIds: next });
+            break;
+          }
+          case "postComment": {
+            const comment = await api.createComment(this.resolveIssueRef(action.issueRef), action.body);
+            action.createdCommentId = comment.id;
+            this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, action);
+            break;
+          }
+          case "createLabel": {
+            const label = await api.createLabel({
+              teamId: action.teamId, name: action.name, color: action.color, description: action.description,
+            });
+            action.createdLabelId = label.id;
+            this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, action);
+            // Map the provisional label id to the real one, so dependent addLabels can resolve it.
+            this.ctx.storage.kv.put<string>(`provisionalLabel:${action.synthetic.id}`, label.id);
+            // The team's real label set changed; drop the cache so the new label shows promptly.
+            this.ctx.storage.kv.delete(`cache:labels:${action.teamId}`);
+            break;
+          }
+          case "archive":
+            await api.setIssueArchived(this.resolveIssueRef(action.issueRef), action.archived);
+            break;
         }
-        case "updateIssue": {
-          // Resolve a provisional parent id (set via setParent against a pending-created issue).
-          if (action.input.parentId) action.input.parentId = this.resolveIssueRef(action.input.parentId);
-          await api.updateIssue(this.resolveIssueRef(action.issueRef), action.input);
-          break;
-        }
-        case "addLabels": {
-          const issue = await api.getIssue(this.resolveIssueRef(action.issueRef));
-          if (!issue) break;
-          // Resolve any provisional `~label:` ids to the real labels their create actions produced.
-          const add = action.labelIds.map(id => this.#requireLabelId(id));
-          const current = (issue.labels?.nodes ?? []).map(l => l.id);
-          await api.updateIssue(issue.id, { labelIds: [...new Set([...current, ...add])] });
-          break;
-        }
-        case "removeLabels": {
-          const issue = await api.getIssue(this.resolveIssueRef(action.issueRef));
-          if (!issue) break;
-          // Skip unresolved provisional labels: they were never really attached, so nothing to remove.
-          const remove = new Set(action.labelIds.map(id => this.#resolveLabelId(id)).filter((id): id is string => !!id));
-          const next = (issue.labels?.nodes ?? []).map(l => l.id).filter(id => !remove.has(id));
-          await api.updateIssue(issue.id, { labelIds: next });
-          break;
-        }
-        case "postComment": {
-          const comment = await api.createComment(this.resolveIssueRef(action.issueRef), action.body);
-          action.createdCommentId = comment.id;
-          this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, action);
-          break;
-        }
-        case "createLabel": {
-          const label = await api.createLabel({
-            teamId: action.teamId, name: action.name, color: action.color, description: action.description,
-          });
-          action.createdLabelId = label.id;
-          this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, action);
-          // Map the provisional label id to the real one, so dependent addLabels can resolve it.
-          this.ctx.storage.kv.put<string>(`provisionalLabel:${action.synthetic.id}`, label.id);
-          // The team's real label set changed; drop the cache so the new label shows promptly.
-          this.ctx.storage.kv.delete(`cache:labels:${action.teamId}`);
-          break;
-        }
-        case "archive":
-          await api.setIssueArchived(this.resolveIssueRef(action.issueRef), action.archived);
-          break;
+      });
+    } catch (error) {
+      if (isLinearOutcomeUnknown(error)) {
+        // No definitive answer arrived, so the write may have landed. Record the action terminally
+        // with the reason and surface it; a rejection clears the record after the user checks.
+        const message = `${APPLY_OUTCOME_UNKNOWN_MESSAGE} (${error instanceof Error ? error.message : String(error)})`;
+        this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, { ...action, status: "failed", failure: message });
+        this.#invalidatePendingActions();
+        throw new ActionOutcomeUnknownError(message);
       }
-    });
+      // Linear answered with a refusal (or the failure is internal): the write did not land, so
+      // the record goes back to pending and the failure stays retryable, as before.
+      this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, { ...action, status: "pending" });
+      this.#invalidatePendingActions();
+      throw error;
+    }
 
     // Mark applied and keep the record (so revert can find it). The change is now real, so the
-    // simulation overlay (which only considers "pending" actions) stops applying it.
+    // simulation overlay (which considers pending and claimed actions) stops applying it.
     action.status = "applied";
     this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, action);
     this.#invalidatePendingActions();
+  }
+
+  /**
+   * Records that the outcome of a dispatched action cannot be known, and returns the error that
+   * surfaces it. Terminal: only a rejection clears the record.
+   */
+  #failUnknownOutcome(action: StoredAction): ActionOutcomeUnknownError {
+    this.ctx.storage.kv.put<StoredAction>(
+      `action:${action.id}`, { ...action, status: "failed", failure: APPLY_OUTCOME_UNKNOWN_MESSAGE });
+    this.#invalidatePendingActions();
+    return new ActionOutcomeUnknownError(APPLY_OUTCOME_UNKNOWN_MESSAGE);
   }
 
   // Recursively drop every pending action that depends on a rejected provisional issue: edits and
@@ -1654,9 +1769,22 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
 
   async rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
     const action = this.ctx.storage.kv.get<StoredAction>(`action:${actionId}`);
+    if (!action) return;
+    // Undoing an applied action is `revertAction`'s job; a stray reject must not report an
+    // effect that landed as discarded.
+    if (action.status === "applied") throw new Error(`Linear action ${actionId} is no longer pending.`);
+    // A claim left behind means a dispatched write whose outcome is unknown: settle it terminally
+    // and say so, never silently discard a write that may have reached Linear.
+    if (action.status === "claimed") throw this.#failUnknownOutcome(action);
+    // Rejecting a terminal failure is the user clearing the settled record: its write already
+    // concluded, so there is nothing to cascade and nothing to restart.
+    if (action.status === "failed") {
+      this.ctx.storage.kv.delete(`action:${actionId}`);
+      this.#invalidatePendingActions();
+      return;
+    }
     this.ctx.storage.kv.delete(`action:${actionId}`);
     this.#invalidatePendingActions();
-    if (!action) return;
 
     // Rejecting a create invalidates every action queued against its provisional id, which can
     // never be applied. Drop them all and ask the Overseer to restart the gadget.

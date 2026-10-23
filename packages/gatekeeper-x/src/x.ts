@@ -39,7 +39,10 @@ import {
   type RejectionVerdict,
 } from "@gadgets/gatekeeper-kit/credentials";
 import { notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
-import { commitStagedCredentials, discardStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import {
+  clearConnectionSubject, commitReconnect, ConnectionSubject, discardStagedCredentials,
+  pinConnectionSubject, stageReconnect,
+} from "@gadgets/gatekeeper-kit/credential-stage";
 import { probeAccess } from "@gadgets/gatekeeper-kit/http-errors";
 import {
   OAuthClient,
@@ -121,8 +124,15 @@ type ConnectAttempt = {
   scopes: string[];
 };
 
-/** A reconnect's grant, staged until the Workshop confirms the browser that finished it. */
+/**
+ * A reconnect's grant, staged until the Workshop confirms the browser that finished it. The
+ * `identity` is the account's cache record, written live at commit; the reconnect fence's subject
+ * travels in the stage's kit-owned subject slot.
+ */
 type ReconnectStage = { grant: XGrant; identity: StoredIdentity; startedUnder: string };
+
+/** What the kit's reconnect fence compares, and the username its refusal names. */
+type XSubject = ConnectionSubject & { username: string };
 
 /** How the callback ended: a handoff for the browser, or a refusal to show it. */
 type CallbackResult = { handoff: ConnectHandoff } | { refused: { title: string; detail: string } };
@@ -403,25 +413,27 @@ export class UserAccount extends DurableObject<Env> {
 
     let handoff: ConnectHandoff;
     if (!attempt.firstConnect) {
-      const pinned = kv.get<StoredIdentity>("identity");
-      if (pinned !== undefined && pinned.id !== identity.id) {
+      // The connection is pinned to the X user it was made as: a reconnect that comes back as
+      // anyone else is refused and its grant revoked, since it provably cannot share an
+      // authorization with the live one.
+      const staged = stageReconnect<ReconnectStage, XSubject>(kv,
+        { grant, identity, startedUnder: attempt.startedUnder },
+        { id: identity.id, username: identity.username }, Date.now(),
+        (pinned, granted) => ({
+          title: "That's a different X account",
+          detail: `This connection is for @${pinned.username}, but X authorized @${granted.username}. ` +
+            `Sign in to X as @${pinned.username} and reconnect, or connect @${granted.username} ` +
+            "as a separate account.",
+        }));
+      if ("refused" in staged) {
         await this.#revokeGrant(grant);
-        return {
-          refused: {
-            title: "That's a different X account",
-            detail: `This connection is for @${pinned.username}, but X authorized @${identity.username}. ` +
-              `Sign in to X as @${pinned.username} and reconnect, or connect @${identity.username} ` +
-              "as a separate account.",
-          },
-        };
+        return { refused: staged.refused };
       }
       // The reconnect URL is a bearer capability, so the new grant is only staged until the
-      // Workshop has confirmed the browser that finished the flow is the owner's. A stage this
-      // one displaces is the same user's, so it is dropped unrevoked.
-      discardStagedCredentials<ReconnectStage>(kv);
-      const stageId = stageCredentials<ReconnectStage>(kv,
-        { grant, identity, startedUnder: attempt.startedUnder }, Date.now());
-      handoff = await callback.reconnectComplete(stageId);
+      // Workshop has confirmed the browser that finished the flow is the owner's. A stage it
+      // displaces is the same user's, so it is dropped unrevoked: X does not say whether revoking
+      // one of the user's refresh tokens revokes the rest, and the rest include the live one.
+      handoff = await callback.reconnectComplete(staged.stageId);
     } else {
       try {
         this.#creds.connect(grant, { ifGeneration: attempt.startedUnder });
@@ -431,7 +443,7 @@ export class UserAccount extends DurableObject<Env> {
         throw new Error("The X account was disconnected while it was being authorized. Connect it again.",
           { cause: error });
       }
-      kv.put<StoredIdentity>("identity", identity);
+      pinConnectionSubject<XSubject>(kv, { id: identity.id, username: identity.username });
       try {
         const props = { userObjectId: this.ctx.id.toString() };
         handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
@@ -439,7 +451,7 @@ export class UserAccount extends DurableObject<Env> {
         // A connection the Workshop never took leaves its tokens with nobody: revoke them.
         const abandoned = this.#creds.stored() ?? grant;
         this.#creds.clear();
-        kv.delete("identity");
+        clearConnectionSubject(kv);
         await this.#revokeGrant(abandoned);
         throw error;
       }
@@ -450,10 +462,11 @@ export class UserAccount extends DurableObject<Env> {
 
   /**
    * Makes the grant staged under `stageId` live. One a newer reconnect overtook is discarded, and
-   * the connection stays pinned to the identity it was made with.
+   * the kit keeps the connection pinned: re-pinning the staged subject follows a rename and never
+   * moves an established pin.
    */
   async commitReconnect(stageId: string): Promise<void> {
-    const staged = commitStagedCredentials<ReconnectStage>(this.ctx.storage.kv, Date.now(), stageId);
+    const staged = commitReconnect<ReconnectStage>(this.ctx.storage.kv, Date.now(), stageId);
     if (!staged) throw new Error("No reconnect is awaiting confirmation. Please try again.");
     try {
       this.#creds.connect(staged.grant, { ifGeneration: staged.startedUnder });

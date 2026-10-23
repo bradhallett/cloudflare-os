@@ -18,7 +18,9 @@ import {
   type VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
-import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import {
+  clearConnectionSubject, commitReconnect, ConnectionSubject, pinConnectionSubject, stageReconnect,
+} from "@gadgets/gatekeeper-kit/credential-stage";
 import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
 import { readTextCapped } from "@gadgets/gatekeeper-kit/response-body";
 import INSTANCE_CONFIGURATOR_HTML from "./generated/instance-configurator-ui.txt";
@@ -51,6 +53,7 @@ import {
   fetchDashboardConfig,
   resolveTargets,
 } from "./approvals";
+import { HomeAssistantActionStore } from "./action-store";
 import {
   indexPendingByEntity,
   overlayDashboardConfig,
@@ -414,6 +417,15 @@ type CompleteConnectionResult =
   | { kind: "invalid_nonce" }
   | { kind: "error"; message: string };
 
+/**
+ * The subject credentials pin the connection to: the Home Assistant instance itself, spelled by
+ * its normalized base URL. Long-lived access tokens carry no user identity the API will report
+ * back, so the instance is the only provable subject — a token for the SAME instance under a
+ * DIFFERENT user passes the fence below, and that swap is undetectable here (it is only prevented
+ * by the instance's own token discipline, not by this Gatekeeper).
+ */
+type HomeAssistantSubject = ConnectionSubject;
+
 export class UserAccount extends DurableObject<Env> {
   async setCallback(callback: Fetcher<GatekeeperConnectCallback>, nonce: string): Promise<void> {
     if (!this.ctx.storage.kv.get<StoredCredentials>("credentials")) {
@@ -473,8 +485,9 @@ export class UserAccount extends DurableObject<Env> {
       return { kind: "error", message: msg };
     }
 
-    // Consume the nonce now that we've validated.
-    this.ctx.storage.kv.delete("nonce");
+    // Consume the nonce now that we've validated — except a reconnect, whose submission may still
+    // be refused below; that path releases its claim instead so the owner can resubmit.
+    if (!stored.reconnect) this.ctx.storage.kv.delete("nonce");
 
     const callback = this.ctx.storage.kv.get<Fetcher<GatekeeperConnectCallback>>("callback");
     if (!callback) {
@@ -486,23 +499,42 @@ export class UserAccount extends DurableObject<Env> {
     if (stored.reconnect) {
       // The reconnect URL is a bearer capability, so the new credentials are only staged until the
       // Workshop has confirmed the browser that finished the flow is the owner's (see
-      // commitReconnect). Bound gadgets keep reading the current token meanwhile.
-      const stageId = stageCredentials<StoredCredentials>(
-          this.ctx.storage.kv, { baseUrl, token }, Date.now());
+      // commitReconnect). Bound gadgets keep reading the current token meanwhile. The connection
+      // is pinned to its instance, so credentials for a different instance are refused outright —
+      // nothing is staged — and the claim on the nonce is released so the owner can resubmit the
+      // pinned instance's token. (A same-instance user-swap cannot be detected; see
+      // HomeAssistantSubject.)
+      const subject: HomeAssistantSubject = { id: baseUrl };
+      const staged = stageReconnect<StoredCredentials, HomeAssistantSubject>(
+        this.ctx.storage.kv, { baseUrl, token }, subject, Date.now(),
+        (pinned, submitted) => ({
+          title: "That's a different Home Assistant instance",
+          detail: "This connection is for the Home Assistant instance at " + pinned.id +
+            ", but you submitted credentials for " + submitted.id + ". Reconnect with a token " +
+            "for " + pinned.id + ", or connect " + submitted.id + " as a separate account.",
+        }));
+      if ("refused" in staged) {
+        this.#releaseNonceClaim(nonce);
+        return { kind: "error", message: staged.refused.detail };
+      }
+      // Accepted: the nonce is spent.
+      this.ctx.storage.kv.delete("nonce");
       try {
-        handoff = await callback.reconnectComplete(stageId);
-      } catch (e: any) {
-        return { kind: "error", message: `Failed to notify workshop: ${e?.message ?? e}` };
+        handoff = await callback.reconnectComplete(staged.stageId);
+      } catch (e) {
+        return { kind: "error", message: `Failed to notify workshop: ${e instanceof Error ? e.message : e}` };
       }
     } else {
       this.ctx.storage.kv.put<StoredCredentials>("credentials", { baseUrl, token });
+      pinConnectionSubject(this.ctx.storage.kv, { id: baseUrl });
       clearCredentialExpiryLatch(this.ctx.storage.kv);
       try {
         const props: HomeAssistantUserImplProps = { userObjectId: this.ctx.id.toString() };
         handoff = await callback.complete(this.ctx.exports.HomeAssistantUserImpl({ props }));
-      } catch (e: any) {
+      } catch (e) {
         this.ctx.storage.kv.delete("credentials");
-        return { kind: "error", message: `Failed to notify workshop: ${e?.message ?? e}` };
+        clearConnectionSubject(this.ctx.storage.kv);
+        return { kind: "error", message: `Failed to notify workshop: ${e instanceof Error ? e.message : e}` };
       }
     }
 
@@ -519,9 +551,11 @@ export class UserAccount extends DurableObject<Env> {
     this.ctx.storage.kv.put<StoredNonce>("nonce", released);
   }
 
-  /** Makes the credentials staged under `stageId` live; see GatekeeperUser.commitReconnect. */
+  /** Makes the credentials staged under `stageId` live; see GatekeeperUser.commitReconnect. The
+   * kit's commit is fenced on the connection's pinned subject and re-pins the staged subject, so
+   * an account made before the pin existed adopts its first reconnect's instance. */
   async commitReconnect(stageId: string): Promise<void> {
-    const creds = commitStagedCredentials<StoredCredentials>(this.ctx.storage.kv, Date.now(), stageId);
+    const creds = commitReconnect<StoredCredentials>(this.ctx.storage.kv, Date.now(), stageId);
     if (!creds) throw new Error("No reconnect is awaiting confirmation. Please try again.");
     this.ctx.storage.kv.put<StoredCredentials>("credentials", creds);
     clearCredentialExpiryLatch(this.ctx.storage.kv);
@@ -1059,29 +1093,20 @@ export type HomeAssistantRevertInfo =
     }
   | { type: "noRevert" };
 
-// Internal storage row for pending (submitted but not yet applied) actions.
-type PendingActionRow = {
-  id: number;
-  action: HomeAssistantAction;
-  submittedAt: number;
-};
-
-// Internal storage row for actions that have been applied. Retained so that revertAction() can
-// look up the information needed to undo the action. The overseer only passes back the action ID,
-// so all revert information lives here in DO storage rather than being round-tripped through the
-// overseer.
-type AppliedActionRow = {
-  id: number;
-  action: HomeAssistantAction;
-  revertInfo: HomeAssistantRevertInfo;
-  appliedAt: number;
-};
-
 @validateRpc()
 export class HomeAssistantGatekeeperImpl
   extends DurableObject<Env, HomeAssistantGatekeeperImplProps>
   implements Gatekeeper<HomeAssistantSession | Area | Label | Device | Entity>
 {
+  // Claim-before-apply lifecycle for device actions, over this object's storage. Credentials are
+  // resolved per dispatch, so a reconnect between approval and apply is picked up.
+  readonly #actions = new HomeAssistantActionStore({
+    kv: this.ctx.storage.kv,
+    dispatch: async action => executeAction(action, await this.#getCreds()),
+    snapshotForRevert: async action => this.#snapshotForRevert(action, await this.#getCreds()),
+    onAuthError: () => this.#userAccount().noteCredentialsExpired(),
+  });
+
   #userAccount() {
     const id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
     return this.ctx.exports.UserAccount.get(id);
@@ -1189,41 +1214,13 @@ export class HomeAssistantGatekeeperImpl
   }
 
   async applyAction(actionId: number): Promise<void> {
-    // The overseer only knows the numeric action ID; the full action lives in DO storage.
-    const pending = this.#getPending(actionId);
-    if (!pending) {
-      throw new Error(`No queued Home Assistant action exists with id ${actionId}.`);
-    }
-    const action = pending.action;
-    const creds = await this.#getCreds();
-
-    let revertInfo: HomeAssistantRevertInfo;
-    try {
-      revertInfo = await this.#snapshotForRevert(action, creds);
-    } catch {
-      // If we can't snapshot, proceed without revert.
-      revertInfo = { type: "noRevert" };
-    }
-
-    try {
-      await executeAction(action, creds);
-    } catch (e) {
-      if (e instanceof HomeAssistantError && e.isAuthError) {
-        await this.#userAccount().noteCredentialsExpired();
-      }
-      throw e;
-    }
-
-    // Action succeeded: move the row from "pending" to "applied", storing the revert info so a
-    // later revertAction() can find it (the overseer passes back only the action ID).
-    this.#storeApplied(action, revertInfo);
-    this.#deletePending(actionId);
+    // The overseer only knows the numeric action ID; the full action and its claim-before-apply
+    // lifecycle live in DO storage, via HomeAssistantActionStore.
+    await this.#actions.apply(actionId);
   }
 
   async rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
-    this.#deletePending(actionId);
-    // No simulation state to clean up yet; once Phase 2 (caching/simulation) lands this may
-    // need to invalidate overlays. For now, rejection is a no-op apart from clearing storage.
+    return await this.#actions.reject(actionId);
   }
 
   async revertAction(
@@ -1232,7 +1229,7 @@ export class HomeAssistantGatekeeperImpl
     // The overseer passes back only the action ID; we stored everything we need (including the
     // original action, inside `stateSnapshot.originalAction` / `dashboardSnapshot`) under
     // `applied:<id>` when the action was applied.
-    const applied = this.#getApplied(actionId);
+    const applied = this.#actions.getApplied(actionId);
     if (!applied) {
       throw new Error(`No applied Home Assistant action exists with id ${actionId}.`);
     }
@@ -1327,10 +1324,7 @@ export class HomeAssistantGatekeeperImpl
         // (rather than ending up in the approval queue or hitting Home Assistant later).
         validateWriteBody(body);
 
-        const id = self.#nextActionId();
-        const action = { ...body, id } as HomeAssistantAction;
-        const row: PendingActionRow = { id, action, submittedAt: Date.now() };
-        self.ctx.storage.kv.put<PendingActionRow>(`pending:${id}`, row);
+        const action = self.#actions.allocate(body);
 
         let description;
         try {
@@ -1350,22 +1344,23 @@ export class HomeAssistantGatekeeperImpl
         }
 
         try {
-          await approvalQueue.submitAction(id, description);
+          await approvalQueue.submitAction(action.id, description);
         } catch (e) {
-          // The submit failed (e.g., the approval queue stub is gone). Drop the pending row.
-          self.#deletePending(id);
+          // The submit failed (e.g., the approval queue stub is gone). Roll the staged record back.
+          self.#actions.rollbackSubmission(action.id);
           throw e;
         }
+        self.#actions.markSubmitted(action.id);
       },
       async registrySnapshot() {
         return await fetchRegistrySnapshot(creds);
       },
       listPendingActions() {
-        return self.#listPendingActions();
+        return self.#actions.pendingActions();
       },
       async registrySnapshotWithOverlay() {
         const snapshot = await fetchRegistrySnapshot(creds);
-        const pending = self.#listPendingActions();
+        const pending = self.#actions.pendingActions();
         if (pending.length === 0) {
           return { snapshot, appliedCount: 0 };
         }
@@ -1409,49 +1404,6 @@ export class HomeAssistantGatekeeperImpl
     return ctx;
   }
 
-  /** List currently-pending actions, in chronological order. Reads from DO storage's KV
-   * `pending:*` rows. */
-  #listPendingActions(): HomeAssistantAction[] {
-    const rows = [...this.ctx.storage.kv.list<PendingActionRow>({ prefix: "pending:" })];
-    return rows
-      .map(([_, row]) => row.action)
-      .toSorted((a, b) => a.id - b.id);
-  }
-
-  // Action storage (KV layout):
-  //   counter:nextActionId  → number
-  //   pending:<id>          → PendingActionRow  (submitted, awaiting approval)
-  //   applied:<id>          → AppliedActionRow  (approved + applied; retains revert info)
-
-  #nextActionId(): number {
-    const v = (this.ctx.storage.kv.get<number>("counter:nextActionId") ?? 0) + 1;
-    this.ctx.storage.kv.put("counter:nextActionId", v);
-    return v;
-  }
-
-  #getPending(id: number): PendingActionRow | undefined {
-    return this.ctx.storage.kv.get<PendingActionRow>(`pending:${id}`);
-  }
-
-  #deletePending(id: number): void {
-    this.ctx.storage.kv.delete(`pending:${id}`);
-  }
-
-  /** Record an applied action along with the info needed to revert it later. Keyed by the
-   * action's numeric ID so revertAction() can look it up (the overseer passes back only the ID). */
-  #storeApplied(action: HomeAssistantAction, revertInfo: HomeAssistantRevertInfo): void {
-    const row: AppliedActionRow = {
-      id: action.id,
-      action,
-      revertInfo,
-      appliedAt: Date.now(),
-    };
-    this.ctx.storage.kv.put<AppliedActionRow>(`applied:${action.id}`, row);
-  }
-
-  #getApplied(id: number): AppliedActionRow | undefined {
-    return this.ctx.storage.kv.get<AppliedActionRow>(`applied:${id}`);
-  }
 
   async #snapshotForRevert(
     action: HomeAssistantAction,
@@ -1556,9 +1508,11 @@ interface SessionContext {
   registrySnapshotWithOverlay(): Promise<{ snapshot: RegistrySnapshot; appliedCount: number }>;
 }
 
-// The fields of a HomeAssistantAction that the caller fills in (everything except `id`, which
-// the gatekeeper assigns).
-type SubmitWriteBody =
+/**
+ * The fields of a HomeAssistantAction that the caller fills in (everything except `id`, which
+ * the gatekeeper assigns). Exported for the action store, which stamps the id in.
+ */
+export type SubmitWriteBody =
   | Omit<HomeAssistantAction & { type: "callService" }, "id">
   | Omit<HomeAssistantAction & { type: "fireEvent" }, "id">
   | Omit<HomeAssistantAction & { type: "saveDashboard" }, "id">;

@@ -567,6 +567,20 @@ provided by a pending or claimed action: once its provider was rejected or faile
 would fail retryably, and an auto-approvable one would stall the drain behind it. A provider
 decided while the dependent was being delivered fails it instead, as the cascade would have.
 
+### A dispatch that can lose its reply is marked before it goes out
+
+`ActionOutcomeUnknownError` is the end of the outcome-unknown protocol, not the whole of it: it
+records a dispatch that can no longer be reconciled. A dispatch that can be — the provider's
+records can say what became of it — is marked first and looked for on the next apply, so a
+re-delivered apply never repeats a non-idempotent write blind, and the action is refused rejection
+while any dispatch is unreported (rejecting would discard the only warning that the provider may
+already have changed). `./outcome-unknown` owns that state: `AttemptJournal` for the markers
+(keyed by action and step, surviving the crash between dispatch and reconciliation), and
+`desiredStateReached` for a write whose provider state settles it without a marker — a
+compare-and-swap'd push or a merge bound to a head, whose refusal answers "already at the approved
+state" exactly when the earlier dispatch landed. The provider look that reconciles a marker, and
+every refusal's wording, stay in the gatekeeper.
+
 ### Describe with `buildDescription`
 
 Write `describe` with `buildDescription` from `@gadgets/gatekeeper-kit/action-description`. The
@@ -812,12 +826,12 @@ Every other failure has an unknown outcome. The gate releases in-memory bookkeep
 durable fences because a lost reply may have left an observation record. A tracked-collection marker is
 reclaimed only after every read that disclosed the collection was refused. One unknown result retains it.
 
-The Workshop overseer does not yet add this code: both pre-recording refusal paths — owner-only
-observations in shared workspaces, and collaborator exclusions — still throw plain errors. Until a
-kernel change marks them, every failure takes the fail-closed unknown-outcome path above, and
-`discard()` never runs. For a `withholdFromObservers` read that is not merely a retained marker:
-`abandon` latches the binding unshareable for good, so a refused owner-only read costs the
-workspace its sharing until the kernel distinguishes the two.
+The Workshop overseer marks its refusals with this code: `authorizeObservation` throws it from
+`createObservationRefusedError()` (in `@gadgets/workshop-shared/gatekeeper`) for every pre-recording
+refusal — owner-only observations in shared workspaces and collaborator exclusions alike — so
+`discard()` runs on them and a refused owner-only read no longer costs the workspace its sharing.
+A refusal from an overseer deployment older than the mark reads as an unknown outcome, which keeps
+the fail-closed direction above.
 
 ## Bounds
 
@@ -832,7 +846,7 @@ The kit supplies defaults where they apply across consumers:
 | `maxTrackedCollections` | 1000 |
 | `maxObservers` | 10 |
 | `remotePageSize` | 100 |
-| cursor `maxProviderPagesPerCall` | 10 |
+| cursor `maxProviderPagesPerCall` | 2 |
 | `OAuthClient` `timeoutMs` | 30 000 ms |
 | `OAuthClient` `maxResponseBytes` | 64 KiB |
 
@@ -846,9 +860,11 @@ bounds the distinct collections this binding has *ever* disclosed, including mar
 left behind, so size it from the whole resource rather than one page — a per-page value starts
 refusing valid reads once later pages reveal new collections. `maxObservers` must account for the Workers
 subrequest ceiling because every observer costs a verifier call on each read. `remotePageSize`
-cannot exceed the provider's page cap. Lower `maxProviderPagesPerCall` for a provider that bills
-each row it returns: a filter that drops whole pages otherwise pays for up to ten per `next()`, and
-`1` with a `pageSize` no provider page exceeds makes each `next()` one provider request.
+cannot exceed the provider's page cap. The `maxProviderPagesPerCall` default of 2 keeps one
+`next()` from reading far past the page it returns before authorizing that page; raise it,
+explicitly, only for a provider whose rows are cheap and whose pages mostly drop out of the walk.
+Lower it for a provider that bills each row it returns: `1` with a `pageSize` no provider page
+exceeds makes each `next()` one provider request.
 
 ## Git
 

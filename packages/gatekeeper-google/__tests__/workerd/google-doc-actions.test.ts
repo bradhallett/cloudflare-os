@@ -2023,7 +2023,7 @@ const CREATED_DOC_URL = "https://docs.google.com/document/d/doc-1/edit";
 
 /** The bearer token the test worker's `UserAccount` named `userName` hands out. */
 function tokenOf(userName: string): string {
-  return `Bearer test-access-token:${env.USER_ACCOUNT.idFromName(userName)}`;
+  return `Bearer test-access-token:${env.UserAccount.idFromName(userName)}`;
 }
 
 describe("creating a Google Doc", () => {

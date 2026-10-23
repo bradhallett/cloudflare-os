@@ -13,6 +13,7 @@ import CodeDiffEditor from './CodeDiffEditor'
 import type {
   ChatCodeChanges, ChatLiveChangeRows, ChatLiveEditPreviews, EditPreviewEvent,
 } from '../../ChatInterface'
+import { fileKey, RemoteFileListeners } from './remoteFileListeners'
 import { ChatOtClient, type ChatContentReader, type RemoteFileEvent } from './otClient'
 import { commitFileStore, type CommitFileReader } from './commitFileStore'
 import { useChangedPaths, useCommitTree, useFilesAtCommit } from './useCommitContent'
@@ -183,10 +184,8 @@ type PendingPreview = {
   text: string
 }
 
-// Preview maps are keyed like the per-file listener map (see fileListenersRef).
-function fileKey(gadgetId: WorkpieceId, path: string): string {
-  return `${gadgetId}\u0000${path}`
-}
+// Preview maps are keyed like the remote-delta listener map (see remoteFileListeners.ts, whose
+// fileKey is the one definition of the scheme).
 
 function splitFileKey(key: string): [WorkpieceId, string] {
   const sep = key.indexOf('\u0000')
@@ -276,8 +275,18 @@ export default function WorkpieceCodeInterface({
   // Unacknowledged local edits are stuck behind a failing submission ("connection issue").
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false)
 
-  // Per-open-file remote-delta listeners, keyed by `${gadgetId}\u0000${path}` (see EditSession).
-  const fileListenersRef = useRef(new Map<string, Set<(change: FileChange) => void>>())
+  // Per-open-file remote-delta listeners (see EditSession and remoteFileListeners.ts).
+  const remoteListenersRef = useRef(new RemoteFileListeners())
+
+  // A wholesale editor reload: every open editor re-keys its EditSession (see `activeSession`)
+  // and rebuilds its document from the client. Retiring the remote listeners in the same
+  // synchronous step is what makes the reload race-safe -- the client's drain can deliver
+  // per-file deltas in the very same tick as the coarse reset that caused it, and those must
+  // not patch the sessions being torn down (see RemoteFileListeners).
+  const reloadEditors = useCallback(() => {
+    remoteListenersRef.current.retire()
+    setResetToken(token => token + 1)
+  }, [])
 
   // Streaming edit-preview state (see the module comment above PreviewOverlay): the call whose
   // content is streaming, its display overlay once attached, finished previews awaiting their
@@ -298,8 +307,7 @@ export default function WorkpieceCodeInterface({
 
   const dispatchFileChange = useCallback(
     (gadgetId: WorkpieceId, path: string, change: FileChange) => {
-      fileListenersRef.current.get(fileKey(gadgetId, path))
-        ?.forEach(listener => listener(change))
+      remoteListenersRef.current.dispatch(gadgetId, path, change)
     }, [])
 
   const contentBumpPendingRef = useRef(false)
@@ -344,7 +352,7 @@ export default function WorkpieceCodeInterface({
           activeOverlayRef.current = null
           pendingPreviewsRef.current.clear()
           deferredPreviewsRef.current.length = 0
-          setResetToken(token => token + 1)
+          reloadEditors()
         } else {
           for (const event of events) {
             const key = fileKey(event.gadgetId, event.path)
@@ -836,7 +844,7 @@ export default function WorkpieceCodeInterface({
   useEffect(() => {
     if (!clientReady) return
     if (!client!.hasGadget(workpieceId) && prevUnpinnedBaseRef.current !== acceptedCommit) {
-      setResetToken(token => token + 1)
+      reloadEditors()
     }
     prevUnpinnedBaseRef.current = acceptedCommit
   }, [client, clientReady, acceptedCommit, workpieceId])
@@ -1180,21 +1188,10 @@ export default function WorkpieceCodeInterface({
           // the client rather than corrupting the chat.
           console.error('Local edit did not fit chat content; reloading editor:', err)
           reportIssue('code-view.local-edit', err, { handled: true })
-          setResetToken(token => token + 1)
+          reloadEditors()
         }
       },
-      subscribeRemote: (listener: (change: FileChange) => void) => {
-        let listeners = fileListenersRef.current.get(listenerKey)
-        if (!listeners) {
-          listeners = new Set()
-          fileListenersRef.current.set(listenerKey, listeners)
-        }
-        listeners.add(listener)
-        return () => {
-          listeners.delete(listener)
-          if (listeners.size === 0) fileListenersRef.current.delete(listenerKey)
-        }
-      },
+      subscribeRemote: listener => remoteListenersRef.current.subscribe(gadgetId, path, listener),
     }
   }, [branchMode, client, activeFile, workpieceId, selectedChatId, resetToken,
       bumpContentVersion])

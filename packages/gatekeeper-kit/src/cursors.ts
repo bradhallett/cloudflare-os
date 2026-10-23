@@ -77,9 +77,11 @@ type CursorShape<T> = {
   /** How many items to ask the provider for at a time. */
   remotePageSize?: number;
   /**
-   * Most provider pages one `next()` fetches; default 10. At the bound it returns what it has, `[]`
-   * included, which says "ask again". Every fetch counts, not only empty ones. Lower it for a
-   * provider that bills each row fetched.
+   * Most provider pages one `next()` fetches; default 2, bounding what a call reads before it
+   * authorizes and returns a page. At the bound it returns what it has, `[]` included, which says
+   * "ask again". Every fetch counts, not only empty ones. Raise it, explicitly, only for a
+   * provider whose rows are cheap and whose pages mostly drop out of the walk; lower it for one
+   * that bills each row fetched.
    */
   maxProviderPagesPerCall?: number;
   /**
@@ -120,7 +122,7 @@ type CursorShape<T> = {
   authorizePage(items: readonly T[], context: { terminal: boolean }): Promise<void>;
 };
 
-const DEFAULT_MAX_PROVIDER_PAGES_PER_CALL = 10;
+const DEFAULT_MAX_PROVIDER_PAGES_PER_CALL = 2;
 
 const DEFAULT_REMOTE_PAGE_SIZE = 100;
 

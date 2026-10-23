@@ -13,7 +13,8 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { collectAssets, collectModules, stableStringify } from "./hash-lib.ts";
 import {
-  generateManifest, readDeployablePackages, readDeployInputs, releaseShortName,
+  gatekeeperBindingName, generateManifest, readDeployablePackages, readDeployInputs,
+  releaseShortName,
 } from "./manifest-lib.ts";
 
 const RELEASE = dirname(fileURLToPath(import.meta.url));
@@ -246,6 +247,18 @@ test("releaseShortName folds package names into the slug charset", () => {
   assert.equal(releaseShortName("gatekeeper-mcp-portal"), "mcpportal");
   // No-op for names that already conform.
   assert.equal(releaseShortName("gatekeeper-google"), "google");
+});
+
+// The deploy service binds customer instances as GATEKEEPER_<SLUG> with the folded shortName, and
+// the router's routes and the backend's vendor ids derive from that binding. Dev and preview both
+// derive their bindings from this helper, so all environments bind — and therefore route — the
+// same spelling (the multi-word gatekeeper is GATEKEEPER_MCPPORTAL, never GATEKEEPER_MCP_PORTAL:
+// customer deployments registered OAuth redirect URIs against the folded URLs).
+test("gatekeeperBindingName binds the production GATEKEEPER_<SLUG> spelling", () => {
+  assert.equal(gatekeeperBindingName("gatekeeper-google"), "GATEKEEPER_GOOGLE");
+  assert.equal(gatekeeperBindingName("gatekeeper-mcp-portal"), "GATEKEEPER_MCPPORTAL");
+  // An illegal fold is a packaging error in any environment, not just the release build.
+  assert.throws(() => gatekeeperBindingName("gatekeeper-1password"), /is not a legal install slug/);
 });
 
 // The fold only removes characters, so a name can fold to a remnant the charset still rejects.

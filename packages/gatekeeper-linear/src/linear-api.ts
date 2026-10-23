@@ -31,6 +31,28 @@ export class LinearApiError extends Error {
   }
 }
 
+/**
+ * A Linear request that never produced an HTTP answer (network failure, timeout). The call may
+ * still have reached Linear and been applied, so this class — not the raw TypeError/DOMException
+ * — is what outcome classification keys on.
+ */
+export class LinearTransportError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "LinearTransportError";
+  }
+}
+
+/**
+ * Whether an error from a Linear call has an unknown outcome: the request may have reached
+ * Linear and been applied without the answer coming back. A definitive answer, including a
+ * refusal, means the outcome is known.
+ */
+export function isLinearOutcomeUnknown(error: unknown): boolean {
+  return error instanceof LinearTransportError
+    || (error instanceof LinearApiError && error.status >= 500);
+}
+
 // ---------------------------------------------------------------------------
 // OAuth
 
@@ -337,15 +359,23 @@ export class LinearApi {
 
   async graphql<T>(query: string, variables?: Record<string, unknown>): Promise<T> {
     const token = await this.#getToken();
-    const response = await fetch(GRAPHQL_ENDPOINT, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({ query, variables }),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
+    let response: Response;
+    try {
+      response = await fetch(GRAPHQL_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ query, variables }),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (error) {
+      // The call may have reached Linear and been applied, so it surfaces as a transport error,
+      // which outcome classification treats as unknown.
+      throw new LinearTransportError(
+        error instanceof Error ? error.message : String(error), { cause: error });
+    }
 
     if (response.status === 401) {
       throw new LinearApiError(401, "Linear rejected the access token.");

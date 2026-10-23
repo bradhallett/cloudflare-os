@@ -8,6 +8,7 @@ import {
   completeRun,
   createSchedule,
   failRun,
+  RECOVERY_DELAY_MS,
   rejectRun,
   type EnabledSchedule,
   type ScheduleRegistration,
@@ -29,7 +30,6 @@ const logger = obsContext.createLogger({
 const ALARM_BATCH_SIZE = 20;
 const DELIVERY_CONCURRENCY = 4;
 const REVOCATION_CLEANUP_BATCH_SIZE = 100;
-const RECOVERY_DELAY_MS = 5 * 60_000;
 const MAX_ENABLED_SCHEDULES_PER_ACCOUNT = 500;
 const MAX_ENABLED_SCHEDULES_PER_WORKSPACE = 100;
 
@@ -73,6 +73,8 @@ type PreparedRun = {
   workspaceId: string;
   scheduleId: string;
   runId: string;
+  /** Fences this delivery attempt: the retry reuses `runId` but never this token. */
+  attempt: string;
   scheduledTime: number;
 };
 
@@ -281,11 +283,12 @@ export class ScheduleDriver extends DurableObject {
       .toSorted(compareDueSchedules);
     const batch = due.slice(0, ALARM_BATCH_SIZE);
 
-    // An alarm cannot overlap its own live handler, so an immediate write would not bypass a hung
-    // callback. Rev1 relies on the recovery watchdog and replans after a successful batch.
+    // The recovery alarm armed above recovers a handler that dies mid-batch; the lease deadline
+    // enforced per delivery below bounds one that stays alive but wedges on a hung workspace RPC.
     let startHookRejectedCount = 0;
-    // A hung callback stalls this entire per-account batch. Stronger isolation is deferred beyond
-    // rev1; ordinary work remains bounded to four concurrent deliveries.
+    // Each delivery is fenced by its persisted lease, so a callback that never settles releases
+    // its slot at the deadline instead of stalling this entire per-account batch; ordinary work
+    // remains bounded to four concurrent deliveries.
     await runBounded(batch, DELIVERY_CONCURRENCY, async ([key, schedule]) => {
       if (await this.#deliverSafely(key, schedule)) startHookRejectedCount++;
     });
@@ -378,12 +381,54 @@ export class ScheduleDriver extends DurableObject {
     if (!prepared) return false;
     return obsContext.with({ runId: prepared.runId }, async () => {
       try {
-        return await this.#deliverPrepared(prepared);
+        return await this.#enforceLeaseDeadline(prepared, this.#deliverPrepared(prepared));
       } catch (error) {
         this.#reportDeliveryFailure(error);
         return false;
       }
     });
+  }
+
+  /**
+   * Races one in-flight delivery against its persisted lease deadline. The platform never runs a
+   * second alarm while a handler is still live, so a workspace RPC that never settles would hold
+   * the shared alarm handler — and with it every other schedule on the account — open forever;
+   * the recovery alarm cannot preempt it. On expiry the run is settled exactly as the hung await's
+   * own failure path would have settled it, and the abandoned promise stays fenced by the
+   * pending-run compare-and-set so a late settlement can never double-settle the run.
+   */
+  async #enforceLeaseDeadline(prepared: PreparedRun, delivery: Promise<boolean>): Promise<boolean> {
+    const stored = this.#readSchedule(scheduleKey(prepared.workspaceId, prepared.scheduleId));
+    const deadline = stored?.state.status === "pending" ? stored.state.leaseExpiresAt : undefined;
+    if (deadline === undefined) return delivery;
+    const expired = Promise.withResolvers<"expired">();
+    const timer = setTimeout(() => expired.resolve("expired"), Math.max(deadline - Date.now(), 0));
+    let outcome: boolean | "expired";
+    try {
+      outcome = await Promise.race([delivery, expired.promise]);
+    } finally {
+      clearTimeout(timer);
+    }
+    if (outcome !== "expired") return outcome;
+
+    const now = Date.now();
+    // An admission that never resolved skips its occurrence like an admission rejection; a
+    // delivery that crossed the boundary consumes a callback attempt like a callback failure.
+    // Both are compare-and-set fenced, so only the branch matching the persisted stage applies.
+    this.#rejectPending(prepared, now);
+    this.#failPending(prepared, "callback_failed", now);
+    const error = new Error(`Schedule delivery did not settle within its lease: ${prepared.scheduleId}`);
+    logger.warn("schedule delivery exceeded its lease deadline", {
+      event: "scheduler.delivery.timeout",
+      error,
+    });
+    reportIssue("scheduler.delivery.timeout", error, {
+      handled: true,
+      attributes: obsContext.get(),
+    });
+    // The abandoned delivery may still settle; keep its unexpected late failures reported.
+    delivery.catch((reason) => this.#reportDeliveryFailure(reason));
+    return false;
   }
 
   async #deliverPrepared(prepared: PreparedRun): Promise<boolean> {
@@ -499,6 +544,7 @@ export class ScheduleDriver extends DurableObject {
         workspaceId: state.workspaceId,
         scheduleId: state.scheduleId,
         runId: state.runId,
+        attempt: state.attempt,
         scheduledTime: state.scheduledTime,
       };
     });
@@ -639,7 +685,8 @@ function matchesPending(
   stored: StoredSchedule | undefined,
   prepared: PreparedRun,
 ): stored is StoredSchedule & { state: Extract<EnabledSchedule, { status: "pending" }> } {
-  return stored?.state.status === "pending" && stored.state.runId === prepared.runId;
+  return stored?.state.status === "pending" && stored.state.runId === prepared.runId &&
+      stored.state.attempt === prepared.attempt;
 }
 
 function isDue(schedule: StoredSchedule, now: number): boolean {

@@ -21,6 +21,7 @@ import {
   type ActionDescriptionBuilder,
 } from "@gadgets/gatekeeper-kit/action-description";
 import type { ActionFileReference } from "@gadgets/gatekeeper-kit/action-files";
+import { AttemptJournal } from "@gadgets/gatekeeper-kit/outcome-unknown";
 import type { ProvisionalIds } from "@gadgets/gatekeeper-kit/simulation";
 import type { XListInfo, XPostDraft, XPostInfo, XReplySettings, XUserInfo, XUserSummary } from "./types";
 import {
@@ -175,9 +176,7 @@ export type XActionHost = {
     delete(id: number): void;
   };
   /** A send whose outcome X never reported, keyed by action and post index (0 for a List). */
-  attempts: {
-    get(key: string): SendAttempt | undefined; put(key: string, attempt: SendAttempt): void; delete(key: string): void;
-  };
+  attempts: AttemptJournal<SendAttempt>;
   /** Drops cached reads once an action changed what they show. */
   invalidate(): Promise<void>;
 };
@@ -547,14 +546,14 @@ async function findCreatedList(host: XActionHost, payload: XActions["createList"
 
 /** Publishes one draft, replying to `replyTo` when given. */
 async function publishOne(host: XActionHost, draft: StoredDraft, replyTo: string | undefined,
-                          attemptKey: string): Promise<string> {
-  const prior = host.attempts.get(attemptKey);
+                          actionId: number, step: string): Promise<string> {
+  const prior = host.attempts.attempt(actionId, step);
   if (prior) {
     // Judged before the look: one run while the window was open proves nothing by finding nothing.
     const conclusive = windowClosed(prior);
     const landed = await findPublished(host, draft, replyTo, prior);
     if (landed) {
-      host.attempts.delete(attemptKey);
+      host.attempts.settle(actionId, step);
       return landed;
     }
     if (!conclusive) throw notShownYet(prior.at + RECONCILE_WINDOW_MS + CLOCK_SKEW_MS, "post");
@@ -584,11 +583,11 @@ async function publishOne(host: XActionHost, draft: StoredDraft, replyTo: string
   if (replyTo) body.reply = { in_reply_to_tweet_id: replyTo };
 
   const attempt: SendAttempt = { at: Date.now(), mediaIds };
-  host.attempts.put(attemptKey, attempt);
+  host.attempts.begin(actionId, step, attempt);
   try {
     const created = await host.write(api => api.post<{ id: string }>("/2/tweets", body));
     const id = requireCreated(created, "post");
-    host.attempts.delete(attemptKey);
+    host.attempts.settle(actionId, step);
     return id;
   } catch (error) {
     const duplicate = error instanceof XApiError && error.isDuplicate;
@@ -597,14 +596,14 @@ async function publishOne(host: XActionHost, draft: StoredDraft, replyTo: string
     const unconfirmed = isOutcomeUnknown(error) ? attempt : duplicate ? prior : undefined;
     const landed = unconfirmed && await findPublished(host, draft, replyTo, unconfirmed);
     if (landed) {
-      host.attempts.delete(attemptKey);
+      host.attempts.settle(actionId, step);
       return landed;
     }
     if (isOutcomeUnknown(error)) {
       throw new Error("X did not confirm whether this post was published. Approving it again first " +
         "checks the account's recent posts, so it is not posted twice.", { cause: error });
     }
-    host.attempts.delete(attemptKey);
+    host.attempts.settle(actionId, step);
     if (duplicate) throw new ActionApplyError("X refused this post as a duplicate of one posted recently.");
     refuse(error, "publish this post");
   }
@@ -620,7 +619,7 @@ async function publishAll(host: XActionHost, ctx: ActionContext, drafts: readonl
   try {
     for (let index = published.length; index < drafts.length; index++) {
       const replyTo = index === 0 ? firstReplyTo : published[index - 1];
-      const id = await publishOne(host, drafts[index], replyTo, `${ctx.id}:${index}`);
+      const id = await publishOne(host, drafts[index], replyTo, ctx.id, String(index));
       published.push(id);
       host.refs.bind(refs[index], id);
       host.progress.put(ctx.id, published);
@@ -651,8 +650,7 @@ async function publishAll(host: XActionHost, ctx: ActionContext, drafts: readonl
  */
 function refuseIfSent(host: XActionHost, id: number, posts: number): void {
   const published = host.progress.get(id).length;
-  const unconfirmed = Array.from({ length: posts }, (_, index) => host.attempts.get(`${id}:${index}`))
-    .some(attempt => attempt !== undefined);
+  const unconfirmed = host.attempts.possiblyApplied(id);
   if (published > 0) {
     throw new Error(`${published} of this thread's ${posts} posts are already on X, so it can't be ` +
       "rejected. Approve it again to finish the thread, then revert it to delete every post.");
@@ -935,8 +933,7 @@ export const actions = defineActions<XActionHost, XActions>({
     provides: payload => [payload.ref],
     // Reconciled as a post is: `POST /2/lists` has no idempotency key either.
     apply: async (payload, host, ctx) => {
-      const attemptKey = `${ctx.id}:0`;
-      const prior = host.attempts.get(attemptKey);
+      const prior = host.attempts.attempt(ctx.id, "0");
       // Judged before the look, as for a post: X can take minutes to list a new List.
       const conclusive = prior !== undefined && windowClosed(prior);
       let createdId = prior && await findCreatedList(host, payload, prior);
@@ -947,7 +944,7 @@ export const actions = defineActions<XActionHost, XActions>({
         // Lists can share every detail, so those already there are noted before the first send.
         const existing = prior?.existing ?? (await matchingLists(host, payload)).map(list => list.id);
         const attempt: SendAttempt = { at: Date.now(), existing };
-        host.attempts.put(attemptKey, attempt);
+        host.attempts.begin(ctx.id, "0", attempt);
         try {
           const created = await host.write(api => api.post<{ id: string }>("/2/lists", {
             name: payload.name,
@@ -957,7 +954,7 @@ export const actions = defineActions<XActionHost, XActions>({
           createdId = requireCreated(created, "List");
         } catch (error) {
           if (!isOutcomeUnknown(error)) {
-            host.attempts.delete(attemptKey);
+            host.attempts.settle(ctx.id, "0");
             refuse(error, "create this List");
           }
           createdId = await findCreatedList(host, payload, attempt);
@@ -967,12 +964,12 @@ export const actions = defineActions<XActionHost, XActions>({
           }
         }
       }
-      host.attempts.delete(attemptKey);
+      host.attempts.settle(ctx.id, "0");
       host.refs.bind(payload.ref, createdId);
       return { action: { ...payload, createdId, appliedAt: Date.now() } };
     },
     reject: async (_payload, host, ctx) => {
-      if (host.attempts.get(`${ctx.id}:0`)) {
+      if (host.attempts.possiblyApplied(ctx.id)) {
         throw new Error("X never confirmed whether this List was created, so it may already exist and " +
           "can't be rejected. Approve it again -- that checks the account's Lists first, so it is never " +
           "created twice -- then revert it if it shouldn't stay.");

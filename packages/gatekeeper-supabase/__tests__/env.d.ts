@@ -1,0 +1,17 @@
+/// <reference types="@cloudflare/vitest-plugin/types" />
+
+// Types for the workerd suite's environment. The pool types `env` as `Cloudflare.Env`, so the
+// test-only bindings, declared in `vitest.worker.config.ts` rather than `cloudflare.config.ts`, are
+// added by augmenting it.
+
+import type { TestHooks } from "./workerd/worker.js";
+import type { UserAccount } from "../src/supabase.js";
+
+declare global {
+  namespace Cloudflare {
+    interface Env {
+      TEST_HOOKS: DurableObjectNamespace<TestHooks>;
+      USER_ACCOUNT: DurableObjectNamespace<UserAccount>;
+    }
+  }
+}

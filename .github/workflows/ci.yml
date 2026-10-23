@@ -140,15 +140,81 @@ jobs:
           node scripts/vp/run.ts --cache --fail-if-no-match $FILTERS test
 
   # main's ruleset requires a check with exactly this name: renaming the job blocks every merge. It
-  # passes only if every `test` leg passed. `always()` because a skipped required check counts as
-  # passed, and without it a failed or cancelled leg would skip this job.
+  # passes only if every `test` leg, the whole `lint` job (lint, scripts types, generated-config
+  # check, build) and the release smoke passed — before, `needs: test` alone let a PR that failed
+  # only `lint` merge. `always()` because a skipped required check counts as passed, and without it
+  # a failed or cancelled leg would skip this job.
   build-and-test:
     name: Build and test
-    needs: test
+    needs: [test, lint, release-smoke]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
-      - name: Require every test leg to pass
+      - name: Require test, lint and the release smoke to pass
         env:
-          RESULT: ${{ needs.test.result }}
-        run: test "$RESULT" = success
+          TEST_RESULT: ${{ needs.test.result }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          SMOKE_RESULT: ${{ needs.release-smoke.result }}
+        run: |
+          test "$TEST_RESULT" = success
+          test "$LINT_RESULT" = success
+          test "$SMOKE_RESULT" = success
+
+  # The release pipeline has no other execution in this repo: the real build/upload/promote runs in
+  # the private gadgets-internal GitLab pipeline, against a pinned submodule. Without this job, a
+  # change that breaks scripts/release/build-release.ts (a wrangler CLI change, a config-shape
+  # drift, a manifest regression) surfaces only when a release is attempted. So every PR builds a
+  # full release, dry-run, into a throwaway directory: the same `pnpm build` prerequisites the
+  # internal pipeline has, the same pinned wrangler, the same manifest generation — just no R2
+  # upload. Bounded by the job timeout; honest in that nothing about the build is stubbed.
+  release-smoke:
+    name: Release build smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # As `lint` explains: Corepack puts `pnpm` on PATH for setup-vp's install.
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Set up Vite+, Node.js and dependencies
+        uses: voidzero-dev/setup-vp@3754dd7dbdb32bd8f6d28b6043de13ad3a75f21f # v1.21.1
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: false
+          run-install: true
+
+      # The workers bundle from the committed wrangler.jsonc files, but their sources import
+      # gitignored generated files (bundled blueprints, configurator frames, app bundles) that only
+      # the workspace build produces — the same prerequisite the internal release pipeline has.
+      - name: Build
+        run: pnpm build
+
+      - name: Build a release (dry run)
+        run: |
+          out="$(mktemp -d)"
+          node scripts/release/build-release.ts --out "$out" --release-id ci-smoke
+          # The script's own exit code is the main gate; this catches a build that "succeeds"
+          # while emitting a manifest whose blobs are not all on disk.
+          node - "$out" <<'EOF'
+          const { readFileSync, existsSync } = require("node:fs");
+          const out = process.argv[2];
+          const manifest = JSON.parse(readFileSync(`${out}/manifest.json`, "utf8"));
+          const workers = Object.entries(manifest.workers);
+          if (workers.length === 0) throw new Error("release smoke: manifest lists no workers");
+          for (const [name, worker] of workers) {
+            if (worker.mainModule === undefined) {
+              throw new Error(`release smoke: ${name} has no main module`);
+            }
+            for (const mod of worker.modules) {
+              if (!existsSync(`${out}/modules/${mod.sha256}`)) {
+                throw new Error(`release smoke: ${name} module blob missing: ${mod.sha256}`);
+              }
+            }
+          }
+          console.log(`release smoke: ${workers.length} workers, all module blobs present`);
+          EOF

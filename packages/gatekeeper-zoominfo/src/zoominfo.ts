@@ -18,31 +18,31 @@ import {
   type VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { buildDescription, codeSpan } from "@gadgets/gatekeeper-kit/action-description";
-import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
-import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
-import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
+import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
+import { ActionOutcomeUnknownError, APPLY_OUTCOME_UNKNOWN_MESSAGE } from "@gadgets/gatekeeper-kit/actions";
+import {
+  clearConnectionSubject, commitReconnect, ConnectionSubject, pinConnectionSubject,
+  pinnedConnectionSubject, stageReconnect,
+} from "@gadgets/gatekeeper-kit/credential-stage";
 import {
   ZoomInfoApi,
   ZoomInfoApiError,
+  isOutcomeUnknown,
   deriveCodeChallenge,
   exchangeAuthCode,
   generateCodeVerifier,
   refreshAccessToken,
   resolveOAuthConfig,
-  type JsonApiDoc,
-  type JsonApiResource,
   type QueryParams,
 } from "./zoominfo-api";
 import type {
   AccountSummary,
   CompanyEnrichInput,
-  CompanyHashtag,
   CompanyInsightsCriteria,
   CompanyInsights,
   CompanyLookalike,
   CompanyMatch,
   CompanyOutputField,
-  CompanyRecord,
   CompanyRefInput,
   CompanySearchCriteria,
   ContactEnrichInput,
@@ -52,18 +52,14 @@ import type {
   ContactOutputField,
   ContactRecommendation,
   ContactRecommendationsCriteria,
-  ContactRecord,
   ContactSearchCriteria,
   CorporateHierarchyOutputField,
-  CorporateHierarchyRecord,
   CreditUsage,
   EnrichEntity,
   EnrichFieldInfo,
-  EnrichMatchStatus,
   EnrichmentKind,
   EnrichmentOutcome,
   EnrichmentTicket,
-  EnrichResult,
   Insight,
   IntentEnrichCriteria,
   IntentSearchCriteria,
@@ -85,17 +81,32 @@ import type {
 } from "./types";
 import TYPES_CODE from "./types.txt";
 import ZOOMINFO_LOGO_SVG from "./zoominfo-logo.svg";
+import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
+import { dailyReadLimit, type Env } from "./zoominfo-env";
+import {
+  asResources,
+  attrs,
+  bool,
+  clean,
+  firstResource,
+  idValue,
+  mapCompanyMatch,
+  mapContactMatch,
+  mapIntentSignal,
+  mapNewsArticle,
+  mapScoop,
+  num,
+  pageQuery,
+  str,
+  toSearchPage,
+} from "./zoominfo-mapping";
+import { EnrichmentStore, performEnrichment } from "./zoominfo-enrichment";
+import { withinReadLimit, ReadLimitError, type ReadReservation } from "./zoominfo-reads";
 import ZOOMINFO_ACCOUNT_CONFIGURATOR_HTML from "./generated/account-configurator-ui.txt";
 import type { ZoomInfoAccountConfiguratorRpc } from "./configurator/account-configurator-types";
 
-type Env = Cloudflare.Env & {
-  BASE_URL?: string;
-  CLIENT_ID?: string;
-  CLIENT_SECRET?: string;
-  ZOOMINFO_AUTHORIZE_URL?: string;
-  ZOOMINFO_TOKEN_URL?: string;
-  ZOOMINFO_API_BASE_URL?: string;
-};
+/** What finishing an OAuth flow yields: a handoff page, or a refusal to show. */
+type CallbackResult = { handoff: ConnectHandoff } | { refused: { title: string; detail: string } };
 
 type StoredNonce = {
   value: string;
@@ -112,6 +123,15 @@ type StoredNonce = {
 type StoredIdentity = {
   displayName?: string;
   uniqueName?: string;
+  /** The OIDC `sub` claim, when ZoomInfo's ID token carried one; reconnects pin against it. */
+  subject?: string;
+};
+
+/** The subject a grant's identity pins the connection to: `id` is what the kit's fence compares,
+ * the names are for display and refusal messages. */
+type ZoomInfoSubject = ConnectionSubject & {
+  displayName?: string;
+  uniqueName?: string;
 };
 
 /** The values a token grant is persisted as; staged whole during a reconnect (see commitReconnect). */
@@ -120,7 +140,6 @@ type StoredGrant = {
   accessToken: string;
   accessTokenExpiresAt: number;
   scopes: string[];
-  identity: StoredIdentity;
 };
 
 type ZoomInfoGatekeeperImplProps = {
@@ -255,10 +274,32 @@ function parseIdTokenClaims(idToken: string | null): StoredIdentity {
     return {
       displayName: json.name || json.email || json.preferred_username,
       uniqueName: json.email || json.preferred_username || json.sub,
+      // The OIDC subject: the stable id ZoomInfo pins a reconnect against.
+      subject: json.sub,
     };
   } catch {
     return {};
   }
+}
+
+/**
+ * The connection subject an identity establishes: the immutable OIDC `sub` claim when the ID token
+ * carried one, else the mutable-but-best-available unique name. An identity carrying neither
+ * cannot be told from any other account's, so it establishes no subject: its reconnect stages
+ * subjectless and the fence does not compare it.
+ */
+function connectionSubjectOf(identity: StoredIdentity): ZoomInfoSubject | undefined {
+  const id = identity.subject ?? identity.uniqueName;
+  return id === undefined ? undefined : {
+    id,
+    ...(identity.displayName !== undefined ? { displayName: identity.displayName } : {}),
+    ...(identity.uniqueName !== undefined ? { uniqueName: identity.uniqueName } : {}),
+  };
+}
+
+/** How an account-carrying record is named in user-facing reconnect refusals. */
+function describeZoomInfoAccount(named: { displayName?: string; uniqueName?: string }): string {
+  return named.displayName || named.uniqueName || "the original account";
 }
 
 // ---------------------------------------------------------------------------
@@ -324,12 +365,14 @@ export default {
       const stub: DurableObjectStub<UserAccount> = ctx.exports.UserAccount.get(
         ctx.exports.UserAccount.idFromString(doId),
       );
-      const handoff = await stub.acceptAuthCode(code, oauthNonce);
-      if (!handoff) {
+      const result = await stub.acceptAuthCode(code, oauthNonce);
+      if (result === null) {
         return new Response(INVALID_LINK_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
       }
-
-      return htmlResponse(connectHandoffPageHtml(handoff));
+      if ("refused" in result) {
+        return htmlResponse(errorPageHtml(result.refused.title, result.refused.detail), 409);
+      }
+      return htmlResponse(connectHandoffPageHtml(result.handoff));
     }
 
     return new Response("Not Found", { status: 404 });
@@ -432,10 +475,11 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   /**
-   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on, or
-   * null when the callback's nonce doesn't match.
+   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on:
+   * a handoff, a refusal to show (never the page for a reconnect that pinned a different
+   * account), or null when the callback's nonce doesn't match.
    */
-  async acceptAuthCode(code: string, oauthNonce: string): Promise<ConnectHandoff | null> {
+  async acceptAuthCode(code: string, oauthNonce: string): Promise<CallbackResult | null> {
     const stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
     if (!stored || stored.stage !== "oauth" || Date.now() >= stored.expiresAt ||
         !constantTimeEqual(stored.value, oauthNonce)) {
@@ -470,35 +514,50 @@ export class UserAccount extends DurableObject<Env> {
       accessToken: grant.accessToken,
       accessTokenExpiresAt: Date.now() + grant.expiresIn * 1000,
       scopes: grant.scopes,
-      identity: parseIdTokenClaims(grant.idToken),
     };
+    const subject = connectionSubjectOf(parseIdTokenClaims(grant.idToken));
 
     let handoff: ConnectHandoff;
     if (stored.reconnect) {
+      // A reconnect only ever reconnects the account it was made for: the OIDC subject the grant
+      // carries must be the one this connection is pinned to. A different account's grant is
+      // dropped unstaged (ZoomInfo offers no token revocation endpoint to retire it with).
+      const staged = stageReconnect(this.ctx.storage.kv, storedGrant, subject, Date.now(),
+        (pinned, granted) => ({
+          title: "That's a different ZoomInfo account",
+          detail: `This connection is for ${describeZoomInfoAccount(pinned)}, but ZoomInfo ` +
+            `authorized ${describeZoomInfoAccount(granted)}. Sign in to ZoomInfo as ` +
+            `${describeZoomInfoAccount(pinned)} and reconnect, or connect ` +
+            `${describeZoomInfoAccount(granted)} as a separate account.`,
+        }));
+      if ("refused" in staged) return { refused: staged.refused };
       // The reconnect URL is a bearer capability, so the new grant is only staged until the Workshop
       // has confirmed the browser that finished the flow is the owner's (see commitReconnect). Bound
       // gadgets keep reading the current token meanwhile.
-      const stageId = stageCredentials(this.ctx.storage.kv, storedGrant, Date.now());
-      handoff = await callback.reconnectComplete(stageId);
+      handoff = await callback.reconnectComplete(staged.stageId);
     } else {
       this.#writeGrant(storedGrant);
+      if (subject !== undefined) pinConnectionSubject(this.ctx.storage.kv, subject);
       try {
         const props: ZoomInfoGatekeeperImplProps = { userObjectId: this.ctx.id.toString() };
         handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
       } catch (err) {
         this.ctx.storage.kv.delete("refreshToken");
         this.ctx.storage.kv.delete("accessToken");
+        clearConnectionSubject(this.ctx.storage.kv);
         throw err;
       }
     }
 
     await this.ctx.storage.deleteAlarm();
-    return handoff;
+    return { handoff };
   }
 
-  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
+  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. The kit
+   * re-pins the staged subject when the grant carried one, adopting a connection made before any
+   * pin and never moving an established one. */
   async commitReconnect(stageId: string): Promise<void> {
-    const grant = commitStagedCredentials<StoredGrant>(this.ctx.storage.kv, Date.now(), stageId);
+    const grant = commitReconnect<StoredGrant>(this.ctx.storage.kv, Date.now(), stageId);
     if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
     this.#writeGrant(grant);
   }
@@ -508,7 +567,6 @@ export class UserAccount extends DurableObject<Env> {
     this.ctx.storage.kv.put("accessToken", grant.accessToken);
     this.ctx.storage.kv.put("accessTokenExpiresAt", grant.accessTokenExpiresAt);
     this.ctx.storage.kv.put("scopes", grant.scopes);
-    this.ctx.storage.kv.put<StoredIdentity>("identity", grant.identity);
     clearCredentialExpiryLatch(this.ctx.storage.kv);
   }
 
@@ -545,7 +603,39 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async getIdentity(): Promise<StoredIdentity> {
-    return this.ctx.storage.kv.get<StoredIdentity>("identity") ?? {};
+    // The connection's pinned subject carries the identity: its names came from the ID token the
+    // grant that earned the pin was verified with. A keyless grant pins nothing, so nothing shows.
+    return pinnedConnectionSubject<ZoomInfoSubject>(this.ctx.storage.kv) ?? {};
+  }
+
+  /**
+   * Reserves one ZoomInfo API request against the connection's daily limit (`0` = none). The UTC
+   * day the reservation was made against travels with the answer so a straggler can be settled.
+   */
+  async reserveRead(): Promise<ReadReservation> {
+    const limit = dailyReadLimit(this.env);
+    if (limit === null) return { ok: true };
+    const now = Date.now();
+    const day = new Date(now).toISOString().slice(0, 10);
+    const stored = this.ctx.storage.kv.get<{ day: string; used: number }>("reads");
+    const used = stored?.day === day ? stored.used : 0;
+    if (used >= limit) {
+      const midnight = new Date(`${day}T00:00:00.000Z`).getTime() + 24 * 60 * 60 * 1000;
+      return { ok: false, limit, resetsAt: midnight };
+    }
+    this.ctx.storage.kv.put("reads", { day, used: used + 1 });
+    return { ok: true, day };
+  }
+
+  /**
+   * Settles one read reserved against `day` with whether the request was spent. A reservation
+   * that outlived its day settles nothing: the new day's count isn't its to change.
+   */
+  async settleRead(day: string, spent: boolean): Promise<void> {
+    if (dailyReadLimit(this.env) === null) return;
+    const stored = this.ctx.storage.kv.get<{ day: string; used: number }>("reads");
+    if (stored?.day !== day) return;
+    this.ctx.storage.kv.put("reads", { day, used: Math.max(0, stored.used - (spent ? 0 : 1)) });
   }
 
   async noteCredentialsExpired(): Promise<void> {
@@ -703,34 +793,53 @@ export class ZoomInfoGatekeeperImpl extends DurableObject<Env, ZoomInfoGatekeepe
 
   /**
    * Approved: replay the queued enrichment against ZoomInfo (spending credits) and store the result
-   * for the Gadget to read via getEnrichmentResult(). A ZoomInfo failure is recorded as a "failed"
-   * outcome rather than re-thrown: the action is considered resolved (we don't want the overseer to
-   * retry a paid operation that may have already charged credits), and the Gadget sees the failure.
+   * for the Gadget to read via getEnrichmentResult(). A definitive ZoomInfo failure is recorded as
+   * a "failed" outcome rather than re-thrown: the action is considered resolved (we don't want the
+   * overseer to retry a paid operation that may have already charged credits), and the Gadget sees
+   * the failure.
+   *
+   * A failure whose outcome is unknown — the request may have reached ZoomInfo and been charged —
+   * is recorded as "unknown" *before* dispatch and re-thrown as `ActionOutcomeUnknownError`, so the
+   * enrichment is never replayed blind: a re-apply finds the stored record and throws its message
+   * without calling ZoomInfo again (mirrors the kit's `claimBeforeApply` contract).
    */
   async applyAction(action: number): Promise<void> {
     const store = new EnrichmentStore(this.ctx.storage.kv);
     const pending = store.getPending(action);
     if (!pending) {
+      const stored = store.getResult(action);
+      if (stored?.status === "unknown") throw new ActionOutcomeUnknownError(stored.message);
       throw new Error(`Unknown pending ZoomInfo enrichment: ${action}`);
     }
     const account = this.#userAccount();
     try {
-      const result = await callZoomInfo(account, () => performEnrichment(this.#makeApi(account), pending));
+      const result = await withinReadLimit(account, () => {
+        // The claim, taken before dispatch: an activation that dies past this point leaves the
+        // "unknown" record behind, so the enrichment cannot be replayed on a retry.
+        store.removePending(action);
+        store.putResult(action, { status: "unknown", message: APPLY_OUTCOME_UNKNOWN_MESSAGE });
+        return callZoomInfo(account, () => performEnrichment(this.#makeApi(account), pending));
+      });
       store.putResult(action, { status: "ready", result });
     } catch (error) {
+      if (error instanceof ReadLimitError) throw error;  // never dispatched: retryable, pending intact
+      if (isOutcomeUnknown(error)) throw new ActionOutcomeUnknownError(APPLY_OUTCOME_UNKNOWN_MESSAGE);
       store.putResult(action, {
         status: "failed",
         message: error instanceof Error ? error.message : String(error),
       });
     }
-    store.removePending(action);
   }
 
   /** Rejected: discard the queued enrichment (no credits spent) and record the outcome. */
   async rejectAction(action: number): Promise<void> {
     const store = new EnrichmentStore(this.ctx.storage.kv);
     store.removePending(action);
-    store.putResult(action, { status: "rejected" });
+    // An outcome a failed apply left unknown survives rejection: its credits may have been spent,
+    // and the record is what tells the Gadget the enrichment may have run.
+    if (store.getResult(action)?.status !== "unknown") {
+      store.putResult(action, { status: "rejected" });
+    }
   }
 
   /**
@@ -761,54 +870,6 @@ export class ZoomInfoGatekeeperImpl extends DurableObject<Env, ZoomInfoGatekeepe
   async removeObserver(_id: string): Promise<void> {}
 }
 
-// ---------------------------------------------------------------------------
-// Mapping helpers
-
-function asResources(doc: JsonApiDoc): JsonApiResource[] {
-  if (Array.isArray(doc.data)) return doc.data;
-  return doc.data ? [doc.data] : [];
-}
-
-function firstResource(doc: JsonApiDoc): JsonApiResource | null {
-  const resources = asResources(doc);
-  return resources[0] ?? null;
-}
-
-function attrs(resource: JsonApiResource): Record<string, unknown> {
-  return resource.attributes ?? {};
-}
-
-function str(value: unknown): string | undefined {
-  if (value === undefined || value === null) return undefined;
-  return String(value);
-}
-
-function num(value: unknown): number | undefined {
-  if (typeof value === "number") return value;
-  if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) return Number(value);
-  return undefined;
-}
-
-function bool(value: unknown): boolean | undefined {
-  return typeof value === "boolean" ? value : undefined;
-}
-
-// Coerce an id-like value to a number when it is a numeric string (ZoomInfo expects int64 ids in
-// enrich/insight inputs), leaving non-numeric values untouched.
-function idValue(value: string | undefined): number | string | undefined {
-  if (value === undefined) return undefined;
-  return Number.isFinite(Number(value)) && value.trim() !== "" ? Number(value) : value;
-}
-
-// Drop undefined entries so we don't send empty attribute keys. Generic so callers keep their
-// narrow value types (e.g. a query-param bag stays assignable to QueryParams).
-function clean<T extends Record<string, unknown>>(obj: T): Partial<T> {
-  const out: Partial<T> = {};
-  for (const k in obj) {
-    if (obj[k] !== undefined) out[k] = obj[k];
-  }
-  return out;
-}
 
 // Intent- and scoop-signal search filter by firmographics only; ZoomInfo rejects company-identity
 // inputs there with an opaque "Invalid field requested" 400. The typed API omits these fields (see
@@ -845,46 +906,6 @@ function assertCompatibleLocation(company: Record<string, unknown> | undefined, 
   }
 }
 
-function pageQuery(page?: PageRequest): QueryParams {
-  const query: QueryParams = {};
-  if (page?.page !== undefined) query["page[number]"] = page.page;
-  if (page?.pageSize !== undefined) query["page[size]"] = page.pageSize;
-  if (page?.sort !== undefined) query["sort"] = page.sort;
-  return query;
-}
-
-function toSearchPage<T>(doc: JsonApiDoc, map: (r: JsonApiResource) => T, page?: PageRequest): SearchPage<T> {
-  const results = asResources(doc).map(map);
-  const pageNumber = doc.meta?.page?.number ?? page?.page ?? 1;
-  const pageSize = page?.pageSize ?? 25;
-  const totalResults = doc.meta?.totalResults ?? results.length;
-  const hasMore = doc.links?.next !== undefined || pageNumber * pageSize < totalResults;
-  return { results, totalResults, page: pageNumber, pageSize, hasMore };
-}
-
-const MATCHED_STATUSES = new Set<EnrichMatchStatus>(["FULL_MATCH", "COMPANY_ONLY_MATCH", "CONTACT_ONLY_MATCH"]);
-const ERROR_STATUSES = new Set<EnrichMatchStatus>(["INVALID_INPUT", "LIMIT_EXCEEDED"]);
-
-function mapEnrichResult<T>(resource: JsonApiResource, buildRecord: (r: JsonApiResource) => T): EnrichResult<T> {
-  const meta = (resource.meta ?? {}) as { matchStatus?: EnrichMatchStatus; input?: unknown };
-  const matchStatus: EnrichMatchStatus =
-    meta.matchStatus ?? (resource.type === "NoMatch" ? "NO_MATCH" : "FULL_MATCH");
-
-  if (ERROR_STATUSES.has(matchStatus)) {
-    return { status: "error", input: meta.input, message: matchStatus };
-  }
-  const hasRecord = resource.type !== "NoMatch" && resource.attributes !== undefined &&
-    MATCHED_STATUSES.has(matchStatus);
-  if (!hasRecord) {
-    return { status: "noMatch", matchStatus, input: meta.input };
-  }
-  // Best-effort: if ZoomInfo tells us the record is already under management, no credit was charged;
-  // otherwise assume a credit was charged (worst case).
-  const managementStatus = (resource.attributes as { managementStatus?: { underManagement?: boolean } })
-    ?.managementStatus;
-  const creditCharged = managementStatus?.underManagement !== true;
-  return { status: "matched", matchStatus, record: buildRecord(resource), creditCharged };
-}
 
 // Run a ZoomInfo API call, translating auth failures into a reconnect-prompting error and notifying
 // the account so the user is asked to reconnect. Shared by the session (reads) and applyAction
@@ -903,145 +924,7 @@ async function callZoomInfo<T>(account: DurableObjectStub<UserAccount>, fn: () =
   }
 }
 
-// ---------------------------------------------------------------------------
-// Enrichment action queue.
-//
-// Each enrich* call stores a PendingEnrichment and submits it for approval. When the user approves,
-// ZoomInfoGatekeeperImpl.applyAction() replays it against the API (spending credits) and stores the
-// result; the Gadget reads it back via getEnrichmentResult(). Rejection stores a "rejected" outcome
-// and spends nothing. Everything lives in the GatekeeperImpl DO's KV, shared by the session (which
-// submits/reads) and the apply/reject callbacks.
-
-// How many recent enrichment outcomes to retain per connected account. Enough that a Gadget can
-// still read back results from earlier in a session, while capping the DO's KV footprint (each
-// outcome is small and gated behind a human approval, so this window is generous).
-const MAX_RETAINED_ENRICHMENTS = 100;
-
-// A cached value with the time it was fetched, for TTL expiry.
 type CachedValue<T> = { value: T; fetchedAt: number };
-
-// A submitted-but-not-yet-applied enrichment: enough to replay the ZoomInfo call on approval.
-type PendingEnrichment = {
-  kind: EnrichmentKind;
-  summary: string;
-  attributes: Record<string, unknown>;
-  page?: PageRequest;
-};
-
-// The stored outcome once the user has decided (mirrors EnrichmentOutcome minus the "pending" state,
-// which is represented by the absence of a stored outcome while the request is still pending).
-type StoredEnrichmentOutcome =
-  | { status: "ready"; result: unknown }
-  | { status: "rejected" }
-  | { status: "failed"; message: string };
-
-class EnrichmentStore {
-  #kv: DurableObjectStorage["kv"];
-
-  constructor(kv: DurableObjectStorage["kv"]) {
-    this.#kv = kv;
-  }
-
-  #pendingKey(id: number): string {
-    return `enrich:pending:${id}`;
-  }
-
-  #resultKey(id: number): string {
-    return `enrich:result:${id}`;
-  }
-
-  submit(pending: PendingEnrichment): number {
-    const id = this.#kv.get<number>("enrich:nextId") ?? 1;
-    this.#kv.put("enrich:nextId", id + 1);
-    this.#kv.put(this.#pendingKey(id), pending);
-    return id;
-  }
-
-  getPending(id: number): PendingEnrichment | undefined {
-    return this.#kv.get<PendingEnrichment>(this.#pendingKey(id));
-  }
-
-  removePending(id: number): void {
-    this.#kv.delete(this.#pendingKey(id));
-  }
-
-  getResult(id: number): StoredEnrichmentOutcome | undefined {
-    return this.#kv.get<StoredEnrichmentOutcome>(this.#resultKey(id));
-  }
-
-  putResult(id: number, outcome: StoredEnrichmentOutcome): void {
-    this.#kv.put(this.#resultKey(id), outcome);
-    // Bound storage: evict the enrichment that has fallen out of the retention window. IDs are
-    // dense and monotonic (see submit), so this keeps at most MAX_RETAINED_ENRICHMENTS recent
-    // outcomes readable while preventing unbounded growth over the account's lifetime. Dropping the
-    // pending key too sweeps up any never-decided request that aged out.
-    const evictId = id - MAX_RETAINED_ENRICHMENTS;
-    if (evictId >= 1) {
-      this.#kv.delete(this.#resultKey(evictId));
-      this.#kv.delete(this.#pendingKey(evictId));
-    }
-  }
-
-  removeResult(id: number): void {
-    this.#kv.delete(this.#resultKey(id));
-  }
-}
-
-// Replay an approved enrichment against the ZoomInfo API and shape the response into the same
-// payload the (former) synchronous method would have returned. Dispatches on the stored kind.
-async function performEnrichment(api: ZoomInfoApi, pending: PendingEnrichment): Promise<unknown> {
-  const { kind, attributes, page } = pending;
-  switch (kind) {
-    case "companies": {
-      const doc = await api.post("/data/v1/companies/enrich", "CompanyEnrich", attributes);
-      return asResources(doc).map(r => mapEnrichResult<CompanyRecord>(r, res => ({
-        id: res.id ?? str(attrs(res).id) ?? "",
-        fields: attrs(res),
-      })));
-    }
-    case "corporateHierarchy": {
-      const doc = await api.post("/data/v1/companies/corporate-hierarchy/enrich", "CorporateHierarchyEnrich", attributes);
-      return asResources(doc).map(r => mapEnrichResult<CorporateHierarchyRecord>(r, res => ({
-        companyId: str(attrs(res).companyId) ?? res.id ?? "",
-        fields: attrs(res),
-      })));
-    }
-    case "hashtags": {
-      const doc = await api.post("/data/v1/companies/hashtags/enrich", "HashtagEnrich", attributes);
-      return asResources(doc).map(r => {
-        const a = attrs(r);
-        return {
-          id: r.id ?? "",
-          label: str(a.label),
-          displayLabel: str(a.displayLabel),
-          description: str(a.description),
-          group: str(a.group),
-          parentCategory: str(a.parentCategory),
-          priority: num(a.priority),
-        } satisfies CompanyHashtag;
-      });
-    }
-    case "contacts": {
-      const doc = await api.post("/data/v1/contacts/enrich", "ContactEnrich", attributes);
-      return asResources(doc).map(r => mapEnrichResult<ContactRecord>(r, res => ({
-        id: res.id ?? str(attrs(res).id) ?? "",
-        fields: attrs(res),
-      })));
-    }
-    case "intent": {
-      const doc = await api.post("/data/v1/intent/enrich", "IntentEnrich", attributes, pageQuery(page));
-      return toSearchPage(doc, mapIntentSignal, page);
-    }
-    case "scoops": {
-      const doc = await api.post("/data/v1/scoops/enrich", "ScoopEnrich", attributes, pageQuery(page));
-      return toSearchPage(doc, mapScoop, page);
-    }
-    case "news": {
-      const doc = await api.post("/data/v1/news/enrich", "NewsEnrich", attributes, pageQuery(page));
-      return toSearchPage(doc, mapNewsArticle, page);
-    }
-  }
-}
 
 // ---------------------------------------------------------------------------
 // SessionImpl — the RPC interface exposed to the Gadget.
@@ -1070,9 +953,10 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
     this.#approvalQueue[Symbol.dispose]();
   }
 
-  // Run an API call, translating auth failures into a reconnect-prompting error.
+  // Run an API call within the connection's daily read limit, translating auth failures into a
+  // reconnect-prompting error. Cache hits skip this chokepoint entirely.
   #call<T>(fn: (api: ZoomInfoApi) => Promise<T>): Promise<T> {
-    return callZoomInfo(this.#account, () => fn(this.#api));
+    return withinReadLimit(this.#account, () => callZoomInfo(this.#account, () => fn(this.#api)));
   }
 
   #observe(title: string, description: string): Promise<void> {
@@ -1549,122 +1433,4 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
     await this.#observe("Get ZoomInfo usage", `Retrieved ${usage.length} usage/limit counter(s).`);
     return { usage };
   }
-}
-
-// ---------------------------------------------------------------------------
-// Resource → typed-shape mappers (module-level; pure functions over JSON:API resources).
-
-function mapCompanyMatch(resource: JsonApiResource): CompanyMatch {
-  const a = attrs(resource);
-  return {
-    id: resource.id ?? "",
-    name: str(a.name) ?? "",
-    website: str(a.website),
-    city: str(a.city),
-    state: str(a.state),
-    country: str(a.country),
-    revenue: str(a.revenue),
-    employeeCount: str(a.employeeCount),
-    logoUrl: str(a.logo),
-  };
-}
-
-function mapContactMatch(resource: JsonApiResource): ContactMatch {
-  const a = attrs(resource);
-  const company = a.company as { id?: unknown; name?: unknown } | undefined;
-  return {
-    id: resource.id ?? "",
-    firstName: str(a.firstName),
-    middleName: str(a.middleName),
-    lastName: str(a.lastName),
-    jobTitle: str(a.jobTitle),
-    managementLevel: str(a.managementLevel),
-    contactAccuracyScore: num(a.contactAccuracyScore),
-    hasEmail: bool(a.hasEmail),
-    hasDirectPhone: bool(a.hasDirectPhone),
-    hasMobilePhone: bool(a.hasMobilePhone),
-    company: company ? { id: str(company.id) ?? "", name: str(company.name) } : undefined,
-  };
-}
-
-function mapIntentSignal(resource: JsonApiResource): IntentSignal {
-  const a = attrs(resource);
-  const company = (a.company ?? {}) as Record<string, unknown>;
-  const recommended = (a.recommendedContacts ?? []) as Record<string, unknown>[];
-  const locations = (a.topSignalLocations ?? []) as Record<string, unknown>[];
-  return {
-    category: str(a.category),
-    topic: str(a.topic) ?? "",
-    signalScore: num(a.signalScore) ?? 0,
-    audienceStrength: str(a.audienceStrength),
-    signalDate: str(a.signalDate),
-    spikesInDateRange: num(a.spikesInDateRange),
-    company: {
-      id: str(company.id) ?? "",
-      name: str(company.name),
-      website: str(company.website),
-      hasOtherTopicConsumption: bool(company.hasOtherTopicConsumption),
-    },
-    recommendedContacts: recommended.map(c => ({
-      id: str(c.id) ?? "",
-      firstName: str(c.firstName),
-      lastName: str(c.lastName),
-      jobTitle: str(c.jobTitle),
-      companyName: str(c.companyName),
-      jobFunctions: ((c.jobFunctions ?? []) as Record<string, unknown>[]).map(f => ({
-        name: str(f.name),
-        department: str(f.department),
-      })),
-    })),
-    topSignalLocations: locations.map(l => ({
-      city: str(l.city),
-      state: str(l.state),
-      country: str(l.country),
-    })),
-  };
-}
-
-function mapScoop(resource: JsonApiResource): Scoop {
-  const a = attrs(resource);
-  const company = a.company as { id?: unknown; name?: unknown } | undefined;
-  const topics = (a.topics ?? []) as Record<string, unknown>[];
-  const types = (a.types ?? []) as Record<string, unknown>[];
-  const contacts = (a.contacts ?? []) as Record<string, unknown>[];
-  return {
-    id: resource.id ?? "",
-    publishedDate: str(a.publishedDate),
-    originalPublishedDate: str(a.originalPublishedDate),
-    linkText: str(a.linkText),
-    link: str(a.link),
-    description: str(a.description),
-    updateText: str(a.updateText),
-    topics: topics.map(t => ({ id: str(t.id) ?? "", topic: str(t.topic) ?? "" })),
-    types: types.map(t => ({ id: str(t.id) ?? "", type: str(t.type) ?? "" })),
-    company: company ? { id: str(company.id) ?? "", name: str(company.name) } : undefined,
-    contacts: contacts.map(c => ({
-      id: str(c.id) ?? "",
-      firstName: str(c.firstName),
-      lastName: str(c.lastName),
-      jobTitle: str(c.jobTitle),
-      jobFunction: ((c.jobFunction ?? []) as Record<string, unknown>[]).map(f => ({
-        name: str(f.name),
-        department: str(f.department),
-      })),
-    })),
-  };
-}
-
-function mapNewsArticle(resource: JsonApiResource): NewsArticle {
-  const a = attrs(resource);
-  const companies = (a.company ?? []) as Record<string, unknown>[];
-  return {
-    domain: str(a.domain),
-    title: str(a.title),
-    url: str(a.url),
-    imageUrl: str(a.imageUrl),
-    pageDate: str(a.pageDate),
-    categories: (a.categories ?? []) as string[],
-    description: str(a.description),
-    company: companies.map(c => ({ id: str(c.id) ?? "", name: str(c.name) })),
-  };
 }

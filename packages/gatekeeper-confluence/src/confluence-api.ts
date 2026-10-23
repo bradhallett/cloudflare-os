@@ -89,6 +89,28 @@ export class ConfluenceApiError extends Error {
   }
 }
 
+/**
+ * A Confluence request that never produced an HTTP answer (network failure, timeout). The call
+ * may still have reached Atlassian and been applied, so this class — not the raw
+ * TypeError/DOMException — is what outcome classification keys on.
+ */
+export class ConfluenceTransportError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "ConfluenceTransportError";
+  }
+}
+
+/**
+ * Whether an error from a Confluence call has an unknown outcome: the request may have reached
+ * Atlassian and been applied without the answer coming back. A definitive answer, including a
+ * refusal, means the outcome is known.
+ */
+export function isConfluenceOutcomeUnknown(error: unknown): boolean {
+  return error instanceof ConfluenceTransportError
+    || (error instanceof ConfluenceApiError && error.status >= 500);
+}
+
 // ---------------------------------------------------------------------------------------------
 // OAuth + identity
 
@@ -529,7 +551,14 @@ export class ConfluenceApi {
     const headers = new Headers(init?.headers);
     headers.set("Authorization", `Bearer ${token}`);
     if (!headers.has("Accept")) headers.set("Accept", "application/json");
-    return await fetch(url, { ...init, method, headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+    try {
+      return await fetch(url, { ...init, method, headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+    } catch (error) {
+      // The call may have reached Atlassian and been applied, so it surfaces as a transport
+      // error, which outcome classification treats as unknown.
+      throw new ConfluenceTransportError(
+        error instanceof Error ? error.message : String(error), { cause: error });
+    }
   }
 
   // Core request: `path` is the gateway-relative path (e.g. "/wiki/api/v2/pages/1"). Refreshes the

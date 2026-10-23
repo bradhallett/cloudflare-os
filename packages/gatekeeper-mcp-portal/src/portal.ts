@@ -108,7 +108,9 @@ const PORTAL_COLOR = "#f6821f";
 // Helpers
 
 function getBaseUrl(env: Env): string {
-  return stripTrailingSlashes(env.BASE_URL ?? "http://localhost:8787/gatekeeper/mcp-portal");
+  // The folded production slug: every environment serves this gatekeeper at /gatekeeper/mcpportal
+  // (manifest-lib.ts releaseShortName), so the fallback must not spell it with a hyphen.
+  return stripTrailingSlashes(env.BASE_URL ?? "http://localhost:8787/gatekeeper/mcpportal");
 }
 
 async function listPortalServers(

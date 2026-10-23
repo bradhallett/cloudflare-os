@@ -2,9 +2,9 @@ import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint, restore } from "cl
 import { GmailForwardSnapshotStore } from "../../src/gmail-state";
 import { GmailGatekeeperImpl, type GmailGatekeeperImplProps } from "../../src/gmail";
 import { GoogleChatGatekeeperImpl, type GoogleChatGatekeeperImplProps } from "../../src/chat";
-import { GoogleVerifier, UserAccount as GoogleUserAccount, type HookDriverRef } from "../../src/google";
+import { UserAccount as GoogleUserAccount, type HookDriverRef } from "../../src/google";
 import type {
-  ActionKind, HookController, ResourceDescription,
+  ActionKind, ConnectHandoff, HookController, ResourceDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import {TestGitCache} from "../test-git-cache";
 import type {
@@ -22,7 +22,40 @@ import { GmailHookDriver as GoogleGmailHookDriver, type GmailHookParams } from "
 export { default } from "../../src/google";
 export { ChatHookController } from "../../src/chat-hooks";
 export { GmailHookController } from "../../src/gmail-hooks";
-export { GmailGatekeeperImpl, GoogleChatGatekeeperImpl, GoogleVerifier };
+export { GmailGatekeeperImpl, GoogleChatGatekeeperImpl, GoogleVerifier } from "../../src/google";
+// Named as well, so the pool builds `ctx.exports` entrypoints from exports it can see statically
+// and acceptAuthCode() can mint the user the Workshop is handed on first connect.
+export { GatekeeperUserImpl } from "../../src/google";
+
+/** What each `TestConnectCallback` was told, by its `props.name`. */
+export const connectCallbackEvents = new Map<string, string[]>();
+
+/** Stands in for the Workshop's connect callback, recording each call it receives. */
+export class TestConnectCallback extends WorkerEntrypoint<Cloudflare.Env, { name: string }> {
+  #record(event: string): void {
+    const events = connectCallbackEvents.get(this.ctx.props.name) ?? [];
+    events.push(event);
+    connectCallbackEvents.set(this.ctx.props.name, events);
+  }
+
+  async complete(): Promise<ConnectHandoff> {
+    this.#record("complete");
+    return { targetOrigin: "https://workshop.example", ticket: "ticket" };
+  }
+
+  async reconnectComplete(stageId: string): Promise<ConnectHandoff> {
+    this.#record(`reconnectComplete:${stageId}`);
+    return { targetOrigin: "https://workshop.example", ticket: "ticket" };
+  }
+
+  async credentialsExpired(): Promise<void> {
+    this.#record("credentialsExpired");
+  }
+
+  async credentialsRestored(): Promise<void> {
+    this.#record("credentialsRestored");
+  }
+}
 
 const UNREACHABLE = "The test hook driver can't be reached.";
 

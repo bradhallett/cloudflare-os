@@ -579,7 +579,7 @@ export type ResourceConfiguratorFrame = GatekeeperUiFrame;
  * purpose (e.g. billing) without asking the user to grant data access it will never use.
  */
 export type GatekeeperConnectOptions = {
-  scopes?: "auth" | "full";
+  scopes?: "auth" | "billing";
   resourceUrlPatterns?: string[];
 };
 
@@ -633,9 +633,12 @@ export interface GatekeeperVendor extends WorkerEntrypoint {
    * include a cryptographic nonce (in addition to the DO ID), stored in the DO and verified when the
    * user visits the URL, to prevent replay. See gatekeeper-github for a reference implementation.
    *
-   * `options.scopes` selects how much access to request (default "full"):
-   *   - "full": the gatekeeper's full capability scopes (repos, docs, etc.). The resulting
-   *     connection is persisted as a usable connected account.
+   * `options.scopes` selects how much access to request (default: the gatekeeper's full
+   * capability scopes, e.g. repos and docs, persisted as a usable connected account):
+   *   - "billing": a persisted grant for billing only, not data access -- paired with
+   *     `resourceUrlPatterns: []` it requests no resource authorization at all (Cloudflare uses
+   *     this at sign-in to link AI Gateway billing). Vendors without a separate billing tier
+   *     treat it as the default full-capability request.
    *   - "auth": only the minimal scopes needed to verify the user's email for sign-in. The grant is
    *     transient — after `complete()` lets the caller read getAuthenticatedEmail(), the gatekeeper
    *     discards it. Vendors without `providesAuth` ignore this and always use their full scopes.
@@ -1233,6 +1236,38 @@ export interface ObservationAuthorizer extends RpcTarget {
    * of possession.
    */
   getGitCache(): Promise<GitCache>;
+}
+
+/**
+ * The mark the overseer puts on a refusal from `authorizeObservation`: the error carries it as an
+ * own enumerable `code`. A failure carrying it proves the observation was refused by policy
+ * *before* anything was recorded, so prepared observer state may be reclaimed; any other failure
+ * leaves the outcome unknown, and durable fences must be retained.
+ *
+ * The mark rides `code` because both observation RPC transports preserve own enumerable Error
+ * props where they drop the thrown class: Cap'n Web rebuilds errors client-side, and workerd RPC
+ * serializes `code` the same way the openGadget error codes rely on. A refusal from an overseer
+ * deployment too old to mark it therefore reads as an unknown outcome, which is the safe
+ * direction.
+ */
+export const OBSERVATION_REFUSED_CODE = "ObservationRefusedError";
+
+/** Creates the refusal `authorizeObservation` throws when policy blocks an observation. */
+export function createObservationRefusedError(): Error & {code: typeof OBSERVATION_REFUSED_CODE} {
+  return Object.assign(
+      new Error(
+          "This observation was blocked because it contains data that a current collaborator " +
+          "is not permitted to see."),
+      {code: OBSERVATION_REFUSED_CODE} as const);
+}
+
+/**
+ * Reads whether a failure from `authorizeObservation` is a marked observation refusal.
+ * @param error Caught failure.
+ * @returns Whether the overseer refused the observation before recording it.
+ */
+export function isObservationRefused(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === OBSERVATION_REFUSED_CODE;
 }
 
 /**

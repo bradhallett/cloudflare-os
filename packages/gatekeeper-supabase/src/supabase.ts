@@ -17,18 +17,27 @@ import {
   type VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { buildDescription, codeSpan } from "@gadgets/gatekeeper-kit/action-description";
-import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
-import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
+import {
+  clearConnectionSubject, commitReconnect, ConnectionSubject, pinConnectionSubject, stageReconnect,
+} from "@gadgets/gatekeeper-kit/credential-stage";
 import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
 import {
   SupabaseApi,
   SupabaseApiError,
   exchangeAuthCode,
+  fetchProfile,
+  isSupabaseOutcomeUnknown,
   refreshAccessToken,
   revokeRefreshToken,
   type ProjectResponse,
   type SupabaseOAuthGrant,
+  type SupabaseProfile,
 } from "./supabase-api";
+import { PendingActionStore, SupabaseCache, type StoredExecuteAction } from "./supabase-storage";
+import {
+  APPLY_OUTCOME_UNKNOWN_MESSAGE, ActionOutcomeUnknownError,
+} from "@gadgets/gatekeeper-kit/actions";
 import { describeTable, listSchemas, listTables } from "./supabase-introspection";
 import {
   SupabaseOrganizationConfiguratorUI,
@@ -96,8 +105,19 @@ type StoredToken = {
 };
 
 /**
+ * The connected account's identity, read from `/v1/profile` right after the token exchange. The
+ * GoTrue user id is the stable property the kit's reconnect fence pins against; email and
+ * username are for display and refusal messages.
+ */
+type StoredIdentity = ConnectionSubject & {
+  email?: string;
+  username?: string;
+};
+
+/**
  * A grant as persisted (or staged for a reconnect): the expiry is absolute, since the provider's
  * relative `expiresIn` counts from the exchange, not from whenever the grant is later made live.
+ * Which account a grant belongs to travels separately, as the connection's subject.
  */
 type StoredGrant = {
   accessToken: string;
@@ -113,19 +133,23 @@ function toStoredGrant(grant: SupabaseOAuthGrant, now: number): StoredGrant {
   };
 }
 
-// A mutating SQL statement queued for human approval and applied once approved.
-type StoredExecuteAction = {
-  ref: string;
-  sql: string;
-  params?: SupabaseValue[];
-  submittedAt: number;
-};
+/** The account a freshly exchanged grant belongs to, as the connection's subject. */
+function profileSubject(profile: SupabaseProfile): StoredIdentity {
+  return {
+    id: profile.gotrueId,
+    email: profile.primaryEmail,
+    username: profile.username,
+  };
+}
 
-type Cached<T> = {
-  fetchedAt: number;
-  value: T;
-  generation: number;
-};
+/** How an identity is named in user-facing reconnect refusals. */
+function describeSupabaseAccount(identity: StoredIdentity): string {
+  return identity.email || identity.username || "the original account";
+}
+
+/** What finishing an OAuth flow yields: a handoff page, or a refusal to show. */
+type CallbackResult = { handoff: ConnectHandoff } | { refused: { title: string; detail: string } };
+
 
 // Cache TTLs. Project/org metadata and service lists change rarely; schema introspection can shift
 // after DDL, so it gets a shorter TTL and is invalidated entirely when an action is applied.
@@ -134,11 +158,10 @@ const SCHEMA_CACHE_TTL_MS = 30 * 1000;
 // Re-fetch the access token from the UserAccount DO at most this often per gatekeeper session.
 const SESSION_TOKEN_TTL_MS = 30 * 1000;
 
-type ResourceKind = "project" | "organization";
-
-type SupabaseGatekeeperImplProps = {
+/** Props the Overseer instantiates the gatekeeper facet with: the account and resource it serves. */
+export type SupabaseGatekeeperImplProps = {
   userObjectId: string;
-  resourceKind: ResourceKind;
+  resourceKind: "project" | "organization";
   ref?: string;
   slug?: string;
 };
@@ -344,12 +367,14 @@ export default {
       const stub: DurableObjectStub<UserAccount> = ctx.exports.UserAccount.get(
         ctx.exports.UserAccount.idFromString(doId),
       );
-      const handoff = await stub.acceptAuthCode(code, oauthNonce);
-      if (!handoff) {
+      const result = await stub.acceptAuthCode(code, oauthNonce);
+      if (result === null) {
         return new Response(INVALID_LINK_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
       }
-
-      return htmlResponse(connectHandoffPageHtml(handoff));
+      if ("refused" in result) {
+        return htmlResponse(errorPageHtml(result.refused.title, result.refused.detail), 409);
+      }
+      return htmlResponse(connectHandoffPageHtml(result.handoff));
     }
 
     return new Response("Not Found", { status: 404 });
@@ -445,10 +470,11 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   /**
-   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on, or
-   * null when the callback's nonce doesn't match.
+   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on:
+   * a handoff, a refusal to show (never the page for a reconnect that pinned a different
+   * account), or null when the callback's nonce doesn't match.
    */
-  async acceptAuthCode(code: string, oauthNonce: string): Promise<ConnectHandoff | null> {
+  async acceptAuthCode(code: string, oauthNonce: string): Promise<CallbackResult | null> {
     const stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
     if (!stored || stored.stage !== "oauth" || Date.now() >= stored.expiresAt
         || !constantTimeEqual(stored.value, oauthNonce)) {
@@ -467,20 +493,47 @@ export class UserAccount extends DurableObject<Env> {
       throw new Error("Took too long to complete authorization. Please try again.");
     }
 
-    const grant = toStoredGrant(
-      await exchangeAuthCode(code, clientId, clientSecret, `${getBaseUrl(this.env)}/oauth`),
-      Date.now(),
-    );
+    const exchanged = await exchangeAuthCode(code, clientId, clientSecret, `${getBaseUrl(this.env)}/oauth`);
+
+    // Read which account just authorized before the grant is trusted anywhere: the profile's
+    // GoTrue id is what a reconnect pins against. Without it the grant is unusable — a reconnect
+    // could not be told from an account swap — so it is retired and the flow fails.
+    let profile: SupabaseProfile;
+    try {
+      profile = await fetchProfile(exchanged.accessToken);
+    } catch (error) {
+      await this.#revokeExchangedGrant(exchanged.refreshToken, clientId, clientSecret);
+      throw new Error(
+        "Could not read which Supabase account authorized the connection, so it was not " +
+          "connected. Please try again.", { cause: error });
+    }
+    const grant = toStoredGrant(exchanged, Date.now());
+    const subject = profileSubject(profile);
 
     let handoff: ConnectHandoff;
     if (stored.reconnect) {
+      // A reconnect only ever reconnects the account it was made for: the profile's GoTrue id
+      // must be the one this connection is pinned to. A different account's grant is revoked
+      // outright.
+      const staged = stageReconnect(this.ctx.storage.kv, grant, subject, Date.now(),
+        (pinned, granted) => ({
+          title: "That's a different Supabase account",
+          detail: `This connection is for ${describeSupabaseAccount(pinned)}, but Supabase ` +
+            `authorized ${describeSupabaseAccount(granted)}. Sign in to Supabase as ` +
+            `${describeSupabaseAccount(pinned)} and reconnect, or connect ` +
+            `${describeSupabaseAccount(granted)} as a separate account.`,
+        }));
+      if ("refused" in staged) {
+        await this.#revokeExchangedGrant(grant.refreshToken, clientId, clientSecret);
+        return { refused: staged.refused };
+      }
       // The reconnect URL is a bearer capability, so the new grant is only staged until the Workshop
       // has confirmed the browser that finished the flow is the owner's (see commitReconnect). Bound
       // gadgets keep reading the current token meanwhile.
-      const stageId = stageCredentials(this.ctx.storage.kv, grant, Date.now());
-      handoff = await callback.reconnectComplete(stageId);
+      handoff = await callback.reconnectComplete(staged.stageId);
     } else {
       this.#storeGrant(grant);
+      pinConnectionSubject(this.ctx.storage.kv, subject);
       clearCredentialExpiryLatch(this.ctx.storage.kv);
       try {
         const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
@@ -489,17 +542,19 @@ export class UserAccount extends DurableObject<Env> {
         this.ctx.storage.kv.delete("accessToken");
         this.ctx.storage.kv.delete("refreshToken");
         this.ctx.storage.kv.delete("accessTokenExpiresAt");
+        clearConnectionSubject(this.ctx.storage.kv);
         throw error;
       }
     }
 
     await this.ctx.storage.deleteAlarm();
-    return handoff;
+    return { handoff };
   }
 
-  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
+  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. The kit
+   * re-pins the staged subject, adopting a connection made before the pin existed. */
   async commitReconnect(stageId: string): Promise<void> {
-    const grant = commitStagedCredentials<StoredGrant>(this.ctx.storage.kv, Date.now(), stageId);
+    const grant = commitReconnect<StoredGrant>(this.ctx.storage.kv, Date.now(), stageId);
     if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
     this.#storeGrant(grant);
     clearCredentialExpiryLatch(this.ctx.storage.kv);
@@ -509,6 +564,21 @@ export class UserAccount extends DurableObject<Env> {
     this.ctx.storage.kv.put("accessToken", grant.accessToken);
     this.ctx.storage.kv.put("refreshToken", grant.refreshToken);
     this.ctx.storage.kv.put<number>("accessTokenExpiresAt", grant.accessTokenExpiresAt);
+  }
+
+  /**
+   * Best-effort revocation of a grant whose exchange completed but which must not be kept: the
+   * account could not be identified, or it is not the one this connection is pinned to. Logged,
+   * never thrown — the refusal or failure already carries the user-facing outcome.
+   */
+  async #revokeExchangedGrant(refreshToken: string, clientId: string, clientSecret: string): Promise<void> {
+    try {
+      await revokeRefreshToken(refreshToken, clientId, clientSecret);
+    } catch (error) {
+      logger.error("failed to revoke an unusable Supabase OAuth grant", {
+        event: "oauth.grant.usable-revoke.failed", error,
+      });
+    }
   }
 
   /** Returns a valid access token (and its expiry), transparently refreshing when close to expiry. */
@@ -545,8 +615,12 @@ export class UserAccount extends DurableObject<Env> {
     }
 
     try {
-      const grant = toStoredGrant(
-        await refreshAccessToken(refreshToken, clientId, clientSecret), Date.now());
+      const refreshed = await refreshAccessToken(refreshToken, clientId, clientSecret);
+      const grant: StoredGrant = {
+        accessToken: refreshed.accessToken,
+        refreshToken: refreshed.refreshToken,
+        accessTokenExpiresAt: Date.now() + refreshed.expiresIn * 1000,
+      };
       this.#storeGrant(grant);
       return { token: grant.accessToken, expiresAt: grant.accessTokenExpiresAt };
     } catch (error) {
@@ -785,72 +859,6 @@ export class SupabaseVerifier extends WorkerEntrypoint<Env, SupabaseVerifierProp
   }
 }
 
-// ---------------------------------------------------------------------------
-// Action queue storage. Mutating SQL statements are stored here when submitted for approval and
-// removed once applied or rejected.
-
-class PendingActionStore {
-  #kv: DurableObjectStorage["kv"];
-
-  constructor(kv: DurableObjectStorage["kv"]) {
-    this.#kv = kv;
-  }
-
-  #key(id: number): string {
-    return `pending:action:${id}`;
-  }
-
-  submit(action: StoredExecuteAction): number {
-    const id = this.#kv.get<number>("pending:nextActionId") ?? 1;
-    this.#kv.put("pending:nextActionId", id + 1);
-    this.#kv.put(this.#key(id), action);
-    return id;
-  }
-
-  get(id: number): StoredExecuteAction | undefined {
-    return this.#kv.get<StoredExecuteAction>(this.#key(id));
-  }
-
-  remove(id: number): void {
-    this.#kv.delete(this.#key(id));
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Cache for stable, read-only metadata (project info, schema introspection, etc.). Backed by the
-// gatekeeper DO's KV storage and keyed within a "generation" that is bumped when an action is
-// applied, so structural changes invalidate cached schema in one stroke.
-
-class SupabaseCache {
-  #kv: DurableObjectStorage["kv"];
-
-  constructor(kv: DurableObjectStorage["kv"]) {
-    this.#kv = kv;
-  }
-
-  #generation(): number {
-    return this.#kv.get<number>("cache:generation") ?? 0;
-  }
-
-  bumpGeneration(): void {
-    this.#kv.put("cache:generation", this.#generation() + 1);
-  }
-
-  get<T>(key: string, ttlMs: number): T | undefined {
-    const cached = this.#kv.get<Cached<T>>(`cache:entry:${key}`);
-    if (!cached || cached.generation !== this.#generation()) return undefined;
-    if (Date.now() - cached.fetchedAt >= ttlMs) return undefined;
-    return cached.value;
-  }
-
-  put<T>(key: string, value: T): void {
-    this.#kv.put<Cached<T>>(`cache:entry:${key}`, {
-      fetchedAt: Date.now(),
-      value,
-      generation: this.#generation(),
-    });
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Session context shared by a session's RpcTargets.
@@ -954,7 +962,11 @@ class SupabaseSessionContext {
         awaitDecision: true,
       });
     } catch (error) {
-      this.#pending.remove(actionId);
+      // An auto-approval can apply the action mid-flight, which proves the overseer received it
+      // -- only the reply was lost, and deleting the record would discard a claim or a settled
+      // outcome. Only a still-pending record (or one never handed over) is safe to drop.
+      const record = this.#pending.record(actionId);
+      if (record === undefined || record.state === "pending") this.#pending.remove(actionId);
       throw error;
     }
   }
@@ -962,6 +974,18 @@ class SupabaseSessionContext {
 
 // ---------------------------------------------------------------------------
 // GatekeeperImpl DO — per-resource instance, runs as a facet of the Overseer.
+
+/**
+ * Records that the outcome of a dispatched SQL run cannot be known, and returns the error that
+ * surfaces it. Terminal: only a rejection clears the record.
+ */
+function failUnknownOutcome(
+  journal: PendingActionStore["journal"] extends () => infer J ? J : never,
+  actionId: number,
+): ActionOutcomeUnknownError {
+  journal.markFailed(actionId, APPLY_OUTCOME_UNKNOWN_MESSAGE, { outcome: "unknown" });
+  return new ActionOutcomeUnknownError(APPLY_OUTCOME_UNKNOWN_MESSAGE);
+}
 
 @validateRpc()
 export class SupabaseGatekeeperImpl extends DurableObject<Env, SupabaseGatekeeperImplProps>
@@ -1132,15 +1156,34 @@ export class SupabaseGatekeeperImpl extends DurableObject<Env, SupabaseGatekeepe
   }
 
   /**
-   * Approved: run the queued SQL statement for real, then drop it and invalidate cached schema
-   * metadata (the database may have changed).
+   * Approved: run the queued SQL statement once, then drop it and invalidate cached schema
+   * metadata (the database may have changed). The claim is taken before the statement runs, so a
+   * replayed or interrupted apply never runs the SQL a second time; a run whose outcome cannot be
+   * known is recorded terminally and surfaced instead.
    */
   async applyAction(actionId: number): Promise<void> {
     const pending = new PendingActionStore(this.ctx.storage.kv);
-    const action = pending.get(actionId);
-    if (!action) {
-      throw new Error(`Unknown pending Supabase action: ${actionId}`);
+    const journal = pending.journal();
+    // A retired id is remembered as applied, so a replayed approval settles instead of erroring.
+    if (journal.wasApplied(actionId)) return;
+    const record = pending.record(actionId);
+    if (!record) throw new Error(`Unknown pending Supabase action: ${actionId}`);
+    // A terminal failure answers every later attempt with the same message, no SQL.
+    if (record.state === "failed") throw new Error(record.error);
+    // A claim left behind means a previous run's outcome is unknown: the statement may have
+    // reached the database. Record it terminally and surface it — never silently re-run SQL.
+    if (record.state === "claimed") throw failUnknownOutcome(journal, actionId);
+    // Retained rows are settled applies an interrupted retire left behind; finish the removal.
+    if (record.state === "applied") {
+      journal.retire(actionId);
+      return;
     }
+    // Staged means a submission whose reply was lost; this callback proves the overseer holds
+    // the id, so promote it rather than strand it.
+    journal.markSubmitted(actionId);
+
+    const action = record.action;
+    journal.markClaimed(actionId);
     try {
       await this.#makeApi().runQuery(action.ref, action.sql, action.params);
     } catch (error) {
@@ -1148,17 +1191,45 @@ export class SupabaseGatekeeperImpl extends DurableObject<Env, SupabaseGatekeepe
       // The action stays queued (we don't remove it) so it can be retried after reconnecting.
       if (error instanceof SupabaseApiError && error.isAuthError) {
         await this.#userAccount().noteCredentialsExpired();
+        journal.restorePending(actionId);
         throw new Error("Supabase credentials have expired or been revoked. Reconnect the account, then retry.", { cause: error });
       }
+      if (isSupabaseOutcomeUnknown(error)) {
+        // No definitive answer arrived, so the statement may have landed. Record the action
+        // terminally with the reason and surface it; a rejection clears the record after the
+        // user checks the database.
+        const message = `${APPLY_OUTCOME_UNKNOWN_MESSAGE} (${error instanceof Error ? error.message : String(error)})`;
+        journal.markFailed(actionId, message, { outcome: "unknown" });
+        throw new ActionOutcomeUnknownError(message);
+      }
+      // Supabase answered with a refusal (or the failure is internal): the statement did not
+      // land, so the record goes back to pending and the failure stays retryable, as before.
+      journal.restorePending(actionId);
       throw error;
     }
-    pending.remove(actionId);
+    // Settled: retire the record and remember the id, so replays settle rather than re-run.
+    journal.retire(actionId);
     new SupabaseCache(this.ctx.storage.kv).bumpGeneration();
   }
 
   /** Rejected: discard the queued statement. There is no simulation state to roll back. */
   async rejectAction(actionId: number): Promise<void> {
-    new PendingActionStore(this.ctx.storage.kv).remove(actionId);
+    const pending = new PendingActionStore(this.ctx.storage.kv);
+    const journal = pending.journal();
+    const record = pending.record(actionId);
+    if (record?.state === "claimed") {
+      // The SQL may already have run; deleting the record would discard the only trace that it
+      // might have. The user checks the database, then rejects again to clear the failure this
+      // records.
+      throw failUnknownOutcome(journal, actionId);
+    }
+    // Rejecting a recorded failure is the user clearing it after checking; anything else simply
+    // goes. Retire (rather than remove) an applied row so a replayed approval still settles.
+    if (record?.state === "applied") {
+      journal.retire(actionId);
+      return;
+    }
+    journal.remove(actionId);
   }
 
   /**
