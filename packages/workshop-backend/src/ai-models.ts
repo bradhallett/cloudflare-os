@@ -1276,8 +1276,19 @@ export class DecisionModelGatekeeper
     await refuseRevokedModel(this.env, this.ctx.props);
     let usageGate = bindingUsageGate(
         this.env, this.ctx.props.ownerUserId, this.ctx.exports.UserDurableObject);
+    // Meter the binding's classifier calls as the LLM binding meters run() (#17's seam): the
+    // owner is in scope here, and decide() would otherwise discard the usage pi reports on the
+    // result. Fire-and-forget at the port (OSS unbound: no-op); config.model is the catalog id
+    // the classifier catalog is keyed by, so it is the id a price table resolves.
+    let onUsage = this.ctx.props.ownerUserId === undefined ? undefined
+        : (usage: Usage) => emitUsageEvent(this.env, {
+              modelId: config.model,
+              tokens: usageTokens(usage),
+              userId: this.ctx.props.ownerUserId!,
+              surface: "binding",
+            });
     return new DecisionModelBindingImpl(
-        getDecisionModel(this.env, config, initiator, metadata), usageGate);
+        getDecisionModel(this.env, config, initiator, metadata), usageGate, onUsage);
   }
 
   applyAction(action: number): Promise<void> {
@@ -1303,13 +1314,18 @@ export class DecisionModelGatekeeper
 
 @validateRpc()
 class DecisionModelBindingImpl extends RpcTarget implements DecisionModelBinding {
-  constructor(private model: DecisionModel, private usageGate: () => Promise<void>) {
+  constructor(private model: DecisionModel, private usageGate: () => Promise<void>,
+      private onUsage?: (usage: Usage) => void) {
     super();
   }
 
   async decide(request: DecisionRequest): Promise<Record<string, DecisionAnswer>> {
     await this.usageGate();
     let result = await this.model(request);
+    // Meter the call whenever the service reported token counts — before the failure check
+    // below, since pi keeps usage on a result whose answers failed to parse ("was still
+    // billed") and the tokens were spent either way. Fire-and-forget, like run()'s hook.
+    if (result.usage !== undefined) this.onUsage?.(result.usage);
     // pi reports a failure in the result; gadget code expects a rejection, as completeText()
     // gives the LLM binding.
     if (result.stopReason !== "stop") throw new Error(result.errorMessage);

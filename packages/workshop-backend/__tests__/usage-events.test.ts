@@ -151,10 +151,11 @@ describe("addChatMessages emission", () => {
       impl.ownerId = undefined;                                       // pre-ownership workspace
       impl.addChatMessages(1, author, msgs, usage());                 // spend but no owner
     });
-    // Fire-and-forget is the contract: the emission exposes no promise to await, so absence
-    // can only be observed after the RPC channel has had time to deliver. Deterministic time
-    // control is impossible across isolates; this single short delay is the honest bound.
-    await new Promise(resolve => setTimeout(resolve, 10));
+    // The guarded paths all decline synchronously, before any RPC is initiated, so nothing is
+    // in flight by the time the kernel call above resolves: draining the microtask queue
+    // settles every promise those calls created, and the port read can only see writes already
+    // delivered — no wall-clock timer needed.
+    for (let i = 0; i < 5; i++) await Promise.resolve();
     expect(await env.SAAS_USAGE_EVENTS.events()).toEqual([]);
   });
 });

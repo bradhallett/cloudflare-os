@@ -605,6 +605,10 @@ export abstract class OverseerPublishing extends OverseerFacets {
           break;
         }
       }
+      // Edge, accepted: a batch with spend but no step carrying modelData (no model snapshot
+      // was persisted) finds no model and silently drops the event — UsageEvent.modelId has no
+      // null form, and guessing an id would bill the wrong price row. The spend stays in the
+      // chat's cost record (addRequestCost below); only the port goes unmetered.
       if (model !== undefined) {
         emitUsageEvent(this.env, {
           modelId: model,

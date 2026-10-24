@@ -29,9 +29,27 @@ export interface UsageEventTokens {
 
 /**
  * One meterable model request, as the bound usage-events service receives it. Emitted
- * fire-and-forget at the two seams every billable model call crosses (agent chat steps and
- * model-binding `run()`); the core never waits on the port, and a port failure is logged, never
- * thrown into the model-call path.
+ * fire-and-forget — the core never waits on the port, and a port failure is logged, never
+ * thrown into the model-call path — at the seams where a request's usage is in scope:
+ *
+ * - agent chat steps, `surface: "chat"`: OverseerPublishing.addChatMessages
+ *   (workshop-backend), the accounting barrier every step crosses with its tokens, model and
+ *   gateway log id;
+ * - gadget model bindings, `surface: "binding"`: LanguageModelBinding.run() and
+ *   DecisionModelBinding.decide() (workshop-backend/src/ai-models.ts).
+ *
+ * These seams do NOT cover every billable model call. A meter built on these events must know
+ * the gaps, each deliberate:
+ *
+ * - Quick-model one-shots — thread and gadget titles, binding naming, the admin panel's model
+ *   test. Platform-cost only, and skipped once the workspace owner's allowance is spent (see
+ *   #allowQuickModelCall); noted in #16.
+ * - Agent compaction requests (workshop-backend agent.ts: requestAnthropicCompaction and the
+ *   summary completeText). Their spend is attributed to the chat's cost records — the gateway
+ *   logs them under the chat like any turn request — but they publish no chat message, so they
+ *   cross no seam.
+ * - Chat cache-warming resends (workshop-backend chat-cache-warming.ts). Billed to the chat's
+ *   cost record through addRequestCost (overseer-impl.ts) without crossing addChatMessages.
  */
 export interface UsageEvent {
   /**
