@@ -127,7 +127,7 @@ async function withEntry(
 describe("bundled blueprints", () => {
   // The bucket outlives a test, and every test here installs under the same ids.
   beforeEach(async () => {
-    for (let { blueprintId } of BUNDLED_BLUEPRINTS) await deleteBlueprintContent(env, blueprintId);
+    for (let { blueprintId } of BUNDLED_BLUEPRINTS) await deleteBlueprintContent(env, undefined, blueprintId);
   });
 
   it("installs every manifest entry as an ordinary blueprint", async () => {
@@ -164,7 +164,7 @@ describe("bundled blueprints", () => {
       // names, which is where readBlueprintRelease() looks for it.
       let commitId = record.metadata.commitId!;
       let key = `${entry.blueprintId}/${commitId}`;
-      expect(blueprintContentKey(entry.blueprintId, record.metadata)).toBe(key);
+      expect(blueprintContentKey(undefined, entry.blueprintId, record.metadata)).toBe(key);
       expect(await storedKeys(entry.blueprintId)).toEqual([key]);
       let objects = await readReleasePack(await storedContent(key), commitId);
       expect(listReleaseFiles(objects, commitId)).toEqual(new Map(entry.files));
@@ -194,8 +194,8 @@ describe("bundled blueprints", () => {
     let older = { ...installed };
     delete older.commitId;
     await env.BLUEPRINT_CONTENT.put(
-        blueprintContentKey("older-install", older), await snapshotContent(entry.files));
-    let release = await readBlueprintRelease(env, "older-install", older);
+        blueprintContentKey(undefined, "older-install", older), await snapshotContent(entry.files));
+    let release = await readBlueprintRelease(env, undefined, "older-install", older);
     expect(release.commitId).toBe(installed.commitId);
   });
 

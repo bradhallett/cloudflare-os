@@ -8,12 +8,16 @@
 // TypeScript file is the source of truth and wrangler.jsonc a generated artifact every existing
 // consumer keeps reading; `pnpm configs:check` (CI's lint job) keeps the two in step.
 //
-// Usage: node scripts/generate-worker-configs.ts [--check]
+// Usage: node scripts/generate-worker-configs.ts [--check] [--scan-root <dir>]...
+//
+// Extra scan roots (repeatable --scan-root, or WORKER_SCAN_ROOTS — see scan-roots.ts) also get
+// their wrangler.jsonc generated, so an overlay workspace's workers stay authored in TypeScript.
 
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { convertToWranglerConfig, resolveAndParseConfig } from "@cloudflare/config";
+import { resolveScanRoots, scanRootArgs } from "./scan-roots.ts";
 import type { WranglerConfig } from "./release/manifest-lib.ts";
 import type { WranglerExtras } from "./worker-config.ts";
 
@@ -34,11 +38,12 @@ const subdirs = (dir: string) => readdirSync(dir, { withFileTypes: true })
   .map((e) => join(dir, e.name));
 
 /**
- * Every directory holding a Worker config: the root dev router, each package, and each integration
- * fixture. A directory with only a wrangler.jsonc is kept so that a hand-written one fails.
+ * Every directory holding a Worker config: the root dev router, each package under the given
+ * scan roots (the repo's own plus any overlay roots), and each integration fixture. A directory
+ * with only a wrangler.jsonc is kept so that a hand-written one fails.
  */
-export function workerConfigDirs(): string[] {
-  return [ROOT, ...subdirs(PACKAGES_DIR), ...subdirs(FIXTURES_DIR)]
+export function workerConfigDirs(scanRoots: readonly string[]): string[] {
+  return [ROOT, ...scanRoots.flatMap(subdirs), ...subdirs(FIXTURES_DIR)]
     .filter((dir) => existsSync(join(dir, SOURCE_NAME)) || existsSync(join(dir, GENERATED_NAME)))
     .toSorted();
 }
@@ -98,8 +103,10 @@ export async function renderWorkerConfig(dir: string): Promise<string> {
  * Regenerates every Worker's wrangler.jsonc, writing only files whose content changed. With
  * `check`, writes nothing. Returns the repo-relative paths that differed.
  */
-export async function generateWorkerConfigs({ check }: { check: boolean }): Promise<string[]> {
-  const dirs = workerConfigDirs();
+export async function generateWorkerConfigs(
+  { check, scanRoots }: { check: boolean; scanRoots: readonly string[] },
+): Promise<string[]> {
+  const dirs = workerConfigDirs(scanRoots);
   const rendered = await Promise.all(dirs.map(renderWorkerConfig));
   return dirs.flatMap((dir, i) => {
     const path = join(dir, GENERATED_NAME);
@@ -115,7 +122,8 @@ export async function generateWorkerConfigs({ check }: { check: boolean }): Prom
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const check = process.argv.includes("--check");
-  const stale = await generateWorkerConfigs({ check });
+  const scanRoots = resolveScanRoots(scanRootArgs(process.argv.slice(2)));
+  const stale = await generateWorkerConfigs({ check, scanRoots });
   if (check && stale.length > 0) {
     console.error(`worker configs out of date (run \`pnpm configs:generate\`):\n  ${stale.join("\n  ")}`);
     process.exitCode = 1;

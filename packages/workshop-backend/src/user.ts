@@ -1,5 +1,5 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, type DeviceSessionHandoffStart, type BotDefinition, type BotInfo, type BotSelection, type BotSkillChoice, type BotSkillRef } from '@gadgets/workshop-shared/api';
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, type DeviceSessionHandoffStart, type BotDefinition, type BotInfo, type BotSelection, type BotSkillChoice, type BotSkillRef, type OrgMemberStatus, type OrgRole } from '@gadgets/workshop-shared/api';
 import { ActionDescription, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperUserSelection, GatekeeperUserSelectionExchange, RedeemedGatekeeperUserSelection } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { botKey, normalizeBotDefinition } from "./bot-config.js";
@@ -8,8 +8,10 @@ import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
   makeUserStorage, type BlueprintUserRecord, type CloudflareBilling, type ConnectedAccountRecord,
-  type GadgetRecord, type PendingConnectFlow, type PendingDeviceHandoffRecord,
-  type PendingHandoffRecord, type UserAiModelRecord, type UserStorage, type WorkspaceOutputEntry,
+  type GadgetRecord, type LoginSessionRecord, type PendingConnectFlow,
+  type PendingDeviceHandoffRecord, type PendingHandoffRecord, type OrgMembershipRecord,
+  type UserAiModelRecord, type UserStorage,
+  type WorkspaceOutputEntry,
 } from "./storage-schema/user-storage.js";
 import { recordAnalytics } from "./analytics";
 import { createWorkshopLogger } from "./observability";
@@ -18,6 +20,7 @@ import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-bi
 import type { AdminSettings } from "./admin-settings.js";
 import { deleteBlueprintContent } from "./blueprint-archive.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./storage-schema/blueprints-kv.js";
+import { resolveBlueprintForUser } from "./blueprint-access.js";
 import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./admin-config.js";
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
 import { CONNECT_FLOW_LIFETIME_MS, handoffTargetOrigin, hashPresentedSecret, hashSecret, newSecretToken, PENDING_HANDOFF_LIFETIME_MS } from "./connect-handoff.js";
@@ -50,6 +53,19 @@ export type ProvidedAccountInfo = {
   accountId: number;
   vendorId: string;
   description: AccountDescription;   // carries `singleton` / `providesUi` declarations
+};
+
+/**
+ * The caller's user-directory scope: who they may find with `searchUsers()` and pick with a
+ * gatekeeper user-selection ticket. One entry per org that still holds the caller as an active
+ * member (re-checked live through the org's own member listing, so a stale index entry or a
+ * removed membership yields no entry), naming that org's active member ids; `partnerIds` adds the
+ * owners of workspaces shared with the caller, the explicit share relationships that outlive org
+ * boundaries. Together these are the whole searchable set — nobody outside them is discoverable.
+ */
+export type UserDirectoryScope = {
+  orgs: { orgId: string; memberIds: string[] }[];
+  partnerIds: string[];
 };
 
 // The singleton/UI methods (createAccount on GatekeeperVendor; getSingletonGatekeeperClass /
@@ -263,6 +279,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async authenticate(token: string): Promise<void> {
+    // A deprovisioned account is closed: any surviving record (e.g. staged before the flag was
+    // set) must not authenticate. Same failure shape as any other bad token, so the client
+    // simply signs out.
+    if (this.storage.deprovisioned.get()) {
+      throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
+    }
     let tokenBytes: Uint8Array;
     try {
       tokenBytes = Uint8Array.fromBase64(token);
@@ -295,6 +317,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * existing users can still sign in.
    */
   async authenticateFromCfAccess(email: string, allowCreate: boolean): Promise<boolean> {
+    this.#refuseIfDeprovisioned();
     const isNew = !this.storage.created.get();
     if (isNew) {
       if (!allowCreate) {
@@ -310,6 +333,14 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
     this.#syncDirectory();
     return isNew;
+  }
+
+  // Deprovisioning closes the account (see deprovision()): no sign-in path may create it again
+  // or mint a new session afterwards.
+  #refuseIfDeprovisioned(): void {
+    if (this.storage.deprovisioned.get()) {
+      throw new Error("This account has been deprovisioned and can no longer sign in.");
+    }
   }
 
   async #newSessionToken(options: { expiresAt?: Date; pendingUntil?: Date } = {}): Promise<string> {
@@ -454,6 +485,130 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
+   * Deletes every session record — browser and device sessions alike — plus every staged device
+   * handoff and gatekeeper user-selection ticket, and returns how many session records were
+   * deleted. Sessions are validated per request with no cache, so a deleted record fails on the
+   * caller's very next `authenticate()`; a staged handoff's ticket can no longer be consumed
+   * either, and the session it had staged dies with it (see `#dropPendingDeviceHandoff`).
+   */
+  async revokeAllSessions(): Promise<number> {
+    // Snapshot the ids first: the handoff loop below deletes staged sessions itself, and the
+    // loops must not iterate a collection they are mutating.
+    let tokenIds = [...this.storage.sessions.list()].map(session => session.tokenId);
+    for (let pending of this.storage.pendingDeviceHandoffs.list()) {
+      this.#dropPendingDeviceHandoff(pending);
+    }
+    for (let selection of this.storage.pendingUserSelections.list()) {
+      this.storage.pendingUserSelections.delete(selection.ticketHash);
+    }
+    for (let tokenId of tokenIds) {
+      this.storage.sessions.delete(tokenId);
+    }
+    await this.#armExpirySweep();
+    return tokenIds.length;
+  }
+
+  /**
+   * Every current session record, for an admin surface to list "signed-in browsers and devices".
+   * Metadata only: the tokens themselves are unrecoverable by design (only their SHA-256 hash is
+   * stored), so a listing cannot be turned into access. `pendingUntil` marks a device session
+   * staged but not yet activated by its handoff.
+   */
+  async listSessions(): Promise<LoginSessionRecord[]> {
+    return [...this.storage.sessions.list()];
+  }
+
+  /**
+   * Closes the account and severs everything that outlives a session:
+   *
+   * - every session and staged handoff/selection (revokeAllSessions, so the next `authenticate()`
+   *   fails and no staged device handoff can be consumed);
+   * - every connected gatekeeper account, revoked best-effort like `disconnectAccount()` (a
+   *   gatekeeper that throws must not block the rest) and then deleted;
+   * - the password (`passwordHashHash` nulled, so `login()` can never succeed again);
+   * - push subscriptions, AI Gateway billing state and the daily LLM counter;
+   * - the `deprovisioned` flag, set first so every sign-in path (password, gatekeeper, Cloudflare
+   *   Access) refuses even if a later step stalls;
+   * - the deployment-wide directory, where the user is flagged so collaborator search hides them
+   *   (the counterpart of `#syncDirectory()`);
+   * - every workspace shared *with* the user, whose collaborator edges are severed so each
+   *   affected workspace force-restarts and the user's live chat sessions die with it (see
+   *   `#severSharedWorkspaceAccess`).
+   *
+   * Not touched: short-lived connect handoffs and flows (the alarm sweep owns those), and the
+   * user's own workspaces and data — deprovisioning removes access, not content. Idempotent:
+   * a second call finds nothing left to remove.
+   */
+  async deprovision(): Promise<void> {
+    // Flag first, before any await: once set, no authentication path can mint a new session, so a
+    // deprovision that stalls partway still leaves the account closed.
+    this.storage.deprovisioned.put(true);
+    await this.revokeAllSessions();
+    for (let account of this.storage.connectedAccounts.list()) {
+      try {
+        await account.account.revoke();
+      } catch (err) {
+        logger.error("revoke() failed during deprovision", {
+          event: "account.revoke.failed",
+          vendorId: account.vendorId, accountId: account.id, error: err,
+        });
+      }
+      this.storage.connectedAccounts.delete(account.id);
+    }
+    this.storage.passwordHashHash.put(null);
+    this.storage.notificationSubscriptions.put({});
+    this.storage.cloudflareBilling.put(null);
+    this.storage.dailyLlmCount.put(null);
+    if (this.storage.created.get()) {
+      // Only a created account has a directory record (or a real profile id to flag).
+      try {
+        await this.ctx.exports.UserDirectoryDurableObject.getByName("")
+            .markUserDeprovisioned(this.storage.profile.get().id, true);
+      } catch (error) {
+        logger.warn("failed to flag deprovisioned user in the directory", {
+          event: "user.directory.deprovision.failed",
+          error,
+        });
+      }
+    }
+    await this.#severSharedWorkspaceAccess();
+    logger.info("user deprovisioned", { event: "user.deprovisioned" });
+  }
+
+  /**
+   * Removes the user's collaborator edges from every workspace that was shared with them, so each
+   * affected workspace force-restarts (`scheduleAccessRestart`) and the user's live chat sessions
+   * die with the restart rather than at their next re-open. Best-effort per workspace: one that
+   * cannot be reached keeps its stale edge, which grants nothing — the deprovisioned user can no
+   * longer open anything.
+   *
+   * Two lazy residuals are accepted, consistent with the sharing model's revocation contract
+   * (docs/sharing.md, docs/observers.md): only workspaces the user has *opened* are known here
+   * (the gadgets index is written on open), so an edge for a share they never opened lingers
+   * until its owner removes it — inert, for the same reason; and the post-restart cleanup the
+   * restart can cut off (observer teardown, listing refresh) self-heals lazily, exactly as in
+   * `removeCollaborator()`.
+   */
+  async #severSharedWorkspaceAccess(): Promise<void> {
+    let profileId = this.storage.profile.get().id;
+    let shared = [...this.storage.gadgets.list()].filter(record => record.owner);
+    if (shared.length === 0) return;
+    let overseers = this.ctx.exports.OverseerDurableObject;
+    let results = await Promise.allSettled(shared.map(workspace =>
+        overseers.get(overseers.idFromString(workspace.id))
+            .severCollaboratorAccess(profileId)));
+    for (let i = 0; i < results.length; i++) {
+      let result = results[i];
+      if (result.status === "rejected") {
+        logger.warn("failed to sever deprovisioned user's workspace access", {
+          event: "deprovision.workspace.sever.failed",
+          gadgetId: shared[i].id, error: result.reason,
+        });
+      }
+    }
+  }
+
+  /**
    * Log in via an authentication gatekeeper, creating the account on first use. The user DO is keyed
    * by the verified email (this DO's id derives from idFromName(email)), so `email` is also used as
    * the profile id and the initial display name is the email's local-part — consistent with the
@@ -468,6 +623,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * returns null instead of creating one — existing users can still sign in.
    */
   async loginOrCreateViaGatekeeper(email: string, allowCreate: boolean): Promise<string | null> {
+    this.#refuseIfDeprovisioned();
     if (!this.storage.created.get()) {
       if (!allowCreate) return null;
       this.storage.created.put(true);
@@ -1172,6 +1328,26 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
   }
 
+  /**
+   * Mirror one organization membership into this user's index, or drop it with null. Called by
+   * the org's Durable Object whenever the membership changes (see OrgDurableObject). The org is
+   * the authority; this index only lets listMyOrgs find the orgs in one read of the user's own
+   * object, and every entry is re-checked against its org when read.
+   */
+  syncOrgMembership(
+      orgId: string, membership: { role: OrgRole; status: OrgMemberStatus } | null): void {
+    if (membership === null) {
+      this.storage.orgMemberships.delete(orgId);
+    } else {
+      this.storage.orgMemberships.put({ orgId, ...membership });
+    }
+  }
+
+  /** The user's mirrored org memberships (see syncOrgMembership), sorted by org id. */
+  listOrgMemberships(): OrgMembershipRecord[] {
+    return [...this.storage.orgMemberships.list()];
+  }
+
   async listOutputs(): Promise<ListOutputsResult> {
     let catchingUp = await this.#backfillOutputs();
     return {outputs: this.#readOutputs(), catchingUp};
@@ -1301,7 +1477,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async addBlueprintToLibrary(id: string): Promise<void> {
-    let kvRecord = await readBlueprintKvRecord(this.env, id);
+    // The blueprint may belong to one of the user's orgs, so this is the member-gated read.
+    let kvRecord = await resolveBlueprintForUser(
+        this.env, this.ctx.exports.OrgDurableObject,
+        [...this.storage.orgMemberships.list()].map(entry => entry.orgId), this.ctx.id.name!, id);
     if (!kvRecord) {
       throw new Error("Blueprint not found.");
     }
@@ -1356,12 +1535,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     if (kvRecord) {
-      if (kvRecord.ownerId !== this.ctx.id.toString()) {
+      if (kvRecord.owner?.type !== "user" || kvRecord.owner.id !== this.ctx.id.toString()) {
         throw new Error("You don't own this blueprint.");
       }
 
       // Delete all R2 objects with the blueprint ID prefix.
-      await deleteBlueprintContent(this.env, id);
+      await deleteBlueprintContent(this.env, kvRecord.owner, id);
       await this.env.BLUEPRINT_CONTENT.delete(`${BLUEPRINT_SCREENSHOT_R2_PREFIX}${id}`);
 
       // Delete from KV.
@@ -1752,11 +1931,54 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
+   * The caller's directory scope (see `UserDirectoryScope`), as `searchUsers` and the gatekeeper
+   * user picker compute it. The user's mirrored membership index names the orgs; each org's own
+   * member listing — an actor-checked read, so it re-checks this membership live — names the
+   * people. An org that cannot be read (the index is stale, the membership ended, or the read
+   * failed) contributes nothing: the scope fails closed, so an unreachable org can only shrink
+   * discovery, never widen it.
+   */
+  async getDirectoryScope(): Promise<UserDirectoryScope> {
+    const me = this.storage.profile.get().id;
+    const orgs = await Promise.allSettled([...this.storage.orgMemberships.list()].map(
+        async (entry): Promise<UserDirectoryScope["orgs"][number]> => ({
+          orgId: entry.orgId,
+          memberIds: (await this.ctx.exports.OrgDurableObject.getByName(entry.orgId)
+              .listMembersFor(me))
+              .filter(member => member.status === "active")
+              .map(member => member.userId),
+        })));
+    return {
+      orgs: orgs.flatMap(result => result.status === "fulfilled" ? [result.value] : []),
+      partnerIds: [...this.#sharePartnerIds()],
+    };
+  }
+
+  /**
+   * The ids of people this user already holds an explicit share relationship with: the owners of
+   * workspaces shared with them, as their own object records from opening each share. (The
+   * converse — collaborators on workspaces this user owns — lives in those workspaces' Overseers,
+   * not here, and org scoping of sharing graphs tracks it in later issues.) A dismissed share
+   * drops its record, and with it the partnership.
+   */
+  #sharePartnerIds(): Set<string> {
+    const partners = new Set<string>();
+    for (const gadget of this.storage.gadgets.list()) {
+      if (gadget.owner) partners.add(gadget.owner.id);
+    }
+    return partners;
+  }
+
+  /**
    * Mint a single-use ticket for a user selected on behalf of a gatekeeper app,
    * redeemable through that gatekeeper app's exchange capability (see
    * GatekeeperUserSelectionExchangeImpl). Returns null if the selected user is
-   * this user or does not exist. Self-selection uses stable DO identity because
-   * ctx.id.name may be absent after a cold start through idFromString().
+   * this user, does not exist, or falls outside the caller's directory scope
+   * (see `UserDirectoryScope`) — the same scope `searchUsers` covers, so an
+   * org's members can be neither searched nor picked from outside it. The
+   * ticket records the orgs that justified the pick; redemption re-checks them
+   * live. Self-selection uses stable DO identity because ctx.id.name may be
+   * absent after a cold start through idFromString().
    */
   async createGatekeeperUserSelection(
       appAccountId: number, selectedUserId: string,
@@ -1767,11 +1989,16 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (this.ctx.id.equals(selectedId)) return null;
     let selectedProfile = await this.ctx.exports.UserDurableObject.get(selectedId).whoamiIfExists();
     if (!selectedProfile) return null;
+    let scope = await this.getDirectoryScope();
+    let orgIds = scope.orgs
+        .filter(org => org.memberIds.includes(selectedUserId))
+        .map(org => org.orgId);
+    if (orgIds.length === 0 && !scope.partnerIds.includes(selectedUserId)) return null;
     let profile = { displayName: selectedProfile.name };
     let { secret, hash: ticketHash } = await newSecretToken();
     let expiresAt = new Date(Date.now() + GATEKEEPER_USER_SELECTION_LIFETIME_MS);
     this.storage.pendingUserSelections.put({
-      ticketHash, appAccountId, vendorId: app.vendorId, selectedUserId, expiresAt,
+      ticketHash, appAccountId, vendorId: app.vendorId, selectedUserId, orgIds, expiresAt,
     });
     await this.#armExpirySweep();
     return { ticket: secret.toHex(), profile };
@@ -1786,6 +2013,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * zero or multiple results. A ticket represents a Workshop user, not a
    * connected account, so a 1:1 mapping with a connected account is not
    * guaranteed.
+   *
+   * The pick's justification is re-checked live: for an org-justified ticket,
+   * some recorded org must still hold both the selector and the selected as
+   * active members (the lazy-revocation contract — a removed member's pending
+   * picks die at redemption); a share-justified ticket requires the share
+   * relationship to still stand.
    */
   async redeemGatekeeperUserSelection(
       appAccountId: number, ticket: string,
@@ -1802,8 +2035,33 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
     let app = await this.#uiAccountRecord(appAccountId);
     if (!app || app.vendorId !== record.vendorId) throw new Error("No such app.");
+    if (!(await this.#selectionStillJustified(record))) {
+      throw new Error("This selection is no longer available. Please select the user again.");
+    }
     return this.ctx.exports.UserDurableObject.getByName(record.selectedUserId)
         .selectableGatekeeperUsers(record.vendorId);
+  }
+
+  /**
+   * Whether a pending selection's recorded justification still holds. Org-justified tickets name
+   * their orgs (`orgIds`); each is asked, as the authority on its own membership, whether the
+   * selector and the selected are still active members — one surviving org suffices. A ticket
+   * without orgs was justified by a workspace share, which must still be recorded here. Tickets
+   * minted before org scoping recorded no orgIds and read as share-justified.
+   */
+  async #selectionStillJustified(
+      record: { orgIds?: string[]; selectedUserId: string },
+  ): Promise<boolean> {
+    let orgIds = record.orgIds ?? [];
+    if (orgIds.length === 0) return this.#sharePartnerIds().has(record.selectedUserId);
+    let me = this.storage.profile.get().id;
+    for (let orgId of orgIds) {
+      let org = this.ctx.exports.OrgDurableObject.getByName(orgId);
+      let [mine, theirs] = await Promise.all([
+        org.getMember(me), org.getMember(record.selectedUserId)]);
+      if (mine?.status === "active" && theirs?.status === "active") return true;
+    }
+    return false;
   }
 
   /**

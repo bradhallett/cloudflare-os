@@ -34,16 +34,25 @@ it("user search tracks display names and honours the admin switch without droppi
     async () => {
   using stack = new DisposableStack();
   const publicApi = stack.use(connect(harness.url));
-  const [viewer, target] = nextUsernames("viewer", "target");
+  const [viewer, target, foreign] = nextUsernames("viewer", "target", "foreign");
   stack.use(await signUp(publicApi, viewer!));
   const targetApi = stack.use(await signUp(publicApi, target!, "Directory Target Before"));
+  const foreignApi = stack.use(await signUp(publicApi, foreign!, "Directory Target Before"));
   const before = [{ id: target, name: "Directory Target Before" }];
   const after = [{ id: target, name: "Directory Target After" }];
+
+  // Search is scoped to the viewer's org co-members (plus explicit share partners): the target
+  // becomes findable by joining the viewer's org, while the foreign account — identically named,
+  // in an org of its own the viewer does not belong to — never appears in any assertion below.
+  await foreignApi.createOrg("Foreign Org");
 
   await admin.setUserSearchEnabled(true);
   expect((await publicApi.getServerConfig()).userSearchEnabled).toBe(true);
   // Each capability caches the search policy, so every phase logs in afresh.
   let viewerApi = stack.use(await logIn(publicApi, viewer!));
+  const viewerOrg = await viewerApi.createOrg("Viewer Org");
+  await viewerApi.inviteOrgMember(viewerOrg.id, target!);
+  await targetApi.acceptOrgInvitation(viewerOrg.id);
   await waitFor("the target to be indexed", async () =>
     (await viewerApi.searchUsers("target before", [])).length > 0 || null);
   await expect(viewerApi.searchUsers("target before", [])).resolves.toEqual(before);

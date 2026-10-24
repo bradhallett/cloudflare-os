@@ -3,6 +3,7 @@ import { Overseer, ConsoleLogEvent, CollaboratorRole, ObserverConfigCallback, Bl
 import { ApprovalQueue } from "@gadgets/workshop-shared/gatekeeper";
 import { DurableObject, RpcStub as NativeRpcStub, restore } from "cloudflare:workers";
 import { chatKeyPrefix } from "./storage-schema/overseer-storage";
+import type { BlueprintOwnerSubject } from "./storage-schema/blueprints-kv";
 import type { ExternalChatRecord, GatekeeperCaller } from "./storage-schema/overseer-storage";
 import type { WorkspaceOutputEntry } from "./storage-schema/user-storage";
 import { commitIdentityForAuthor } from "./git-store";
@@ -66,6 +67,37 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   async getOutputsForOwnerBackfill(ownerId: string): Promise<WorkspaceOutputEntry[] | null> {
     if (this.impl.ownerId !== ownerId) return null;
     return this.impl.outputsSnapshot();
+  }
+
+  /**
+   * Sever every sharing edge granting `profileId` access to this workspace — an owner-style
+   * removal (all incoming edges), without a session, called by the user's Durable Object while
+   * deprovisioning them (UserDurableObject.#severSharedWorkspaceAccess). Like
+   * removeCollaborator, a workspace that actually lost the user is force-restarted
+   * (scheduleAccessRestart), so their live chat sessions die with the restart rather than at
+   * their next re-open, and the best-effort cleanup after the restart (observer teardown,
+   * listing refresh) self-heals lazily if the abort cuts it off. A no-op when `profileId` holds
+   * no collaborator record here (never shared, or the owner themself).
+   */
+  async severCollaboratorAccess(profileId: string): Promise<void> {
+    let sharing = await this.impl.getSharingManager();
+    if (!sharing.isCollaborator(profileId)) return;
+    let affected = sharing.removeCollaborator(
+        { profileId: await this.impl.getOwnerProfileId(), isOwner: true }, profileId, []);
+    if (affected.length > 0) {
+      this.impl.scheduleAccessRestart(
+          "Gadget restarted to revoke access for a deprovisioned user.");
+      // Fire-and-forget, as in the ownerInvitesOnly sweep: awaiting cross-DO cleanup would let
+      // the scheduled abort reject this call (and stall the caller's deprovision) whenever the
+      // cleanup loses the race.
+      this.impl.tearDownLostObservers(affected)
+          .then(() => this.impl.refreshAffectedCollaboratorListings(affected))
+          .catch(err => {
+            this.impl.logger.warn("failed to clean up after deprovisioning removed a collaborator", {
+              event: "deprovision.collaborator.cleanup.failed", error: err,
+            });
+          });
+    }
   }
 
   /**
@@ -376,9 +408,11 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
    * describes. Called by AuthenticatedApi.newGadgetFromBlueprint() after creating (and opening)
    * the DO, with the metadata it goes on to set up the gadget's bindings from: the blueprint may
    * be republished meanwhile, and the code has to be the version those bindings belong to.
+   * `owner` is the blueprint's owner subject, which scopes the content it reads.
    */
   async initializeFromBlueprint(
-      blueprintId: string, metadata: BlueprintMetadata, output?: BlueprintOutput): Promise<void> {
+      blueprintId: string, metadata: BlueprintMetadata, output?: BlueprintOutput,
+      blueprintOwner?: BlueprintOwnerSubject): Promise<void> {
     // Set the title. The default gadget (created below) inherits it.
     let { title } = metadata;
     this.impl.storage.title.put(title);
@@ -391,7 +425,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     // gadget's first committed tree. An empty release is refused rather than instantiated as a
     // code-less gadget: blueprints of such gadgets cannot be created (see createBlueprint), so
     // one can only arrive corrupted or hand-crafted.
-    let release = await this.impl.loadBlueprint(blueprintId, metadata);
+    let release = await this.impl.loadBlueprint(blueprintId, metadata, blueprintOwner);
     if ((await this.impl.gitStore.readCommitFiles(release)).size === 0) {
       throw new Error("This blueprint's code archive is empty.");
     }

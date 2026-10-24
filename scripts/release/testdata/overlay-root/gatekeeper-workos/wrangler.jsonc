@@ -1,0 +1,8 @@
+// Fixture standing in for a private overlay workspace's gatekeeper (see manifest-lib.test.ts).
+// The gatekeeper- prefix classifies it as a gatekeeper wherever it is scanned from; the overlay
+// specifics (its deploy inputs, in particular) are that workspace's to declare.
+{
+  "name": "gatekeeper-workos",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-01-01"
+}
