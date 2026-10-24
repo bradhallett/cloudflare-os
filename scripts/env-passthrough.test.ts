@@ -78,6 +78,7 @@ const EXPECTED: Record<string, ExpectedArea> = {
       "VITE_DEV_PASSWORD",
       "VITE_DEV_USERNAME",
       "VITE_FRONTEND_ERROR_REPORTING",
+      "VITE_SAAS",
     ],
     injected: ["NODE_ENV"],
   },
@@ -94,6 +95,7 @@ const EXPECTED: Record<string, ExpectedArea> = {
     forwarded: [
       "TESTS_WITH_TIMEOUT_DISABLE", "TESTS_WITH_TIMEOUT_IDLE_SECONDS",
       "TESTS_WITH_TIMEOUT_MAX_SECONDS", "VITE_FRONTEND_ERROR_REPORTING",
+      "WORKER_SCAN_ROOTS",
     ],
     external: [
       "CF_ACCESS_AUD", "CF_ACCESS_ISS", "CF_AI_GATEWAY", "CF_AI_GATEWAY_ACCOUNT_ID",

@@ -821,7 +821,7 @@ export abstract class OverseerAgents extends OverseerMainline {
         let byokRouting: UserGatewayRouting | undefined;
         if (this.ownerId) {
           let ownerStub = this.users.get(this.users.idFromString(this.ownerId));
-          let usage = await checkUsageAndBalance(this.env, ownerStub);
+          let usage = await checkUsageAndBalance(this.env, ownerStub, this.ownerId);
           if (!usage.allowed) {
             turn.setErrorType("usage_limit");
             failure = {message: usage.reason ?? "Usage limit reached.", code: "usage_limit"};

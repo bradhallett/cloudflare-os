@@ -1,12 +1,12 @@
 import { createContext, useContext, useState, useEffect, ReactNode } from 'react'
 import { RpcStub } from 'capnweb'
-import { AuthenticatedApi, AiChatAuthorInfo } from '@gadgets/workshop-shared/api'
+import { AuthenticatedApi, WhoamiInfo } from '@gadgets/workshop-shared/api'
 
 interface AuthContextType {
   authenticatedApi: RpcStub<AuthenticatedApi>
   logout: () => void
-  /** Last confirmed user; retained while an API reconnect is being authenticated. */
-  currentUser: AiChatAuthorInfo | null
+  /** Last confirmed user (with org memberships); retained while an API reconnect is being authenticated. */
+  currentUser: WhoamiInfo | null
   /** True only when the current API, not a previous connection, confirmed the user. */
   isCurrentUserConfirmed: boolean
   /** Whether the current user is a deployment admin. False while loading / for non-admins. */
@@ -24,7 +24,7 @@ interface AuthProviderProps {
 export function AuthProvider({ children, authenticatedApi, onLogout }: AuthProviderProps) {
   const [identity, setIdentity] = useState<{
     api: RpcStub<AuthenticatedApi>
-    user: AiChatAuthorInfo
+    user: WhoamiInfo
   } | null>(null)
   const [isAdmin, setIsAdmin] = useState(false)
 

@@ -152,14 +152,14 @@ Blueprint data is stored in three places, with one-way propagation: Gadget DO ->
 
 2. **User DO** (`blueprints` collection) -- a denormalized copy for efficient listing. Stores `BlueprintUserRecord` with metadata and a reference to the source gadget. This allows a user to audit and manage their blueprints even if the source gadget has been deleted.
 
-3. **Workers KV** (`BLUEPRINTS` namespace) -- the public-facing lookup store. Stores `BlueprintKvRecord` keyed by blueprint hex ID. This is what `PublicApi.getBlueprint()` reads from.
+3. **Workers KV** (`BLUEPRINTS` namespace) -- the public-facing lookup store. Stores `BlueprintKvRecord` keyed by blueprint hex ID. This is what `PublicApi.getBlueprint()` reads from. Every record carries an owner subject -- `{type: 'user'}` for one the workspace's owner published or a user imported, `{type: 'org'}` for one an organization owns, or none for one the deployment installed itself (a bundled blueprint). A user-owned or unowned blueprint sits at the bare `<blueprintId>` key, where its id is a bearer share link anyone can read it by; an org-owned one sits inside its org's scope at `org/<orgId>/<blueprintId>`, which the public by-id reads never enter, so only an org's members can reach it (`blueprint-access.ts` resolves a blueprint for a user by re-checking their membership against the org's Durable Object live, so a removed member's access ends at the next read). The reserved mirror keys (`.featured`, `.adminConfig`) hold in every scope, and a caller-supplied id containing `/` is refused, so no id can forge a key inside some org's scope. Records written before owner subjects exist carry a bare `ownerId`; parsing reads it as a `{type: 'user'}` subject, and a one-shot migration (`migrateBlueprintOwnership`, triggered on a deployment's first `/api` request by `AdminSettings.ensureBlueprintOwnershipMigrated`) rewrites them in place, idempotently.
 
 Blueprint **code content** is stored separately in an **R2 bucket** (`BLUEPRINT_CONTENT`), in one of two forms (`blueprintContentKey`):
 
-- A release pack at `<blueprintId>/<commitId>`, for metadata that names its release commit. A release never changes, so neither does the object stored for it.
-- A Yjs snapshot at `<blueprintId>/<version>`, for metadata that names none (see [Snapshot releases](#snapshot-releases)). Publishing no longer writes this form. Importing a version 1 `.gadget` archive still does, since an import stores the archive's content as it is.
+- A release pack at `<scope><blueprintId>/<commitId>`, for metadata that names its release commit. A release never changes, so neither does the object stored for it.
+- A Yjs snapshot at `<scope><blueprintId>/<version>`, for metadata that names none (see [Snapshot releases](#snapshot-releases)). Publishing no longer writes this form. Importing a version 1 `.gadget` archive still does, since an import stores the archive's content as it is.
 
-When a blueprint is updated, earlier releases are retained. When a blueprint is deleted, everything under the `<blueprintId>/` prefix is deleted, which covers both forms.
+`<scope>` is the owner subject's scope segment: `org/<orgId>/` for an org-owned blueprint, and empty for any other owner, which is where all content written before owner subjects already lives. When a blueprint is updated, earlier releases are retained. When a blueprint is deleted, everything under its `<scope><blueprintId>/` prefix is deleted, which covers both forms.
 
 The `dirty` flag handles propagation failures gracefully: it is set to `true` before propagation begins and cleared only after all writes succeed. If a failure leaves it set, the UI shows a warning with a "Retry" button. A retry rebuilds the pack of the release that was being published, not of the gadget's current code. (A record that was left dirty before releases were commits has no release to re-send, and has to be republished instead.)
 
@@ -202,7 +202,7 @@ A download serves whatever is stored, so a blueprint last published before relea
 
 The archive's header is validated on import. Metadata is capped at 64 KiB and the content is capped at 32 MiB so a malformed archive cannot force unbounded allocation in the worker. The content itself is not decoded at upload: it is checked when it is loaded into a workspace (see [Validation](#validation)), so an archive whose content is invalid imports, but then refuses to instantiate or to be applied to a gadget.
 
-Only `BlueprintMetadata` is included in the file, not the full KV record. In particular, the archive does not include `ownerId`, `gadgetId`, or screenshot bytes. Imported archives clear any screenshot marker because screenshots are stored separately from the archive content.
+Only `BlueprintMetadata` is included in the file, not the full KV record. In particular, the archive does not include the owner subject, `gadgetId`, or screenshot bytes. Imported archives clear any screenshot marker because screenshots are stored separately from the archive content.
 
 Import/export streams the content bytes directly to and from R2 using `pipeTo()` rather than buffering the whole archive in memory on the server.
 
