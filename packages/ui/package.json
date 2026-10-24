@@ -8,6 +8,9 @@
       "types": "./src/index.ts",
       "import": "./src/index.ts"
     },
+    "./button-shake.css": {
+      "import": "./src/button-shake.css"
+    },
     "./hotkey": {
       "types": "./src/hotkey.ts",
       "import": "./src/hotkey.ts"
