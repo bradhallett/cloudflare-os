@@ -55,4 +55,4 @@ All three read the org's own index copy, so their counts are exact under samplin
 **Model usage is event-count grade today.** Token and cost accounting for models arrives with the
 SaaS usage stream (metered overage), which records per-turn usage and carries the same org
 dimension; until then the model rollup counts the usage events the activity dataset has. The
-billing dashboard reads the same queries for its per-org usage panels.
+planned billing dashboard (bots-team #17) will read these same queries for its per-org panels.
