@@ -11,23 +11,51 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { collectAssets, collectModules, stableStringify } from "./hash-lib.ts";
+import { collectAssets, collectModules, sha256Hex, stableStringify } from "./hash-lib.ts";
 import {
-  gatekeeperBindingName, generateManifest, readDeployablePackages, readDeployInputs,
-  releaseShortName,
+  buildWorkerEntry, gatekeeperBindingName, generateManifest, readDeployablePackages,
+  readDeployInputs, releaseShortName,
+  type DeployablePackage, type WorkerBuild,
 } from "./manifest-lib.ts";
+import { resolveScanRoots, scanRootArgs } from "../scan-roots.ts";
 
 const RELEASE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(RELEASE, "..", "..");
 const TESTDATA = join(RELEASE, "testdata");
 const GOLDEN_PATH = join(TESTDATA, "golden-manifest.json");
 
+// What the scripts themselves scan: the repo's packages/ first, then any overlay roots the
+// invocation asked for (--scan-root / WORKER_SCAN_ROOTS). The committed golden covers the repo
+// alone; an overlay run regenerates it only when UPDATE_GOLDEN says so (same as a config change).
+const SCAN_ROOTS = resolveScanRoots(scanRootArgs(process.argv.slice(2)));
 // Placeholder syntax the deploy-side renderer understands. Closed list — see manifest-lib.ts.
 const PLACEHOLDER_RE =
     /^\$(ACCOUNT_ID|PUBLIC_BASE_URL|KV_[A-Z0-9_]+_ID|R2_[A-Z0-9_]+_NAME|WORKER_NAME\([a-z0-9-]+\)|SECRET\([A-Z0-9_]+\))/;
 
-function readTestWorkerBuilds() {
-  return readDeployablePackages(join(ROOT, "packages")).map((pkg) => {
+// An overlay worker has no fixture bundle in this repo (it is not ours to build), so its stand-in
+// is a synthetic module — content-free but content-addressed, so the manifest stays honest about
+// the bytes it claims to ship.
+function syntheticBuild(pkg: DeployablePackage): WorkerBuild {
+  const bytes = Buffer.from("export {};\n");
+  return {
+    pkgName: pkg.name,
+    config: pkg.config,
+    mainModule: "index.js",
+    modules: [{
+      name: "index.js",
+      type: "esm",
+      sha256: sha256Hex(bytes),
+      size: bytes.length,
+      bytes,
+    }],
+    deployInputs: readDeployInputs(pkg.dir),
+    ...(pkg.overlay ? { overlay: true } : {}),
+  };
+}
+
+function readTestWorkerBuilds(scanRoots: readonly string[] = SCAN_ROOTS) {
+  return readDeployablePackages(scanRoots).map((pkg) => {
+    if (pkg.overlay) return syntheticBuild(pkg);
     const bundleDir = join(TESTDATA, "fixture-bundles", pkg.name);
     assert.ok(existsSync(bundleDir),
         `missing fixture bundle for new deployable package: add scripts/release/testdata/` +
@@ -304,7 +332,7 @@ test("generateManifest rejects gatekeepers whose folded shortNames collide", () 
 
 test("per-package deploy-inputs.json files are well-formed when present", () => {
   const KINDS = new Set(["secret", "var", "workerName"]);
-  for (const pkg of readDeployablePackages(join(ROOT, "packages"))) {
+  for (const pkg of readDeployablePackages(SCAN_ROOTS)) {
     const inputs = readDeployInputs(pkg.dir);
     if (inputs === undefined) continue;
     assert.ok(Array.isArray(inputs), `${pkg.name}/deploy-inputs.json must be an array`);
@@ -332,7 +360,56 @@ test("per-package deploy-inputs.json files are well-formed when present", () => 
 // kit a deployable, `workerKind` would type it a gatekeeper from its name, and the deploy wizard
 // would demand CLIENT_ID/CLIENT_SECRET for a library before letting anyone install it.
 test("a gatekeeper-prefixed library is not a deployable worker", () => {
-  const deployable = readDeployablePackages(join(ROOT, "packages")).map((pkg) => pkg.name);
+  const deployable = readDeployablePackages(SCAN_ROOTS).map((pkg) => pkg.name);
   assert.ok(!deployable.includes("gatekeeper-kit"),
       "gatekeeper-kit is a library; adding a wrangler.jsonc would publish it as a connector");
+});
+
+// ---------------------------------------------------------------------------
+// Overlay scan roots (a private workspace's workers joining a release). The fixtures stand in for
+// one: scripts/release/testdata/overlay-root holds a plain worker (saas-billing) and an overlay
+// gatekeeper (gatekeeper-workos, whose own deploy-inputs.json declares no inputs).
+// ---------------------------------------------------------------------------
+const OVERLAY_ROOT = join(TESTDATA, "overlay-root");
+
+test("overlay packages classify without vendor knowledge in this repo", () => {
+  const [core, ...overlayRoots] = SCAN_ROOTS;
+  const packages = readDeployablePackages([core, ...overlayRoots, OVERLAY_ROOT]);
+
+  const billing = packages.find((pkg) => pkg.name === "saas-billing");
+  assert.ok(billing?.overlay, "fixture saas-billing not found among overlay packages");
+  const billingEntry = buildWorkerEntry(syntheticBuild(billing));
+  assert.equal(billingEntry.kind, "worker");
+  assert.equal(billingEntry.installable, false);
+  assert.equal("inputs" in billingEntry, false);
+  assert.equal("BASE_URL" in billingEntry.vars, false);
+  // Bindings and vars ship as declared: this overlay worker binds the workshop backend by name.
+  assert.ok(billingEntry.bindings.some(
+      (b) => b.type === "service" && b.name === "WORKSHOP_BACKEND"));
+  assert.equal(billingEntry.vars.POLAR_WEBHOOK_PATH, "/webhooks/polar");
+
+  const workos = packages.find((pkg) => pkg.name === "gatekeeper-workos");
+  assert.ok(workos?.overlay, "fixture gatekeeper-workos not found among overlay packages");
+  const workosEntry = buildWorkerEntry(syntheticBuild(workos));
+  assert.equal(workosEntry.kind, "gatekeeper");
+  assert.equal(workosEntry.shortName, "workos");
+  assert.equal(workosEntry.installable, true);
+  // Its own deploy-inputs.json ([]), not this repo's DEFAULT_CRED_INPUTS: a private overlay
+  // gatekeeper decides for itself what the deploy wizard asks for.
+  assert.deepEqual(workosEntry.inputs, []);
+});
+
+test("a core package name never classifies as a plain worker", () => {
+  // Fail-closed: only an overlay root's non-gatekeeper packages may take the plain-worker kind.
+  // Otherwise a typo'd core package would silently ship as an unreachable worker.
+  const packages = readDeployablePackages([join(ROOT, "packages")]);
+  const backend = packages.find((pkg) => pkg.name === "workshop-backend");
+  assert.ok(backend);
+  assert.throws(() => buildWorkerEntry({ ...syntheticBuild(backend), pkgName: "saas-billing" }),
+      /cannot classify deployable package: saas-billing/);
+});
+
+test("the same package name may not appear under two scan roots", () => {
+  assert.throws(() => readDeployablePackages([join(ROOT, "packages"), join(ROOT, "packages")]),
+      /appears under both .* and .*: the package name is the worker name/);
 });

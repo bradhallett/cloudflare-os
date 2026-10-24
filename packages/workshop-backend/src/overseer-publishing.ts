@@ -8,7 +8,10 @@ import { AiGatewayLogRetryableError, getAiGatewayLogCost } from "./ai-gateway";
 import type { BindingRecord } from "./storage-schema/overseer-storage";
 import type { AiGatewayLogRoute } from "./ai-gateway";
 import type { AiChatMessageBodyWithModelData, WorktreeTurnAccess } from "./agent";
-import { blueprintContentKey, deleteBlueprintContent, readBlueprintRelease } from "./blueprint-archive";
+import {
+  blueprintContentKey, deleteBlueprintContent, readBlueprintRelease,
+} from "./blueprint-archive";
+import type { BlueprintOwnerSubject } from "./storage-schema/blueprints-kv";
 import { buildReleasePack, buildSnapshotRelease, encodeReleaseCommit, releasesMergedBy } from "./blueprint-release";
 import type { Release } from "./blueprint-release";
 import { encodeGitTree, gitObjectOid, parseGitCommitRefs } from "./git-codec";
@@ -343,8 +346,12 @@ export abstract class OverseerPublishing extends OverseerFacets {
    * This is the one way a blueprint's objects enter the workspace, so what
    * readBlueprintRelease() admits is all that one can add to the store.
    */
-  async loadBlueprint(blueprintId: string, metadata: BlueprintMetadata): Promise<string> {
-    let release = await readBlueprintRelease(this.env, blueprintId, metadata);
+  async loadBlueprint(
+      blueprintId: string,
+      metadata: BlueprintMetadata,
+      owner: BlueprintOwnerSubject | undefined,
+  ): Promise<string> {
+    let release = await readBlueprintRelease(this.env, owner, blueprintId, metadata);
     await this.gitCache.importObjects(release.objects.values());
     return release.commitId;
   }
@@ -362,6 +369,8 @@ export abstract class OverseerPublishing extends OverseerFacets {
       screenshot?: BlueprintScreenshotUpload | null,
   ): Promise<void> {
     if (!this.ownerId) throw new Error("Workspace not initialized.");
+    // A published blueprint belongs to its workspace's owner: the user the workspace runs as.
+    let ownerSubject: BlueprintOwnerSubject = {type: "user", id: this.ownerId};
 
     let release = record.releases?.at(-1);
     if (!pack && record.dirty && release) {
@@ -374,7 +383,8 @@ export abstract class OverseerPublishing extends OverseerFacets {
 
     // Upload the release to R2 (only when code is being created/updated).
     if (pack) {
-      await this.env.BLUEPRINT_CONTENT.put(blueprintContentKey(record.id, record.metadata), pack);
+      await this.env.BLUEPRINT_CONTENT.put(
+          blueprintContentKey(ownerSubject, record.id, record.metadata), pack);
     }
 
     if (screenshot !== undefined) {
@@ -407,7 +417,7 @@ export abstract class OverseerPublishing extends OverseerFacets {
     // Write to KV.
     let kvRecord: BlueprintKvRecord = {
       metadata: record.metadata,
-      ownerId: this.ownerId,
+      owner: ownerSubject,
       gadgetId: this.ctx.id.toString(),
     };
     await this.env.BLUEPRINTS.put(record.id, JSON.stringify(kvRecord));
@@ -425,7 +435,7 @@ export abstract class OverseerPublishing extends OverseerFacets {
     await this.env.BLUEPRINTS.delete(record.id);
 
     // Delete all historical versions from R2.
-    await deleteBlueprintContent(this.env, record.id);
+    await deleteBlueprintContent(this.env, {type: "user", id: this.ownerId}, record.id);
     await this.env.BLUEPRINT_CONTENT.delete(`${BLUEPRINT_SCREENSHOT_R2_PREFIX}${record.id}`);
 
     // Delete from User DO.

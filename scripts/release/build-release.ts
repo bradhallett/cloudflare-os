@@ -15,6 +15,10 @@
 // and writes only its own directory, and results are reassembled in package order.
 //
 // Usage: node scripts/release/build-release.ts --out <dir> [--release-id <id>] [--concurrency <n>]
+//                                        [--scan-root <dir>]...
+//
+// Extra scan roots (repeatable --scan-root, or WORKER_SCAN_ROOTS — see scan-roots.ts) add a
+// private overlay workspace's workers to the release.
 
 import {
   execFile, execFileSync, type ChildProcess, type ExecFileOptions,
@@ -35,6 +39,7 @@ import {
   generateManifest, readDeployablePackages, readDeployInputs,
   type DeployablePackage, type WorkerBuild,
 } from "./manifest-lib.ts";
+import { resolveScanRoots } from "../scan-roots.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const PACKAGES_DIR = join(ROOT, "packages");
@@ -88,12 +93,14 @@ function parseArgs(argv: string[]): {
   out: string;
   releaseId: string | undefined;
   concurrency: number;
+  scanRoots: string[];
 } {
   let out: string | undefined;
   let releaseId: string | undefined;
   // Each bundle is one mostly CPU-bound esbuild process. Lower it on a runner that cannot afford
   // that many at once; raise it on one whose cores this undercounts.
   let concurrency = availableParallelism();
+  const scanRoots: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--out") out = resolve(argv[++i]);
     else if (argv[i] === "--release-id") releaseId = argv[++i];
@@ -102,10 +109,16 @@ function parseArgs(argv: string[]): {
       if (!Number.isInteger(concurrency) || concurrency < 1) {
         throw new Error(`--concurrency must be a positive integer, got: ${argv[i]}`);
       }
+    } else if (argv[i] === "--scan-root") {
+      const dir = argv[++i];
+      if (!dir || dir.startsWith("--")) {
+        throw new Error(`--scan-root must be followed by a directory path, got: ${dir ?? "nothing"}`);
+      }
+      scanRoots.push(resolve(dir));
     } else throw new Error(`unknown argument: ${argv[i]}`);
   }
   if (!out) throw new Error("--out <dir> is required");
-  return { out, releaseId, concurrency };
+  return { out, releaseId, concurrency, scanRoots };
 }
 
 // Runs a command to completion and prints its output as one block once it finishes.
@@ -353,12 +366,14 @@ async function main() {
   const wranglerVersion = pinnedWranglerVersion();
   console.log(`building release ${releaseId} (commit ${commit}, wrangler ${wranglerVersion}, ` +
       `${args.concurrency} bundles at a time)`);
+  const scanRoots = resolveScanRoots(args.scanRoots);
+  for (const root of scanRoots.slice(1)) console.log(`extra scan root: ${root}`);
 
   rmSync(args.out, { recursive: true, force: true });
   mkdirSync(join(args.out, "modules"), { recursive: true });
   mkdirSync(join(args.out, "assets"), { recursive: true });
 
-  const packages = readDeployablePackages(PACKAGES_DIR);
+  const packages = readDeployablePackages(scanRoots);
 
   // 1. Every bundle, overlapping.
   const { bundles, assets } = await buildAll(packages, args.concurrency);
@@ -383,6 +398,7 @@ async function main() {
       mainModule,
       modules,
       deployInputs: readDeployInputs(pkg.dir),
+      ...(pkg.overlay ? { overlay: true } : {}),
     };
   });
 

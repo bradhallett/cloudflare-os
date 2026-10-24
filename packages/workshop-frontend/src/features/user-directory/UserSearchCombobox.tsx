@@ -29,6 +29,8 @@ type Props = {
   disabled?: boolean
   /** Disable directory lookup and accept only a typed exact identifier. */
   searchEnabled?: boolean
+  /** Who directory results are scoped to, shown under the input while search is enabled. */
+  scopeNote?: string
   inputName: string
   search: (query: string) => RpcPromise<UserDirectoryRecord[]>
   /** People hidden from results, such as ones chosen after the current search was issued. */
@@ -47,6 +49,7 @@ export function UserSearchCombobox({
   selected,
   disabled = false,
   searchEnabled = true,
+  scopeNote,
   inputName,
   search,
   excludeIds,
@@ -161,6 +164,9 @@ export function UserSearchCombobox({
         className="h-9 w-full min-w-0 appearance-none border-0 bg-transparent p-0 text-[14px] leading-5 tracking-[-0.25px] text-kumo-default outline-none placeholder:text-kumo-inactive disabled:cursor-not-allowed [&::-webkit-search-cancel-button]:hidden"
         disabled={disabled}
       />
+      {searchEnabled && scopeNote && (
+        <p className="mt-1 text-[12px] text-kumo-subtle">{scopeNote}</p>
+      )}
       {!searchEnabled && !disabled && !selected && query !== '' && (
         <button type="button" onClick={submitCurrentIdentifier} className="mt-2 text-[13px] underline">
           Select {query}
