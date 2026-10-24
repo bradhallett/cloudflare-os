@@ -1,10 +1,15 @@
 import { describe, it, expect } from "vitest";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
 import { SharingManager, SharingStorage } from "../src/sharing.js";
-import type { CollaboratorRecord, ShareKeyRecord } from "../src/storage-schema/overseer-storage.js";
+import type { OrgRole } from "@gadgets/workshop-shared/api";
 import {
-  AiChatAuthorInfo, PermissionEdge, CollaboratorRole, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES,
+  AiChatAuthorInfo,
+  PermissionEdge,
+  CollaboratorRole,
+  getOpenGadgetErrorCode,
+  OPEN_GADGET_ERROR_CODES,
 } from "@gadgets/workshop-shared/api";
+import type { CollaboratorRecord, ShareKeyRecord } from "../src/storage-schema/overseer-storage.js";
 import { makeMockStorage } from "./mock-storage.js";
 
 function makeStorage(): SharingStorage {
@@ -16,8 +21,10 @@ function makeStorage(): SharingStorage {
       shareKeys: collection<ShareKeyRecord>()({
         primaryKey: "id",
         nonUniqueIndexes: {
-          byAlias(record: ShareKeyRecord) { return record.alias ?? null; }
-        }
+          byAlias(record: ShareKeyRecord) {
+            return record.alias ?? null;
+          },
+        },
       }),
     },
   });
@@ -25,16 +32,33 @@ function makeStorage(): SharingStorage {
 
 const OWNER = "owner@example.com";
 
-function makeManager(ownerInvitesOnly: () => boolean = () => false)
-    : { storage: SharingStorage; mgr: SharingManager } {
+function makeManager(
+    ownerInvitesOnly: () => boolean = () => false,
+    owningOrgRoles: () => Promise<ReadonlyMap<string, OrgRole> | null> = async () => null,
+): {
+  storage: SharingStorage;
+  mgr: SharingManager;
+} {
   let storage = makeStorage();
-  return { storage, mgr: new SharingManager(storage, OWNER, ownerInvitesOnly) };
+  return { storage, mgr: new SharingManager(storage, OWNER, ownerInvitesOnly, owningOrgRoles) };
 }
 
 // A manager whose `ownerInvitesOnly` flag the test can flip at any point.
 function makeManagerWithFlag() {
   let flags = { ownerInvitesOnly: false };
   return { flags, ...makeManager(() => flags.ownerInvitesOnly) };
+}
+
+// A manager for a workspace owned by the org with the given members (userId → org role). Tests
+// mutate the map to model membership changes between reads, as a live snapshot would.
+function makeOrgManager(members: Record<string, OrgRole>, ownerInvitesOnly = false) {
+  let snapshot = new Map(Object.entries(members));
+  let flags = { ownerInvitesOnly };
+  return {
+    snapshot,
+    flags,
+    ...makeManager(() => flags.ownerInvitesOnly, async () => snapshot),
+  };
 }
 
 function profile(id: string): AiChatAuthorInfo {
@@ -56,7 +80,11 @@ function seedCollaborator(storage: SharingStorage, id: string, addedBy: Permissi
 // Seed a share link. A link is stored as its first key, so `linkId` is that key's hash -- which is
 // what `shareKey` edges reference.
 function seedLink(
-    storage: SharingStorage, linkId: string, createdBy: string, role: CollaboratorRole = "build") {
+  storage: SharingStorage,
+  linkId: string,
+  createdBy: string,
+  role: CollaboratorRole = "build",
+) {
   storage.shareKeys.put({ id: linkId, created: new Date(), createdBy, role });
 }
 
@@ -68,7 +96,7 @@ function link(storage: SharingStorage, linkId: string) {
 }
 
 function ids(list: { profile: AiChatAuthorInfo }[]): string[] {
-  return list.map(x => x.profile.id).toSorted();
+  return list.map((x) => x.profile.id).toSorted();
 }
 
 const owner = { profileId: OWNER, isOwner: true };
@@ -77,29 +105,29 @@ function collab(id: string) {
 }
 
 describe("authorization", () => {
-  it("isCollaborator reflects the collaborators table", () => {
+  it("isCollaborator reflects the collaborators table", async () => {
     let { storage, mgr } = makeManager();
     expect(mgr.isCollaborator("a")).toBe(false);
     seedCollaborator(storage, "a", [userEdge(OWNER)]);
     expect(mgr.isCollaborator("a")).toBe(true);
   });
 
-  it("getEffectiveRole returns build for the owner", () => {
+  it("getEffectiveRole returns build for the owner", async () => {
     let { mgr } = makeManager();
-    expect(mgr.getEffectiveRole(OWNER)).toBe("build");
+    expect(await mgr.getEffectiveRole(OWNER)).toBe("build");
   });
 
-  it("getEffectiveRole returns undefined for non-collaborators", () => {
+  it("getEffectiveRole returns undefined for non-collaborators", async () => {
     let { mgr } = makeManager();
-    expect(mgr.getEffectiveRole("nobody")).toBeUndefined();
+    expect(await mgr.getEffectiveRole("nobody")).toBeUndefined();
   });
 
-  it("getEffectiveRole reflects the granted role", () => {
+  it("getEffectiveRole reflects the granted role", async () => {
     let { storage, mgr } = makeManager();
     seedCollaborator(storage, "a", [userEdge(OWNER, "use")]);
     seedCollaborator(storage, "b", [userEdge(OWNER, "build")]);
-    expect(mgr.getEffectiveRole("a")).toBe("use");
-    expect(mgr.getEffectiveRole("b")).toBe("build");
+    expect(await mgr.getEffectiveRole("a")).toBe("use");
+    expect(await mgr.getEffectiveRole("b")).toBe("build");
   });
 });
 
@@ -112,7 +140,10 @@ describe("redeemShareKey", () => {
     await mgr.redeemShareKey({
       rawKey: key,
       profileId: "newbie",
-      fetchProfile: async () => { fetched++; return profile("newbie"); },
+      fetchProfile: async () => {
+        fetched++;
+        return profile("newbie");
+      },
     });
 
     expect(fetched).toBe(1);
@@ -125,13 +156,15 @@ describe("redeemShareKey", () => {
     let { key } = await mgr.createShareLink({ caller: owner, role: "use" });
 
     await mgr.redeemShareKey({
-      rawKey: key, profileId: "a",
+      rawKey: key,
+      profileId: "a",
       fetchProfile: async () => profile("a"),
     });
 
-    expect(storage.collaborators.get("a")!.addedBy)
-        .toEqual([expect.objectContaining({ type: "shareKey", role: "use" })]);
-    expect(mgr.getEffectiveRole("a")).toBe("use");
+    expect(storage.collaborators.get("a")!.addedBy).toEqual([
+      expect.objectContaining({ type: "shareKey", role: "use" }),
+    ]);
+    expect(await mgr.getEffectiveRole("a")).toBe("use");
   });
 
   it("adds a key edge to an existing collaborator without fetching the profile", async () => {
@@ -141,8 +174,12 @@ describe("redeemShareKey", () => {
 
     let fetched = 0;
     await mgr.redeemShareKey({
-      rawKey: key, profileId: "a",
-      fetchProfile: async () => { fetched++; return profile("a"); },
+      rawKey: key,
+      profileId: "a",
+      fetchProfile: async () => {
+        fetched++;
+        return profile("a");
+      },
     });
 
     expect(fetched).toBe(0);
@@ -154,11 +191,13 @@ describe("redeemShareKey", () => {
     let { key } = await mgr.createShareLink({ caller: owner, role: "build" });
 
     await mgr.redeemShareKey({
-      rawKey: key, profileId: "a",
+      rawKey: key,
+      profileId: "a",
       fetchProfile: async () => profile("a"),
     });
     await mgr.redeemShareKey({
-      rawKey: key, profileId: "a",
+      rawKey: key,
+      profileId: "a",
       fetchProfile: async () => profile("a"),
     });
 
@@ -169,7 +208,8 @@ describe("redeemShareKey", () => {
     let { storage, mgr } = makeManager();
     // A syntactically-valid raw key (hex) that was never created.
     await mgr.redeemShareKey({
-      rawKey: "00112233445566778899aabbccddeeff", profileId: "a",
+      rawKey: "00112233445566778899aabbccddeeff",
+      profileId: "a",
       fetchProfile: async () => profile("a"),
     });
     expect(storage.collaborators.get("a")).toBeUndefined();
@@ -177,9 +217,14 @@ describe("redeemShareKey", () => {
 });
 
 describe("addCollaborator", () => {
-  it("adds a new collaborator with a user edge from the caller", () => {
+  it("adds a new collaborator with a user edge from the caller", async () => {
     let { storage, mgr } = makeManager();
-    let info = mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "build", note: "hi" });
+    let info = await mgr.addCollaborator({
+      caller: owner,
+      profile: profile("a"),
+      role: "build",
+      note: "hi",
+    });
     expect(info.addedBy).toEqual([
       expect.objectContaining({ type: "user", sharer: OWNER, role: "build", note: "hi" }),
     ]);
@@ -187,52 +232,55 @@ describe("addCollaborator", () => {
     expect(storage.collaborators.get("a")).toBeDefined();
   });
 
-  it("records the granted role", () => {
+  it("records the granted role", async () => {
     let { mgr } = makeManager();
-    let info = mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "use" });
+    let info = await mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "use" });
     expect(info.role).toBe("use");
   });
 
-  it("refuses to add the owner", () => {
+  it("refuses to add the owner", async () => {
     let { mgr } = makeManager();
-    expect(() => mgr.addCollaborator({ caller: owner, profile: profile(OWNER), role: "build" }))
-        .toThrow(/owner/);
+    await expect(
+      mgr.addCollaborator({ caller: owner, profile: profile(OWNER), role: "build" }),
+    ).rejects.toThrow(/owner/);
   });
 
-  it("forbids granting a role higher than the caller's own", () => {
+  it("forbids granting a role higher than the caller's own", async () => {
     let { storage, mgr } = makeManager();
     seedCollaborator(storage, "a", [userEdge(OWNER, "use")]);
-    expect(() => mgr.addCollaborator({ caller: collab("a"), profile: profile("b"), role: "build" }))
-        .toThrow(/higher than your own/);
+    await expect(
+      mgr.addCollaborator({ caller: collab("a"), profile: profile("b"), role: "build" }),
+    ).rejects.toThrow(/higher than your own/);
     // Granting an equal-or-lower role is fine.
-    expect(() => mgr.addCollaborator({ caller: collab("a"), profile: profile("b"), role: "use" }))
-        .not.toThrow();
+    await expect(
+      mgr.addCollaborator({ caller: collab("a"), profile: profile("b"), role: "use" }),
+    ).resolves.toBeDefined();
   });
 
-  it("adds a second edge from a different sharer but dedups same sharer", () => {
+  it("adds a second edge from a different sharer but dedups same sharer", async () => {
     let { storage, mgr } = makeManager();
-    mgr.addCollaborator({ caller: owner, profile: profile("b"), role: "build" });
-    mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "build" });
-    mgr.addCollaborator({ caller: collab("b"), profile: profile("a"), role: "build" });
-    mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "build" });  // dup sharer
+    await mgr.addCollaborator({ caller: owner, profile: profile("b"), role: "build" });
+    await mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "build" });
+    await mgr.addCollaborator({ caller: collab("b"), profile: profile("a"), role: "build" });
+    await mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "build" }); // dup sharer
     expect(storage.collaborators.get("a")!.addedBy).toHaveLength(2);
   });
 
-  it("upgrades (never downgrades) the role of an existing same-sharer edge", () => {
+  it("upgrades (never downgrades) the role of an existing same-sharer edge", async () => {
     let { storage, mgr } = makeManager();
-    mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "use" });
-    mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "build" });
+    await mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "use" });
+    await mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "build" });
     expect(storage.collaborators.get("a")!.addedBy).toHaveLength(1);
-    expect(mgr.getEffectiveRole("a")).toBe("build");
+    expect(await mgr.getEffectiveRole("a")).toBe("build");
 
     // A subsequent lower grant does not downgrade the existing edge.
-    mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "use" });
-    expect(mgr.getEffectiveRole("a")).toBe("build");
+    await mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "use" });
+    expect(await mgr.getEffectiveRole("a")).toBe("build");
   });
 });
 
 describe("computeEffectiveRoles", () => {
-  it("propagates roles along a chain", () => {
+  it("propagates roles along a chain", async () => {
     let { storage, mgr } = makeManager();
     // owner -> a -> b
     seedCollaborator(storage, "a", [userEdge(OWNER, "build")]);
@@ -242,23 +290,23 @@ describe("computeEffectiveRoles", () => {
     expect(roles.get("b")).toBe("build");
   });
 
-  it("bounds a granted role by the sharer's effective role", () => {
+  it("bounds a granted role by the sharer's effective role", async () => {
     let { storage, mgr } = makeManager();
     // owner -grants use-> a; a -grants build-> b. b is bounded by a's "use".
     seedCollaborator(storage, "a", [userEdge(OWNER, "use")]);
     seedCollaborator(storage, "b", [userEdge("a", "build")]);
-    expect(mgr.getEffectiveRole("b")).toBe("use");
+    expect(await mgr.getEffectiveRole("b")).toBe("use");
   });
 
-  it("takes the maximum across multiple paths", () => {
+  it("takes the maximum across multiple paths", async () => {
     let { storage, mgr } = makeManager();
     // b is reachable via owner directly (use) and via a (build).
     seedCollaborator(storage, "a", [userEdge(OWNER, "build")]);
     seedCollaborator(storage, "b", [userEdge(OWNER, "use"), userEdge("a", "build")]);
-    expect(mgr.getEffectiveRole("b")).toBe("build");
+    expect(await mgr.getEffectiveRole("b")).toBe("build");
   });
 
-  it("excludes a removed user and drops their sole dependents", () => {
+  it("excludes a removed user and drops their sole dependents", async () => {
     let { storage, mgr } = makeManager();
     seedCollaborator(storage, "a", [userEdge(OWNER)]);
     seedCollaborator(storage, "b", [userEdge("a")]);
@@ -267,7 +315,7 @@ describe("computeEffectiveRoles", () => {
     expect(roles.has("b")).toBe(false);
   });
 
-  it("cascades share-link revocation through dependent users", () => {
+  it("cascades share-link revocation through dependent users", async () => {
     let { storage, mgr } = makeManager();
     seedLink(storage, "k1", OWNER);
     seedCollaborator(storage, "a", [keyEdge("k1")]);
@@ -279,171 +327,173 @@ describe("computeEffectiveRoles", () => {
 });
 
 describe("previewRemoveCollaborator", () => {
-  it("reports a transitively-removed dependent", () => {
+  it("reports a transitively-removed dependent", async () => {
     let { storage, mgr } = makeManager();
     seedCollaborator(storage, "a", [userEdge(OWNER)]);
     seedCollaborator(storage, "b", [userEdge("a")]);
-    let affected = mgr.previewRemoveCollaborator(owner, "a");
+    let affected = await mgr.previewRemoveCollaborator(owner, "a");
     expect(ids(affected)).toEqual(["a", "b"]);
-    expect(affected.find(x => x.profile.id === "b")!.newRole).toBe(null);
+    expect(affected.find((x) => x.profile.id === "b")!.newRole).toBe(null);
   });
 
-  it("reports a downgrade rather than a removal", () => {
+  it("reports a downgrade rather than a removal", async () => {
     let { storage, mgr } = makeManager();
     // b has build via a, but also use directly from the owner. Removing a downgrades b to use.
     seedCollaborator(storage, "a", [userEdge(OWNER, "build")]);
     seedCollaborator(storage, "b", [userEdge(OWNER, "use"), userEdge("a", "build")]);
-    let affected = mgr.previewRemoveCollaborator(owner, "a");
-    let b = affected.find(x => x.profile.id === "b")!;
+    let affected = await mgr.previewRemoveCollaborator(owner, "a");
+    let b = affected.find((x) => x.profile.id === "b")!;
     expect(b.oldRole).toBe("build");
     expect(b.newRole).toBe("use");
   });
 });
 
 describe("removeCollaborator", () => {
-  it("severs the target's access and lets dependents go dark, but retains records", () => {
+  it("severs the target's access and lets dependents go dark, but retains records", async () => {
     let { storage, mgr } = makeManager();
     seedCollaborator(storage, "a", [userEdge(OWNER)]);
     seedCollaborator(storage, "b", [userEdge("a")]);
 
-    let affected = mgr.removeCollaborator(owner, "a", []);
+    let affected = await mgr.removeCollaborator(owner, "a", []);
     expect(ids(affected)).toEqual(["a", "b"]);
     // Records are NOT deleted under the lazy model.
     expect(storage.collaborators.get("a")).toBeDefined();
     expect(storage.collaborators.get("b")).toBeDefined();
     // But neither has access anymore.
-    expect(mgr.getEffectiveRole("a")).toBeUndefined();
-    expect(mgr.getEffectiveRole("b")).toBeUndefined();
+    expect(await mgr.getEffectiveRole("a")).toBeUndefined();
+    expect(await mgr.getEffectiveRole("b")).toBeUndefined();
   });
 
-  it("owner severs ALL incoming edges to the target", () => {
+  it("owner severs ALL incoming edges to the target", async () => {
     let { storage, mgr } = makeManager();
     seedCollaborator(storage, "a", [userEdge(OWNER)]);
     // t is reachable via both the owner and a.
     seedCollaborator(storage, "t", [userEdge(OWNER), userEdge("a")]);
 
-    mgr.removeCollaborator(owner, "t", []);
+    await mgr.removeCollaborator(owner, "t", []);
     expect(storage.collaborators.get("t")!.addedBy).toEqual([]);
-    expect(mgr.getEffectiveRole("t")).toBeUndefined();
+    expect(await mgr.getEffectiveRole("t")).toBeUndefined();
   });
 
-  it("re-adding a removed intermediary restores their downstream shares (undo)", () => {
+  it("re-adding a removed intermediary restores their downstream shares (undo)", async () => {
     let { storage, mgr } = makeManager();
     seedCollaborator(storage, "a", [userEdge(OWNER)]);
     // a has shared with five users.
     for (let i = 0; i < 5; i++) seedCollaborator(storage, `d${i}`, [userEdge("a")]);
 
-    mgr.removeCollaborator(owner, "a", []);
-    expect(mgr.getEffectiveRole("a")).toBeUndefined();
-    for (let i = 0; i < 5; i++) expect(mgr.getEffectiveRole(`d${i}`)).toBeUndefined();
+    await mgr.removeCollaborator(owner, "a", []);
+    expect(await mgr.getEffectiveRole("a")).toBeUndefined();
+    for (let i = 0; i < 5; i++) expect(await mgr.getEffectiveRole(`d${i}`)).toBeUndefined();
 
     // Undo by re-adding a; the five downstream grants were never deleted.
-    mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "build" });
-    expect(mgr.getEffectiveRole("a")).toBe("build");
-    for (let i = 0; i < 5; i++) expect(mgr.getEffectiveRole(`d${i}`)).toBe("build");
+    await mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "build" });
+    expect(await mgr.getEffectiveRole("a")).toBe("build");
+    for (let i = 0; i < 5; i++) expect(await mgr.getEffectiveRole(`d${i}`)).toBe("build");
   });
 
-  it("re-roots a kept dependent under the caller", () => {
+  it("re-roots a kept dependent under the caller", async () => {
     let { storage, mgr } = makeManager();
     seedCollaborator(storage, "a", [userEdge(OWNER)]);
     seedCollaborator(storage, "b", [userEdge("a")]);
 
-    let affected = mgr.removeCollaborator(owner, "a", ["b"]);
-    expect(ids(affected)).toEqual(["a"]);  // b is kept, so not reported
-    expect(mgr.getEffectiveRole("b")).toBe("build");
+    let affected = await mgr.removeCollaborator(owner, "a", ["b"]);
+    expect(ids(affected)).toEqual(["a"]); // b is kept, so not reported
+    expect(await mgr.getEffectiveRole("b")).toBe("build");
     // b gained a fresh edge from the caller.
-    expect(storage.collaborators.get("b")!.addedBy)
-        .toContainEqual(expect.objectContaining({ type: "user", sharer: OWNER, role: "build" }));
+    expect(storage.collaborators.get("b")!.addedBy).toContainEqual(
+      expect.objectContaining({ type: "user", sharer: OWNER, role: "build" }),
+    );
   });
 
-  it("keeps a downgraded user at their prior role when kept", () => {
+  it("keeps a downgraded user at their prior role when kept", async () => {
     let { storage, mgr } = makeManager();
     seedCollaborator(storage, "a", [userEdge(OWNER, "build")]);
     seedCollaborator(storage, "b", [userEdge(OWNER, "use"), userEdge("a", "build")]);
 
-    let affected = mgr.removeCollaborator(owner, "a", ["b"]);
+    let affected = await mgr.removeCollaborator(owner, "a", ["b"]);
     expect(ids(affected)).toEqual(["a"]);
-    expect(mgr.getEffectiveRole("b")).toBe("build");
+    expect(await mgr.getEffectiveRole("b")).toBe("build");
   });
 
-  it("downgrades a non-kept user instead of removing them", () => {
+  it("downgrades a non-kept user instead of removing them", async () => {
     let { storage, mgr } = makeManager();
     seedCollaborator(storage, "a", [userEdge(OWNER, "build")]);
     seedCollaborator(storage, "b", [userEdge(OWNER, "use"), userEdge("a", "build")]);
 
-    let affected = mgr.removeCollaborator(owner, "a", []);
-    expect(affected.map(x => x.profile.id).toSorted()).toEqual(["a", "b"]);
-    expect(affected.find(x => x.profile.id === "b")!.newRole).toBe("use");
+    let affected = await mgr.removeCollaborator(owner, "a", []);
+    expect(affected.map((x) => x.profile.id).toSorted()).toEqual(["a", "b"]);
+    expect(affected.find((x) => x.profile.id === "b")!.newRole).toBe("use");
     // b retains access at the lower role; its (now-inert) edge from a is left untouched (lazy).
-    expect(mgr.getEffectiveRole("b")).toBe("use");
+    expect(await mgr.getEffectiveRole("b")).toBe("use");
     expect(storage.collaborators.get("b")!.addedBy).toHaveLength(2);
   });
 
-  it("does not prune now-inert edges from surviving collaborators (lazy)", () => {
+  it("does not prune now-inert edges from surviving collaborators (lazy)", async () => {
     let { storage, mgr } = makeManager();
     seedCollaborator(storage, "a", [userEdge(OWNER)]);
     // c is supported by the owner directly, but also carries an edge from a.
     seedCollaborator(storage, "c", [userEdge(OWNER), userEdge("a")]);
 
-    mgr.removeCollaborator(owner, "a", []);
+    await mgr.removeCollaborator(owner, "a", []);
     // c keeps full access; the inert edge from a remains in storage.
-    expect(mgr.getEffectiveRole("c")).toBe("build");
+    expect(await mgr.getEffectiveRole("c")).toBe("build");
     expect(storage.collaborators.get("c")!.addedBy).toHaveLength(2);
   });
 
-  it("lets a non-owner remove only their own edge, sparing the target if others remain", () => {
+  it("lets a non-owner remove only their own edge, sparing the target if others remain", async () => {
     let { storage, mgr } = makeManager();
     seedCollaborator(storage, "a", [userEdge(OWNER)]);
     seedCollaborator(storage, "t", [userEdge(OWNER), userEdge("a")]);
 
-    let affected = mgr.removeCollaborator(collab("a"), "t", []);
+    let affected = await mgr.removeCollaborator(collab("a"), "t", []);
     expect(affected).toEqual([]);
-    expect(storage.collaborators.get("t")!.addedBy)
-        .toEqual([expect.objectContaining({ type: "user", sharer: OWNER })]);
+    expect(storage.collaborators.get("t")!.addedBy).toEqual([
+      expect.objectContaining({ type: "user", sharer: OWNER }),
+    ]);
   });
 
-  it("forbids a non-owner from removing a user they didn't add", () => {
+  it("forbids a non-owner from removing a user they didn't add", async () => {
     let { storage, mgr } = makeManager();
     seedCollaborator(storage, "t", [userEdge(OWNER)]);
-    expect(() => mgr.removeCollaborator(collab("a"), "t", [])).toThrow(/only remove users/);
+    await expect(mgr.removeCollaborator(collab("a"), "t", [])).rejects.toThrow(/only remove users/);
   });
 
-  it("throws when the target is not a collaborator", () => {
+  it("throws when the target is not a collaborator", async () => {
     let { mgr } = makeManager();
-    expect(() => mgr.removeCollaborator(owner, "ghost", [])).toThrow(/not a collaborator/);
+    await expect(mgr.removeCollaborator(owner, "ghost", [])).rejects.toThrow(/not a collaborator/);
   });
 });
 
 describe("revokeShareLink", () => {
-  it("soft-revokes the link and cuts off users supported only by it", () => {
+  it("soft-revokes the link and cuts off users supported only by it", async () => {
     let { storage, mgr } = makeManager();
     seedLink(storage, "k1", OWNER);
     seedCollaborator(storage, "a", [keyEdge("k1")]);
     seedCollaborator(storage, "b", [userEdge("a")]);
 
-    let affected = mgr.revokeShareLink(owner, "k1", []);
+    let affected = await mgr.revokeShareLink(owner, "k1", []);
     expect(ids(affected)).toEqual(["a", "b"]);
     // The link record is retained but marked revoked.
     expect(link(storage, "k1").revoked).toBe(true);
-    expect(mgr.getEffectiveRole("a")).toBeUndefined();
-    expect(mgr.getEffectiveRole("b")).toBeUndefined();
+    expect(await mgr.getEffectiveRole("a")).toBeUndefined();
+    expect(await mgr.getEffectiveRole("b")).toBeUndefined();
   });
 
-  it("does not cascade-revoke links created by cut-off users (lazy)", () => {
+  it("does not cascade-revoke links created by cut-off users (lazy)", async () => {
     let { storage, mgr } = makeManager();
     seedLink(storage, "k1", OWNER);
     seedCollaborator(storage, "a", [keyEdge("k1")]);
-    seedLink(storage, "k2", "a");  // link created by a
+    seedLink(storage, "k2", "a"); // link created by a
     seedCollaborator(storage, "b", [keyEdge("k2")]);
 
-    mgr.revokeShareLink(owner, "k1", []);
+    await mgr.revokeShareLink(owner, "k1", []);
     // k2 is left untouched, but b is unreachable because a (k2's creator) is unreachable.
     expect(link(storage, "k2").revoked).toBeFalsy();
-    expect(mgr.getEffectiveRole("b")).toBeUndefined();
+    expect(await mgr.getEffectiveRole("b")).toBeUndefined();
 
     // Undo: re-add a, and b regains access through k2.
-    mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "build" });
-    expect(mgr.getEffectiveRole("b")).toBe("build");
+    await mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "build" });
+    expect(await mgr.getEffectiveRole("b")).toBe("build");
   });
 
   it("a revoked link's keys can no longer be redeemed", async () => {
@@ -451,19 +501,20 @@ describe("revokeShareLink", () => {
     let { key } = await mgr.createShareLink({ caller: owner, role: "build" });
     let linkId = mgr.listShareLinkRecords()[0].id;
 
-    mgr.revokeShareLink(owner, linkId, []);
+    await mgr.revokeShareLink(owner, linkId, []);
 
     await mgr.redeemShareKey({
-      rawKey: key, profileId: "a",
+      rawKey: key,
+      profileId: "a",
       fetchProfile: async () => profile("a"),
     });
     expect(storage.collaborators.get("a")).toBeUndefined();
   });
 
-  it("forbids a non-owner from revoking a link they didn't create", () => {
+  it("forbids a non-owner from revoking a link they didn't create", async () => {
     let { storage, mgr } = makeManager();
     seedLink(storage, "k1", OWNER);
-    expect(() => mgr.revokeShareLink(collab("a"), "k1", [])).toThrow(/only revoke/);
+    await expect(mgr.revokeShareLink(collab("a"), "k1", [])).rejects.toThrow(/only revoke/);
   });
 });
 
@@ -482,8 +533,9 @@ describe("createShareLink", () => {
   it("forbids creating a link with a higher role than the caller's own", async () => {
     let { storage, mgr } = makeManager();
     seedCollaborator(storage, "a", [userEdge(OWNER, "use")]);
-    await expect(mgr.createShareLink({ caller: collab("a"), role: "build" }))
-        .rejects.toThrow(/higher than your own/);
+    await expect(mgr.createShareLink({ caller: collab("a"), role: "build" })).rejects.toThrow(
+      /higher than your own/,
+    );
   });
 });
 
@@ -505,10 +557,18 @@ describe("newShareLinkKey", () => {
     expect(listed[0].note).toBe("team");
 
     // Both secrets redeem, and a user redeeming both gets a single (deduplicated) edge.
-    await mgr.redeemShareKey({ rawKey: key1, profileId: "a", fetchProfile: async () => profile("a") });
-    await mgr.redeemShareKey({ rawKey: key2, profileId: "a", fetchProfile: async () => profile("a") });
+    await mgr.redeemShareKey({
+      rawKey: key1,
+      profileId: "a",
+      fetchProfile: async () => profile("a"),
+    });
+    await mgr.redeemShareKey({
+      rawKey: key2,
+      profileId: "a",
+      fetchProfile: async () => profile("a"),
+    });
     expect(storage.collaborators.get("a")!.addedBy).toHaveLength(1);
-    expect(mgr.getEffectiveRole("a")).toBe("use");
+    expect(await mgr.getEffectiveRole("a")).toBe("use");
   });
 
   it("revoking a link revokes every key minted for it", async () => {
@@ -517,10 +577,10 @@ describe("newShareLinkKey", () => {
     let linkId = mgr.listShareLinkRecords()[0].id;
     let { key: key2 } = await mgr.newShareLinkKey({ caller: owner, linkId });
 
-    mgr.revokeShareLink(owner, linkId, []);
+    await mgr.revokeShareLink(owner, linkId, []);
     expect(link(storage, linkId).revoked).toBe(true);
     // The copies are reclaimed; the link row stays, since edges point at it.
-    expect([...storage.shareKeys.list()].map(r => r.id)).toEqual([linkId]);
+    expect([...storage.shareKeys.list()].map((r) => r.id)).toEqual([linkId]);
 
     // Neither the original nor the copied secret can be redeemed anymore.
     for (let rawKey of [key1, key2]) {
@@ -533,8 +593,9 @@ describe("newShareLinkKey", () => {
     let { storage, mgr } = makeManager();
     seedLink(storage, "k1", OWNER);
     seedCollaborator(storage, "a", [userEdge(OWNER, "build")]);
-    await expect(mgr.newShareLinkKey({ caller: collab("a"), linkId: "k1" }))
-        .rejects.toThrow(/only copy/);
+    await expect(mgr.newShareLinkKey({ caller: collab("a"), linkId: "k1" })).rejects.toThrow(
+      /only copy/,
+    );
   });
 
   it("forbids copying a link that now grants a higher role than the caller's own", async () => {
@@ -542,8 +603,9 @@ describe("newShareLinkKey", () => {
     // "a" created a build link, then was downgraded to use.
     seedLink(storage, "k1", "a", "build");
     seedCollaborator(storage, "a", [userEdge(OWNER, "use")]);
-    await expect(mgr.newShareLinkKey({ caller: collab("a"), linkId: "k1" }))
-        .rejects.toThrow(/higher than your own/);
+    await expect(mgr.newShareLinkKey({ caller: collab("a"), linkId: "k1" })).rejects.toThrow(
+      /higher than your own/,
+    );
   });
 
   it("cannot manage a link through the id of one of its copies", async () => {
@@ -554,13 +616,14 @@ describe("newShareLinkKey", () => {
 
     // A copy has its own hash in the same table. Mistaking one for a link would make revocation a
     // silent no-op: redemption resolves the copy through to the link, which would go untouched.
-    let aliasId = [...storage.shareKeys.list()].find(r => r.alias !== undefined)!.id;
-    expect(mgr.listShareLinkRecords().map(r => r.id)).toEqual([linkId]);
-    await expect(mgr.newShareLinkKey({ caller: owner, linkId: aliasId })).rejects.toThrow(/not found/);
+    let aliasId = [...storage.shareKeys.list()].find((r) => r.alias !== undefined)!.id;
+    expect(mgr.listShareLinkRecords().map((r) => r.id)).toEqual([linkId]);
+    await expect(mgr.newShareLinkKey({ caller: owner, linkId: aliasId })).rejects.toThrow(
+      /not found/,
+    );
     expect(() => mgr.updateShareLink(owner, aliasId, "x")).toThrow(/not found/);
-    expect(() => mgr.revokeShareLink(owner, aliasId, [])).toThrow(/not found/);
+    await expect(mgr.revokeShareLink(owner, aliasId, [])).rejects.toThrow(/not found/);
   });
-
 });
 
 describe("pre-copy share keys", () => {
@@ -569,59 +632,67 @@ describe("pre-copy share keys", () => {
     // A key written before copies existed already has the shape of a link, and its edges already
     // point at the hash, so it reads back as a link with no migration.
     storage.shareKeys.put({
-      id: "hash1", note: "team", created: new Date("2025-01-01"), createdBy: OWNER, role: "use",
+      id: "hash1",
+      note: "team",
+      created: new Date("2025-01-01"),
+      createdBy: OWNER,
+      role: "use",
     });
     seedCollaborator(storage, "a", [keyEdge("hash1", "use")]);
 
-    expect(mgr.listShareLinkRecords()).toMatchObject(
-        [{ id: "hash1", note: "team", createdBy: OWNER, role: "use" }]);
-    expect(mgr.getEffectiveRole("a")).toBe("use");
+    expect(mgr.listShareLinkRecords()).toMatchObject([
+      { id: "hash1", note: "team", createdBy: OWNER, role: "use" },
+    ]);
+    expect(await mgr.getEffectiveRole("a")).toBe("use");
 
     // Such a link can also be copied, and the copy grants the same access.
     let { key } = await mgr.newShareLinkKey({ caller: owner, linkId: "hash1" });
-    await mgr.redeemShareKey(
-        { rawKey: key, profileId: "b", fetchProfile: async () => profile("b") });
-    expect(mgr.getEffectiveRole("b")).toBe("use");
+    await mgr.redeemShareKey({
+      rawKey: key,
+      profileId: "b",
+      fetchProfile: async () => profile("b"),
+    });
+    expect(await mgr.getEffectiveRole("b")).toBe("use");
   });
 });
 
 describe("listCollaborators", () => {
-  it("includes each collaborator's effective role", () => {
+  it("includes each collaborator's effective role", async () => {
     let { storage, mgr } = makeManager();
     seedCollaborator(storage, "a", [userEdge(OWNER, "build")]);
     seedCollaborator(storage, "b", [userEdge(OWNER, "use")]);
-    let list = mgr.listCollaborators();
-    expect(list.find(x => x.profile.id === "a")!.role).toBe("build");
-    expect(list.find(x => x.profile.id === "b")!.role).toBe("use");
+    let list = await mgr.listCollaborators();
+    expect(list.find((x) => x.profile.id === "a")!.role).toBe("build");
+    expect(list.find((x) => x.profile.id === "b")!.role).toBe("use");
   });
 
-  it("omits collaborators who linger in storage but are unreachable", () => {
+  it("omits collaborators who linger in storage but are unreachable", async () => {
     let { storage, mgr } = makeManager();
     seedCollaborator(storage, "a", [userEdge(OWNER)]);
-    seedCollaborator(storage, "dead", []);  // record with no incoming edges
-    let list = mgr.listCollaborators();
+    seedCollaborator(storage, "dead", []); // record with no incoming edges
+    let list = await mgr.listCollaborators();
     expect(ids(list)).toEqual(["a"]);
   });
 });
 
 describe("listShareLinkRecords", () => {
-  it("omits revoked links", () => {
+  it("omits revoked links", async () => {
     let { storage, mgr } = makeManager();
     seedLink(storage, "k1", OWNER);
     storage.shareKeys.put({ id: "k2", created: new Date(), createdBy: OWNER, revoked: true });
-    expect(mgr.listShareLinkRecords().map(r => r.id)).toEqual(["k1"]);
+    expect(mgr.listShareLinkRecords().map((r) => r.id)).toEqual(["k1"]);
   });
 });
 
 describe("updateShareLink", () => {
-  it("owner can edit any link's note", () => {
+  it("owner can edit any link's note", async () => {
     let { storage, mgr } = makeManager();
     seedLink(storage, "k1", "a");
     mgr.updateShareLink(owner, "k1", "renamed");
     expect(link(storage, "k1").note).toBe("renamed");
   });
 
-  it("non-owner cannot edit a link they didn't create", () => {
+  it("non-owner cannot edit a link they didn't create", async () => {
     let { storage, mgr } = makeManager();
     seedLink(storage, "k1", OWNER);
     expect(() => mgr.updateShareLink(collab("a"), "k1", "x")).toThrow(/only edit/);
@@ -634,14 +705,16 @@ describe("ownerInvitesOnly", () => {
     seedLink(storage, "k1", OWNER);
     flags.ownerInvitesOnly = true;
 
-    await expect(mgr.createShareLink({ caller: owner, role: "use" }))
-        .rejects.toThrow(/Share links are disabled/);
-    await expect(mgr.newShareLinkKey({ caller: owner, linkId: "k1" }))
-        .rejects.toThrow(/Share links are disabled/);
-    expect([...storage.shareKeys.list()].map(r => r.id)).toEqual(["k1"]);
+    await expect(mgr.createShareLink({ caller: owner, role: "use" })).rejects.toThrow(
+      /Share links are disabled/,
+    );
+    await expect(mgr.newShareLinkKey({ caller: owner, linkId: "k1" })).rejects.toThrow(
+      /Share links are disabled/,
+    );
+    expect([...storage.shareKeys.list()].map((r) => r.id)).toEqual(["k1"]);
 
     // Link management isn't an open() failure, so it carries no open-gadget code.
-    let error = await mgr.createShareLink({ caller: owner, role: "use" }).catch(e => e);
+    let error = await mgr.createShareLink({ caller: owner, role: "use" }).catch((e) => e);
     expect(getOpenGadgetErrorCode(error)).toBeUndefined();
   });
 
@@ -656,7 +729,7 @@ describe("ownerInvitesOnly", () => {
 
     await expect(created).rejects.toThrow(/Share links are disabled/);
     await expect(copied).rejects.toThrow(/Share links are disabled/);
-    expect([...storage.shareKeys.list()].map(r => r.id)).toEqual(["k1"]);
+    expect([...storage.shareKeys.list()].map((r) => r.id)).toEqual(["k1"]);
   });
 
   it("refuses a new user redeeming a link created before ownerInvitesOnly", async () => {
@@ -665,10 +738,16 @@ describe("ownerInvitesOnly", () => {
     flags.ownerInvitesOnly = true;
 
     let fetched = 0;
-    await expect(mgr.redeemShareKey({
-      rawKey: key, profileId: "newbie",
-      fetchProfile: async () => { fetched++; return profile("newbie"); },
-    })).rejects.toMatchObject({
+    await expect(
+      mgr.redeemShareKey({
+        rawKey: key,
+        profileId: "newbie",
+        fetchProfile: async () => {
+          fetched++;
+          return profile("newbie");
+        },
+      }),
+    ).rejects.toMatchObject({
       code: OPEN_GADGET_ERROR_CODES.shareLinksDisabled,
       message: expect.stringMatching(/Share links are disabled/),
     });
@@ -682,10 +761,16 @@ describe("ownerInvitesOnly", () => {
     let { storage, flags, mgr } = makeManagerWithFlag();
     let { key } = await mgr.createShareLink({ caller: owner, role: "build" });
 
-    await expect(mgr.redeemShareKey({
-      rawKey: key, profileId: "newbie",
-      fetchProfile: async () => { flags.ownerInvitesOnly = true; return profile("newbie"); },
-    })).rejects.toMatchObject({ code: OPEN_GADGET_ERROR_CODES.shareLinksDisabled });
+    await expect(
+      mgr.redeemShareKey({
+        rawKey: key,
+        profileId: "newbie",
+        fetchProfile: async () => {
+          flags.ownerInvitesOnly = true;
+          return profile("newbie");
+        },
+      }),
+    ).rejects.toMatchObject({ code: OPEN_GADGET_ERROR_CODES.shareLinksDisabled });
     expect(storage.collaborators.get("newbie")).toBeUndefined();
   });
 
@@ -696,7 +781,8 @@ describe("ownerInvitesOnly", () => {
     flags.ownerInvitesOnly = true;
 
     await mgr.redeemShareKey({
-      rawKey: key, profileId: "a",
+      rawKey: key,
+      profileId: "a",
       fetchProfile: async () => profile("a"),
     });
 
@@ -704,7 +790,7 @@ describe("ownerInvitesOnly", () => {
     expect(storage.collaborators.get("a")!.addedBy).toEqual([
       expect.objectContaining({ type: "user", sharer: OWNER }),
     ]);
-    expect(mgr.getEffectiveRole("a")).toBe("use");
+    expect(await mgr.getEffectiveRole("a")).toBe("use");
   });
 
   it("refuses an existing collaborator the owner did not add directly", async () => {
@@ -713,10 +799,13 @@ describe("ownerInvitesOnly", () => {
     seedCollaborator(storage, "a", [keyEdge(linkId)]);
     flags.ownerInvitesOnly = true;
 
-    await expect(mgr.redeemShareKey({
-      rawKey: key, profileId: "a",
-      fetchProfile: async () => profile("a"),
-    })).rejects.toMatchObject({ code: OPEN_GADGET_ERROR_CODES.shareLinksDisabled });
+    await expect(
+      mgr.redeemShareKey({
+        rawKey: key,
+        profileId: "a",
+        fetchProfile: async () => profile("a"),
+      }),
+    ).rejects.toMatchObject({ code: OPEN_GADGET_ERROR_CODES.shareLinksDisabled });
     expect(storage.collaborators.get("a")!.addedBy).toEqual([
       expect.objectContaining({ type: "shareKey", keyId: linkId }),
     ]);
@@ -726,73 +815,75 @@ describe("ownerInvitesOnly", () => {
     let { storage, flags, mgr } = makeManagerWithFlag();
     flags.ownerInvitesOnly = true;
     await mgr.redeemShareKey({
-      rawKey: "00112233445566778899aabbccddeeff", profileId: "a",
+      rawKey: "00112233445566778899aabbccddeeff",
+      profileId: "a",
       fetchProfile: async () => profile("a"),
     });
     expect(storage.collaborators.get("a")).toBeUndefined();
   });
 
-  it("lets only the owner add collaborators", () => {
+  it("lets only the owner add collaborators", async () => {
     let { storage, flags, mgr } = makeManagerWithFlag();
     seedCollaborator(storage, "a", [userEdge(OWNER, "build")]);
     flags.ownerInvitesOnly = true;
 
-    expect(() => mgr.addCollaborator({ caller: collab("a"), profile: profile("b"), role: "use" }))
-        .toThrow(/Only the workspace owner/);
+    await expect(
+      mgr.addCollaborator({ caller: collab("a"), profile: profile("b"), role: "use" }),
+    ).rejects.toThrow(/Only the workspace owner/);
     expect(storage.collaborators.get("b")).toBeUndefined();
 
-    mgr.addCollaborator({ caller: owner, profile: profile("b"), role: "use" });
-    expect(mgr.getEffectiveRole("b")).toBe("use");
+    await mgr.addCollaborator({ caller: owner, profile: profile("b"), role: "use" });
+    expect(await mgr.getEffectiveRole("b")).toBe("use");
   });
 
-  it("keeps link management available to the owner", () => {
+  it("keeps link management available to the owner", async () => {
     let { storage, flags, mgr } = makeManagerWithFlag();
     seedLink(storage, "k1", OWNER);
     seedCollaborator(storage, "a", [keyEdge("k1"), userEdge(OWNER, "use")]);
     flags.ownerInvitesOnly = true;
 
-    expect(mgr.listShareLinkRecords().map(r => r.id)).toEqual(["k1"]);
+    expect(mgr.listShareLinkRecords().map((r) => r.id)).toEqual(["k1"]);
     mgr.updateShareLink(owner, "k1", "renamed");
     // The link already grants nothing, so revoking it changes nobody's access.
-    expect(mgr.revokeShareLink(owner, "k1", [])).toEqual([]);
-    expect(mgr.getEffectiveRole("a")).toBe("use");
-    expect(ids(mgr.removeCollaborator(owner, "a", []))).toEqual(["a"]);
+    expect(await mgr.revokeShareLink(owner, "k1", [])).toEqual([]);
+    expect(await mgr.getEffectiveRole("a")).toBe("use");
+    expect(ids(await mgr.removeCollaborator(owner, "a", []))).toEqual(["a"]);
   });
 
-  it("counts only direct owner grants", () => {
+  it("counts only direct owner grants", async () => {
     let { storage, flags, mgr } = makeManagerWithFlag();
     seedLink(storage, "k1", OWNER);
     seedCollaborator(storage, "direct", [userEdge(OWNER, "build")]);
     seedCollaborator(storage, "linked", [keyEdge("k1")]);
     seedCollaborator(storage, "transitive", [userEdge("direct", "build")]);
     let baseline = mgr.computeEffectiveRoles();
-    expect(ids(mgr.listCollaborators())).toEqual(["direct", "linked", "transitive"]);
+    expect(ids(await mgr.listCollaborators())).toEqual(["direct", "linked", "transitive"]);
 
     flags.ownerInvitesOnly = true;
 
-    expect(mgr.getEffectiveRole("direct")).toBe("build");
-    expect(mgr.getEffectiveRole("linked")).toBeUndefined();
-    expect(mgr.getEffectiveRole("transitive")).toBeUndefined();
-    expect(ids(mgr.listCollaborators())).toEqual(["direct"]);
+    expect(await mgr.getEffectiveRole("direct")).toBe("build");
+    expect(await mgr.getEffectiveRole("linked")).toBeUndefined();
+    expect(await mgr.getEffectiveRole("transitive")).toBeUndefined();
+    expect(ids(await mgr.listCollaborators())).toEqual(["direct"]);
     expect(mgr.computeAffectedByOwnerInvitesOnly(baseline)).toEqual([
       expect.objectContaining({ profile: profile("linked"), oldRole: "build", newRole: null }),
       expect.objectContaining({ profile: profile("transitive"), oldRole: "build", newRole: null }),
     ]);
   });
 
-  it("counts a user the owner kept during a removal as direct", () => {
+  it("counts a user the owner kept during a removal as direct", async () => {
     let { storage, flags, mgr } = makeManagerWithFlag();
     seedCollaborator(storage, "a", [userEdge(OWNER, "build")]);
     seedCollaborator(storage, "b", [userEdge("a", "use")]);
 
     // Removing a while keeping b re-roots b on an edge from the owner.
-    mgr.removeCollaborator(owner, "a", ["b"]);
+    await mgr.removeCollaborator(owner, "a", ["b"]);
     flags.ownerInvitesOnly = true;
 
-    expect(mgr.getEffectiveRole("b")).toBe("use");
+    expect(await mgr.getEffectiveRole("b")).toBe("use");
   });
 
-  it("downgrades a collaborator to their owner edge's role", () => {
+  it("downgrades a collaborator to their owner edge's role", async () => {
     let { storage, flags, mgr } = makeManagerWithFlag();
     seedCollaborator(storage, "a", [userEdge(OWNER, "build")]);
     seedCollaborator(storage, "b", [userEdge(OWNER, "use"), userEdge("a", "build")]);
@@ -801,28 +892,125 @@ describe("ownerInvitesOnly", () => {
 
     flags.ownerInvitesOnly = true;
 
-    expect(mgr.getEffectiveRole("b")).toBe("use");
+    expect(await mgr.getEffectiveRole("b")).toBe("use");
     expect(mgr.computeAffectedByOwnerInvitesOnly(baseline)).toEqual([
       expect.objectContaining({ profile: profile("b"), oldRole: "build", newRole: "use" }),
     ]);
   });
 
-  it("re-adding an intermediary restores nobody else", () => {
+  it("re-adding an intermediary restores nobody else", async () => {
     let { storage, flags, mgr } = makeManagerWithFlag();
     seedCollaborator(storage, "a", [userEdge(OWNER, "build")]);
     seedCollaborator(storage, "b", [userEdge("a", "use")]);
 
-    mgr.removeCollaborator(owner, "a", []);
-    expect(mgr.getEffectiveRole("b")).toBeUndefined();
+    await mgr.removeCollaborator(owner, "a", []);
+    expect(await mgr.getEffectiveRole("b")).toBeUndefined();
     flags.ownerInvitesOnly = true;
 
     // Without the flag, re-adding a would bring b back through a's untouched edge. Once it is set,
     // only the owner's direct grants count, so b stays out until the owner adds them directly.
-    mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "build" });
-    expect(mgr.getEffectiveRole("a")).toBe("build");
-    expect(mgr.getEffectiveRole("b")).toBeUndefined();
+    await mgr.addCollaborator({ caller: owner, profile: profile("a"), role: "build" });
+    expect(await mgr.getEffectiveRole("a")).toBe("build");
+    expect(await mgr.getEffectiveRole("b")).toBeUndefined();
 
-    mgr.addCollaborator({ caller: owner, profile: profile("b"), role: "use" });
-    expect(mgr.getEffectiveRole("b")).toBe("use");
+    await mgr.addCollaborator({ caller: owner, profile: profile("b"), role: "use" });
+    expect(await mgr.getEffectiveRole("b")).toBe("use");
+  });
+});
+
+describe("org-owned workspaces", () => {
+  it("seeds each active member at the role their org role grants", async () => {
+    let { mgr } = makeOrgManager({ orgOwner: "owner", admin: "admin", member: "member" });
+    expect(await mgr.getEffectiveRole("orgOwner")).toBe("build");
+    expect(await mgr.getEffectiveRole("admin")).toBe("build");
+    expect(await mgr.getEffectiveRole("member")).toBe("use");
+    expect(await mgr.getEffectiveRole("outsider")).toBeUndefined();
+  });
+
+  it("ends a removed member's access lazily, on the next read", async () => {
+    let { snapshot, mgr } = makeOrgManager({ admin: "admin", member: "member" });
+    expect(await mgr.getEffectiveRole("member")).toBe("use");
+    snapshot.delete("member");
+    expect(await mgr.getEffectiveRole("member")).toBeUndefined();
+  });
+
+  it("narrows a demoted admin to use", async () => {
+    let { snapshot, mgr } = makeOrgManager({ admin: "admin" });
+    expect(await mgr.getEffectiveRole("admin")).toBe("build");
+    snapshot.set("admin", "member");
+    expect(await mgr.getEffectiveRole("admin")).toBe("use");
+  });
+
+  it("leaves a user-owned workspace unchanged when the resolver returns null", async () => {
+    let { storage, mgr } = makeManager();
+    seedCollaborator(storage, "a", [userEdge(OWNER, "build")]);
+    expect(await mgr.getEffectiveRole(OWNER)).toBe("build");
+    expect(await mgr.getEffectiveRole("a")).toBe("build");
+  });
+
+  it("roots the graph at the org, not the former user owner", async () => {
+    let { storage, mgr } = makeOrgManager({ admin: "admin", member: "member" });
+    // The former user owner is not a member: their stored edges grant nothing, and they hold
+    // no access of their own.
+    seedCollaborator(storage, "friend", [userEdge(OWNER, "build")]);
+    expect(await mgr.getEffectiveRole(OWNER)).toBeUndefined();
+    expect(await mgr.getEffectiveRole("friend")).toBeUndefined();
+    // A member's edge still extends access on top of the baselines.
+    seedCollaborator(storage, "pal", [userEdge("admin", "build")]);
+    expect(await mgr.getEffectiveRole("pal")).toBe("build");
+  });
+
+  it("bounds a member's grant by their use baseline", async () => {
+    let { mgr } = makeOrgManager({ member: "member" });
+    await expect(mgr.addCollaborator(
+        { caller: collab("member"), profile: profile("pal"), role: "build" }))
+        .rejects.toThrow(/higher than your own/);
+  });
+
+  it("denies the former user owner sharing authority when they are not a member", async () => {
+    let { mgr } = makeOrgManager({ member: "member" });
+    await expect(mgr.addCollaborator({ caller: owner, profile: profile("pal"), role: "use" }))
+        .rejects.toThrow(/do not have permission to share/);
+  });
+
+  it("lets an org admin remove a collaborator with owner authority", async () => {
+    let { storage, mgr } = makeOrgManager({ admin: "admin", member: "member" });
+    seedCollaborator(storage, "hanger-on", [userEdge("member", "use")]);
+    let affected =
+        await mgr.removeCollaborator({ profileId: "admin", isOwner: true }, "hanger-on", []);
+    expect(ids(affected)).toEqual(["hanger-on"]);
+    expect(await mgr.getEffectiveRole("hanger-on")).toBeUndefined();
+    expect(await mgr.getEffectiveRole("member")).toBe("use");
+  });
+
+  it("counts only member baselines once ownerInvitesOnly is set", async () => {
+    let { storage, snapshot, flags, mgr } = makeOrgManager({ admin: "admin" });
+    seedCollaborator(storage, "pal", [userEdge("admin", "build")]);
+    let baseline = mgr.computeEffectiveRoles({ orgRoles: snapshot });
+    expect(baseline.get("pal")).toBe("build");
+
+    flags.ownerInvitesOnly = true;
+
+    // An org-owned workspace has no owner-authored edges to keep: only baselines count.
+    expect(await mgr.getEffectiveRole("admin")).toBe("build");
+    expect(await mgr.getEffectiveRole("pal")).toBeUndefined();
+    expect(mgr.computeAffectedByOwnerInvitesOnly(baseline, snapshot)).toEqual([
+      expect.objectContaining({ profile: profile("pal"), oldRole: "build" }),
+    ]);
+  });
+
+  it("lets a member redeem a share link on top of their baseline", async () => {
+    let { mgr } = makeOrgManager({ admin: "admin", member: "member" });
+    let { key } = await mgr.createShareLink(
+        { caller: { profileId: "admin", isOwner: true }, role: "build" });
+    expect(await mgr.getEffectiveRole("member")).toBe("use");
+
+    await mgr.redeemShareKey({
+      rawKey: key,
+      profileId: "member",
+      fetchProfile: async () => profile("member"),
+    });
+
+    expect(await mgr.getEffectiveRole("member")).toBe("build");
   });
 });

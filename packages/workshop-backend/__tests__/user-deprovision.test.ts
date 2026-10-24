@@ -218,7 +218,7 @@ describe("deprovision sweeps shared workspaces", () => {
       impl.ownerId = `owner-do-${id}`;
       impl.ownerProfileId = ownerProfileId;
       const sharing = await impl.getSharingManager();
-      sharing.addCollaborator({
+      await sharing.addCollaborator({
         caller: { profileId: ownerProfileId, isOwner: true },
         profile: { type: "user", id, name: "Swept User" },
         role: "build",
@@ -248,7 +248,7 @@ describe("deprovision sweeps shared workspaces", () => {
     const after = await runInDurableObject(overseer, async (instance: OverseerDurableObject) => {
       const impl = implOf(instance);
       const sharing = await impl.getSharingManager();
-      return { role: sharing.getEffectiveRole(id), restartReasons: [...impl.restartReasons!] };
+      return { role: await sharing.getEffectiveRole(id), restartReasons: [...impl.restartReasons!] };
     });
     expect(after.role).toBeUndefined();
     expect(after.restartReasons)
