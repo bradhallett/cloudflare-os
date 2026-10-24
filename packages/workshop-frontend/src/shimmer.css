@@ -39,6 +39,15 @@
     --shimmer-color,
     oklch(from currentColor l c h / calc(alpha* 0.2))
   );
+  /* Relative color syntax needs Safari 18 / Chrome 119; where it is
+     unsupported the gradient would be invalid (and, with transparent
+     text-fill, invisible), so fall back to a translucent currentColor. */
+  @supports not (color: oklch(from red l c h)) {
+    --_highlight: var(
+      --shimmer-color,
+      color-mix(in oklch, currentColor, transparent 80%)
+    );
+  }
 
   background-image: var(
     --shimmer-image,
@@ -66,6 +75,12 @@
       --shimmer-color,
       oklch(from currentColor max(0.8, calc(l + 0.4)) c h / calc(alpha + 0.4))
     );
+    @supports not (color: oklch(from red l c h)) {
+      --_highlight: var(
+        --shimmer-color,
+        color-mix(in oklch, currentColor, white 45%)
+      );
+    }
   }
 
   &:where([dir="rtl"], [dir="rtl"] *) {
