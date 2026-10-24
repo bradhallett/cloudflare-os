@@ -8,6 +8,7 @@ import { WorkshopIconButton } from '../../components/WorkshopControls'
 import { PersonAvatar } from '../../components/PersonAvatar'
 import { UserSearchCombobox } from '../user-directory/UserSearchCombobox'
 import { useServerConfig } from '../../ServerConfigContext'
+import { useOptionalAuthenticatedApi } from '../../AuthContext'
 
 type Props = {
   authenticatedApi: RpcStub<AuthenticatedApi>
@@ -60,6 +61,14 @@ export default function GatekeeperUserPickerDialog({
   const closeRequested = useRef(false)
   const closeCompleted = useRef(false)
   const searchEnabled = useServerConfig()?.userSearchEnabled ?? false
+  const orgCount = useOptionalAuthenticatedApi()?.currentUser?.orgs.length ?? 0
+  // Who directory results are scoped to (see AuthenticatedApi.searchUsers): the user's org
+  // co-members plus the owners of workspaces shared with them.
+  const scopeNote = orgCount === 0
+    ? 'You can select people you share workspaces with.'
+    : orgCount === 1
+      ? 'You can select members of your organization and people you share workspaces with.'
+      : `You can select members of your ${orgCount} organizations and people you share workspaces with.`
   const [closing, setClosing] = useState(false)
   // Set when a pick fails; cleared on the next keystroke.
   const [notice, setNotice] = useState<string | null>(null)
@@ -192,6 +201,7 @@ export default function GatekeeperUserPickerDialog({
               selected={false}
               disabled={closing || atLimit}
               searchEnabled={searchEnabled}
+              scopeNote={searchEnabled ? scopeNote : undefined}
               inputName="gatekeeper-share-people-search"
               search={search}
               excludeIds={excludeIds}
