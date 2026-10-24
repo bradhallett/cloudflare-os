@@ -72,4 +72,6 @@ removed member's pending picks die at redemption. A ticket justified by a share 
 Org events are logged under the `workshop.org` component (`org.created`, `org.member.invited`,
 `org.member.joined`, `org.member.role_changed`, `org.member.removed`, `org.member.left`,
 `org.settings.updated`) carrying `orgId` and, where one was granted or changed, `orgRole`. Member
-user ids never enter org logs.
+user ids never enter org logs. Org-owned workspaces carry their org the same way: the workspace
+logger folds in the owning org, and its activity events record an org dimension with per-org
+rollup queries — see [`org-observability.md`](org-observability.md).

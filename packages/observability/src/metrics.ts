@@ -30,7 +30,8 @@ declare global {
 
 /**
  * One product activity event. Ids are the raw hex Durable Object ids; the encoder adds the
- * `usr_`/`ws_` prefixes. There is no outcome: activity is recorded only once the action succeeded.
+ * `usr_`/`ws_`/`org_` prefixes. There is no outcome: activity is recorded only once the action
+ * succeeded.
  */
 export type ActivityMetricInput = {
   eventType: ActivityEventType;
@@ -40,6 +41,8 @@ export type ActivityMetricInput = {
   ownerId?: string;
   /** The workspace (Overseer Durable Object) the action concerns. */
   workspaceId?: string;
+  /** The organization that owns the workspace the action concerns, on org-owned workspaces. */
+  orgId?: string;
   /** Event-specific qualifier, e.g. the source of a creation or the kind of an interaction. */
   detail?: string;
   /** The gadget workpiece the action concerns, within `workspaceId`. */
@@ -48,13 +51,15 @@ export type ActivityMetricInput = {
 
 /**
  * Encodes one activity event as its Analytics Engine points: always the canonical `actor` point,
- * plus one for each of the owner and workspace the event names. Columns the event leaves empty
- * are written as `""`, and reserved columns past the family's last one are not written at all.
+ * plus one for each of the owner, workspace, and org the event names. Columns the event leaves
+ * empty are written as `""`, and reserved columns past the family's last one are not written at
+ * all.
  */
 export function encodeActivityPoints(input: ActivityMetricInput): AnalyticsEngineDataPoint[] {
   const actorRef = input.actorId ? `usr_${input.actorId}` : UNATTRIBUTED_ACTOR;
   const ownerRef = input.ownerId ? `usr_${input.ownerId}` : undefined;
   const workspaceRef = input.workspaceId ? `ws_${input.workspaceId}` : undefined;
+  const orgRef = input.orgId ? `org_${input.orgId}` : undefined;
   const gadgetRef = workspaceRef && input.gadgetId !== undefined
       ? `${workspaceRef}/${input.gadgetId}` : undefined;
 
@@ -62,6 +67,7 @@ export function encodeActivityPoints(input: ActivityMetricInput): AnalyticsEngin
     ["actor", actorRef],
     ["owner", ownerRef],
     ["workspace", workspaceRef],
+    ["org", orgRef],
   ];
   return scopes
       .filter(([, ref]) => ref !== undefined)
@@ -77,6 +83,7 @@ export function encodeActivityPoints(input: ActivityMetricInput): AnalyticsEngin
           [COMMON_SLOTS.outcome]: "success",
           [ACTIVITY_V1_SLOTS.detail]: input.detail,
           [ACTIVITY_V1_SLOTS.gadgetRef]: gadgetRef,
+          [ACTIVITY_V1_SLOTS.orgId]: orgRef,
         }, ""),
         doubles: columns<DoubleSlot, number>({
           [COMMON_SLOTS.durationMs]: 0,

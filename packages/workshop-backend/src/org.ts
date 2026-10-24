@@ -10,7 +10,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
-import { createWorkshopLogger } from "./observability";
+import { createWorkshopLogger, type WorkshopLogger } from "./observability";
 import {
   MAX_ORG_NAME_LENGTH, type OrgMember, type OrgMemberStatus, type OrgRole, type OrgSummary,
 } from "@gadgets/workshop-shared/api";
@@ -51,6 +51,17 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
     const org = this.storage.org.get();
     if (org === null) throw new Error("No such organization.");
     return org;
+  }
+
+  /**
+   * This org's logger: the `workshop.org` component with the org's id folded in
+   * (`logger.with({orgId})`, the org observability convention), so every event names its org
+   * without each call site saying so. Before `initializeOrg` creates the record there is no id
+   * yet, and events carry none.
+   */
+  get #log(): WorkshopLogger {
+    const org = this.storage.org.get();
+    return org === null ? logger : logger.with({ orgId: org.id });
   }
 
   /**
@@ -96,9 +107,8 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
       if (invitation.expiresAt.getTime() > now) continue;
       this.storage.invitations.delete(invitation.inviteeId);
       this.storage.members.delete(invitation.inviteeId);
-      logger.debug("swept an expired org invitation", {
+      this.#log.debug("swept an expired org invitation", {
         event: "org.invitation.expired",
-        orgId: this.storage.org.get()?.id,
       });
       await this.#mirror(invitation.inviteeId, null);
     }
@@ -119,9 +129,8 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
       await this.ctx.exports.UserDurableObject.getByName(userId)
           .syncOrgMembership(this.#org().id, membership);
     } catch (error) {
-      logger.warn("failed to mirror org membership into user object", {
+      this.#log.warn("failed to mirror org membership into user object", {
         event: "org.membership.mirror.failed",
-        orgId: this.storage.org.get()?.id,
         error,
       });
     }
@@ -154,7 +163,7 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
       joinedAt: now,
     };
     this.storage.members.put(member);
-    logger.info("created an organization", { event: "org.created", orgId: org.id });
+    this.#log.info("created an organization", { event: "org.created" });
     await this.#mirror(creatorUserId, { role: member.role, status: member.status });
     return this.#summaryFor(org, this.storage.settings.get(), member);
   }
@@ -217,7 +226,7 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
   async inviteMember(
       actorId: string, inviteeId: string, role: OrgRole = "member",
   ): Promise<OrgMember> {
-    const org = this.#org();
+    this.#org();
     await this.#sweepExpiredInvitations();
     const invitee = inviteeId.trim();
     if (invitee === "") throw new Error("The invited user id must not be empty.");
@@ -250,7 +259,7 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
       invitedAt: now,
       expiresAt: new Date(now.getTime() + INVITATION_TTL_MS),
     });
-    logger.info("invited an org member", { event: "org.member.invited", orgId: org.id, orgRole: role });
+    this.#log.info("invited an org member", { event: "org.member.invited", orgRole: role });
     await this.#mirror(invitee, { role: member.role, status: member.status });
     return member;
   }
@@ -276,8 +285,8 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
     const joined: OrgMember = { ...member, status: "active", joinedAt: new Date() };
     this.storage.members.put(joined);
     this.storage.invitations.delete(userId);
-    logger.info("an org member joined", {
-      event: "org.member.joined", orgId: org.id, orgRole: joined.role,
+    this.#log.info("an org member joined", {
+      event: "org.member.joined", orgRole: joined.role,
     });
     await this.#mirror(userId, { role: joined.role, status: joined.status });
     return this.#summaryFor(org, this.storage.settings.get(), joined);
@@ -289,7 +298,7 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
    * same way.
    */
   async changeMemberRole(actorId: string, userId: string, role: OrgRole): Promise<OrgMember> {
-    const org = this.#org();
+    this.#org();
     if (!canManageRoles(this.#accessFor(actorId))) {
       throw new Error("Only an owner may change roles in this organization.");
     }
@@ -305,8 +314,8 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
     this.storage.members.put(changed);
     const invitation = this.storage.invitations.get(userId);
     if (invitation !== undefined) this.storage.invitations.put({ ...invitation, role });
-    logger.info("changed an org member's role", {
-      event: "org.member.role_changed", orgId: org.id, orgRole: role,
+    this.#log.info("changed an org member's role", {
+      event: "org.member.role_changed", orgRole: role,
     });
     await this.#mirror(userId, { role: changed.role, status: changed.status });
     // A demotion to member narrows the member's baseline on every org-owned workspace; sever
@@ -324,7 +333,7 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
    * yourself is exactly memberLeave(). Refused when it would leave the org with no owner.
    */
   async removeMember(actorId: string, userId: string): Promise<void> {
-    const org = this.#org();
+    this.#org();
     if (actorId === userId) return this.memberLeave(userId);
     const member = this.storage.members.get(userId);
     if (member === undefined) throw new Error("No such member.");
@@ -336,7 +345,7 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
           "An organization must keep at least one owner; hand ownership over first.");
     }
     this.#deleteMember(member);
-    logger.info("removed an org member", { event: "org.member.removed", orgId: org.id });
+    this.#log.info("removed an org member", { event: "org.member.removed" });
     await this.#mirror(userId, null);
     await this.#severOwnedGadgetSessions();
   }
@@ -346,7 +355,7 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
    * who must first hand ownership over.
    */
   async memberLeave(userId: string): Promise<void> {
-    const org = this.#org();
+    this.#org();
     const member = this.storage.members.get(userId);
     if (member === undefined) throw new Error("You are not a member of this organization.");
     // A pending invitation is never the last owner being protected above: an invited owner can
@@ -356,7 +365,7 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
           "An organization must keep at least one owner; hand ownership over first.");
     }
     this.#deleteMember(member);
-    logger.info("an org member left", { event: "org.member.left", orgId: org.id });
+    this.#log.info("an org member left", { event: "org.member.left" });
     await this.#mirror(userId, null);
     await this.#severOwnedGadgetSessions();
   }
@@ -373,13 +382,13 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
    * retried transfer refreshes the record rather than duplicating it.
    */
   async addOwnedGadget(actorId: string, gadgetId: string): Promise<void> {
-    const org = this.#org();
+    this.#org();
     if (!canManageOrgAssets(this.#accessFor(actorId))) {
       throw new Error("Only an owner or admin of this organization may transfer workspaces into it.");
     }
     this.storage.ownedGadgets.put({ gadgetId });
-    logger.info("a workspace was transferred into the org", {
-      event: "org.gadget.transferred", orgId: org.id,
+    this.#log.info("a workspace was transferred into the org", {
+      event: "org.gadget.transferred",
     });
   }
 
@@ -391,8 +400,8 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
   async removeOwnedGadget(gadgetId: string): Promise<void> {
     this.#org();
     this.storage.ownedGadgets.delete(gadgetId);
-    logger.info("a workspace left the org's index", {
-      event: "org.gadget.unindexed", orgId: this.storage.org.get()?.id,
+    this.#log.info("a workspace left the org's index", {
+      event: "org.gadget.unindexed",
     });
   }
 
@@ -408,9 +417,9 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
             .get(this.ctx.exports.OverseerDurableObject.idFromString(gadget.gadgetId))
             .severOrgMemberSessions();
       } catch (error) {
-        logger.warn("failed to notify an org-owned workspace of a membership change", {
+        this.#log.warn("failed to notify an org-owned workspace of a membership change", {
           event: "org.gadget.membership.notify.failed",
-          orgId: this.storage.org.get()?.id, error,
+          error,
         });
       }
     }
@@ -432,7 +441,7 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
     }
     const updated: OrgSettings = { invitePolicy: settings.invitePolicy };
     this.storage.settings.put(updated);
-    logger.info("updated org settings", { event: "org.settings.updated", orgId: org.id });
+    this.#log.info("updated org settings", { event: "org.settings.updated" });
     const member = this.storage.members.get(actorId)!;
     return this.#summaryFor(org, updated, member);
   }

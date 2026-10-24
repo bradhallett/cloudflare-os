@@ -14,6 +14,7 @@ import { makeOrgStorage } from "../src/storage-schema/org-storage";
 import type { OverseerDurableObject } from "../src/overseer.js";
 import type { UserDurableObject } from "../src/user.js";
 import { UseOverseerInterface } from "../src/overseer-client-use.js";
+import type { ProductAnalyticsGadgetInput } from "../src/analytics.js";
 
 declare module "cloudflare:workers" {
   interface ProvidedEnv {
@@ -326,4 +327,64 @@ describe("org-owned workspaces", () => {
       expect(models).not.toContain("alices-model");
     });
   });
+
+  // The org observability dimension (#20), probed from inside the workspace's DO: the logger's
+  // fields, and the org column (blob10) of the activity points one event wrote. A user-owned
+  // workspace names no org anywhere; from the transfer on, both surfaces carry it.
+  it("an org-owned workspace's events carry its org; a user-owned one's do not", async () => {
+    const orgId = await createOrg({});
+    const { name, userIds } = await seedWorkspace();
+    const overseer = env.TEST_OVERSEER.getByName(name);
+
+    const before = await probeOrgDimension(name);
+    expect(before.logFields.orgId).toBeUndefined();
+    expect(before.metricOrgColumn).toEqual([""]);
+
+    using ownerClient = await overseer.open(
+        userIds.alice, ALICE, new NativeRpcStub<() => void>(() => {}));
+    await ownerClient.transferToOrg(orgId);
+
+    const after = await probeOrgDimension(name);
+    expect(after.logFields.orgId).toBe(orgId);
+    expect(after.metricOrgColumn).toEqual([`org_${orgId}`]);
+  });
 });
+
+type OrgDimensionProbe = { logFields: Record<string, unknown>; metricOrgColumn: unknown[] };
+
+// Runs inside the workspace's DO: captures one logger entry, and the points one activity event
+// writes to a stubbed METRICS binding, without either escaping the probe.
+async function probeOrgDimension(name: string): Promise<OrgDimensionProbe> {
+  return runInDurableObject(env.TEST_OVERSEER.getByName(name), (instance: OverseerDurableObject) => {
+    // The same unchecked cast every overseer suite uses: workerd hands back only the DO facade.
+    const impl = (instance as unknown as {
+      impl: TestImpl & {
+        logger: { info(message: string, details: { event: string }): void };
+        recordGadgetAnalytics(event: ProductAnalyticsGadgetInput): void;
+      };
+    }).impl;
+    let logFields: Record<string, unknown> = {};
+    const info = console.info;
+    console.info = (entry: Record<string, unknown>) => { logFields = entry; };
+    const points: AnalyticsEngineDataPoint[] = [];
+    // The Workers env the metrics writer reads, as a mutable binding table for the probe.
+    const ambient = env as unknown as {
+      METRICS?: { writeDataPoint(point: AnalyticsEngineDataPoint): void };
+    };
+    ambient.METRICS = { writeDataPoint: point => points.push(point) };
+    try {
+      impl.logger.info("probing the org dimension", { event: "org.dimension.probe" });
+      impl.recordGadgetAnalytics({
+        event_name: "gadget_interaction", user_id: "probe", interaction_type: "chat_message_sent",
+      });
+    } finally {
+      console.info = info;
+      delete ambient.METRICS;
+    }
+    // blob10 is the org column; every point of one event carries the same value (or blank).
+    return {
+      logFields,
+      metricOrgColumn: [...new Set(points.map(point => point.blobs?.[9] ?? null))],
+    };
+  });
+}
