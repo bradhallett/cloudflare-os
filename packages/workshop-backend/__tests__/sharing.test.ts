@@ -1061,4 +1061,23 @@ describe("org-owned workspaces", () => {
 
     expect(await mgr.getEffectiveRole("member")).toBe("build");
   });
+
+  it("grants a cross-org outsider nothing for a pre-transfer link they redeem", async () => {
+    // The link was minted while the workspace was user-owned. After the transfer its creator
+    // holds no live org role, and a shareKey edge's grant is bounded by that role — so even a
+    // perfectly valid key, redeemed by whoever got hold of it across the org boundary, counts
+    // for nothing: the graph roots at the org's baselines, not at stored edges.
+    let snapshot: ReadonlyMap<string, OrgRole> | null = null;
+    let { mgr } = makeManager(() => false, async () => snapshot);
+    let { key } = await mgr.createShareLink({ caller: owner, role: "build" });
+    snapshot = new Map(Object.entries({ admin: "admin" }));
+
+    await mgr.redeemShareKey({
+      rawKey: key,
+      profileId: "outsider",
+      fetchProfile: async () => profile("outsider"),
+    });
+
+    expect(await mgr.getEffectiveRole("outsider")).toBeUndefined();
+  });
 });

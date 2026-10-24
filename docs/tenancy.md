@@ -44,12 +44,17 @@ Removing a membership revokes nothing downstream. Org-derived access (org-owned 
 Library org grants, SCIM-provisioned members) holds its grant and **re-checks** the org when
 access matters. A removed member's access therefore ends at the next check, without cascading
 deletes across resource owners, and a later re-add restores it seamlessly. The authority read
-differs by surface: per-user surfaces ask `getMember(userId)` (Context Library grants,
-SCIM-provisioned members), while an org-owned *workspace* snapshots the org's whole active
-membership (`activeMembers()`) into its sharing graph's baselines at every `open()`
-(docs/sharing.md) — and the org additionally fans every membership removal, leave, or demotion
-out through its `ownedGadgets` index, so those workspaces' live sessions are severed at once
-rather than at each user's next open.
+differs by surface: the Context Library holds **no service binding to the org authority**, so the
+Workshop pushes each account's membership snapshot to it (in `AppUiContext.orgMemberships` when a
+management UI opens, and with every redeemed picker selection), and Context re-checks grants
+against that snapshot live; SCIM-provisioned members ask `getMember(userId)`; and an org-owned
+*workspace* snapshots the org's whole active membership (`activeMembers()`) into its sharing
+graph's baselines at every `open()` (docs/sharing.md) — and the org additionally fans every
+membership removal, leave, or demotion out through its `ownedGadgets` index, so those workspaces'
+live sessions are severed at once rather than at each user's next open. Deprovisioning a user
+ends their memberships directly (`memberLeave` per org, pending invitations declined), the one
+case that cannot wait for a lazy re-check, because the account will never open a session again
+(docs/org-threat-model.md).
 
 ## Org-scoped user directory
 

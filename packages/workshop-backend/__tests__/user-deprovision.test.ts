@@ -7,9 +7,9 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import type { OrgDurableObject } from "../src/org.js";
 import type { OverseerDurableObject } from "../src/overseer.js";
 import type { SharingManager } from "../src/sharing.js";
-import type { UserDirectoryDurableObject } from "../src/user-directory.js";
 import type { UserDurableObject } from "../src/user.js";
 import type { GatekeeperUserPickerTestHooks } from "./test-worker.js";
 // Load the whole backend (the pool's `main`) up front, so its load time doesn't count against
@@ -20,7 +20,7 @@ declare module "cloudflare:workers" {
   interface ProvidedEnv {
     TEST_USER: DurableObjectNamespace<UserDurableObject>;
     TEST_OVERSEER: DurableObjectNamespace<OverseerDurableObject>;
-    TEST_USER_DIRECTORY: DurableObjectNamespace<UserDirectoryDurableObject>;
+    TEST_ORG: DurableObjectNamespace<OrgDurableObject>;
     TEST_GATEKEEPER_USER_PICKER: DurableObjectNamespace<GatekeeperUserPickerTestHooks>;
   }
 }
@@ -35,8 +35,7 @@ type UserInternals = UserDurableObject & {
       list(): Iterable<{ ticketHash: string }>;
       put(record: unknown): void;
     };
-    connectedAccounts: { list(): Iterable<{ id: number }> };
-    gadgets: { list(): Iterable<{ id: string; owner?: unknown }> };
+    orgMemberships: { list(): Iterable<{ orgId: string }> };
     notificationSubscriptions: { put(value: Record<string, string>): void };
     cloudflareBilling: { put(value: unknown): void };
     dailyLlmCount: { put(value: unknown): void };
@@ -269,5 +268,49 @@ describe("deprovision sweeps shared workspaces", () => {
     const restarts = await runInDurableObject(overseer, async (instance: OverseerDurableObject) =>
         [...implOf(instance).restartReasons!]);
     expect(restarts).toHaveLength(1);
+  });
+});
+
+describe("deprovision leaves the user's organizations", () => {
+  it("ends active memberships and pending invitations alike, dropping the mirror index", async () => {
+    const id = newUserId("org-leaver");
+    const ownerA = `owner-a-${id}`;
+    const ownerB = `owner-b-${id}`;
+    const joined = `org-joined-${id}`;
+    const invited = `org-invited-${id}`;
+    await env.TEST_ORG.getByName(joined).initializeOrg("Acme", ownerA);
+    await env.TEST_ORG.getByName(joined).inviteMember(ownerA, id);
+    await env.TEST_ORG.getByName(joined).acceptInvitation(id);
+    await env.TEST_ORG.getByName(invited).initializeOrg("Beta", ownerB);
+    await env.TEST_ORG.getByName(invited).inviteMember(ownerB, id);
+
+    const user = env.TEST_USER.getByName(id);
+    await user.createAccount(id, "Org Leaver", crypto.getRandomValues(new Uint8Array(32)));
+    // The mirror index holds both orgs before the sweep, invitation included.
+    expect((await inUser(user, internals => [...internals.storage.orgMemberships.list()]))
+      .map(record => record.orgId).toSorted()).toEqual([invited, joined].toSorted());
+
+    await user.deprovision();
+
+    // Both orgs stop naming the user — membership ended, invitation declined — and the mirror
+    // index is empty with them.
+    expect(await env.TEST_ORG.getByName(joined).getMember(id)).toBeNull();
+    expect(await env.TEST_ORG.getByName(invited).getMember(id)).toBeNull();
+    expect(await inUser(user, internals => [...internals.storage.orgMemberships.list()])).toEqual([]);
+  });
+
+  it("keeps the record when the deprovisioned user is an org's sole owner", async () => {
+    const id = newUserId("sole-owner");
+    const orgId = `org-sole-${id}`;
+    await env.TEST_ORG.getByName(orgId).initializeOrg("Sole", id);
+
+    const user = env.TEST_USER.getByName(id);
+    await user.createAccount(id, "Sole Owner", crypto.getRandomValues(new Uint8Array(32)));
+    await user.deprovision();
+
+    // The org keeps its last owner (memberLeave refuses), a fail-closed residual: the account
+    // is closed and cannot authenticate, so the stale record names no one who can act.
+    expect(await env.TEST_ORG.getByName(orgId).getMember(id))
+      .toMatchObject({ userId: id, role: "owner", status: "active" });
   });
 });
