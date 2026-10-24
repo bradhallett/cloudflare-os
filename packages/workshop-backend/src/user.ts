@@ -1,6 +1,6 @@
 import { RpcStub } from "capnweb";
 import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, type DeviceSessionHandoffStart, type BotDefinition, type BotInfo, type BotSelection, type BotSkillChoice, type BotSkillRef, type OrgMemberStatus, type OrgRole } from '@gadgets/workshop-shared/api';
-import { ActionDescription, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperUserSelection, GatekeeperUserSelectionExchange, RedeemedGatekeeperUserSelection } from "@gadgets/workshop-shared/gatekeeper";
+import { ActionDescription, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperUserSelection, GatekeeperUserSelectionExchange, RedeemedGatekeeperUserSelection, GatekeeperOrgMembership } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { botKey, normalizeBotDefinition } from "./bot-config.js";
 import { isActiveMember } from "./org-access.js";
@@ -535,7 +535,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    *   (the counterpart of `#syncDirectory()`);
    * - every workspace shared *with* the user, whose collaborator edges are severed so each
    *   affected workspace force-restarts and the user's live chat sessions die with it (see
-   *   `#severSharedWorkspaceAccess`).
+   *   `#severSharedWorkspaceAccess`);
+   * - every org the user belonged to, which they leave so directory scopes, picker
+   *   justifications and org-owned workspace baselines stop naming them (see
+   *   `#leaveOrgsOnDeprovision`).
    *
    * Not touched: short-lived connect handoffs and flows (the alarm sweep owns those), and the
    * user's own workspaces and data — deprovisioning removes access, not content. Idempotent:
@@ -574,7 +577,36 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       }
     }
     await this.#severSharedWorkspaceAccess();
+    await this.#leaveOrgsOnDeprovision();
     logger.info("user deprovisioned", { event: "user.deprovisioned" });
+  }
+
+  /**
+   * Leaves every org the user belonged to, so a closed account does not linger there as an
+   * "active" member: co-members' directory scopes, picker-ticket justifications, and org-owned
+   * workspaces' baselines all read the org's own member records, and each leave ends the
+   * membership, mirrors this index entry away, and severs the org's workspaces in one move
+   * (OrgDurableObject.memberLeave). Best-effort per org, like #severSharedWorkspaceAccess: a
+   * leave that fails, or is refused because the user is the org's sole active owner (the org
+   * keeps an unreachable owner rather than none, per org-access.ts), leaves a member record
+   * nothing can exercise — the deprovisioned user can no longer authenticate, and any org admin
+   * may still remove the record by hand. Pending invitations are declined the same way, unless
+   * the account was never created (no profile id to leave under), in which case the org's own
+   * expiry sweep reclaims them.
+   */
+  async #leaveOrgsOnDeprovision(): Promise<void> {
+    const me = this.storage.profile.get()?.id;
+    if (me === undefined) return;
+    await Promise.all([...this.storage.orgMemberships.list()].map(async entry => {
+      try {
+        await this.ctx.exports.OrgDurableObject.getByName(entry.orgId).memberLeave(me);
+      } catch (error) {
+        logger.warn("failed to remove a deprovisioned user from an organization", {
+          event: "deprovision.org.leave.failed",
+          orgId: entry.orgId, error,
+        });
+      }
+    }));
   }
 
   /**
@@ -1350,6 +1382,25 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return [...this.storage.orgMemberships.list()];
   }
 
+  /**
+   * The user's organization memberships read afresh from each org, as the Workshop reports them
+   * to gatekeepers (GatekeeperOrgMembership): the mirrored index names the orgs and each org
+   * answers for the user live — describeForMember returns null once a membership has ended, so a
+   * stale index entry or an unreadable org contributes nothing (fail-closed, like
+   * getDirectoryScope). Only active memberships are reported: a pending invitation grants
+   * nothing yet, and neither may an org-keyed grant it would justify.
+   */
+  async #freshOrgMemberships(): Promise<GatekeeperOrgMembership[]> {
+    const me = this.storage.profile.get().id;
+    const orgs = await Promise.allSettled([...this.storage.orgMemberships.list()].map(
+        async entry => await this.ctx.exports.OrgDurableObject.getByName(entry.orgId)
+            .describeForMember(me)));
+    return orgs.flatMap(result => {
+      const org = result.status === "fulfilled" ? result.value : null;
+      return org !== null && org.status === "active" ? [{ orgId: org.id, role: org.role }] : [];
+    });
+  }
+
   async listOutputs(): Promise<ListOutputsResult> {
     let catchingUp = await this.#backfillOutputs();
     return {outputs: this.#readOutputs(), catchingUp};
@@ -1925,8 +1976,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * Open the full-page management UI for an account that declares one. `context.isAdmin` is supplied
-   * fresh by the caller so admin-gated features reflect the user's current status.
+   * Open the full-page management UI for an account that declares one. `context.isAdmin` is
+   * supplied fresh by the caller so admin-gated features reflect the user's current status, and
+   * `context.orgMemberships` fresh from the org authority (see #freshOrgMemberships) so a
+   * gatekeeper resolves org-keyed grants against the memberships the user holds right now — the
+   * snapshot delivery AppUiContext promises, and the lazy-revocation hook that retires them when
+   * a membership has since ended.
    */
   async startAccountAppUi(
       accountId: number, options: Pick<AppUiContext, "isAdmin">,
@@ -1936,8 +1991,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let userSelectionExchange = this.ctx.exports.GatekeeperUserSelectionExchangeImpl({
       props: { selectorUserId: this.ctx.id.toString(), appAccountId: accountId },
     });
-    return (record.account as unknown as SingletonAccountStub)
-        .startAppUi({ isAdmin: options.isAdmin, userSelectionExchange });
+    return (record.account as unknown as SingletonAccountStub).startAppUi({
+      isAdmin: options.isAdmin,
+      orgMemberships: await this.#freshOrgMemberships(),
+      userSelectionExchange,
+    });
   }
 
   // The account record behind one of this user's gatekeeper apps, or undefined
@@ -2732,13 +2790,20 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * display-name snapshot. Returns an empty array when none qualify; does not
    * choose between multiple accounts. Accounts are resolved at redemption time
    * and need not be the same accounts the user had when the ticket was minted.
+   *
+   * Each result also carries the selected user's org memberships read afresh from the org
+   * authority (#freshOrgMemberships): the snapshot a gatekeeper records at share time is what
+   * makes its org-keyed grants resolve for them, from the moment the share lands, and retires
+   * orgs whose membership has since ended.
    */
   async selectableGatekeeperUsers(vendorId: string): Promise<RedeemedGatekeeperUserSelection[]> {
     let accounts = await this.#eligibleGatekeeperAccounts(vendorId);
     if (accounts.length === 0) return [];
     let profile = { displayName: this.storage.profile.get().name };
+    // Read once and duplicated across the results, like every other per-user fact here.
+    let orgMemberships = await this.#freshOrgMemberships();
     return Promise.all(accounts.map(async account => ({
-      verifier: await account.account.getVerifier(), profile,
+      verifier: await account.account.getVerifier(), profile, orgMemberships,
     })));
   }
 

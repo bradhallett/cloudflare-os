@@ -193,6 +193,50 @@ describe("org-owned workspaces", () => {
     });
   });
 
+  it("a member leaving severs their live session like a removal", async () => {
+    const orgId = await createOrg({ [CAROL]: "member" });
+    await withWorkspace(async ws => {
+      using ownerClient = await ws.open(ws.userIds.alice, ALICE);
+      await ownerClient.transferToOrg(orgId);
+      ws.restarts.length = 0;
+
+      using asCarol = await ws.open(ws.userIds.carol, CAROL);
+      expect(asCarol).toBeInstanceOf(UseOverseerInterface);
+      expect(ws.restarts).toEqual([]);
+
+      await env.TEST_ORG.getByName(orgId).memberLeave(CAROL);
+      expect(ws.restarts).toHaveLength(1);
+      await expect(ws.open(ws.userIds.carol, CAROL)).rejects.toThrow();
+    });
+  });
+
+  it("a refused sole-owner removal or leave severs nothing, a co-owner's still does", async () => {
+    const orgId = await createOrg({ [BOB]: "admin", [CAROL]: "member" });
+    await withWorkspace(async ws => {
+      using ownerClient = await ws.open(ws.userIds.alice, ALICE);
+      await ownerClient.transferToOrg(orgId);
+      ws.restarts.length = 0;
+
+      // Carol's live session must survive both refused operations untouched.
+      using asCarol = await ws.open(ws.userIds.carol, CAROL);
+      expect(asCarol).toBeInstanceOf(UseOverseerInterface);
+      await expect(env.TEST_ORG.getByName(orgId).removeMember(ALICE, ALICE)).rejects.toThrow(
+          "at least one owner");
+      await expect(env.TEST_ORG.getByName(orgId).memberLeave(ALICE)).rejects.toThrow(
+          "at least one owner");
+      expect(ws.restarts).toEqual([]);
+      expect(asCarol).toBeInstanceOf(UseOverseerInterface);
+
+      // With a second owner standing, removing him severs his own session, as a removal must.
+      await env.TEST_ORG.getByName(orgId).changeMemberRole(ALICE, BOB, "owner");
+      using asBob = await ws.open(ws.userIds.bob, BOB);
+      expect(asBob).not.toBeInstanceOf(UseOverseerInterface);
+      await env.TEST_ORG.getByName(orgId).removeMember(ALICE, BOB);
+      expect(ws.restarts).toHaveLength(1);
+      await expect(ws.open(ws.userIds.bob, BOB)).rejects.toThrow();
+    });
+  });
+
   it("a refused or repeated transfer leaves the workspace exactly as it was", async () => {
     const orgId = await createOrg({ [BOB]: "admin" });
     const { name, userIds } = await seedWorkspace();
