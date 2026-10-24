@@ -1,5 +1,5 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, type DeviceSessionHandoffStart, type BotDefinition, type BotInfo, type BotSelection, type BotSkillChoice, type BotSkillRef, type OrgMemberStatus, type OrgRole } from '@gadgets/workshop-shared/api';
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, createPlanRefusalError, type DeviceSessionHandoffStart, type BotDefinition, type BotInfo, type BotSelection, type BotSkillChoice, type BotSkillRef, type OrgMemberStatus, type OrgRole } from '@gadgets/workshop-shared/api';
 import { ActionDescription, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperUserSelection, GatekeeperUserSelectionExchange, RedeemedGatekeeperUserSelection, GatekeeperOrgMembership } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { botKey, normalizeBotDefinition } from "./bot-config.js";
@@ -1148,7 +1148,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (record) {
       let tier = models?.get(id)?.tier;
       if (tier !== undefined && tiers !== null && !tiers.has(tier)) {
-        throw new Error(`The "${record.profile.name}" model isn't available on your plan.`);
+        throw createPlanRefusalError("MODEL_NOT_ON_PLAN",
+            `The "${record.profile.name}" model isn't available on your plan.`);
       }
       return record;
     }
@@ -1393,7 +1394,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (cap !== undefined) {
       let owned = [...this.storage.gadgets.list()].filter(record => !record.owner).length;
       if (owned >= cap) {
-        throw new Error(`You've reached your plan's limit of ${cap} workspaces.`);
+        throw createPlanRefusalError("WORKSPACE_CAP_REACHED",
+            `You've reached your plan's limit of ${cap} workspaces.`);
       }
     }
     let created = new Date();
@@ -1851,7 +1853,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     // completes an OAuth flow only to fail at the first gatekeeper mint.
     let allowed = await this.#allowedGatekeepers();
     if (allowed !== null && !allowed.has(normalized)) {
-      throw new Error(`The "${vendorId}" connector isn't available on your plan.`);
+      throw createPlanRefusalError("CONNECTOR_NOT_ON_PLAN",
+          `The "${vendorId}" connector isn't available on your plan.`);
     }
 
     let accountId = this.storage.nextAccountId.get();
@@ -1967,7 +1970,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     // ambient vendor the plan doesn't offer can't be opted into directly either.
     let allowed = await this.#allowedGatekeepers();
     if (allowed !== null && !allowed.has(vendorId)) {
-      throw new Error(`The "${vendorId}" connector isn't available on your plan.`);
+      throw createPlanRefusalError("CONNECTOR_NOT_ON_PLAN",
+          `The "${vendorId}" connector isn't available on your plan.`);
     }
 
     let description = await vendor.describe();
@@ -2861,7 +2865,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
     let allowed = await this.#allowedGatekeepers();
     if (allowed !== null && !allowed.has(normalized)) {
-      throw new Error(`The "${vendorId}" connector isn't available on your plan.`);
+      throw createPlanRefusalError("CONNECTOR_NOT_ON_PLAN",
+          `The "${vendorId}" connector isn't available on your plan.`);
     }
   }
 

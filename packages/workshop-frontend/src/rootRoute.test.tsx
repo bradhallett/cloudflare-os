@@ -43,6 +43,7 @@ vi.mock('./LoginPage', () => ({ default: () => <div data-testid="login">Login</d
 // suite. The gate's own logic is saasRoute.test.tsx; the bundle-level wiring is saasBundle.test.ts.
 const saasGate = vi.hoisted(() => ({ on: false }))
 vi.mock('./features/saas/saasRoute', () => ({
+  SAAS_MODE: false,
   isSaasRoute: (pathname: string) => saasGate.on && pathname.startsWith('/saas'),
   SaasSurface: () => <div data-testid="saas-surface">SaaS surface</div>,
 }))

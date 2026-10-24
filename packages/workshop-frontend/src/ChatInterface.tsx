@@ -20,6 +20,8 @@ import {
   AiChatAuthorInfo,
   AiChatMetadata,
   AiToolCall,
+  isPlanRefusalCode,
+  type PlanRefusalCode,
   BotInfo,
   BotSelection,
   ChatAttachmentRef,
@@ -226,6 +228,9 @@ function ChatInterface({
   // Out-of-credits modal (free-tier limit reached). `usageModalShownFor` tracks the error sequence
   // we've already auto-opened for, so dismissing it doesn't immediately reopen.
   const [usageModalOpen, setUsageModalOpen] = useState(false);
+  // Why the modal is open — the usage_limit surface or a plan-refusal code — picked up from the
+  // error that opened it, so the SaaS upgrade prompt can say what to upgrade for.
+  const [usageModalReason, setUsageModalReason] = useState<"usage_limit" | PlanRefusalCode>("usage_limit");
   const usageModalShownForRef = useRef<number | null>(null);
   const [chatListScope, setChatListScope] = useState<ChatListScope>("all");
   // Fetching the page before the selected chat's compaction boundary.
@@ -478,10 +483,12 @@ function ChatInterface({
     if (
       lastMessage &&
       lastMessage.type === "error" &&
-      lastMessage.code === "usage_limit" &&
+      (lastMessage.code === "usage_limit" || isPlanRefusalCode(lastMessage.code)) &&
       usageModalShownForRef.current !== lastMessage.sequence
     ) {
       usageModalShownForRef.current = lastMessage.sequence;
+      if (lastMessage.code === "usage_limit") setUsageModalReason("usage_limit");
+      else if (isPlanRefusalCode(lastMessage.code)) setUsageModalReason(lastMessage.code);
       setUsageModalOpen(true);
     }
   }, [lastMessage]);
@@ -1138,6 +1145,7 @@ function ChatInterface({
         handleConnectionCreated={handleConnectionCreated}
         usageModalOpen={usageModalOpen}
         setUsageModalOpen={setUsageModalOpen}
+        usageModalReason={usageModalReason}
       />
     </div>
   );
