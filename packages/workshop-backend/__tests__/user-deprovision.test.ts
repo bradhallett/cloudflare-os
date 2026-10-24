@@ -170,10 +170,11 @@ describe("deprovision", () => {
         });
 
         // The user is findable in the directory until deprovisioning hides them. The user DO
-        // reaches the same directory DO (named "") that the test reads here.
+        // reaches the same directory DO (named "") that the test reads here. The directory holds
+        // no membership of its own, so the test passes the user's id as the search scope too.
         const directory = env.TEST_USER_DIRECTORY.getByName("");
         await directory.syncUser({ id, name: "Deprovisioned" }, 1);
-        expect((await directory.searchUsers(id, [])).map(found => found.id)).toEqual([id]);
+        expect((await directory.searchUsers(id, [], [id])).map(found => found.id)).toEqual([id]);
 
         await user.deprovision();
 
@@ -189,8 +190,8 @@ describe("deprovision", () => {
             user.authenticateFromCfAccess(id, true), "can no longer sign in");
         await expectRejection(
             user.loginOrCreateViaGatekeeper(id, true), "can no longer sign in");
-        // Directory: hidden from collaborator search.
-        expect(await directory.searchUsers(id, [])).toEqual([]);
+        // Directory: hidden from collaborator search even while still in the caller's scope.
+        expect(await directory.searchUsers(id, [], [id])).toEqual([]);
         await inUser(user, internals => {
           expect([...internals.storage.connectedAccounts.list()]).toHaveLength(0);
           expect(internals.storage.passwordHashHash.get()).toBeNull();
