@@ -20,6 +20,7 @@ import {
   hasDeviceSessionParameters,
 } from '../features/native-app/DeviceSessionHandoff'
 import { NativeAppBridge } from '../features/native-app/NativeAppBridge'
+import { isSaasRoute, SaasSurface } from '../features/saas/saasRoute'
 import { PageUpdateNotice } from '../features/stale-session/PageUpdateNotice'
 
 export const Route = createRootRoute({
@@ -39,6 +40,11 @@ function RootComponent() {
   // has no session, and ConnectHandoffPage runs its own useAuth for connects.
   const isHandoff = pathname === HANDOFF_PATH
 
+  // SaaS-only surfaces (under /saas) render in their own lazily-loaded shell, outside the
+  // workshop's auth flow and chrome. The gate folds to `false` in OSS builds, which drops the
+  // shell's chunk from them entirely (see ../features/saas/saasRoute).
+  const isSaas = isSaasRoute(pathname)
+
   // A standalone (no app shell) render is used for the handoff popup and for signed-out visitors
   // of public routes. Signed-in users get the full app chrome so public pages (esp. the blueprint
   // detail) feel native — sidebar and all — instead of floating on a bare page.
@@ -53,6 +59,12 @@ function RootComponent() {
     if (token) {
       login(token)
     }
+  }
+
+  // SaaS surfaces replace the workshop entirely, before any auth handling: they bring their own
+  // shell (and, later, their own auth-gated pages). Renders nothing in OSS builds.
+  if (isSaas) {
+    return <SaasSurface />
   }
 
   // Loading state

@@ -12,8 +12,9 @@ import {
   contentTypeFromPath, isTextContentType, VENDOR_ID,
 } from "./context-types.js";
 import {
-  type CollectionAccess, collectionPermissions,
+  type CollectionAccess, collectionPermissions, orgGrantFor, governsOrgGrant,
 } from "./collection-access.js";
+import type { GatekeeperOrgMembership } from "@gadgets/workshop-shared/gatekeeper";
 import { metadataToSummary } from "./collection-kv.js";
 import { domainName } from "./domain.js";
 import {
@@ -133,6 +134,16 @@ type GrantRecord = {
   grantedAt: Date;
 };
 
+// A grant to an org subject: every live member of the org holds `orgGrantRole(role)`, and the
+// org's own admins govern a collection their org owns (collection-access.ts). Org ids are the
+// Workshop's org ids, opaque here; an org never disconnects, so its grants leave only by an
+// explicit change. Memberships are resolved live from each account's library, never stored here.
+type OrgGrantRecord = {
+  orgId: string;
+  role: ContextCollectionRole;
+  grantedAt: Date;
+};
+
 // Which account minted a git write token, so losing write access can revoke it. Legacy tokens are
 // attributed to the creator and recorded when their first sweep runs.
 type GitTokenIssuerRecord = {
@@ -154,8 +165,11 @@ function makeContextCollectionStorage(storage: DurableObjectStorage) {
       documents: collection<ContextRecord>()({ primaryKey: "path" }),
       // Data needed to list skills without loading document bodies.
       skillIndex: collection<SkillIndexEntry>()({ primaryKey: "path" }),
-      // Private collections only: every account's role. Authoritative for access.
+      // Private collections only: every account's role. Authoritative for account-subject access.
       grants: collection<GrantRecord>()({ primaryKey: "accountId" }),
+      // Private collections only: every org's role. Authoritative for org-subject access; each
+      // account's live memberships are resolved against it at access time (see OrgGrantRecord).
+      orgGrants: collection<OrgGrantRecord>()({ primaryKey: "orgId" }),
       gitTokenIssuers: collection<GitTokenIssuerRecord>()({ primaryKey: "tokenId" }),
     },
     singletons: {
@@ -164,6 +178,9 @@ function makeContextCollectionStorage(storage: DurableObjectStorage) {
       // The creating account (its owned index lists this collection); empty for public
       // collections. Authority comes from `grants`, which started with this account as owner.
       ownerAccountId: "",
+      // The org that owns an org-owned collection (an `owner` record in `orgGrants`); empty when
+      // the collection is account-owned or public. Set once at initialization, never rewritten.
+      ownerOrgId: "",
       everyoneCanView: false,
       aclVersion: 0,
       // Consecutive failed attempts to revoke a token whose issuer lost write access.
@@ -261,16 +278,24 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
 
   /**
    * Initialize a new collection. Private collections pass an owner; public collections pass "".
-   * Rejects re-initialization so a (vanishingly unlikely) id reuse can't clobber existing content.
+   * An org-owned private collection passes its creating admin as `ownerAccountId` (kept for
+   * attribution and legacy token sweeps) plus `ownerOrgId`, and the org — not the admin — holds
+   * the owner grant; the admin governs through their live org role (see `getAccess`). Rejects
+   * re-initialization so a (vanishingly unlikely) id reuse can't clobber existing content.
    */
-  async initialize(metadata: ContextCollectionMetadata, sharingDomain: string, ownerAccountId: string): Promise<ContextCollectionMetadata> {
+  async initialize(metadata: ContextCollectionMetadata, sharingDomain: string, ownerAccountId: string, ownerOrgId = ""): Promise<ContextCollectionMetadata> {
     if (this.getMetadata().id) {
       throw new Error("Collection already exists.");
     }
     this.storage.sharingDomain.put(sharingDomain);
     this.storage.ownerAccountId.put(ownerAccountId);
-    if (metadata.visibility === "private" && ownerAccountId) {
-      this.storage.grants.put({ accountId: ownerAccountId, role: "owner", grantedAt: metadata.created });
+    this.storage.ownerOrgId.put(ownerOrgId);
+    if (metadata.visibility === "private") {
+      if (ownerOrgId) {
+        this.storage.orgGrants.put({ orgId: ownerOrgId, role: "owner", grantedAt: metadata.created });
+      } else if (ownerAccountId) {
+        this.storage.grants.put({ accountId: ownerAccountId, role: "owner", grantedAt: metadata.created });
+      }
     }
     this.storage.aclVersion.put(ACL_VERSION);
     if (metadata.content.source === "git") {
@@ -296,7 +321,8 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
 
   // --- Access ---
 
-  // Collections created before sharing existed get their creator as sole owner.
+  // Collections created before sharing existed get their creator as sole owner. Org-owned
+  // collections were created with the org as owner, so no account grant is minted for them.
   #ensureGrants(): void {
     if (this.storage.aclVersion.get() === ACL_VERSION) return;
     let meta = this.storage.metadata.get();
@@ -304,68 +330,134 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     if (!meta.id) return;
     let creator = this.storage.ownerAccountId.get();
     this.storage.transaction(() => {
-      if (meta.visibility === "private" && creator && !this.storage.grants.get(creator)) {
+      if (meta.visibility === "private" && creator && !this.storage.ownerOrgId.get()
+          && !this.storage.grants.get(creator)) {
         this.storage.grants.put({ accountId: creator, role: "owner", grantedAt: meta.created });
       }
       this.storage.aclVersion.put(ACL_VERSION);
     });
   }
 
-  /** The account's standing here; `collection-access.ts` interprets it. */
-  getAccess(accountId: string): CollectionAccess {
+  /**
+   * The account's standing here with its org memberships resolved live; `collection-access.ts`
+   * interprets it. Every access decision for a person goes through this, never `getAccess` alone,
+   * so org grants apply everywhere account grants do.
+   */
+  async getResolvedAccess(accountId: string): Promise<CollectionAccess> {
+    let memberships: GatekeeperOrgMembership[] = [];
+    try {
+      memberships = await this.#library(accountId).listOrgMemberships(this.#domain(), accountId);
+    } catch (err) {
+      // A membership read that fails (e.g. an unreachable library) reads as none: org grants then
+      // confer nothing, the conservative answer, and the account's own grant still applies.
+      logger.warn("failed to read org memberships for access resolution", {
+        event: "collection.org.memberships.read.failed", collectionId: this.getMetadata().id,
+        error: err,
+      });
+    }
+    return this.getAccess(accountId, memberships);
+  }
+
+  /**
+   * The account's standing from this collection's own records. `memberships` (the account's live
+   * org memberships, default none) folds each org grant the account's orgs hold into the effective
+   * role and the governance flag; `collection-access.ts` interprets the result.
+   */
+  getAccess(accountId: string, memberships: readonly GatekeeperOrgMembership[] = []): CollectionAccess {
     this.#ensureGrants();
     let meta = this.storage.metadata.get();
     let grants = [...this.storage.grants.list()];
+    let orgGrants = [...this.storage.orgGrants.list()];
     let everyoneCanView = this.storage.everyoneCanView.get();
-    let role = meta.visibility === "private"
-      ? grants.find(grant => grant.accountId === accountId)?.role ?? null
+    let accountGrant = grants.find(grant => grant.accountId === accountId);
+    let role: ContextCollectionRole | null = meta.visibility === "private"
+      ? accountGrant?.role ?? null
       : null;
+    let manager = false;
+    if (meta.visibility === "private") {
+      for (let grant of orgGrants) {
+        let membership = memberships.find(m => m.orgId === grant.orgId);
+        if (!membership) continue;
+        let granted = orgGrantFor(grant, memberships);
+        if (granted && (role === null || ROLE_ORDER[granted] < ROLE_ORDER[role])) role = granted;
+        if (grant.role === "owner" && governsOrgGrant(membership.role)) manager = true;
+      }
+    }
     return {
       exists: !!meta.id && !this.storage.deletionPending.get(),
       visibility: meta.visibility,
       role,
+      manager,
       everyoneCanView,
-      hasOwner: grants.some(grant => grant.role === "owner"),
-      shared: everyoneCanView || grants.some(grant => grant.accountId !== accountId),
+      hasOwner: grants.some(grant => grant.role === "owner")
+        || orgGrants.some(grant => grant.role === "owner"),
+      shared: everyoneCanView || grants.some(grant => grant.accountId !== accountId)
+        || orgGrants.length > 0,
     };
   }
 
   /**
-   * What a library lists for this collection: its metadata if the account holds a role on it, else
-   * null. `access.exists` tells the library whether the collection is gone for good.
+   * What a library lists for this collection: its metadata if the account holds a role on it —
+   * its own or an org's — else null. `access.exists` tells the library whether the collection is
+   * gone for good. Resolves memberships live, so listings follow grant and membership changes.
    */
-  getLibraryEntry(accountId: string):
-      { access: CollectionAccess; metadata: ContextCollectionMetadata | null } {
-    let access = this.getAccess(accountId);
+  async getLibraryEntry(accountId: string):
+      Promise<{ access: CollectionAccess; metadata: ContextCollectionMetadata | null }> {
+    let access = await this.getResolvedAccess(accountId);
     let isMember = access.exists && access.role !== null;
     return { access, metadata: isMember ? this.getMetadata() : null };
   }
 
-  /** Members and everyone-viewability, for an account holding a role on this collection. */
-  getSharing(accountId: string): ContextCollectionSharing {
-    let access = this.getAccess(accountId);
+  /** Members (accounts and orgs) and everyone-viewability, for a member of this collection. */
+  async getSharing(accountId: string): Promise<ContextCollectionSharing> {
+    let access = await this.getResolvedAccess(accountId);
     if (!access.exists || access.role === null) throw new Error(NOT_FOUND);
-    let members: ContextCollectionMember[] = [...this.storage.grants.list()]
-      .toSorted((left, right) =>
-        ROLE_ORDER[left.role] - ROLE_ORDER[right.role]
-        || left.grantedAt.valueOf() - right.grantedAt.valueOf())
-      .map(grant => ({
+    let members: ContextCollectionMember[] = [
+      ...[...this.storage.grants.list()].map(grant => ({
         memberId: grant.accountId,
+        subject: "account" as const,
         role: grant.role,
         displayName: grant.displayName,
         isViewer: grant.accountId === accountId,
-      }));
+        grantedAt: grant.grantedAt,
+      })),
+      ...[...this.storage.orgGrants.list()].map(grant => ({
+        memberId: grant.orgId,
+        subject: "org" as const,
+        role: grant.role,
+        // The Workshop knows org names; the gatekeeper only ever sees opaque org ids.
+        isViewer: false,
+        grantedAt: grant.grantedAt,
+      })),
+    ].toSorted((left, right) =>
+      ROLE_ORDER[left.role] - ROLE_ORDER[right.role]
+        || left.grantedAt.valueOf() - right.grantedAt.valueOf());
     return { members, everyoneCanView: access.everyoneCanView, hasOwner: access.hasOwner };
   }
 
-  // Throws unless `actorId` may give `targetId` the role `role`, or remove them (null).
-  #authorizeGrantChange(actorId: string, targetId: string, role: ContextCollectionRole | null): void {
-    let access = this.getAccess(actorId);
-    if (!access.exists || access.role === null) throw new Error(NOT_FOUND);
-    let current = this.storage.grants.get(targetId)?.role;
+  // Which subject a member id names, by the store that holds it: an account grant, an org grant,
+  // or neither (account ids and org ids never collide: UUIDs vs the Workshop's hex org ids).
+  #targetOf(memberId: string): { type: "account"; accountId: string } | { type: "org"; orgId: string } | null {
+    if (this.storage.grants.get(memberId)) return { type: "account", accountId: memberId };
+    if (this.storage.orgGrants.get(memberId)) return { type: "org", orgId: memberId };
+    return null;
+  }
+
+  // Throws unless the actor may give the target subject the role `role`, or remove it (null). An
+  // account may always leave; every other change needs sharing rights, and owner-grant changes
+  // need owner rights — an org's own admins hold those over their org's collection. The last
+  // owner grant of either subject type cannot be dropped: the collection would be unmanageable.
+  #authorizeGrantChange(
+      actorId: string, actor: CollectionAccess,
+      target: { type: "account"; accountId: string } | { type: "org"; orgId: string },
+      role: ContextCollectionRole | null): void {
+    if (!actor.exists || actor.role === null) throw new Error(NOT_FOUND);
+    let current = target.type === "account"
+      ? this.storage.grants.get(target.accountId)?.role
+      : this.storage.orgGrants.get(target.orgId)?.role;
     // Anyone may leave; every other change needs sharing rights.
-    if (actorId !== targetId || role !== null) {
-      let permissions = collectionPermissions(access, false);
+    if (target.type !== "account" || target.accountId !== actorId || role !== null) {
+      let permissions = collectionPermissions(actor, false);
       if (!permissions.canShare) {
         throw new Error("Only editors and owners can change who has access to this collection.");
       }
@@ -373,10 +465,15 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
         throw new Error("Only owners can change who owns this collection.");
       }
     }
-    if (current === "owner" && role !== "owner"
-        && [...this.storage.grants.list()].filter(grant => grant.role === "owner").length === 1) {
+    if (current === "owner" && role !== "owner" && this.#ownerCount() === 1) {
       throw new Error("A collection needs an owner. Make someone else an owner first.");
     }
+  }
+
+  // Owner grants across both subject types; a collection always keeps one.
+  #ownerCount(): number {
+    return [...this.storage.grants.list()].filter(grant => grant.role === "owner").length
+      + [...this.storage.orgGrants.list()].filter(grant => grant.role === "owner").length;
   }
 
   /**
@@ -389,7 +486,10 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
       actorId: string, recipients: { accountId: string; displayName: string }[],
       role: ContextCollectionRole): Promise<void> {
     await this.#serializeAccessChange(async () => {
-      for (let { accountId } of recipients) this.#authorizeGrantChange(actorId, accountId, role);
+      let actor = await this.getResolvedAccess(actorId);
+      for (let { accountId } of recipients) {
+        this.#authorizeGrantChange(actorId, actor, { type: "account", accountId }, role);
+      }
       if (role !== "owner") {
         let recipientIds = new Set(recipients.map(recipient => recipient.accountId));
         let owners = [...this.storage.grants.list()].filter(grant => grant.role === "owner");
@@ -406,11 +506,35 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     });
   }
 
+  /**
+   * Give an org a role on this private collection. Nothing is written per member: each member's
+   * access follows their live org membership (see `getAccess`), and the domain registry indexes
+   * the collection under the org so member listings find it, then re-check it live.
+   */
+  async shareOrg(actorId: string, orgId: string, role: ContextCollectionRole): Promise<void> {
+    await this.#serializeAccessChange(async () => {
+      let actor = await this.getResolvedAccess(actorId);
+      this.#authorizeGrantChange(actorId, actor, { type: "org", orgId }, role);
+      let previous = this.storage.orgGrants.get(orgId);
+      this.storage.orgGrants.put({ orgId, role, grantedAt: previous?.grantedAt ?? new Date() });
+      await this.#registry().addOrgCollection(this.#domain(), orgId, this.getMetadata().id);
+      // Members' access may have fallen (e.g. editor demoted to viewer), so re-check tokens.
+      this.#assertGitTokensRevoked(await this.#revokeUnauthorizedGitTokens(), actorId);
+    });
+  }
+
   async setMemberRole(actorId: string, memberId: string, role: ContextCollectionRole): Promise<void> {
     await this.#serializeAccessChange(async () => {
-      if (!this.storage.grants.get(memberId)) throw new Error("That person no longer has access.");
-      this.#authorizeGrantChange(actorId, memberId, role);
-      this.#putGrant(memberId, role);
+      let target = this.#targetOf(memberId);
+      if (!target) throw new Error("That person no longer has access.");
+      let actor = await this.getResolvedAccess(actorId);
+      this.#authorizeGrantChange(actorId, actor, target, role);
+      if (target.type === "account") {
+        this.#putGrant(memberId, role);
+      } else {
+        let previous = this.storage.orgGrants.get(memberId);
+        this.storage.orgGrants.put({ orgId: memberId, role, grantedAt: previous?.grantedAt ?? new Date() });
+      }
       // On every change, so repeating a demotion retries a failed revocation.
       this.#assertGitTokensRevoked(await this.#revokeUnauthorizedGitTokens(), memberId);
     });
@@ -426,13 +550,20 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     });
   }
 
-  /** Remove a member; an account removing itself leaves the collection. */
+  /** Remove a member (account or org); an account removing itself leaves the collection. */
   async removeMember(actorId: string, memberId: string): Promise<void> {
     await this.#serializeAccessChange(async () => {
-      this.#authorizeGrantChange(actorId, memberId, null);
-      if (this.storage.grants.get(memberId)) {
+      let target = this.#targetOf(memberId);
+      // Also when the grant is already gone, so repeating a removal retries a failed revocation.
+      let actor = await this.getResolvedAccess(actorId);
+      this.#authorizeGrantChange(
+        actorId, actor, target ?? { type: "account", accountId: memberId }, null);
+      if (target?.type === "org") {
+        await this.#removeOrgGrant(memberId);
+      } else if (this.storage.grants.get(memberId)) {
         // Library cleanup can outlive this invocation; persist the alarm before removing access.
-        if (this.getMetadata().content.source === "git" || [...this.storage.grants.list()].length === 1) {
+        if (this.getMetadata().content.source === "git"
+            || [...this.storage.grants.list()].length === 1) {
           await this.#armAccessCleanup();
         }
         this.storage.grants.delete(memberId);
@@ -446,11 +577,27 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
           });
         }
       }
-      // Also when the grant was already gone, so repeating a removal retries a failed revocation.
       let unrevoked = await this.#revokeUnauthorizedGitTokens();
       if (await this.#deleteIfMemberless()) return;
       this.#assertGitTokensRevoked(unrevoked, memberId);
     });
+  }
+
+  // Drop one org grant and the registry index entry that let members' listings find it. No library
+  // is touched: org collections are never indexed per account.
+  async #removeOrgGrant(orgId: string): Promise<void> {
+    if (!this.storage.orgGrants.get(orgId)) return;
+    if (this.getMetadata().content.source === "git") await this.#armAccessCleanup();
+    this.storage.orgGrants.delete(orgId);
+    try {
+      await this.#registry().removeOrgCollection(this.#domain(), orgId, this.getMetadata().id);
+    } catch (err) {
+      // Harmless: listings re-check the grant itself, which is already gone.
+      logger.warn("failed to drop a deleted org grant from the domain registry", {
+        event: "collection.org.registry.remove.failed", collectionId: this.getMetadata().id,
+        error: err,
+      });
+    }
   }
 
   /**
@@ -481,7 +628,8 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
   // manage it any more. Deleting its repo also ends every token for it.
   async #deleteIfMemberless(): Promise<boolean> {
     let meta = this.getMetadata();
-    if (!meta.id || meta.visibility !== "private" || [...this.storage.grants.list()].length > 0) {
+    if (!meta.id || meta.visibility !== "private" || [...this.storage.grants.list()].length > 0
+        || [...this.storage.orgGrants.list()].length > 0) {
       return false;
     }
     await this.#deleteSelf();
@@ -489,7 +637,7 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
   }
 
   async setEveryoneCanView(actorId: string, everyoneCanView: boolean): Promise<void> {
-    let access = this.getAccess(actorId);
+    let access = await this.getResolvedAccess(actorId);
     if (!access.exists || access.role === null) throw new Error(NOT_FOUND);
     if (!collectionPermissions(access, false).canShare) {
       throw new Error("Only editors and owners can change who has access to this collection.");
@@ -497,8 +645,9 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     this.storage.everyoneCanView.put(everyoneCanView);
   }
 
-  #canEdit(accountId: string): boolean {
-    return collectionPermissions(this.getAccess(accountId), false).canEdit;
+  // Resolved (org-aware) edit right, so a member's token dies with their org grant or membership.
+  async #canEdit(accountId: string): Promise<boolean> {
+    return collectionPermissions(await this.getResolvedAccess(accountId), false).canEdit;
   }
 
   // Grants and issuer records are the alarm's durable work list for revocation and memberless deletion.
@@ -522,10 +671,13 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     if (meta.visibility !== "private") return unrevoked;
     // Read the records before deleting from the same storage collection.
     let records = Array.from(this.storage.gitTokenIssuers.list());
-    let revocable = records.filter(record => !this.#canEdit(record.accountId));
+    let revocable: { tokenId: string; accountId: string }[] = [];
+    for (let record of records) {
+      if (!await this.#canEdit(record.accountId)) revocable.push(record);
+    }
     let creator = this.storage.ownerAccountId.get();
-    let sweepLegacyTokens = meta.content.source === "git" && !!creator && !this.#canEdit(creator)
-      && !this.storage.legacyGitTokensSwept.get();
+    let sweepLegacyTokens = meta.content.source === "git" && !!creator
+      && !await this.#canEdit(creator) && !this.storage.legacyGitTokensSwept.get();
 
     if (revocable.length > 0 || sweepLegacyTokens) {
       // Rearm retries too, in case the runtime stops while an alarm's external call is pending.
@@ -1088,7 +1240,7 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
       if (!this.getAccess(issuerId).exists) throw new Error(NOT_FOUND);
       if (meta.content.source !== "git") throw new Error("Collection is not git-based.");
       // Public collections are checked by the caller, which knows whether the issuer is an admin.
-      if (meta.visibility === "private" && !this.#canEdit(issuerId)) {
+      if (meta.visibility === "private" && !await this.#canEdit(issuerId)) {
         throw new Error("Only editors and owners can create Git tokens.");
       }
       let repo = await this.#artifacts().get(meta.id);
@@ -1273,7 +1425,8 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
   /** Delete only if the actor may still do so when queued grant changes have finished. */
   deleteSelf(actorId: string, isAdmin: boolean): Promise<void> {
     return this.#serializeAccessChange(async () => {
-      if (!collectionPermissions(this.getAccess(actorId), isAdmin).canDelete) throw new Error(NOT_FOUND);
+      let access = await this.getResolvedAccess(actorId);
+      if (!collectionPermissions(access, isAdmin).canDelete) throw new Error(NOT_FOUND);
       await this.#deleteSelf();
     });
   }
@@ -1298,6 +1451,14 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
           this.#library(grant.accountId).forgetCollection(id).catch((err) => {
             logger.warn("failed to remove deleted collection from a member's library", {
               event: "collection.delete.library.remove.failed", collectionId: id, error: err,
+            });
+          })));
+        // Org grants have no per-account index to clean, only the registry entry that let member
+        // listings discover the collection; a stale one confers nothing.
+        await Promise.all([...this.storage.orgGrants.list()].map(grant =>
+          this.#registry().removeOrgCollection(this.#domain(), grant.orgId, id).catch((err) => {
+            logger.warn("failed to drop a deleted org grant from the domain registry", {
+              event: "collection.org.registry.remove.failed", collectionId: id, error: err,
             });
           })));
       }

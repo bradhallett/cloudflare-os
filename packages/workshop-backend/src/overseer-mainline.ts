@@ -7,6 +7,7 @@ import { commitIdentityForAuthor, filesEqual, threeWayMerge } from "./git-store"
 import type { MergeResult } from "./git-store";
 import { FormatOffer, listFormatOffers, readAdminConfig } from "./admin-config";
 import { listFeaturedBlueprintsFromKv } from "./storage-schema/blueprints-kv";
+import { orgBlueprintsForMember } from "./blueprint-access";
 import { SharingManager } from "./sharing";
 import type { GadgetExportFormat } from "@gadgets/workshop-shared/api";
 import { renderGadgetInBrowser } from "./browser-export";
@@ -380,18 +381,21 @@ export abstract class OverseerMainline extends OverseerChanges {
 
   /**
    * List the blueprints the turn's initiator could instantiate with createGadget: their own
-   * published blueprints, their blueprint library, and the deployment's featured set. Blueprint
-   * libraries are per-user, so this lists the initiator's -- a collaborator driving the agent gets
-   * their own library, not the workspace owner's. There is no search index; these corpora are
-   * small, so the formatted text is handed to the model to scan directly.
+   * published blueprints, the ones their organizations own, their blueprint library, and the
+   * deployment's featured set. Blueprint libraries are per-user, so this lists the initiator's --
+   * a collaborator driving the agent gets their own library, not the workspace owner's. There is
+   * no search index; these corpora are small, so the formatted text is handed to the model to
+   * scan directly.
    */
   async listAvailableBlueprints(initiator: AiChatAuthorInfo): Promise<string> {
     // User DOs are named by user identifier, and `initiator.id` is one: the initiating user for
     // "user" turns, the spawning gadget's owner for "gadget" turns (see AiChatAuthorInfo) -- the
     // same resolution executeCodeMode uses for its self-loopback props.
     let userStub = this.users.get(this.users.idFromName(initiator.id));
-    let [own, library, featured, formats] = await Promise.all([
+    let orgIds = (await userStub.listOrgMemberships()).map(entry => entry.orgId);
+    let [own, orgs, library, featured, formats] = await Promise.all([
       userStub.listBlueprints(),
+      orgBlueprintsForMember(this.env, this.ctx.exports.OrgDurableObject, orgIds, initiator.id),
       userStub.listLibraryBlueprints(),
       listFeaturedBlueprintsFromKv(this.env),
       this.#listStandardFormats(),
@@ -431,6 +435,10 @@ export abstract class OverseerMainline extends OverseerChanges {
       // BlueprintUserSummary carries no binding metadata; createGadget's output describes the
       // bindings after instantiation.
       add(blueprint.id, blueprint.title, `published by you`, blueprint.description);
+    }
+    for (let blueprint of orgs) {
+      add(blueprint.id, blueprint.metadata.title, `published by one of your organizations`,
+          blueprint.metadata.description, blueprint.metadata.bindings);
     }
     for (let blueprint of library) {
       add(blueprint.id, blueprint.metadata.title, `in your library`,

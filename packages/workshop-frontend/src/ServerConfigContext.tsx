@@ -35,3 +35,12 @@ export function useAuthVendors(): AuthVendorInfo[] {
 export function useCloudflareLimitsEnabled(): boolean {
   return useContext(ServerConfigContext)?.cloudflareLimitsEnabled ?? false
 }
+
+/**
+ * Convenience: whether this deployment runs in hosted SaaS mode per the server (false while
+ * config is still loading). Runtime channel for SaaS builds — orthogonal to the compile-time
+ * `VITE_SAAS` flag that decides whether SaaS surfaces exist in the bundle at all.
+ */
+export function useSaasEnabled(): boolean {
+  return useContext(ServerConfigContext)?.saasEnabled ?? false
+}

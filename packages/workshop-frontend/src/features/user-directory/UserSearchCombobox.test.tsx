@@ -290,6 +290,17 @@ describe('UserSearchCombobox', () => {
     expect(onSelect).not.toHaveBeenCalled()
   })
 
+  it('shows the scope note only while directory search is enabled', async () => {
+    const note = 'You can select members of your organization and people you share workspaces with.'
+    const { input, update } = await render({ scopeNote: note })
+    expect(container.textContent).toContain(note)
+    await update({ scopeNote: undefined })
+    expect(container.textContent).not.toContain(note)
+    await update({ scopeNote: note, searchEnabled: false })
+    expect(container.textContent).not.toContain(note)
+    expect(input.getAttribute('aria-label')).toBe('Username or email')
+  })
+
   it('discards an in-flight result when directory search is disabled without clearing the query', async () => {
     const pending = deferred<UserDirectoryRecord[]>()
     const search = vi.fn<PlainSearch>(() => pending.promise)

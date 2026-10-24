@@ -130,6 +130,35 @@ export type RedeemedGatekeeperUserSelection = {
    * GatekeeperUserProfileSnapshot.
    */
   profile: GatekeeperUserProfileSnapshot;
+
+  /**
+   * The selected user's organization memberships, read afresh from the
+   * Workshop's org authority during redemption. Optional: a Workshop without
+   * organizations omits it, and a gatekeeper must treat that as "no orgs" for
+   * the selected user rather than as an error. Duplicated across that user's
+   * account results, like every other per-user fact here.
+   */
+  orgMemberships?: GatekeeperOrgMembership[];
+};
+
+/**
+ * One of a Workshop user's organization roles, as the Workshop reports it to a
+ * gatekeeper. Opaque to the gatekeeper beyond ordering for governance: "owner"
+ * and "admin" may govern org-level grants, "member" may only use them. Mirrors
+ * `OrgRole` in api.ts without coupling gatekeepers to that API surface.
+ */
+export type GatekeeperOrgRole = "owner" | "admin" | "member";
+
+/**
+ * One organization a Workshop user belongs to, identified by the Workshop's org
+ * id. Carried on Workshop-owned contexts (AppUiContext, redeemed selections)
+ * so a gatekeeper can resolve org-keyed grants without knowing org internals;
+ * memberships are a snapshot read from the Workshop's org authority, never
+ * asserted by a client.
+ */
+export type GatekeeperOrgMembership = {
+  orgId: string;
+  role: GatekeeperOrgRole;
 };
 
 /**
@@ -174,6 +203,16 @@ export interface GatekeeperUserSelectionReceiver extends RpcTarget {
 export type AppUiContext = {
   /** Whether the opening user is currently a deployment admin. */
   isAdmin: boolean;
+
+  /**
+   * The opening user's organization memberships, read afresh from the
+   * Workshop's org authority, so a gatekeeper can resolve org-keyed grants for
+   * the acting account (see GatekeeperOrgMembership). Optional and absent on a
+   * Workshop without organizations; a gatekeeper must treat an absent value as
+   * "leave any recorded memberships untouched" rather than as "no orgs", so an
+   * older Workshop core cannot erase org state by simply opening the UI.
+   */
+  orgMemberships?: GatekeeperOrgMembership[];
 
   /**
    * Redeems the tickets this account's UI receives from the Workshop user

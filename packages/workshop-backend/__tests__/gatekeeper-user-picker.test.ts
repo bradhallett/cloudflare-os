@@ -4,12 +4,14 @@ import type { GatekeeperUserSelection } from "@gadgets/workshop-shared/gatekeepe
 import type { UserDurableObject } from "../src/user.js";
 import { GATEKEEPER_USER_SELECTION_LIFETIME_MS } from "../src/user.js";
 import { ADMIN_CONFIG_KEY } from "../src/storage-schema/blueprints-kv.js";
+import type { OrgDurableObject } from "../src/org.js";
 import type { GatekeeperUserPickerTestHooks } from "./test-worker.js";
 
 declare module "cloudflare:test" {
   interface ProvidedEnv {
     TEST_GATEKEEPER_USER_PICKER: DurableObjectNamespace<GatekeeperUserPickerTestHooks>;
     TEST_USER: DurableObjectNamespace<UserDurableObject>;
+    TEST_ORG: DurableObjectNamespace<OrgDurableObject>;
   }
 }
 
@@ -53,6 +55,19 @@ function uniqueUser(prefix: string): string {
   return `${prefix}${crypto.randomUUID().replaceAll("-", "")}`;
 }
 
+// A fresh org holding `owner` (as its owner) and everyone in `people` as active members: the
+// directory scope a picker pick is justified by. Mirrors reach each member's index along the way.
+async function shareAnOrg(owner: string, ...people: string[]): Promise<string> {
+  const orgId = `org-${crypto.randomUUID()}`;
+  const org = env.TEST_ORG.getByName(orgId);
+  await org.initializeOrg("Test Org", owner);
+  for (const person of people) {
+    await org.inviteMember(owner, person);
+    await org.acceptInvitation(person);
+  }
+  return orgId;
+}
+
 function inUser<T>(userId: string, f: (user: UserInternals) => Promise<T> | T): Promise<T> {
   return runInDurableObject(env.TEST_USER.getByName(userId),
     (instance: UserDurableObject) => f(instance as UserInternals));
@@ -64,7 +79,9 @@ function minted(result: GatekeeperUserSelection | null | { error: string }): Gat
   return result;
 }
 
-// A viewer with a UI-providing "context" account, and a pickable person with a plain one.
+// A viewer with a UI-providing "context" account, and a pickable person with a plain one. The two
+// share an org, as a pickable pair must: a pick is justified only by org co-membership or an
+// existing share relationship.
 async function viewerAndPicked(pickedName = "Picked") {
   const viewer = uniqueUser("view");
   const picked = uniqueUser("picked");
@@ -73,6 +90,7 @@ async function viewerAndPicked(pickedName = "Picked") {
     createUser(viewer, "Viewer"),
     createUser(picked, pickedName),
   ]);
+  await shareAnOrg(viewer, picked);
   const [appAccount, pickedAccount] = await Promise.all([
     testHooks.addAccount(viewer, "context", `${viewer}-context`, { providesUi: true }),
     testHooks.addAccount(picked, "context", `${picked}-context`),
@@ -120,6 +138,7 @@ describe("gatekeeper user picker selection tickets", () => {
       createUser(noAccounts, "No Accounts"),
       createUser(ambiguous, "Multiple Accounts"),
     ]);
+    await shareAnOrg(viewer, wrongVendor, expired, noAccounts, ambiguous);
     const [appAccount] = await Promise.all([
       testHooks.addAccount(viewer, "context", `${viewer}-context`, { providesUi: true }),
       testHooks.addAccount(wrongVendor, "github", `${wrongVendor}-github`),
@@ -145,6 +164,84 @@ describe("gatekeeper user picker selection tickets", () => {
     await expect(testHooks.pick(viewer, appAccount, viewer)).resolves.toBeNull();
     await expect(testHooks.pick(viewer, appAccount, missing)).resolves.toBeNull();
     await expect(env.TEST_USER.getByName(missing).whoamiIfExists()).resolves.toBeNull();
+  });
+
+  it("mints nothing for an existing user outside the caller's scope, hiding that they exist", async () => {
+    const viewer = uniqueUser("view");
+    const outsider = uniqueUser("outsider");
+    const testHooks = hooks();
+    await Promise.all([createUser(viewer, "Viewer"), createUser(outsider, "Outsider")]);
+    const appAccount = await testHooks.addAccount(viewer, "context", `${viewer}-context`, { providesUi: true });
+
+    // The outsider exists, yet a pick reveals nothing — the same null as for a missing user.
+    await expect(env.TEST_USER.getByName(outsider).whoamiIfExists()).resolves.toMatchObject({
+      id: outsider,
+    });
+    await expect(testHooks.pick(viewer, appAccount, outsider)).resolves.toBeNull();
+    await inUser(viewer, user => {
+      expect(Array.from(user.storage.pendingUserSelections.list())).toEqual([]);
+    });
+
+    // Co-membership alone reopens the pick; no share relationship exists here.
+    await shareAnOrg(viewer, outsider);
+    await testHooks.addAccount(outsider, "context", `${outsider}-context`);
+    const selection = minted(await testHooks.pick(viewer, appAccount, outsider));
+    await expect(testHooks.redeem(viewer, appAccount, selection.ticket)).resolves.toEqual([{
+      identity: `${outsider}-context`, displayName: "Outsider",
+    }]);
+  });
+
+  it("records the orgs justifying a ticket and refuses it once the membership ends", async () => {
+    const viewer = uniqueUser("view");
+    const picked = uniqueUser("picked");
+    const testHooks = hooks();
+    await Promise.all([createUser(viewer, "Viewer"), createUser(picked, "Picked")]);
+    const orgId = await shareAnOrg(viewer, picked);
+    const appAccount = await testHooks.addAccount(viewer, "context", `${viewer}-context`, { providesUi: true });
+    await testHooks.addAccount(picked, "context", `${picked}-context`);
+    const selection = minted(await testHooks.pick(viewer, appAccount, picked));
+    await inUser(viewer, user => {
+      const [record] = Array.from(user.storage.pendingUserSelections.list());
+      expect(record).toMatchObject({ selectedUserId: picked, orgIds: [orgId] });
+    });
+    await expect(testHooks.redeem(viewer, appAccount, selection.ticket)).resolves.toEqual([{
+      identity: `${picked}-context`, displayName: "Picked",
+    }]);
+
+    // A fresh ticket dies with the membership that justified it, and stays spent.
+    const stranded = minted(await testHooks.pick(viewer, appAccount, picked));
+    await env.TEST_ORG.getByName(orgId).removeMember(viewer, picked);
+    await expect(testHooks.redeem(viewer, appAccount, stranded.ticket))
+      .resolves.toEqual({ error: "This selection is no longer available. Please select the user again." });
+    await expect(testHooks.redeem(viewer, appAccount, stranded.ticket))
+      .resolves.toEqual({ error: expect.any(String) });
+  });
+
+  it("justifies a pick by an existing share relationship, live-checked at redemption", async () => {
+    const viewer = uniqueUser("view");
+    const owner = uniqueUser("owner");
+    const testHooks = hooks();
+    await Promise.all([createUser(viewer, "Viewer"), createUser(owner, "Owner")]);
+    const appAccount = await testHooks.addAccount(viewer, "context", `${viewer}-context`, { providesUi: true });
+    await testHooks.addAccount(owner, "context", `${owner}-context`);
+
+    // No org holds these two; only the recorded share relationship makes the owner pickable.
+    await env.TEST_USER.getByName(viewer).recordSharedGadgetOpen(
+      "shared-gadget", "Shared Gadget", { type: "user", id: owner, name: "Owner" }, "build");
+    const selection = minted(await testHooks.pick(viewer, appAccount, owner));
+    await inUser(viewer, user => {
+      const [record] = Array.from(user.storage.pendingUserSelections.list());
+      expect(record).toMatchObject({ selectedUserId: owner, orgIds: [] });
+    });
+    await expect(testHooks.redeem(viewer, appAccount, selection.ticket)).resolves.toEqual([{
+      identity: `${owner}-context`, displayName: "Owner",
+    }]);
+
+    // Forgetting the share strands a ticket that depended on it.
+    const stranded = minted(await testHooks.pick(viewer, appAccount, owner));
+    await env.TEST_USER.getByName(viewer).forgetSharedGadget("shared-gadget");
+    await expect(testHooks.redeem(viewer, appAccount, stranded.ticket))
+      .resolves.toEqual({ error: "This selection is no longer available. Please select the user again." });
   });
 
   it("refuses self-selection after the selector cold-starts through its serialized ID", async () => {

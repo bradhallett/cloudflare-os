@@ -1,0 +1,18 @@
+// Fixture standing in for a private overlay workspace's plain worker (see manifest-lib.test.ts).
+// Not a real package of this repo: it exercises the extra-scan-root path through
+// readDeployablePackages / buildWorkerEntry, where a non-gatekeeper name classifies as a plain
+// worker instead of failing closed.
+{
+  "name": "saas-billing",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-01-01",
+  "vars": {
+    "POLAR_WEBHOOK_PATH": "/webhooks/polar"
+  },
+  "services": [
+    {
+      "binding": "WORKSHOP_BACKEND",
+      "service": "workshop-backend"
+    }
+  ]
+}
