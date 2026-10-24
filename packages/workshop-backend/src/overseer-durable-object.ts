@@ -101,17 +101,17 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * The owning org reports that `memberId`'s membership ended or narrowed (removed, left, or
-   * demoted -- see OrgDurableObject.#severOwnedGadgetSessions). Access recompute is lazy like
-   * every revocation here: this only force-restarts live sessions (the existing
-   * entitlement-change path), making every caller's next open() re-check the org's live
-   * membership and land at their new -- possibly absent -- role. Sessions are counted by role,
-   * not by member (hasCollaboratorSession), so the restart is conservative: it severs all of
-   * them when any is live, and each reconnect re-authorizes. An authority call from the org DO,
-   * so it takes no actor. No-op on a user-owned workspace (the org's index cannot name one; a
-   * stale entry costs nothing).
+   * The owning org reports that a membership ended or narrowed (removed, left, or demoted --
+   * see OrgDurableObject.#severOwnedGadgetSessions). Access recompute is lazy like every
+   * revocation here: this only force-restarts live sessions (the existing entitlement-change
+   * path), making every caller's next open() re-check the org's live membership and land at
+   * their new -- possibly absent -- role. Sessions are counted by role, not by member
+   * (hasCollaboratorSession), so the restart is conservative: it severs all of them when any is
+   * live, and each reconnect re-authorizes. An authority call from the org DO, so it takes no
+   * actor and names no member -- the sever is the same whoever changed. No-op on a user-owned
+   * workspace (the org's index cannot name one; a stale entry costs nothing).
    */
-  async severOrgMemberSessions(memberId: string): Promise<void> {
+  async severOrgMemberSessions(): Promise<void> {
     if (this.impl.storage.ownerSubject.get()?.type !== "org") return;
     if (this.impl.hasCollaboratorSession()) {
       this.impl.scheduleAccessRestart(

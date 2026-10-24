@@ -36,6 +36,7 @@ import type {
 } from "@gadgets/workshop-shared/gatekeeper";
 import type {ResolvedBotSkill, UnavailableBotSkill} from "../bot-config";
 import type { SpawnCallableOptions } from "../agent-spawner-binding";
+import type { BlueprintOwnerSubject } from "./blueprints-kv";
 
 // =======================================================================================
 // Workpieces
@@ -44,13 +45,12 @@ export type GatekeeperClass = DurableObjectClass<Gatekeeper<any>>;
 
 /**
  * Who owns a workspace: the user DO it runs as, or the organization it was transferred to (see
- * `transferToOrg`). Same shape as the blueprint owner subject (storage-schema/blueprints-kv.ts);
- * the org's Durable Object is the authority on its membership, and an org-owned workspace's
- * sharing graph roots itself there (sharing.ts).
+ * `transferToOrg`). Aliased to the blueprint owner subject, whose {type, id} grammar and org
+ * scoping (storage-schema/blueprints-kv.ts) a workspace and its published blueprints share: the
+ * org's Durable Object is the authority on its membership, and an org-owned workspace's sharing
+ * graph roots itself there (sharing.ts).
  */
-export type WorkspaceOwnerSubject =
-    | { type: 'user'; id: string }
-    | { type: 'org'; id: string };
+export type WorkspaceOwnerSubject = BlueprintOwnerSubject;
 
 /**
  * A gatekeeper (connection) workpiece. IDs are allocated from the shared workpiece counter (see
