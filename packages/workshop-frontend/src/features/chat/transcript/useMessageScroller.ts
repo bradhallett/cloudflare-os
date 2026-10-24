@@ -73,6 +73,8 @@ function rowTopInContainer(container: HTMLElement, row: HTMLElement): number {
 export interface UseMessageScrollerOptions {
   /** The transcript's scroll container. */
   containerRef: RefObject<HTMLDivElement | null>;
+  /** The chat whose rows `entries` are. Message sequences restart per chat, so the per-sequence bookkeeping resets when this changes. */
+  chatId: number | null;
   /** The chat's rendered rows, in order. Rows appended past the last one seen while scrolled away are the missed ones. */
   entries: readonly ChatDisplayEntry[];
   /** Whether an agent turn is running: a prompt that lands now anchors near the top instead of following the bottom. */
@@ -114,6 +116,7 @@ export interface MessageScroller {
  */
 export function useMessageScroller({
   containerRef,
+  chatId,
   entries,
   isTurnActive,
 }: UseMessageScrollerOptions): MessageScroller {
@@ -129,6 +132,14 @@ export function useMessageScroller({
   const lastSeenSequenceRef = useRef<number>(-Infinity);
   const latestSequenceRef = useRef<number>(-Infinity);
   const lastUserSequenceRef = useRef<number>(-Infinity);
+  // The chat the per-sequence refs above describe. Message sequences restart per chat, so a
+  // stale chat's numbers must never be compared against the current chat's rows.
+  const chatIdRef = useRef(chatId);
+  // Armed on chat change, until the switched-to chat's first non-empty rows pass: those rows
+  // are history the reader is landing on, not a prompt to anchor (they may arrive a commit
+  // later, when a fresh page load fills the cache after the switch). Mount is not a switch:
+  // a first send into an empty chat still anchors.
+  const adoptingChatRef = useRef(false);
   const lastScrollHeightRef = useRef(0);
 
   const setAtBottomState = useCallback((next: boolean) => {
@@ -138,6 +149,17 @@ export function useMessageScroller({
 
   useLayoutEffect(() => {
     const el = containerRef.current;
+    // Chat switch: sequence numbers restart per chat, so the previous chat's watermark would
+    // misread this chat's rows (a prompt below it would never anchor; rows above it would count
+    // as missed). Reset before anything below compares against them.
+    if (chatIdRef.current !== chatId) {
+      chatIdRef.current = chatId;
+      lastSeenSequenceRef.current = -Infinity;
+      latestSequenceRef.current = -Infinity;
+      lastUserSequenceRef.current = -Infinity;
+      adoptingChatRef.current = true;
+    }
+
     latestSequenceRef.current = entries.reduce(
       (max, entry) => Math.max(max, entrySequenceId(entry)),
       -Infinity,
@@ -146,6 +168,12 @@ export function useMessageScroller({
     // A prompt that lands while a turn runs anchors near the top of the viewport, with a peek of
     // the prior exchange above it, so the answer streams in below it (HextaUI's scrollAnchor).
     const anchor = latestUserMessageEntry(entries);
+    // The first rows this hook sees for a chat are history the reader is landing on, not a
+    // fresh prompt: adopt the newest one as already anchored instead of scrolling to it.
+    if (adoptingChatRef.current && entries.length > 0) {
+      adoptingChatRef.current = false;
+      if (anchor) lastUserSequenceRef.current = anchor.sequence;
+    }
     if (anchor && anchor.sequence > lastUserSequenceRef.current) {
       lastUserSequenceRef.current = anchor.sequence;
       // Keys are internal row ids; escape the quote so an exotic key cannot break out of the
@@ -199,7 +227,7 @@ export function useMessageScroller({
           .length,
       );
     }
-  }, [entries, isTurnActive, containerRef, setAtBottomState]);
+  }, [chatId, entries, isTurnActive, containerRef, setAtBottomState]);
 
   const handleScroll = useCallback(() => {
     const el = containerRef.current;

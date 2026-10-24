@@ -469,6 +469,10 @@ export function entrySequenceId(entry: ChatDisplayEntry): number {
     case "compactionBoundary":
     case "compactionCut":
       return entry.boundary.to;
+    case "failedSend":
+      // Client-local: it stands in for a message the server never accepted, so it carries
+      // no sequence and never counts as a missed row.
+      return -Infinity;
     default:
       return entry.message.sequence;
   }

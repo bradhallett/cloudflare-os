@@ -134,7 +134,7 @@ const userMessage = (sequence: number, text: string) =>
 // Pins a 1000px transcript in a 400px viewport, so 600 is the live edge and anything below it
 // reads as scrolled away.
 function pinTranscript() {
-  const transcript = document.querySelector<HTMLElement>('[aria-label="Conversation"]')!
+  const transcript = document.querySelector<HTMLElement>('[aria-label="Conversation transcript"]')!
   expect(transcript).not.toBeNull()
   let top = 0
   Object.defineProperty(transcript, 'scrollHeight', { get: () => 1000, configurable: true })
@@ -175,7 +175,7 @@ describe('ChatInterface scroll affordances', () => {
     // a plain jump, with no missed count.
     transcript.setScrollTop(100)
     await act(async () => {
-      document.querySelector<HTMLElement>('[aria-label="Conversation"]')!
+      document.querySelector<HTMLElement>('[aria-label="Conversation transcript"]')!
         .dispatchEvent(new Event('scroll'))
     })
     await settlePillEntrance()

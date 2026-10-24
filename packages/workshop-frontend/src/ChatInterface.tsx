@@ -580,6 +580,7 @@ function ChatInterface({
   // prompt sent mid-turn) before the follow effect decides whether to scroll.
   const scroller = useMessageScroller({
     containerRef: messagesContainerRef,
+    chatId: selectedChatId,
     entries: displayEntries,
     isTurnActive: isAgentActive,
   });

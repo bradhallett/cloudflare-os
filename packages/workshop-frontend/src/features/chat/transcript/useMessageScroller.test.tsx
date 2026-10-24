@@ -87,12 +87,14 @@ const userMessage = (sequence: number): ChatDisplayEntry =>
 function ScrollerHarness({
   entries,
   isTurnActive,
+  chatId,
 }: {
   entries: readonly ChatDisplayEntry[];
   isTurnActive: boolean;
+  chatId: number;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const scroller = useMessageScroller({ containerRef, entries, isTurnActive });
+  const scroller = useMessageScroller({ containerRef, chatId, entries, isTurnActive });
   // Captured for assertions between renders; the harness renders nothing from it.
   currentScroller = scroller;
   return (
@@ -113,22 +115,23 @@ async function renderHarness(
   entries: readonly ChatDisplayEntry[],
   isTurnActive: boolean,
   geometry: { scrollHeight: number; clientHeight: number; scrollTop?: number },
+  chatId = 1,
 ) {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
   await act(async () => {
-    root.render(<ScrollerHarness entries={entries} isTurnActive={isTurnActive} />);
+    root.render(<ScrollerHarness entries={entries} isTurnActive={isTurnActive} chatId={chatId} />);
   });
   const transcript = container.querySelector<HTMLElement>('[data-testid="transcript"]')!;
   const setScrollTop = pinGeometry(transcript, geometry);
   return {
     transcript,
     setScrollTop,
-    async rerender(nextEntries: readonly ChatDisplayEntry[], nextTurnActive: boolean) {
+    async rerender(nextEntries: readonly ChatDisplayEntry[], nextTurnActive: boolean, nextChatId = 1) {
       await act(async () => {
         root.render(
-          <ScrollerHarness entries={nextEntries} isTurnActive={nextTurnActive} />,
+          <ScrollerHarness entries={nextEntries} isTurnActive={nextTurnActive} chatId={nextChatId} />,
         );
       });
     },
@@ -316,6 +319,65 @@ describe("useMessageScroller", () => {
     expect(scroller().atBottom).toBe(true);
     expect(scroller().missedCount).toBe(0);
 
+    harness.unmount();
+  });
+
+  it("lands a chat switch on the live edge instead of anchoring mid-thread", async () => {
+    // Chat 1's prompt (sequence 40) is long anchored; its reader sits on the live edge.
+    const harness = await renderHarness([userMessage(40), agentMessage(41)], false, {
+      scrollHeight: 1000,
+      clientHeight: 400,
+      scrollTop: 600,
+    });
+
+    // Switch to an active chat whose prompt sequence (45) tops chat 1's watermark: the stale
+    // per-chat sequence ref would read it as a fresh prompt and scroll the reader mid-thread.
+    scrollToCalls.length = 0;
+    await harness.rerender([userMessage(45), agentMessage(46)], true, 2);
+    // No turn-anchor scroll happens: the chat's existing rows are history the switch reset
+    // (which ChatInterface issues on the same change) positions the reader under.
+    expect(
+      scrollToCalls.filter((call) => call.top !== 1000 && call.top !== undefined),
+    ).toHaveLength(0);
+    expect(scroller().missedCount).toBe(0);
+    await act(async () => {
+      scroller().resetToBottom();
+    });
+    expect(scrollToCalls.at(-1)?.top).toBe(1000);
+    expect(scroller().atBottom).toBe(true);
+
+    harness.unmount();
+  });
+
+  it("anchors a steer sent mid-turn in a chat whose sequences restart below the previous chat's", async () => {
+    // Chat 1 ran to sequence 41; chat 2's thread so far only reaches sequence 5.
+    const harness = await renderHarness([userMessage(40), agentMessage(41)], false, {
+      scrollHeight: 1000,
+      clientHeight: 400,
+      scrollTop: 600,
+    });
+    await harness.rerender([userMessage(3), agentMessage(5)], false, 2);
+
+    // A steer lands at chat 2's sequence 7, far below chat 1's watermark of 40; without the
+    // per-chat reset the anchor comparison silently no-ops and the send follows the bottom.
+    const rectSpy = vi
+      .spyOn(Element.prototype, "getBoundingClientRect")
+      .mockReturnValue({ top: 0 } as DOMRect);
+    scrollToCalls.length = 0;
+    await harness.rerender([userMessage(3), agentMessage(5), userMessage(7)], true, 2);
+    // Row top (600) minus the peek: 504 — an anchor, not a jump to the bottom at 1000.
+    expect(scrollToCalls.at(-1)?.top).toBe(504);
+    expect(scroller().atBottom).toBe(false);
+
+    // The anchored steer is seen; only what streams in after it counts as missed.
+    await harness.rerender(
+      [userMessage(3), agentMessage(5), userMessage(7), agentMessage(8)],
+      true,
+      2,
+    );
+    expect(scroller().missedCount).toBe(1);
+
+    rectSpy.mockRestore();
     harness.unmount();
   });
 });
