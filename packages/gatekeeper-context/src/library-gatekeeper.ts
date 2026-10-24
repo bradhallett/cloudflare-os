@@ -148,6 +148,14 @@ export class ContextAccount
   }
 
   async startAppUi(context: AppUiContext): Promise<GatekeeperUiFrame> {
+    // A Workshop snapshot of this person's orgs, when it sends one, refreshes the recorded
+    // memberships the account's org grants resolve against. Absent field: recordings stay.
+    if (context.orgMemberships !== undefined) {
+      let userLibrary = this.#userLibraries().get(this.#userLibraries().idFromName(
+        domainName(this.ctx.props.sharingDomain, this.ctx.props.accountId)));
+      await userLibrary.syncOrgMemberships(
+        this.ctx.props.sharingDomain, this.ctx.props.accountId, context.orgMemberships);
+    }
     // Hand the iframe its per-user UI capability. isAdmin and the user-selection exchange are
     // supplied fresh per open.
     let ui = new RpcStub(new ContextApiImpl(
@@ -216,7 +224,7 @@ export class ContextVerifier
     let collections = this.ctx.exports.ContextCollectionDurableObject;
     return Promise.all(collectionIds.map(async collectionId => canReadCollection(
       await collections.get(collections.idFromName(domainName(sharingDomain, collectionId)))
-          .getAccess(this.ctx.props.accountId))));
+          .getResolvedAccess(this.ctx.props.accountId))));
   }
 
   async getAccountId(sharingDomain: string): Promise<string | null> {

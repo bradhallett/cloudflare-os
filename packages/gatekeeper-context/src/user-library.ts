@@ -1,13 +1,17 @@
 // Per-account library: the collections this account created, those shared with it, and (from the
 // domain registry/KV) every public one. Index entries are discovery only; each listing asks the
-// collection itself whether the account still holds a role on it.
+// collection itself whether the account still holds a role on it. The account's recorded org
+// memberships are the same kind of index: synced from Workshop-side snapshots, and re-read by
+// every org-grant resolution, never trusted as the authority for what a collection grants.
 
 import { DurableObject } from "cloudflare:workers";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
+import type { GatekeeperOrgMembership } from "@gadgets/workshop-shared/gatekeeper";
 import { EnabledCollectionInfo, VENDOR_ID } from "./context-types.js";
 import { listPublicCollectionsFromKv } from "./collection-kv.js";
 import { MAX_COLLECTION_FANOUT, mapWithConcurrency } from "./concurrency.js";
 import { domainName } from "./domain.js";
+import type { LibraryRegistryDurableObject } from "./registry-do.js";
 import { obsContext } from "./observability.js";
 
 const logger = obsContext.createLogger({
@@ -25,11 +29,21 @@ type SharedRecord = {
   addedAt: Date;
 };
 
+// One org this account's owner belongs to, as the Workshop last reported it (AppUiContext on UI
+// open, ticket redemption on share). A snapshot, not the authority: org grants are resolved against
+// it live, so a stale entry costs at most delayed revocation until the next sync.
+type OrgMembershipRecord = {
+  orgId: string;
+  role: GatekeeperOrgMembership["role"];
+  syncedAt: Date;
+};
+
 function makeUserLibraryStorage(storage: DurableObjectStorage) {
   return createTypedStorage(storage, {
     collections: {
       ownedCollections: collection<OwnedRecord>()({ primaryKey: "id" }),
       sharedCollections: collection<SharedRecord>()({ primaryKey: "id" }),
+      orgMemberships: collection<OrgMembershipRecord>()({ primaryKey: "orgId" }),
     },
     singletons: {
       // Set once the account starts disconnecting, and kept after its index is wiped, so a share
@@ -78,6 +92,36 @@ export class UserLibraryDurableObject extends DurableObject<Cloudflare.Env> {
   forgetCollection(id: string): void {
     this.storage.sharedCollections.delete(id);
     this.storage.ownedCollections.delete(id);
+  }
+
+  // --- The account's org memberships (Workshop-synced snapshots) ---
+
+  /**
+   * Replace the recorded memberships with a fresh Workshop snapshot. Refused once the account
+   * starts disconnecting, like a share: a disconnect racing a sync must not leave memberships
+   * behind for the wiped library to resolve against.
+   */
+  syncOrgMemberships(_domain: string, _accountId: string, memberships: GatekeeperOrgMembership[]): void {
+    this.#assertConnected();
+    this.storage.transaction(() => {
+      let stale = Array.from(this.storage.orgMemberships.list(), record => record.orgId);
+      for (let orgId of stale) {
+        this.storage.orgMemberships.delete(orgId);
+      }
+      let syncedAt = new Date();
+      for (let membership of memberships) {
+        this.storage.orgMemberships.put({ ...membership, syncedAt });
+      }
+    });
+  }
+
+  /** The recorded memberships; org grants are resolved against these, live, at every check. */
+  listOrgMemberships(_domain: string, _accountId: string): GatekeeperOrgMembership[] {
+    return [...this.storage.orgMemberships.list()].map(({ orgId, role }) => ({ orgId, role }));
+  }
+
+  #registry(domain: string): DurableObjectStub<LibraryRegistryDurableObject> {
+    return this.ctx.exports.LibraryRegistryDurableObject.getByName(domain);
   }
 
   // --- Disconnection ---
@@ -131,22 +175,45 @@ export class UserLibraryDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * The private collections the account holds a role on, checked live against each collection.
-   * Entries it no longer holds a role on are left out, and those whose collection is gone are
-   * forgotten. A collection that can't be reached is left out of this listing only.
+   * The private collections the account holds a role on, checked live against each collection:
+   * its own index first, then the collections its recorded orgs hold grants on (discovered through
+   * the domain registry, never indexed per account). Entries it no longer holds a role on are left
+   * out, and those whose collection is gone are forgotten. A collection that can't be reached is
+   * left out of this listing only.
    */
   async listPrivateLibrary(domain: string, accountId: string): Promise<EnabledCollectionInfo[]> {
-    let entries = await mapWithConcurrency(this.#indexedCollectionIds(), MAX_COLLECTION_FANOUT,
+    let ids = new Set(this.#indexedCollectionIds());
+    for (let id of await this.#orgCollectionIds(domain)) ids.add(id);
+    let entries = await mapWithConcurrency([...ids], MAX_COLLECTION_FANOUT,
       id => this.#privateEntry(domain, accountId, id));
     return entries.filter(entry => entry !== null);
   }
 
   /** Whether one private collection is in the account's library, checked as listings check it. */
   async hasPrivateLibraryCollection(domain: string, accountId: string, id: string): Promise<boolean> {
-    if (!this.storage.sharedCollections.get(id) && !this.storage.ownedCollections.get(id)) {
+    if (!this.storage.sharedCollections.get(id) && !this.storage.ownedCollections.get(id)
+        && !(await this.#orgCollectionIds(domain)).includes(id)) {
       return false;
     }
     return !!await this.#privateEntry(domain, accountId, id);
+  }
+
+  // Collection ids indexed under the account's recorded orgs. Discovery only: the caller
+  // re-checks each collection's own grants, so a stale registry entry can't grant anything.
+  async #orgCollectionIds(domain: string): Promise<string[]> {
+    let orgs = [...this.storage.orgMemberships.list()];
+    if (orgs.length === 0) return [];
+    let ids: string[] = [];
+    try {
+      for (let org of orgs) {
+        ids.push(...await this.#registry(domain).listOrgCollections(domain, org.orgId));
+      }
+    } catch (err) {
+      logger.warn("failed to list an org's collections", {
+        event: "library.org.collections.list.failed", error: err,
+      });
+    }
+    return ids;
   }
 
   async #privateEntry(

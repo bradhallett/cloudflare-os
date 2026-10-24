@@ -38,6 +38,12 @@ export type WorkshopObservabilityFields = {
   executionId: string;
   failureCount: number;
   gadgetId: string;
+  /** Blueprint KV records rewritten by the one-shot owner-subject migration. */
+  migratedBlueprintCount: number;
+  /** Organization membership events: which org, and (where one was granted or changed) a role.
+   *  User ids of members never enter org logs. */
+  orgId: string;
+  orgRole: "owner" | "admin" | "member";
   gatekeeperId: number | string;
   handoffKind: "connect" | "restore";
   hookId: number;

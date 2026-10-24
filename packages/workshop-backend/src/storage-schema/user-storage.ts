@@ -7,7 +7,7 @@
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
 import type {
   AiChatAuthorInfo, AiModelConfig, BlueprintMetadata, BlueprintOutput,
-  BotDefinition, GadgetMetadata, WorkpieceId,
+  BotDefinition, GadgetMetadata, OrgMemberStatus, OrgRole, WorkpieceId,
 } from "@gadgets/workshop-shared/api";
 import type { AccountDescription, GatekeeperUser } from "@gadgets/workshop-shared/gatekeeper";
 import type { DeviceSessionHandoff } from "../auth/device-session-handoff.js";
@@ -66,6 +66,12 @@ type PendingGatekeeperUserSelection = {
   appAccountId: number;
   vendorId: string;
   selectedUserId: string;
+  /**
+   * The orgs that justified the pick (selector and selected both active members at minting);
+   * empty when a workspace share justified it instead. Redemption re-checks whichever it is,
+   * live, so the ticket dies with the relationship that authorized it.
+   */
+  orgIds: string[];
   expiresAt: Date;
 };
 
@@ -167,6 +173,17 @@ export type CloudflareBilling = {
   creditsUpdatedAt?: number;
 };
 
+/**
+ * One of the user's organization memberships, mirrored here by the org's Durable Object
+ * (OrgDurableObject.#mirror) whenever it changes. Discovery only: the org's own members
+ * collection is the authority, and listMyOrgs re-checks each entry against its org live.
+ */
+export type OrgMembershipRecord = {
+  orgId: string;
+  role: OrgRole;
+  status: OrgMemberStatus;
+};
+
 export function makeUserStorage(storage: DurableObjectStorage) {
   return createTypedStorage(storage, {
     collections: {
@@ -212,6 +229,11 @@ export function makeUserStorage(storage: DurableObjectStorage) {
         nonUniqueIndexes: {
           byWorkspace(record: OutputRecord) { return record.workspaceId; },
         },
+      }),
+      // The user's org memberships (see OrgMembershipRecord), mirrored by each org's Durable
+      // Object; listMyOrgs reads this index and re-checks every entry against its org.
+      orgMemberships: collection<OrgMembershipRecord>()({
+        primaryKey: "orgId",
       }),
     },
     singletons: {
@@ -265,6 +287,11 @@ export function makeUserStorage(storage: DurableObjectStorage) {
       // (-1 = never, which also lazily backfills users created before the
       // directory existed). See #syncDirectory().
       directoryRev: -1,
+
+      // Set by deprovision(): the account is closed. Every authentication path refuses while
+      // this is true (authenticate, password login, and both sign-in creators), so a
+      // deprovisioned user can never mint a new session.
+      deprovisioned: false,
     }
   });
 }

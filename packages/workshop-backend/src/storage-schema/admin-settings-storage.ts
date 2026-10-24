@@ -217,6 +217,11 @@ export function makeAdminSettingsStorage(storage: DurableObjectStorage) {
       // The version tag the router last reported (see ROUTER_VERSION_HEADER), "" for none, or null
       // before any report. A label for admins only: any request could have carried it.
       routerVersionTag: <string | null>null,
+
+      // Whether blueprint ownership has been migrated to owner subjects (see
+      // migrateBlueprintOwnership in blueprints-kv.ts). One deployment-wide bit: the migration
+      // is idempotent, so a worker that races the flag's write only redoes no-op work.
+      blueprintOwnershipMigrated: false,
     },
   });
 }
