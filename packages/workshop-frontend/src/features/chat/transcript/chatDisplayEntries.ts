@@ -456,6 +456,46 @@ export function continuesUserGroup(
 }
 
 /**
+ * The sequence number a row stands in for: the newest message it renders. It rises with the
+ * thread's order, so a row that arrives while a reader is scrolled away (a sequence above the
+ * last one they saw) is a missed row, while an earlier page prepended at the top never counts.
+ */
+export function entrySequenceId(entry: ChatDisplayEntry): number {
+  switch (entry.type) {
+    case "workRun":
+      return entry.lastMessageSequence;
+    case "modelChange":
+      return entry.sequence;
+    case "compactionBoundary":
+    case "compactionCut":
+      return entry.boundary.to;
+    case "failedSend":
+      // Client-local: it stands in for a message the server never accepted, so it carries
+      // no sequence and never counts as a missed row.
+      return -Infinity;
+    default:
+      return entry.message.sequence;
+  }
+}
+
+/**
+ * The newest of the user's own message rows: what a send lands as. While a turn runs, the
+ * transcript's scroller anchors this row near the top of the viewport (see useMessageScroller)
+ * so the answer streams in below it instead of burying the prompt at the bottom.
+ */
+export function latestUserMessageEntry(
+  entries: readonly ChatDisplayEntry[],
+): { key: string; sequence: number } | null {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.type === "message" && userMessageAuthor(entry) !== null) {
+      return { key: entry.key, sequence: entry.message.sequence };
+    }
+  }
+  return null;
+}
+
+/**
  * How close to the top of the transcript pulls in the previous page. Roughly a screenful of slack,
  * so the messages are there by the time the user scrolls to them.
  */
