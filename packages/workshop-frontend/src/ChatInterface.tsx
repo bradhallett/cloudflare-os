@@ -20,13 +20,16 @@ import {
   AiChatAuthorInfo,
   AiChatMetadata,
   AiToolCall,
+  isPlanRefusalCode,
+  type PlanRefusalCode,
   BotInfo,
   BotSelection,
   ChatAttachmentRef,
   WorkpieceId,
   BlueprintOutput,
 } from "@gadgets/workshop-shared/api";
-import { logRpcFailure } from "./rpcErrors";
+import { isTransientRpcError, logRpcFailure } from "./rpcErrors";
+import type { FailedChatSend } from "./features/chat/transcript/failedSends";
 import { ChatListPanel, type ChatListScope } from "./features/chat/ChatListPanel";
 import { ChatTranscript } from "./features/chat/ChatTranscript";
 import { ChatDialogs } from "./features/chat/ChatDialogs";
@@ -226,6 +229,9 @@ function ChatInterface({
   // Out-of-credits modal (free-tier limit reached). `usageModalShownFor` tracks the error sequence
   // we've already auto-opened for, so dismissing it doesn't immediately reopen.
   const [usageModalOpen, setUsageModalOpen] = useState(false);
+  // Why the modal is open — the usage_limit surface or a plan-refusal code — picked up from the
+  // error that opened it, so the SaaS upgrade prompt can say what to upgrade for.
+  const [usageModalReason, setUsageModalReason] = useState<"usage_limit" | PlanRefusalCode>("usage_limit");
   const usageModalShownForRef = useRef<number | null>(null);
   const [chatListScope, setChatListScope] = useState<ChatListScope>("all");
   // Fetching the page before the selected chat's compaction boundary.
@@ -432,14 +438,24 @@ function ChatInterface({
     [outputOfWorkpiece],
   );
 
+  // User sends the server definitively rejected (this session only — nothing durable records
+  // them), held so their chat's transcript can show the failed message with a retry.
+  const [failedSends, setFailedSends] = useState<FailedChatSend[]>([]);
+
+  // Failed sends are session-local, so filter to the open chat before feeding the transcript.
+  const currentFailedSends = useMemo(
+    () => (selectedChatId === null ? [] : failedSends.filter((s) => s.chatId === selectedChatId)),
+    [failedSends, selectedChatId],
+  );
+
   const displayEntries = useMemo(
     () =>
       // Hide agent checkpoints; surface them as turn-level discard actions. User-saved
       // checkpoints get their own compact row so the discard action is attached to the
       // edit that actually created it.
       buildChatDisplayEntries(
-          currentMessages, messageStates.changeStatus, currentCompactions, resolveToolOutput),
-    [currentMessages, messageStates, currentCompactions, resolveToolOutput],
+        currentMessages, messageStates.changeStatus, currentCompactions, resolveToolOutput, currentFailedSends),
+    [currentMessages, messageStates, currentCompactions, resolveToolOutput, currentFailedSends],
   );
 
   const entryTopClasses = useMemo(() => {
@@ -478,10 +494,12 @@ function ChatInterface({
     if (
       lastMessage &&
       lastMessage.type === "error" &&
-      lastMessage.code === "usage_limit" &&
+      (lastMessage.code === "usage_limit" || isPlanRefusalCode(lastMessage.code)) &&
       usageModalShownForRef.current !== lastMessage.sequence
     ) {
       usageModalShownForRef.current = lastMessage.sequence;
+      if (lastMessage.code === "usage_limit") setUsageModalReason("usage_limit");
+      else if (isPlanRefusalCode(lastMessage.code)) setUsageModalReason(lastMessage.code);
       setUsageModalOpen(true);
     }
   }, [lastMessage]);
@@ -738,7 +756,6 @@ function ChatInterface({
       if (applyOptimisticActionState(actionId, state)) forceUpdate();
     });
 
-
   const {
     handleSend,
     handleNewChatSend,
@@ -806,7 +823,34 @@ function ChatInterface({
     connectionAcceptRef,
     setConnectionAccept,
     setProcessingConnections,
+    setFailedSends,
   });
+
+  // Retry drops the bubble first so a success leaves no duplicate; a definitive failure re-records
+  // a fresh bubble via handleSend itself, while a transient failure would leave the retry
+  // outcome-unknown — so the original bubble is restored to keep the message reachable.
+  const retryFailedSend = useCallback(
+    async (send: FailedChatSend) => {
+      setFailedSends((prev) => prev.filter((s) => s.id !== send.id));
+      try {
+        await handleSend(
+          send.payload.message,
+          send.payload.modelId,
+          send.payload.capsules,
+          send.payload.attachments,
+          send.payload.formats,
+          send.payload.bot,
+        );
+      } catch (err) {
+        if (isTransientRpcError(err)) setFailedSends((prev) => [...prev, send]);
+      }
+    },
+    [handleSend],
+  );
+
+  const dismissFailedSend = useCallback((send: FailedChatSend) => {
+    setFailedSends((prev) => prev.filter((s) => s.id !== send.id));
+  }, []);
 
   const toggleToolCallExpansion = useCallback((expansionKey: string) => {
     setExpandedToolCalls((prev) => {
@@ -1010,7 +1054,10 @@ function ChatInterface({
               <div
                 ref={messagesContainerRef}
                 onScroll={handleMessagesScroll}
-                className="chat-panel min-h-0 flex-1 overscroll-contain overflow-y-auto"
+                role="region"
+                aria-label="Conversation transcript"
+                tabIndex={0}
+                className="chat-panel min-h-0 flex-1 overscroll-contain overflow-y-auto focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-ring focus-visible:ring-inset"
               >
                 <ChatTranscript
                   isLoading={isLoading}
@@ -1023,6 +1070,8 @@ function ChatInterface({
                   toggleCompactionSummary={toggleCompactionSummary}
                   currentUser={currentUser}
                   chatEpoch={chatEpoch}
+                  onRetryFailedSend={retryFailedSend}
+                  onDismissFailedSend={dismissFailedSend}
                   isAgentActive={isAgentActive}
                   activeAgent={activeAgent}
                   lastDurablePendingChange={lastDurablePendingChange}
@@ -1138,6 +1187,7 @@ function ChatInterface({
         handleConnectionCreated={handleConnectionCreated}
         usageModalOpen={usageModalOpen}
         setUsageModalOpen={setUsageModalOpen}
+        usageModalReason={usageModalReason}
       />
     </div>
   );

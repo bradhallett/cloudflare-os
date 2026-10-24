@@ -12,7 +12,7 @@ import { CloudflareUsageInfo } from "@gadgets/workshop-shared/api";
 import { isCloudflareLimitsEnabled } from "../config.js";
 import { getConnectionStatus, resolveConnection, ByokGatewayRouting } from "../cloudflare/connection-service.js";
 import type { UserDurableObject } from "../../user.js";
-import { resolveUsagePolicy } from "../../entitlements.js";
+import { resolveEntitlements, resolveUsagePolicy } from "../../entitlements.js";
 
 export interface UsageCheckResult {
   /** Whether the request may proceed. */
@@ -61,7 +61,10 @@ function unlimitedResult(): UsageCheckResult {
  * funded users bill their own gateway and skip the daily counter entirely; everyone else draws on
  * the platform free tier (consuming one call against the user object) until it's exhausted. The
  * limit and minimum balance come from resolveUsagePolicy(): env config when no SaaS entitlements
- * service is bound (identical to pre-port behavior, no RPC), else the bound port's answer.
+ * service is bound (identical to pre-port behavior, no RPC), else the bound port's answer. A plan
+ * whose entitlements allow overage never blocks at the exhausted allowance (resolveEntitlements is
+ * consulted only then, never on the allow paths): the bound SaaS meters the spend past the included
+ * allowance itself, so the call proceeds on the platform.
  */
 export async function checkUsageAndBalance(
   env: Cloudflare.Env,
@@ -113,6 +116,26 @@ export async function checkUsageAndBalance(
     balance,
     minimumBalance,
   });
+
+  // A blocked decision is the one point a bound plan's overage policy matters: a plan that allows
+  // spend past the included allowance proceeds on the platform (the SaaS meters it), so only
+  // hard-capped plans ever see the block. Unbound — every OSS deployment — nothing changes, and a
+  // bound port that fails keeps the block (overage is refused rather than granted by an outage).
+  let entitlements = !decision.allowed ? await resolveEntitlements(env, userId) : undefined;
+  if (!decision.allowed && entitlements?.status === "resolved" &&
+      entitlements.entitlements.overageAllowed === true) {
+    return {
+      allowed: true,
+      shouldUseByok: false,
+      withinLimits: quota.withinLimits,
+      remaining: quota.remaining,
+      limit: quota.limit,
+      windowKind: "daily",
+      resetAt: quota.resetAt,
+      balance,
+      hasUserToken,
+    };
+  }
 
   return {
     ...decision,

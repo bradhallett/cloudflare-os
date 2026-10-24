@@ -17,6 +17,7 @@ import {
   Star,
 } from '@phosphor-icons/react'
 import { openCommandPalette } from './commandPaletteBus'
+import { formatHotkey, useIsApple } from '@gadgets/ui/hotkey'
 import { useKumoToastManager } from '@cloudflare/kumo'
 import type { RpcStub } from 'capnweb'
 import {
@@ -269,6 +270,7 @@ export function SidebarWorkspacesProvider({ children }: { children: ReactNode })
  * ─────────────────────────────────────────────────────────────────────────────
  */
 export function SidebarWorkspacesTools({ collapsed = false }: { collapsed?: boolean }) {
+  const isApple = useIsApple()
   // No "New workspace" button: Home *is* the new-workspace launcher, so it would be redundant.
   // Search lives as a magnifying-glass icon in the brand row when expanded; when collapsed the
   // brand-row buttons are hidden, so we surface a compact search icon here instead.
@@ -280,7 +282,7 @@ export function SidebarWorkspacesTools({ collapsed = false }: { collapsed?: bool
         type="button"
         onClick={() => openCommandPalette()}
         aria-label="Search"
-        title="Search (⌘K)"
+        title={`Search (${formatHotkey('mod+k', isApple)})`}
         className="press flex h-9 w-9 cursor-pointer items-center justify-center rounded-lg text-kumo-subtle transition-colors hover:bg-kumo-tint hover:text-kumo-default"
       >
         <MagnifyingGlass size={15} />

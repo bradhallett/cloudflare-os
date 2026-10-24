@@ -63,6 +63,14 @@ describe("toActivityMetric", () => {
         .toMatchObject({ actorId: USER, ownerId: USER });
   });
 
+  it("carries the owning org on org-owned workspaces, and none otherwise", () => {
+    const ORG = "d".repeat(16);
+    expect(toActivityMetric(
+        { event_name: "gadget_opened", ...workspace, gadget_org_id: ORG, source: "direct" }))
+        .toMatchObject({ orgId: ORG });
+    expect(toActivityMetric(CASES.gadget_opened[0]).orgId).toBeUndefined();
+  });
+
   it("records the gadget, and how a permanent one came to be", () => {
     expect(toActivityMetric(CASES.workpiece_created[0]))
         .toMatchObject({ gadgetId: 4, detail: "chat" });

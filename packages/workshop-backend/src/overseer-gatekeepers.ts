@@ -389,12 +389,14 @@ export abstract class OverseerGatekeepers extends OverseerBlueprints {
 
     // Setting ownerInvitesOnly narrows access to direct owner grants (see
     // SharingManager.computeEffectiveRoles), so the first observation to set it snapshots who had
-    // access beforehand. The manager may need an RPC on first use; from the flag read below through
+    // access beforehand. The manager and the owning org's membership snapshot may each need an
+    // RPC on first use; both are fetched before the flag read below, and from that read through
     // the diff after the writes, nothing awaits.
     let sharing = description.ownerInvitesOnly && !this.storage.ownerInvitesOnly.get()
         ? await this.getSharingManager() : undefined;
+    let orgRoles = sharing ? await this.getOwningOrgRoles() : null;
     let baseline = sharing && !this.storage.ownerInvitesOnly.get()
-        ? sharing.computeEffectiveRoles() : undefined;
+        ? sharing.computeEffectiveRoles({ orgRoles }) : undefined;
 
     if (description.containsRestrictedData) {
       this.storage.containsRestrictedData.put(true);
@@ -424,7 +426,7 @@ export abstract class OverseerGatekeepers extends OverseerBlueprints {
     this.associateAction(caller, actionId);
 
     if (sharing && baseline) {
-      let affected = sharing.computeAffectedByOwnerInvitesOnly(baseline);
+      let affected = sharing.computeAffectedByOwnerInvitesOnly(baseline, orgRoles);
       if (affected.length > 0) {
         // Anyone who joined through a link or through another collaborator just lost access (or
         // was downgraded), so sever live sessions as removeCollaborator does, after the writes

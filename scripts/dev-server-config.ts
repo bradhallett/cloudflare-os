@@ -1,3 +1,5 @@
+import { join } from "node:path";
+
 import { releaseShortName } from "./release/manifest-lib.ts";
 
 /**
@@ -68,6 +70,34 @@ export function getDevServerConfig(args: readonly string[], envBackendHost?: str
     backendHost,
     wranglerPort: getWranglerPortFromBackendHost(backendHost),
   };
+}
+
+/**
+ * The `-c` config list for the dev session's multi-config `wrangler dev`, which starts from the
+ * repo root: the dev-router, the workshop backend, then every gatekeeper and overlay plain worker.
+ *
+ * The backend is a core package that is neither a gatekeeper nor an overlay plain worker, so no
+ * scan filter ever selects it — yet the dev-router binds it as WORKSHOP_BACKEND, and Wrangler
+ * answers 503 "Worker ... not found" for a service binding whose target is not in the same dev
+ * session. It is named explicitly here, where a test can pin that, because run-dev-server.ts is
+ * a top-to-bottom script that spawns Wrangler at import time and so cannot be imported by one.
+ */
+export function devWranglerConfigs(
+  { backendDir, gatekeepers, plainWorkers }: {
+    /** The workshop backend's package directory (WORKSHOP_BACKEND_DIR in run-dev-server.ts). */
+    backendDir: string;
+    /** Gatekeeper packages, as `readDeployablePackages` finds them. */
+    gatekeepers: readonly { dir: string }[];
+    /** Overlay plain workers: non-gatekeeper packages from extra scan roots. */
+    plainWorkers: readonly { dir: string }[];
+  },
+): string[] {
+  return [
+    "wrangler.dev.jsonc",
+    join(backendDir, "wrangler.dev.jsonc"),
+    ...gatekeepers.map((gk) => join(gk.dir, "wrangler.dev.jsonc")),
+    ...plainWorkers.map((pkg) => join(pkg.dir, "wrangler.dev.jsonc")),
+  ];
 }
 
 /**

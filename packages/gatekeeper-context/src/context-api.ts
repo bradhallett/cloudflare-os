@@ -4,7 +4,7 @@
 import { RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import { asVerifier } from "@gadgets/gatekeeper-kit/observers";
-import type { GatekeeperUserSelectionExchange } from "@gadgets/workshop-shared/gatekeeper";
+import type { GatekeeperOrgMembership, GatekeeperUserSelectionExchange } from "@gadgets/workshop-shared/gatekeeper";
 import {
   ContextApi, ContextCollectionContent, ContextCollectionMetadata, ContextCollectionPermissions,
   ContextCollectionRole, ContextCollectionSharing, ContextCollectionVisibility,
@@ -50,17 +50,20 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
 
   async #permissions(collectionId: string): Promise<ContextCollectionPermissions> {
     return collectionPermissions(
-      await this.#collection(collectionId).getAccess(this.accountId), this.isAdmin);
+      await this.#collection(collectionId).getResolvedAccess(this.accountId), this.isAdmin);
   }
 
   async #assertCanRead(collectionId: string): Promise<void> {
-    if (!canReadCollection(await this.#collection(collectionId).getAccess(this.accountId))) {
-      throw new Error(NOT_FOUND);
-    }
+    let access = await this.#collection(collectionId).getResolvedAccess(this.accountId);
+    if (!canReadCollection(access)) throw new Error(NOT_FOUND);
   }
 
   async #assertCanEdit(collectionId: string): Promise<void> {
     if (!(await this.#permissions(collectionId)).canEdit) throw new Error(NOT_FOUND);
+  }
+
+  #userLibFor(accountId: string) {
+    return this.userLibraries.get(this.userLibraries.idFromName(domainName(this.domain, accountId)));
   }
 
   #assertArtifactsAvailable(): void {
@@ -85,6 +88,7 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
     visibility: ContextCollectionVisibility,
     icon?: string,
     source: ContextCollectionContent["source"] = "web",
+    ownerOrgId?: string,
   ): Promise<ContextCollectionMetadata> {
     if (visibility === "public") this.#assertAdmin();
     if (source !== "web" && source !== "git") {
@@ -92,6 +96,18 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
     }
     if (source === "git" && !this.env.ARTIFACTS) {
       throw new Error("Git-backed Context collections are not enabled.");
+    }
+    if (ownerOrgId !== undefined && visibility !== "private") {
+      throw new Error("Only private collections can be owned by an org.");
+    }
+    if (ownerOrgId !== undefined) {
+      // The actor's own recorded membership is the only org authority this gatekeeper has;
+      // only an org's owner or admin may spend its name on a new collection.
+      let memberships = await this.#userLib().listOrgMemberships(this.domain, this.accountId);
+      let membership = memberships.find(entry => entry.orgId === ownerOrgId);
+      if (!membership || (membership.role !== "owner" && membership.role !== "admin")) {
+        throw new Error("You must own or administer this org to create collections for it.");
+      }
     }
 
     let id = crypto.randomUUID();
@@ -110,12 +126,16 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
     };
 
     // Initialize before indexing; if this fails, nothing is reachable yet.
-    metadata = await this.#collection(id).initialize(metadata, this.domain, visibility === "private" ? this.accountId : "");
+    metadata = await this.#collection(id).initialize(
+      metadata, this.domain, visibility === "private" ? this.accountId : "", ownerOrgId ?? "");
 
-    // Private collections live in the creator's library; public ones live in the domain registry.
+    // The creator's library indexes private collections, the registry's org index covers
+    // org-owned ones, and the domain registry holds public ones.
     try {
       if (visibility === "public") {
         await this.#registry().addPublic(this.domain, metadataToSummary(metadata));
+      } else if (ownerOrgId !== undefined) {
+        await this.#registry().addOrgCollection(this.domain, ownerOrgId, id);
       } else {
         await this.#userLib().createOwnedCollection(id);
       }
@@ -170,12 +190,23 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
       let collection = this.#collection(collectionId);
       let [meta, access] = await Promise.all([
         collection.getMetadata(),
-        collection.getAccess(this.accountId),
+        collection.getResolvedAccess(this.accountId),
       ]);
       if (!canReadCollection(access)) return null;
       return meta;
     } catch {
       return null;
+    }
+  }
+
+  // The actor's resolved access: account grants, plus org grants its recorded memberships pick
+  // up. Checked here so every sharing entry point resolves the same way.
+  async #assertCanShare(collectionId: string, role: ContextCollectionRole): Promise<void> {
+    let access = await this.#collection(collectionId).getResolvedAccess(this.accountId);
+    let permissions = collectionPermissions(access, this.isAdmin);
+    if (access.visibility !== "private" || !permissions.canShare) throw new Error(NOT_FOUND);
+    if (role === "owner" && !permissions.canManageOwners) {
+      throw new Error("Only owners can change who owns this collection.");
     }
   }
 
@@ -262,29 +293,39 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
   async shareContextCollection(
       collectionId: string, ticket: string, role: ContextCollectionRole): Promise<void> {
     // Checked before spending the single-use ticket; the collection checks again when granting.
+    await this.#assertCanShare(collectionId, role);
     let collection = this.#collection(collectionId);
-    let access = await collection.getAccess(this.accountId);
-    let permissions = collectionPermissions(access, this.isAdmin);
-    if (access.visibility !== "private" || !permissions.canShare) throw new Error(NOT_FOUND);
-    if (role === "owner" && !permissions.canManageOwners) {
-      throw new Error("Only owners can change who owns this collection.");
-    }
 
     let selections = await this.userSelectionExchange.redeem(ticket);
     // Only a Context verifier in this sharing domain names an account; the browser cannot. A
     // failure to ask is not mistaken for an account elsewhere: it rejects, and the share can be
     // retried with a new selection.
-    let recipients = (await Promise.all(selections.map(async ({ verifier, profile }) => ({
+    let recipients = (await Promise.all(selections.map(async ({ verifier, profile, orgMemberships }) => ({
       accountId: await asVerifier<Fetcher<ContextVerifierApi>>(verifier).getAccountId(this.domain),
       displayName: profile.displayName,
-    })))).filter((recipient): recipient is { accountId: string; displayName: string } =>
-      recipient.accountId !== null);
+      orgMemberships,
+    })))).filter((recipient): recipient is {
+      accountId: string; displayName: string; orgMemberships: GatekeeperOrgMembership[] | undefined;
+    } => recipient.accountId !== null);
     if (recipients.length === 0) {
       throw new Error("This person hasn't turned on Skills yet, so you can't share with them.");
     }
+    // Snapshot what the Workshop reports about the recipient's orgs, when it says anything, so
+    // org grants resolve for their accounts from the moment the share lands. Absent field:
+    // whatever was recorded stays.
+    await Promise.all(recipients.map(recipient => recipient.orgMemberships === undefined
+      ? undefined
+      : this.#userLibFor(recipient.accountId)
+        .syncOrgMemberships(this.domain, recipient.accountId, recipient.orgMemberships)));
     // Every result is an account of the one person selected, so sharing with each of them gives
     // that person nothing beyond what was chosen. One call, so their grants land together.
     await collection.share(this.accountId, recipients, role);
+  }
+
+  async shareContextCollectionWithOrg(
+      collectionId: string, orgId: string, role: ContextCollectionRole): Promise<void> {
+    await this.#assertCanShare(collectionId, role);
+    await this.#collection(collectionId).shareOrg(this.accountId, orgId, role);
   }
 
   async setContextCollectionMemberRole(

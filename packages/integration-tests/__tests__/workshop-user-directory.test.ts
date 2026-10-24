@@ -53,6 +53,12 @@ it("user search tracks display names and honours the admin switch without droppi
   const viewerOrg = await viewerApi.createOrg("Viewer Org");
   await viewerApi.inviteOrgMember(viewerOrg.id, target!);
   await targetApi.acceptOrgInvitation(viewerOrg.id);
+
+  // The RPC boundary must serialize the WhoamiInfo intersection: every sign-in reads it.
+  expect((await viewerApi.whoami()).orgs).toContainEqual(
+    { orgId: viewerOrg.id, role: "owner", status: "active" });
+  expect((await targetApi.whoami()).orgs).toContainEqual(
+    { orgId: viewerOrg.id, role: "member", status: "active" });
   await waitFor("the target to be indexed", async () =>
     (await viewerApi.searchUsers("target before", [])).length > 0 || null);
   await expect(viewerApi.searchUsers("target before", [])).resolves.toEqual(before);

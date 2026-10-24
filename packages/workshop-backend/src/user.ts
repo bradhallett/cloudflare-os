@@ -1,8 +1,10 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, type DeviceSessionHandoffStart, type BotDefinition, type BotInfo, type BotSelection, type BotSkillChoice, type BotSkillRef, type OrgMemberStatus, type OrgRole } from '@gadgets/workshop-shared/api';
-import { ActionDescription, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperUserSelection, GatekeeperUserSelectionExchange, RedeemedGatekeeperUserSelection } from "@gadgets/workshop-shared/gatekeeper";
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, createPlanRefusalError, type DeviceSessionHandoffStart, type BotDefinition, type BotInfo, type BotSelection, type BotSkillChoice, type BotSkillRef, type OrgMemberStatus, type OrgRole } from '@gadgets/workshop-shared/api';
+import { ActionDescription, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperUserSelection, GatekeeperUserSelectionExchange, RedeemedGatekeeperUserSelection, GatekeeperOrgMembership } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { botKey, normalizeBotDefinition } from "./bot-config.js";
+import { isActiveMember } from "./org-access.js";
+import { retryOnDoReset } from "./do-retry.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
@@ -22,6 +24,7 @@ import { deleteBlueprintContent } from "./blueprint-archive.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./storage-schema/blueprints-kv.js";
 import { resolveBlueprintForUser } from "./blueprint-access.js";
 import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./admin-config.js";
+import { resolveEntitlements } from "./entitlements.js";
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
 import { CONNECT_FLOW_LIFETIME_MS, handoffTargetOrigin, hashPresentedSecret, hashSecret, newSecretToken, PENDING_HANDOFF_LIFETIME_MS } from "./connect-handoff.js";
 import { deliver, registerDevice } from "./notification-service.js";
@@ -533,7 +536,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    *   (the counterpart of `#syncDirectory()`);
    * - every workspace shared *with* the user, whose collaborator edges are severed so each
    *   affected workspace force-restarts and the user's live chat sessions die with it (see
-   *   `#severSharedWorkspaceAccess`).
+   *   `#severSharedWorkspaceAccess`);
+   * - every org the user belonged to, which they leave so directory scopes, picker
+   *   justifications and org-owned workspace baselines stop naming them (see
+   *   `#leaveOrgsOnDeprovision`).
    *
    * Not touched: short-lived connect handoffs and flows (the alarm sweep owns those), and the
    * user's own workspaces and data — deprovisioning removes access, not content. Idempotent:
@@ -572,7 +578,36 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       }
     }
     await this.#severSharedWorkspaceAccess();
+    await this.#leaveOrgsOnDeprovision();
     logger.info("user deprovisioned", { event: "user.deprovisioned" });
+  }
+
+  /**
+   * Leaves every org the user belonged to, so a closed account does not linger there as an
+   * "active" member: co-members' directory scopes, picker-ticket justifications, and org-owned
+   * workspaces' baselines all read the org's own member records, and each leave ends the
+   * membership, mirrors this index entry away, and severs the org's workspaces in one move
+   * (OrgDurableObject.memberLeave). Best-effort per org, like #severSharedWorkspaceAccess: a
+   * leave that fails, or is refused because the user is the org's sole active owner (the org
+   * keeps an unreachable owner rather than none, per org-access.ts), leaves a member record
+   * nothing can exercise — the deprovisioned user can no longer authenticate, and any org admin
+   * may still remove the record by hand. Pending invitations are declined the same way, unless
+   * the account was never created (no profile id to leave under), in which case the org's own
+   * expiry sweep reclaims them.
+   */
+  async #leaveOrgsOnDeprovision(): Promise<void> {
+    const me = this.storage.profile.get()?.id;
+    if (me === undefined) return;
+    await Promise.all([...this.storage.orgMemberships.list()].map(async entry => {
+      try {
+        await this.ctx.exports.OrgDurableObject.getByName(entry.orgId).memberLeave(me);
+      } catch (error) {
+        logger.warn("failed to remove a deprovisioned user from an organization", {
+          event: "deprovision.org.leave.failed",
+          orgId: entry.orgId, error,
+        });
+      }
+    }));
   }
 
   /**
@@ -821,15 +856,46 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async listModels(kind: ModelKind = "language"): Promise<AiChatAuthorInfo[]> {
-    return this.#listModels(await getGatewayModels(this.env), kind);
+    return this.#listModels(await getGatewayModels(this.env), kind, await this.#allowedModelTiers());
   }
 
-  #listModels(models: GatewayModels | null, kind: ModelKind): AiChatAuthorInfo[] {
+  // The model tiers the user's plan may run, or null while no entitlements service is bound
+  // (every OSS deployment — no gate, identical to pre-port behavior). A gateway model that
+  // states a catalog tier absent from the set is neither listed nor resolved; a model with no
+  // tier, and any model a user stored themselves, is never tier-gated. A bound service that
+  // fails yields the empty set — no tiered model runs — so an outage fails closed.
+  async #allowedModelTiers(): Promise<ReadonlySet<string> | null> {
+    let answer = await resolveEntitlements(this.env, this.ctx.id.toString());
+    if (answer.status === "unbound") return null;
+    if (answer.status === "unavailable") return new Set();
+    return new Set(answer.entitlements.allowedModelTiers);
+  }
+
+  // The gatekeeper vendors the user's plan may connect, or null while no entitlements service
+  // is bound (no gate, as pre-port behavior and every OSS deployment). A bound service that
+  // fails yields the empty set — every vendor is withheld — so an outage fails closed. Shared
+  // by the connector surfaces (listing, connect, ambient provisioning and surfacing) and
+  // #assertResourceEnabled, the same way #allowedModelTiers serves the model surfaces.
+  async #allowedGatekeepers(): Promise<ReadonlySet<string> | null> {
+    let answer = await resolveEntitlements(this.env, this.ctx.id.toString());
+    if (answer.status === "unbound") return null;
+    if (answer.status === "unavailable") return new Set();
+    return new Set(answer.entitlements.allowedGatekeepers.map(id => id.toLowerCase()));
+  }
+
+  #listModels(models: GatewayModels | null, kind: ModelKind,
+              tiers: ReadonlySet<string> | null): AiChatAuthorInfo[] {
     let result: AiChatAuthorInfo[] = [];
 
-    // When AI Gateway mode is active, include the gateway models the deployment offers.
+    // When AI Gateway mode is active, include the gateway models the deployment offers, less
+    // any the user's plan may not run.
     if (models) {
-      result.push(...models.list(kind));
+      for (let model of models.list(kind)) {
+        let tier = models.get(model.id)?.tier;
+        if (tier === undefined || tiers === null || tiers.has(tier)) {
+          result.push(model);
+        }
+      }
     }
 
     // Also include user-configured models, where users may add their own, skipping any that a
@@ -1035,21 +1101,23 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * chat runs on the bot's declared model. A bot or model that no longer resolves throws visibly
    * here, never a silent fallback to another model. */
   async getChatContext(modelId: string | null, bot?: BotSelection): Promise<UserChatContext> {
-    let models = await getGatewayModels(this.env);
-    let result = this.#getChatContext(bot === undefined ? modelId : null, models);
+    let [models, tiers] = await Promise.all(
+        [getGatewayModels(this.env), this.#allowedModelTiers()]);
+    let result = this.#getChatContext(bot === undefined ? modelId : null, models, tiers);
     if (bot !== undefined) {
       result.bot = await this.#resolveBot(bot);
-      result.aiModel = this.#requireModel(result.bot.modelId, models);
+      result.aiModel = this.#requireModel(result.bot.modelId, models, tiers);
     }
     return result;
   }
 
-  #getChatContext(modelId: string | null, models: GatewayModels | null): UserChatContext {
+  #getChatContext(modelId: string | null, models: GatewayModels | null,
+                 tiers: ReadonlySet<string> | null): UserChatContext {
     let result: UserChatContext = {
       profile: this.storage.profile.get()
     };
     if (modelId) {
-      result.aiModel = this.#requireModel(modelId, models);
+      result.aiModel = this.#requireModel(modelId, models, tiers);
     }
 
     // Resolve the quick model (used for lightweight tasks like title generation).
@@ -1070,10 +1138,21 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   // Resolve a model ID the way chats do (see #resolveModel), refusing visibly -- with the most
   // specific reason the ID doesn't resolve -- when it doesn't. Shared by the plain-model and bot
-  // paths of getChatContext, so a bot's model refuses exactly like a hand-picked one.
-  #requireModel(id: string, models: GatewayModels | null): UserAiModelRecord {
+  // paths of getChatContext, so a bot's model refuses exactly like a hand-picked one. A gateway
+  // model whose catalog tier the user's plan doesn't include refuses here too (see
+  // #allowedModelTiers), so a chat naming one — an existing chat after a downgrade, say — fails
+  // visibly rather than silently running a different model.
+  #requireModel(id: string, models: GatewayModels | null,
+               tiers: ReadonlySet<string> | null): UserAiModelRecord {
     let record = this.#resolveModel(id, models);
-    if (record) return record;
+    if (record) {
+      let tier = models?.get(id)?.tier;
+      if (tier !== undefined && tiers !== null && !tiers.has(tier)) {
+        throw createPlanRefusalError("MODEL_NOT_ON_PLAN",
+            `The "${record.profile.name}" model isn't available on your plan.`);
+      }
+      return record;
+    }
     models?.refuseDisabled(id);
     // No gateway model has the ID, so a stored model with it is one the deployment keeps
     // users from running.
@@ -1102,15 +1181,16 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     // An existing chat keeps its model while it still resolves, even once no longer offered. A new
     // conversation takes the user's preferred model only while it is still offered, as the web
     // composer does with its stored choice, and otherwise the first available model.
-    let models = await getGatewayModels(this.env);
+    let [models, tiers] = await Promise.all(
+        [getGatewayModels(this.env), this.#allowedModelTiers()]);
     let selectedModelId = existingChatModelId;
     if (selectedModelId === null || !this.#resolveModel(selectedModelId, models)) {
-      let offered = this.#listModels(models, "language");
+      let offered = this.#listModels(models, "language", tiers);
       let preferredModel = this.storage.preferredModel.get();
       selectedModelId = (offered.find(model => model.id === preferredModel) ?? offered[0])?.id ?? null;
     }
 
-    return this.#getChatContext(selectedModelId, models);
+    return this.#getChatContext(selectedModelId, models, tiers);
   }
 
   /**
@@ -1132,27 +1212,34 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * start instead of mysteriously changing agent.
    */
   async listBots(): Promise<BotInfo[]> {
-    let models = await getGatewayModels(this.env);
+    let [models, tiers] = await Promise.all(
+        [getGatewayModels(this.env), this.#allowedModelTiers()]);
     let result: BotInfo[] = [];
     for (let record of this.storage.bots.list()) {
-      result.push(this.#botInfo({scope: "user", id: record.id}, record.def, models));
+      result.push(this.#botInfo({scope: "user", id: record.id}, record.def, models, tiers));
     }
     for (let {id, def} of (await readAdminConfig(this.env)).deploymentBots) {
-      result.push(this.#botInfo({scope: "deployment", id}, def, models));
+      result.push(this.#botInfo({scope: "deployment", id}, def, models, tiers));
     }
     return result;
   }
 
-  #botInfo(selection: BotSelection, def: BotDefinition, models: GatewayModels | null): BotInfo {
+  #botInfo(selection: BotSelection, def: BotDefinition, models: GatewayModels | null,
+           tiers: ReadonlySet<string> | null): BotInfo {
     let model = this.#resolveModel(def.modelId, models);
+    // A model the user's plan may not run makes the bot unavailable exactly like one that no
+    // longer resolves, so the listing never offers a bot its chat would refuse to start.
+    let tier = model ? models?.get(def.modelId)?.tier : undefined;
+    let runnable = model !== undefined &&
+        (tier === undefined || tiers === null || tiers.has(tier));
     return {
       selection,
       name: def.name,
       ...(def.description ? {description: def.description} : {}),
       modelId: def.modelId,
       ...(model ? {modelName: model.profile.name} : {}),
-      available: model !== undefined,
-      ...(model ? {} : {unavailableReason: "Model not available to you"}),
+      available: runnable,
+      ...(runnable ? {} : {unavailableReason: "Model not available to you"}),
     };
   }
 
@@ -1288,13 +1375,40 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async newGadget(id: string, title: string): Promise<void> {
+    // Idempotent: a retried creation of the same workspace is completing one that already
+    // counts, not adding another, so it is never re-refused by the cap below (an external
+    // message that died between registering a workspace and claiming it retries through here).
+    if (this.storage.gadgets.get(id)) return;
+
+    // A bound SaaS's plan may cap how many workspaces a user owns; counted are only the rows
+    // without an `owner` — the user's own, never ones shared with them. A bound service that
+    // fails refuses creation (fail closed): an outage must not hand out workspaces past a cap
+    // it couldn't read. The cap governs *creating* a workspace only; registering one that
+    // already exists is ensureGadgetRegistered(), which is never capped.
+    let answer = await resolveEntitlements(this.env, this.ctx.id.toString());
+    if (answer.status === "unavailable") {
+      throw new Error(
+          "Your plan couldn't be verified, so the workspace wasn't created. Please try again.");
+    }
+    let cap = answer.status === "resolved" ? answer.entitlements.maxWorkspaces : undefined;
+    if (cap !== undefined) {
+      let owned = [...this.storage.gadgets.list()].filter(record => !record.owner).length;
+      if (owned >= cap) {
+        throw createPlanRefusalError("WORKSPACE_CAP_REACHED",
+            `You've reached your plan's limit of ${cap} workspaces.`);
+      }
+    }
     let created = new Date();
     this.storage.gadgets.put({id, title, created});
   }
 
   async ensureGadgetRegistered(id: string, title: string): Promise<void> {
+    // Registers a workspace that already exists — its Overseer holds state — so the plan's
+    // workspace cap never applies here: refusing could not undo the workspace, and the cap
+    // decision belongs before the workspace is created (newGadget, which the external-message
+    // path consults before claiming one).
     if (this.storage.gadgets.get(id)) return;
-    await this.newGadget(id, title);
+    this.storage.gadgets.put({id, title, created: new Date()});
   }
 
   async setGadgetLastActive(id: string, time: Date, totalCost: number | undefined): Promise<void> {
@@ -1346,6 +1460,25 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   /** The user's mirrored org memberships (see syncOrgMembership), sorted by org id. */
   listOrgMemberships(): OrgMembershipRecord[] {
     return [...this.storage.orgMemberships.list()];
+  }
+
+  /**
+   * The user's organization memberships read afresh from each org, as the Workshop reports them
+   * to gatekeepers (GatekeeperOrgMembership): the mirrored index names the orgs and each org
+   * answers for the user live — describeForMember returns null once a membership has ended, so a
+   * stale index entry or an unreadable org contributes nothing (fail-closed, like
+   * getDirectoryScope). Only active memberships are reported: a pending invitation grants
+   * nothing yet, and neither may an org-keyed grant it would justify.
+   */
+  async #freshOrgMemberships(): Promise<GatekeeperOrgMembership[]> {
+    const me = this.storage.profile.get().id;
+    const orgs = await Promise.allSettled([...this.storage.orgMemberships.list()].map(
+        async entry => await this.ctx.exports.OrgDurableObject.getByName(entry.orgId)
+            .describeForMember(me)));
+    return orgs.flatMap(result => {
+      const org = result.status === "fulfilled" ? result.value : null;
+      return org !== null && org.status === "active" ? [{ orgId: org.id, role: org.role }] : [];
+    });
   }
 
   async listOutputs(): Promise<ListOutputsResult> {
@@ -1486,8 +1619,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     let existing = this.storage.libraryBlueprints.get(id);
+    let orgOwner = kvRecord.owner?.type === "org" ? kvRecord.owner.id : undefined;
     if (existing) {
       existing.metadata = kvRecord.metadata;
+      existing.orgOwner = orgOwner;
       this.storage.libraryBlueprints.put(existing);
       return;
     }
@@ -1497,6 +1632,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       metadata: kvRecord.metadata,
       addedAt: new Date(),
       uploaded: false,
+      // The org whose member this blueprint belongs to, if any: the listing's live gate.
+      orgOwner,
     });
   }
 
@@ -1619,7 +1756,26 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async listLibraryBlueprints(): Promise<BlueprintLibrarySummary[]> {
     let result: BlueprintLibrarySummary[] = [];
     let pinnedBlueprintIds = new Set(this.storage.pinnedBlueprints.get());
+    // An org-owned entry is gated live, like every org read (the lazy-revocation contract,
+    // docs/tenancy.md): the record names the org whose member added it, and the listing asks
+    // that org again, so a removed member's entry is withheld. The record is kept -- a re-add
+    // restores the listing, and opening re-resolves regardless -- and records written before
+    // the gate name no org, so they list as they always did.
+    let me = this.ctx.id.name!;
+    let memberOf = new Map<string, Promise<boolean>>();
     for (let record of this.storage.libraryBlueprints.list()) {
+      if (record.orgOwner !== undefined) {
+        let gate = memberOf.get(record.orgOwner);
+        if (gate === undefined) {
+          // A pure read, retried across an org-DO reset; an unreadable org answers as if
+          // removed, so the listing fails closed.
+          gate = retryOnDoReset(() =>
+              this.ctx.exports.OrgDurableObject.getByName(record.orgOwner!).getMember(me))
+              .then(isActiveMember, () => false);
+          memberOf.set(record.orgOwner, gate);
+        }
+        if (!(await gate)) continue;
+      }
       result.push({
         id: record.id,
         metadata: record.metadata,
@@ -1638,16 +1794,21 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       userId: this.storage.profile.get().id
     };
 
-    // Admin-disabled resources/gatekeepers are filtered out here, which also covers the agent (the
-    // Overseer's connectable-vendor/resource list is sourced from this method).
+    // Admin-disabled resources/gatekeepers are filtered out here, and so is any vendor the
+    // user's plan doesn't offer, which also covers the agent (the Overseer's
+    // connectable-vendor/resource list is sourced from this method).
     let config = await readAdminConfig(this.env);
     let disabledGatekeeperSet = new Set(config.disabledGatekeepers);
+    let planAllowed = await this.#allowedGatekeepers();
 
     let promises: Promise<GatekeeperVendorInfo | null>[] = [];
 
     for (let [id, vendor] of this.vendors) {
       if (disabledGatekeeperSet.has(id)) {
         continue;  // Whole gatekeeper disabled by admin.
+      }
+      if (planAllowed !== null && !planAllowed.has(id.toLowerCase())) {
+        continue;  // Not on the user's plan.
       }
       promises.push((async () => {
         if (filter && !(await checkGatekeeperVendorFilter(vendor, id, filter))) {
@@ -1684,8 +1845,16 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (!vendor) {
       throw new Error("No such service: " + vendorId);
     }
-    if ((await readAdminConfig(this.env)).disabledGatekeepers.includes(vendorId.toLowerCase())) {
+    let normalized = vendorId.toLowerCase();
+    if ((await readAdminConfig(this.env)).disabledGatekeepers.includes(normalized)) {
       throw new Error(`The "${vendorId}" gatekeeper is disabled on this deployment.`);
+    }
+    // The plan gate mirrors #assertResourceEnabled's ordering (admin first), so a connect never
+    // completes an OAuth flow only to fail at the first gatekeeper mint.
+    let allowed = await this.#allowedGatekeepers();
+    if (allowed !== null && !allowed.has(normalized)) {
+      throw createPlanRefusalError("CONNECTOR_NOT_ON_PLAN",
+          `The "${vendorId}" connector isn't available on your plan.`);
     }
 
     let accountId = this.storage.nextAccountId.get();
@@ -1756,15 +1925,18 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * The ambient gatekeepers the user can opt into now: mode "optional" and not yet added. Backs the
-   * Connectors "Available" section. ("enabled" ones are already provisioned; "disabled" ones aren't
-   * offered.)
+   * The ambient gatekeepers the user can opt into now: mode "optional", not yet added, and on
+   * the user's plan. Backs the Connectors "Available" section. ("enabled" ones are already
+   * provisioned; "disabled" ones, and ones the plan doesn't offer, aren't listed — the same
+   * dormancy treatment listProvidedAccounts gives an already-added account.)
    */
   async listAddableGatekeepers(): Promise<GatekeeperVendorInfo[]> {
     let config = await readAdminConfig(this.env);
+    let planAllowed = await this.#allowedGatekeepers();
     return (await this.#ambientVendors())
         .filter(({vendorId}) =>
             ambientGatekeeperMode(config, vendorId) === "optional" && !this.#hasAccountForVendor(vendorId))
+        .filter(({vendorId}) => planAllowed === null || planAllowed.has(vendorId.toLowerCase()))
         // Same shape as listGatekeeperVendors; ambient gatekeepers expose no resources.
         .map(({vendorId, description}) => ({id: vendorId, description, supportedResources: []}));
   }
@@ -1793,6 +1965,13 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
     if (ambientGatekeeperMode(await readAdminConfig(this.env), vendorId) === "disabled") {
       throw new Error(`The "${vendorId}" gatekeeper is disabled on this deployment.`);
+    }
+    // The plan gate mirrors admin-disabled (and #assertResourceEnabled's ordering), so an
+    // ambient vendor the plan doesn't offer can't be opted into directly either.
+    let allowed = await this.#allowedGatekeepers();
+    if (allowed !== null && !allowed.has(vendorId)) {
+      throw createPlanRefusalError("CONNECTOR_NOT_ON_PLAN",
+          `The "${vendorId}" connector isn't available on your plan.`);
     }
 
     let description = await vendor.describe();
@@ -1847,11 +2026,15 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     let config = await readAdminConfig(this.env);
+    let planAllowed = await this.#allowedGatekeepers();
     for (let {vendorId, vendor} of await this.#ambientVendors()) {
       if (provisioned.has(vendorId)) continue;
       // Only "enabled" (forced) vendors are auto-provisioned for everyone. "optional" vendors are
       // added on demand by the user (provisionAmbientAccount); "disabled" ones never.
       if (!shouldAutoProvisionAccount(config, vendorId)) continue;
+      // A vendor the user's plan doesn't offer is never auto-provisioned either (the plan gate
+      // provisionAmbientAccount applies on demand).
+      if (planAllowed !== null && !planAllowed.has(vendorId.toLowerCase())) continue;
 
       try {
         await this.#createAutoProvisionedAccount(vendorId, vendor);
@@ -1873,12 +2056,17 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async listProvidedAccounts(): Promise<ProvidedAccountInfo[]> {
     await this.#ensureAutoProvisionedAccounts();
     let config = await readAdminConfig(this.env);
+    let planAllowed = await this.#allowedGatekeepers();
     let result: ProvidedAccountInfo[] = [];
     for (let rec of this.#connectedAccountRecords()) {
       if (!rec.description.singleton && !rec.description.providesUi) continue;
       // A "disabled" ambient gatekeeper's account stays dormant: don't surface its singleton capsule
-      // or management UI. (Its data is preserved, so re-enabling restores it.)
+      // or management UI. (Its data is preserved, so re-enabling restores it.) A plan that doesn't
+      // offer the vendor dorms it the same way — the account record stays, so disconnecting and
+      // re-upgrading both keep working.
       if (rec.autoProvisioned && ambientGatekeeperMode(config, rec.vendorId) === "disabled") continue;
+      if (rec.autoProvisioned && planAllowed !== null &&
+          !planAllowed.has(rec.vendorId.toLowerCase())) continue;
       result.push({ accountId: rec.id, vendorId: rec.vendorId, description: rec.description });
     }
     return result;
@@ -1889,6 +2077,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * this gatekeeper into the owner's gadgets (as a Facet) like any other gatekeeper, so the session
    * and catalog run gadget-side in the gatekeeper's own worker — no further round-trips through this
    * DO. The account capability stays encapsulated here; only the class reference crosses out.
+   * Returns null while the user's plan doesn't offer the vendor, mirroring the dormancy
+   * listProvidedAccounts applies: the account stays, but it is not bound into new chats.
    */
   async getSingletonGatekeeperClass(accountId: number)
       : Promise<DurableObjectClass<Gatekeeper<any>> | null> {
@@ -1896,12 +2086,18 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     // Present only when description.singleton is set; gate on that, then call through the derived
     // SingletonAccountStub view (see its definition for why the cast is needed).
     if (!record?.description.singleton) return null;
+    let allowed = await this.#allowedGatekeepers();
+    if (allowed !== null && !allowed.has(record.vendorId.toLowerCase())) return null;
     return (record.account as unknown as SingletonAccountStub).getSingletonGatekeeperClass();
   }
 
   /**
-   * Open the full-page management UI for an account that declares one. `context.isAdmin` is supplied
-   * fresh by the caller so admin-gated features reflect the user's current status.
+   * Open the full-page management UI for an account that declares one. `context.isAdmin` is
+   * supplied fresh by the caller so admin-gated features reflect the user's current status, and
+   * `context.orgMemberships` fresh from the org authority (see #freshOrgMemberships) so a
+   * gatekeeper resolves org-keyed grants against the memberships the user holds right now — the
+   * snapshot delivery AppUiContext promises, and the lazy-revocation hook that retires them when
+   * a membership has since ended.
    */
   async startAccountAppUi(
       accountId: number, options: Pick<AppUiContext, "isAdmin">,
@@ -1911,14 +2107,18 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let userSelectionExchange = this.ctx.exports.GatekeeperUserSelectionExchangeImpl({
       props: { selectorUserId: this.ctx.id.toString(), appAccountId: accountId },
     });
-    return (record.account as unknown as SingletonAccountStub)
-        .startAppUi({ isAdmin: options.isAdmin, userSelectionExchange });
+    return (record.account as unknown as SingletonAccountStub).startAppUi({
+      isAdmin: options.isAdmin,
+      orgMemberships: await this.#freshOrgMemberships(),
+      userSelectionExchange,
+    });
   }
 
   // The account record behind one of this user's gatekeeper apps, or undefined
   // if `accountId` is not a UI-providing account the deployment currently
-  // offers (the same test listProvidedAccounts applies, since a "disabled"
-  // ambient gatekeeper's account stays dormant).
+  // offers (the same tests listProvidedAccounts applies, since a "disabled"
+  // ambient gatekeeper's account, or one the user's plan doesn't offer, stays
+  // dormant).
   async #uiAccountRecord(accountId: number): Promise<ConnectedAccountRecord | undefined> {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record?.description.providesUi) return undefined;
@@ -1927,6 +2127,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (record.autoProvisioned) {
       if (ambientGatekeeperMode(config, record.vendorId) === "disabled") return undefined;
     }
+    // A plan that doesn't offer the vendor dorms the account here too (see
+    // listProvidedAccounts), so its management UI is unreachable while the record stays.
+    let allowed = await this.#allowedGatekeepers();
+    if (allowed !== null && !allowed.has(record.vendorId.toLowerCase())) return undefined;
     return record;
   }
 
@@ -2644,7 +2848,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   // instantiation, and the agent's createExternalResource -- never from gadget code). An ambient
   // gatekeeper an admin set to "disabled" is blocked here too. Blocking here prevents minting a
   // capability to a disabled resource even if the request bypasses the (separately filtered)
-  // picker/agent listings.
+  // picker/agent listings. A bound SaaS's plan composes with these: a vendor the plan doesn't
+  // offer is refused the same way, with the admin's settings checked first so an admin-disabled
+  // gatekeeper keeps its message when both apply.
   async #assertResourceEnabled(vendorId: string, resource: SupportedResource) {
     let config = await readAdminConfig(this.env);
     let normalized = vendorId.toLowerCase();
@@ -2656,6 +2862,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (isResourceDisabled(config, normalized, resource.urlPattern)) {
       throw new Error(
           `The "${resource.title}" resource is disabled on this deployment by an administrator.`);
+    }
+    let allowed = await this.#allowedGatekeepers();
+    if (allowed !== null && !allowed.has(normalized)) {
+      throw createPlanRefusalError("CONNECTOR_NOT_ON_PLAN",
+          `The "${vendorId}" connector isn't available on your plan.`);
     }
   }
 
@@ -2707,13 +2918,20 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * display-name snapshot. Returns an empty array when none qualify; does not
    * choose between multiple accounts. Accounts are resolved at redemption time
    * and need not be the same accounts the user had when the ticket was minted.
+   *
+   * Each result also carries the selected user's org memberships read afresh from the org
+   * authority (#freshOrgMemberships): the snapshot a gatekeeper records at share time is what
+   * makes its org-keyed grants resolve for them, from the moment the share lands, and retires
+   * orgs whose membership has since ended.
    */
   async selectableGatekeeperUsers(vendorId: string): Promise<RedeemedGatekeeperUserSelection[]> {
     let accounts = await this.#eligibleGatekeeperAccounts(vendorId);
     if (accounts.length === 0) return [];
     let profile = { displayName: this.storage.profile.get().name };
+    // Read once and duplicated across the results, like every other per-user fact here.
+    let orgMemberships = await this.#freshOrgMemberships();
     return Promise.all(accounts.map(async account => ({
-      verifier: await account.account.getVerifier(), profile,
+      verifier: await account.account.getVerifier(), profile, orgMemberships,
     })));
   }
 

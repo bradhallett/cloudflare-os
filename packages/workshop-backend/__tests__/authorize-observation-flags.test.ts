@@ -153,8 +153,8 @@ describe("authorizeObservation's containsRestrictedData and ownerInvitesOnly fla
       // record is torn down. Bob, whom the owner added directly, keeps both.
       expect(restarts).toHaveLength(1);
       let sharing = await impl.getSharingManager();
-      expect(sharing.getEffectiveRole("dave")).toBeUndefined();
-      expect(sharing.getEffectiveRole("bob")).toBe("build");
+      expect(await sharing.getEffectiveRole("dave")).toBeUndefined();
+      expect(await sharing.getEffectiveRole("bob")).toBe("build");
       expect(impl.storage.observers.get("dave")).toBeUndefined();
       expect(impl.storage.observers.get("bob")).toBeDefined();
 
@@ -185,7 +185,7 @@ describe("authorizeObservation's containsRestrictedData and ownerInvitesOnly fla
 
       expect(impl.storage.ownerInvitesOnly.get()).toBe(true);
       expect(restarts).toEqual([]);
-      expect((await impl.getSharingManager()).getEffectiveRole("bob")).toBe("use");
+      expect(await (await impl.getSharingManager()).getEffectiveRole("bob")).toBe("use");
     });
   });
 });

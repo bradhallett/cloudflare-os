@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type MutableRefObject } from 'react'
 import { AccountDescription, SupportedResource, VendorDescription } from '@gadgets/workshop-shared/gatekeeper'
+import { matchesHotkey } from '@gadgets/ui/hotkey'
 import { useAuthenticatedApi } from './AuthContext'
 import ResourcePicker, { type SelectableItem } from './ResourcePicker'
 import { KeyHint } from './components/pickerRows'
@@ -69,7 +70,7 @@ export default function CapsuleOverlay({ url, onSelectAccount, onRefine, onDismi
   // Dismiss on Escape key.
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
+      if (matchesHotkey(e, 'escape')) {
         onDismiss()
       }
     }

@@ -1,12 +1,14 @@
 // checkUsageAndBalance consults the optional SAAS_ENTITLEMENTS port for the policy it
-// enforces (daily limit / minimum balance). With no binding — every OSS deployment — the
-// env-configured policy applies with no RPC, identical to pre-port behavior. With a bound
-// port, the port's policy decides; a failing port falls back to env config rather than
-// blocking or crashing model calls (see src/entitlements.ts).
+// enforces (daily limit / minimum balance) and, only once that policy would block a call, for
+// the plan's overage allowance. With no binding — every OSS deployment — the env-configured
+// policy applies with no RPC and a block behaves exactly as pre-port code, identical bytes. With
+// a bound port, the port's policy decides, an overage-allowing plan proceeds past the exhausted
+// allowance (the SaaS meters the spend), and a failing port falls back to env config / no gate
+// rather than blocking or crashing model calls (see src/entitlements.ts).
 
 import { describe, expect, it } from "vitest";
-import type { UsagePolicy } from "@gadgets/workshop-shared/entitlements";
-import { resolveUsagePolicy } from "../src/entitlements.js";
+import type { Entitlements, UsagePolicy } from "@gadgets/workshop-shared/entitlements";
+import { resolveEntitlements, resolveUsagePolicy } from "../src/entitlements.js";
 import { checkUsageAndBalance } from "../src/ai-gateway-billing/limits/usage-checker.js";
 import type { UserDurableObject } from "../src/user.js";
 
@@ -32,17 +34,41 @@ function fakeUserStub(withinLimits: boolean) {
   return { limits, stub: stub as unknown as DurableObjectStub<UserDurableObject> };
 }
 
-// A fake port recording the users it was asked about, answering the given policy (or throwing it).
-function fakePort(answer: UsagePolicy | Error) {
+// A fake port recording the users it was asked about, answering the given policy and
+// entitlements (or throwing the error given in its place).
+function fakePort(answer: UsagePolicy | Error, entitlements?: Entitlements | Error) {
   const queried: string[] = [];
+  const queriedEntitlements: string[] = [];
   const port = {
     resolveUsagePolicy: async (query: { userId: string }) => {
       queried.push(query.userId);
       if (answer instanceof Error) throw answer;
       return answer;
     },
+    getEntitlements: async (query: { userId: string }) => {
+      queriedEntitlements.push(query.userId);
+      if (entitlements === undefined || entitlements instanceof Error) {
+        throw entitlements ?? new Error("entitlements down");
+      }
+      return entitlements;
+    },
   };
-  return { queried, port: port as unknown as NonNullable<Cloudflare.Env["SAAS_ENTITLEMENTS"]> };
+  return {
+    queried, queriedEntitlements,
+    port: port as unknown as NonNullable<Cloudflare.Env["SAAS_ENTITLEMENTS"]>,
+  };
+}
+
+// The plan answer the overage tests switch on: hard-capped vs overage-allowing.
+function planEntitlements(overageAllowed: boolean): Entitlements {
+  return {
+    plan: overageAllowed ? "pro" : "free",
+    seats: 1,
+    monthlySpendCapUsd: overageAllowed ? 500 : 5,
+    overageAllowed,
+    allowedModelTiers: ["standard"],
+    allowedGatekeepers: [],
+  };
 }
 
 function env(overrides: Partial<Cloudflare.Env> = {}): Cloudflare.Env {
@@ -122,5 +148,91 @@ describe("checkUsageAndBalance consults the entitlements port", () => {
     expect(result.limit).toBe(Infinity);
     expect(queried).toEqual([]);
     expect(user.limits).toEqual([]);
+  });
+});
+
+describe("checkUsageAndBalance applies the plan's overage policy at the exhausted allowance", () => {
+  // The snapshot of a hard block, shared by every path that must behave like no port at all.
+  const hardBlock = {
+    allowed: false,
+    reason: "Free usage limit reached. Connect your Cloudflare account to continue.",
+    shouldUseByok: true,
+    withinLimits: false,
+    remaining: 0,
+    limit: 3,
+    windowKind: "daily",
+    resetAt: "...",
+    balance: null,
+    hasUserToken: false,
+  };
+
+  it("unbound: blocks exactly as pre-port code did", async () => {
+    const user = fakeUserStub(false);
+    // Same policy the port hands the bound tests below, but via env config and no binding: the
+    // two blocks must match byte-for-byte.
+    const result = await checkUsageAndBalance(
+        env({ DAILY_LLM_CALL_LIMIT: "3", MINIMUM_CLOUDFLARE_BALANCE: "9" }), user.stub, USER_ID);
+    expect(result).toEqual(hardBlock);
+  });
+
+  it("hard-capped plan: the block is byte-identical to the unbound one", async () => {
+    const user = fakeUserStub(false);
+    const { port } = fakePort(
+        { dailyLlmCallLimit: 3, minimumBalance: 9 }, planEntitlements(false));
+    const result = await checkUsageAndBalance(env({ SAAS_ENTITLEMENTS: port }), user.stub, USER_ID);
+    expect(result).toEqual(hardBlock);
+  });
+
+  it("overage-allowing plan: proceeds on the platform, unmetered by the checker", async () => {
+    const user = fakeUserStub(false);
+    const { queriedEntitlements, port } = fakePort(
+        { dailyLlmCallLimit: 3, minimumBalance: 9 }, planEntitlements(true));
+    const result = await checkUsageAndBalance(env({ SAAS_ENTITLEMENTS: port }), user.stub, USER_ID);
+    expect(result).toEqual({
+      ...hardBlock,
+      allowed: true,
+      reason: undefined,
+      shouldUseByok: false,
+    });
+    expect(queriedEntitlements).toEqual([USER_ID]);
+  });
+
+  it("failing entitlements consult: falls back to the block, never to a crash", async () => {
+    const user = fakeUserStub(false);
+    const { port } = fakePort(
+        { dailyLlmCallLimit: 3, minimumBalance: 9 }, new Error("entitlements down"));
+    const result = await checkUsageAndBalance(env({ SAAS_ENTITLEMENTS: port }), user.stub, USER_ID);
+    expect(result).toEqual(hardBlock);
+  });
+
+  it("never consults entitlements while the allowance covers the call", async () => {
+    const user = fakeUserStub(true);
+    const { queriedEntitlements, port } = fakePort(
+        { dailyLlmCallLimit: 3, minimumBalance: 9 }, planEntitlements(true));
+    const result = await checkUsageAndBalance(env({ SAAS_ENTITLEMENTS: port }), user.stub, USER_ID);
+    expect(result.allowed).toBe(true);
+    expect(result.shouldUseByok).toBe(false);
+    expect(queriedEntitlements).toEqual([]);
+  });
+});
+
+describe("resolveEntitlements (SaaS entitlements adapter)", () => {
+  it("reports unbound when no port is bound, without consulting anything", async () => {
+    expect(await resolveEntitlements(env(), USER_ID)).toEqual({ status: "unbound" });
+  });
+
+  it("asks the bound port for the user's entitlements", async () => {
+    const { queriedEntitlements, port } = fakePort(
+        { dailyLlmCallLimit: 3, minimumBalance: 9 }, planEntitlements(true));
+    expect(await resolveEntitlements(env({ SAAS_ENTITLEMENTS: port }), USER_ID))
+        .toEqual({ status: "resolved", entitlements: planEntitlements(true) });
+    expect(queriedEntitlements).toEqual([USER_ID]);
+  });
+
+  it("reports a failed port as unavailable, so the plan gates fail closed", async () => {
+    const { port } = fakePort(
+        { dailyLlmCallLimit: 3, minimumBalance: 9 }, new Error("entitlements down"));
+    expect(await resolveEntitlements(env({ SAAS_ENTITLEMENTS: port }), USER_ID))
+        .toEqual({ status: "unavailable" });
   });
 });

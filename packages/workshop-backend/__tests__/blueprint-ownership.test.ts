@@ -248,9 +248,10 @@ describe("blueprint owner subjects", () => {
   });
 
   it("adds an org's blueprint to a member's library alone, through the user DO", async () => {
-    let { orgId, member, outsider } = await orgWithMembers();
+    let { orgId, owner, member, outsider } = await orgWithMembers();
     let metadata = metadataFor("Org library");
-    await putRecord(blueprintKvKey({ type: "org", id: orgId }, "library-only"), recordOf(metadata));
+    await putRecord(blueprintKvKey({ type: "org", id: orgId }, "library-only"),
+        recordOf(metadata, { type: "org", id: orgId }));
 
     // The member's own DO resolves the blueprint as its membership allows.
     await env.TEST_USER.getByName(member).addBlueprintToLibrary("library-only");
@@ -266,5 +267,17 @@ describe("blueprint owner subjects", () => {
     } catch (err) {
       expect((err as Error).message).toMatch(/Blueprint not found/);
     }
+    // The listing re-checks membership live: the member still sees it, and so does the org's
+    // owner, who holds the same org-owned blueprint in their own library.
+    await env.TEST_USER.getByName(owner).addBlueprintToLibrary("library-only");
+    expect((await env.TEST_USER.getByName(member).listLibraryBlueprints())
+        .map(entry => entry.id)).toEqual(["library-only"]);
+
+    // ...and once removed from the org, no longer does -- while the owner, still a member,
+    // keeps theirs. The record is kept: a re-add restores the listing, and opening re-resolves.
+    await env.TEST_ORG.getByName(orgId).removeMember(owner, member);
+    expect(await env.TEST_USER.getByName(member).listLibraryBlueprints()).toEqual([]);
+    expect((await env.TEST_USER.getByName(owner).listLibraryBlueprints())
+        .map(entry => entry.id)).toEqual(["library-only"]);
   }, 30000);
 });

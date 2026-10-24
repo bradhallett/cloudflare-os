@@ -130,6 +130,13 @@ type LibraryBlueprintRecord = {
   metadata: BlueprintMetadata;
   addedAt: Date;
   uploaded: boolean;
+  /**
+   * The org whose member added this org-owned blueprint. The library listing re-checks active
+   * membership of that org live (listLibraryBlueprints): a removed member's entry is withheld
+   * until they are re-added. Records written before the field exists carry none and list
+   * ungated, as they always did.
+   */
+  orgOwner?: string;
 };
 
 export type GadgetRecord = GadgetMetadata & {
