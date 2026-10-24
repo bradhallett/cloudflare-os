@@ -262,6 +262,60 @@ describe("org membership", () => {
     expect((await org(id).acceptInvitation(BOB)).role).toBe("admin");
   });
 
+  it("a pending invited owner does not dilute the sole active owner's protection", async () => {
+    const { alice: ALICE, bob: BOB } = people();
+    const { id } = await createOrg("Acme", ALICE);
+    await org(id).inviteMember(ALICE, BOB, "owner");
+
+    // Bob's invitation is at the owner role, but he is not an owner yet: Alice remains the sole
+    // active owner, so she can neither leave nor demote herself against a phantom second owner.
+    expect(await failure(() => org(id).memberLeave(ALICE)))
+        .toBe("An organization must keep at least one owner; hand ownership over first.");
+    expect(await failure(() => org(id).changeMemberRole(ALICE, ALICE, "member")))
+        .toBe("An organization must keep at least one owner; hand ownership over first.");
+
+    // The pending owner invitation can be revoked by removal, without stranding the org.
+    await org(id).removeMember(ALICE, BOB);
+    expect(await org(id).getMember(BOB)).toBeNull();
+    expect(await org(id).getMember(ALICE)).toMatchObject({ role: "owner", status: "active" });
+    expect(await myMemberships(BOB)).toEqual([]);
+  });
+
+  it("an expired invited owner is swept without touching the last active member record", async () => {
+    const { alice: ALICE, bob: BOB } = people();
+    const { id } = await createOrg("Acme", ALICE);
+    await org(id).inviteMember(ALICE, BOB, "owner");
+    await expireInvitation(id, BOB);
+
+    // The sweep removes only the invited record; the active owner stays put.
+    expect(await org(id).describeForMember(BOB)).toBeNull();
+    expect(await org(id).getMember(BOB)).toBeNull();
+    expect(await org(id).getMember(ALICE)).toMatchObject({ role: "owner", status: "active" });
+    expect((await org(id).listMembersFor(ALICE)).map(m => m.userId)).toEqual([ALICE]);
+  });
+
+  it("an owner may remove a co-owner; the sole active owner still cannot be removed", async () => {
+    const { alice: ALICE, bob: BOB, carol: CAROL } = people();
+    const { id } = await createOrg("Acme", ALICE);
+    await org(id).inviteMember(ALICE, BOB, "owner");
+    await org(id).acceptInvitation(BOB);
+    await org(id).inviteMember(ALICE, CAROL, "owner");
+    await org(id).acceptInvitation(CAROL);
+
+    // Equal rank: either owner removes a co-owner.
+    await org(id).removeMember(BOB, CAROL);
+    expect(await org(id).getMember(CAROL)).toBeNull();
+    expect(await myMemberships(CAROL)).toEqual([]);
+
+    // Two active owners remain, so Alice may remove Bob too — leaving herself sole owner,
+    // where the last-owner protection takes over again.
+    await org(id).removeMember(ALICE, BOB);
+    expect(await org(id).getMember(BOB)).toBeNull();
+    expect(await failure(() => org(id).removeMember(ALICE, ALICE)))
+        .toBe("An organization must keep at least one owner; hand ownership over first.");
+    expect(await org(id).getMember(ALICE)).toMatchObject({ role: "owner", status: "active" });
+  });
+
   it("revoking an invitation by removal frees the invitee to be re-invited", async () => {
     const { alice: ALICE, bob: BOB } = people();
     const { id } = await createOrg("Acme", ALICE);

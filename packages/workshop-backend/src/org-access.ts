@@ -18,7 +18,7 @@ export type OrgAccess = {
   role: OrgRole | null;
   /** The user's membership status, or null when they are not a member. */
   status: OrgMemberStatus | null;
-  /** How many members currently hold the owner role. */
+  /** How many *active* members currently hold the owner role. */
   ownerCount: number;
   invitePolicy: OrgInvitePolicy;
 };
@@ -69,11 +69,12 @@ export function canUpdateSettings(access: OrgAccess): boolean {
 
 /**
  * Whether the user may remove the member holding `targetRole` (never the target's own last-owner
- * protection — see wouldLoseLastOwner). Owners remove anyone, admins remove members, and an
- * ordinary member removes only themself, which is what leaveOrg() does.
+ * protection — see wouldLoseLastOwner). Owners remove anyone (a co-owner included), admins
+ * remove members, and an ordinary member removes only themself, which is what leaveOrg() does.
  */
 export function canRemoveMember(access: OrgAccess, targetRole: OrgRole): boolean {
   if (!isActingMember(access) || access.role === null) return false;
+  if (access.role === "owner") return true;
   return ROLE_RANK[access.role] > ROLE_RANK[targetRole];
 }
 
