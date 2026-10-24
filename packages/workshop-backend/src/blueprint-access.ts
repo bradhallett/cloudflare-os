@@ -8,6 +8,7 @@
 
 import type { OrgDurableObject } from './org.js';
 import { isActiveMember } from './org-access.js';
+import { retryOnDoReset } from './do-retry.js';
 import {
   blueprintKvKey, isReservedBlueprintKey, listOrgBlueprintKvRecords, parseBlueprintKvRecord,
   readBlueprintKvRecord, type BlueprintKvEnv, type BlueprintKvRecord, type ScopedBlueprintRecord,
@@ -31,7 +32,9 @@ export async function resolveBlueprintForUser(
     let raw = await env.BLUEPRINTS.get(blueprintKvKey({type: 'org', id: orgId}, blueprintId));
     if (raw === null) continue;
     // The record exists in an org's scope: only a member of that org reads it, checked live.
-    if (!isActiveMember(await orgs.getByName(orgId).getMember(userId))) return null;
+    // A pure read, retried across an org-DO reset like the server's org reads (retryOnDoReset).
+    if (!isActiveMember(await retryOnDoReset(() => orgs.getByName(orgId).getMember(userId))))
+      return null;
     return parseBlueprintKvRecord(raw);
   }
   return null;
@@ -48,7 +51,9 @@ export async function orgBlueprintsForMember(
   let result: ScopedBlueprintRecord[] = [];
   for (let orgId of orgIds) {
     if (orgId.includes('/')) continue;
-    if (!isActiveMember(await orgs.getByName(orgId).getMember(userId))) continue;
+    // Live membership again, retried as a read (see resolveBlueprintForUser).
+    if (!isActiveMember(await retryOnDoReset(() => orgs.getByName(orgId).getMember(userId))))
+      continue;
     result.push(...await listOrgBlueprintKvRecords(env, orgId));
   }
   return result;

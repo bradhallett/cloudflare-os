@@ -8,6 +8,7 @@ import type { MergeResult } from "./git-store";
 import { FormatOffer, listFormatOffers, readAdminConfig } from "./admin-config";
 import { listFeaturedBlueprintsFromKv } from "./storage-schema/blueprints-kv";
 import { orgBlueprintsForMember } from "./blueprint-access";
+import { retryOnDoReset } from "./do-retry";
 import { SharingManager } from "./sharing";
 import type { GadgetExportFormat } from "@gadgets/workshop-shared/api";
 import { renderGadgetInBrowser } from "./browser-export";
@@ -392,7 +393,8 @@ export abstract class OverseerMainline extends OverseerChanges {
     // "user" turns, the spawning gadget's owner for "gadget" turns (see AiChatAuthorInfo) -- the
     // same resolution executeCodeMode uses for its self-loopback props.
     let userStub = this.users.get(this.users.idFromName(initiator.id));
-    let orgIds = (await userStub.listOrgMemberships()).map(entry => entry.orgId);
+    let orgIds = (await retryOnDoReset(() => userStub.listOrgMemberships()))
+        .map(entry => entry.orgId);
     let [own, orgs, library, featured, formats] = await Promise.all([
       userStub.listBlueprints(),
       orgBlueprintsForMember(this.env, this.ctx.exports.OrgDurableObject, orgIds, initiator.id),
