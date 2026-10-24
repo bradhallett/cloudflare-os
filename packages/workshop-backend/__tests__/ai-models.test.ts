@@ -16,6 +16,7 @@ import {
   getModel, isRuntimeModel, LanguageModelGatekeeper, type ModelHandle,
 } from "../src/ai-models.js";
 import { LIMIT_ERROR_MESSAGES } from "@gadgets/workshop-shared/limits";
+import type { UsageEvent } from "@gadgets/workshop-shared/usage-events";
 import type { UserDurableObject } from "../src/user.js";
 
 // These tests exercise the real pi-ai stack: no module mocks. Routing decisions are asserted on
@@ -1602,9 +1603,10 @@ describe("model binding usage gate", () => {
     return gatekeeper.startSession(undefined as never);
   }
 
-  function decisionBinding(users: DurableObjectNamespace<UserDurableObject>, ownerUserId?: string) {
+  function decisionBinding(users: DurableObjectNamespace<UserDurableObject>, ownerUserId?: string,
+      envOverrides: Partial<Cloudflare.Env> = {}) {
     const gatekeeper = Object.create(DecisionModelGatekeeper.prototype) as DecisionModelGatekeeper;
-    const props = gatekeeperProps(users, ownerUserId);
+    const props = gatekeeperProps(users, ownerUserId, envOverrides);
     Object.assign(gatekeeper, {
       ...props,
       ctx: { ...props.ctx, props: { ...props.ctx.props, config: {
@@ -1664,6 +1666,80 @@ describe("model binding usage gate", () => {
     await expect(binding.run({ prompt: "hello" })).rejects.toThrow();
     expect(consumed).toHaveLength(0);
     expect(capturedRequests).toHaveLength(1);
+  });
+
+  // #17's binding seam: decide() must meter a classifier call's spend as run() meters a
+  // completion's. The port is a plain object in this isolate and the gatekeeper runs as a
+  // plain object (no Durable Object), so recordUsage fires synchronously — emission is
+  // observable the moment decide() resolves, deterministically.
+  describe("decide() usage emission", () => {
+    const recorded: UsageEvent[] = [];
+
+    beforeEach(() => {
+      recorded.length = 0;
+    });
+
+    // pi's System One envelope for DECISION_REQUEST's one bool question (wire type "noul"),
+    // with or without the token counts a classifier service reports (input and output only,
+    // so the cache classes meter as zero).
+    function classifyResponse(withUsage: boolean): typeof fetch {
+      return async () => Response.json({
+        success: true,
+        result: {
+          model: "@cf/cloudflare/clef",
+          answers: { sky: { type: "noul", noul: 0.9 } },
+          ...(withUsage ? { usage: { input_tokens: 11, output_tokens: 19 } } : {}),
+        },
+      });
+    }
+
+    // An env whose SAAS_USAGE_EVENTS records into `recorded`, as a bound deployment's would.
+    function boundPort(): Partial<Cloudflare.Env> {
+      return {
+        SAAS_USAGE_EVENTS: {
+          recordUsage: async (event: UsageEvent) => {
+            recorded.push(event);
+            return "queued";
+          },
+        },
+      } as Partial<Cloudflare.Env>;
+    }
+
+    it("emits one event with the classifier's model id and token classes", async () => {
+      vi.stubGlobal("fetch", classifyResponse(true));
+      const { namespace } = usersNamespace(true);
+      const binding = await decisionBinding(namespace, OWNER_ID, boundPort());
+      expect(await binding.decide(DECISION_REQUEST))
+          .toEqual({ sky: { type: "bool", probability: 0.9 } });
+      expect(recorded).toHaveLength(1);
+      const [event] = recorded;
+      expect(event!.id).toMatch(/^rnd:/);
+      expect(event!.modelId).toBe("@cf/cloudflare/clef");
+      expect(event!.tokens).toStrictEqual({ input: 11, cacheRead: 0, cacheWrite: 0, output: 19 });
+      expect(event!.userId).toBe(OWNER_ID);
+      expect(event!.surface).toBe("binding");
+    });
+
+    it("emits nothing when the service reported no token counts, or the binding has no owner",
+        async () => {
+      vi.stubGlobal("fetch", classifyResponse(false));
+      const { namespace } = usersNamespace(true);
+      await (await decisionBinding(namespace, OWNER_ID, boundPort())).decide(DECISION_REQUEST);
+      // A pre-gating binding carries no ownerUserId, so it meters nowhere (see run()).
+      await (await decisionBinding(namespace, undefined, boundPort())).decide(DECISION_REQUEST);
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+      expect(recorded).toEqual([]);
+    });
+
+    it("is a no-op with no port bound: decide still answers", async () => {
+      vi.stubGlobal("fetch", classifyResponse(true));
+      const { namespace } = usersNamespace(true);
+      // The env carries no SAAS_USAGE_EVENTS at all (every OSS deployment's shape): the
+      // classifier reports usage, but there is nothing to emit to and nothing may throw.
+      const binding = await decisionBinding(namespace, OWNER_ID);
+      expect(await binding.decide(DECISION_REQUEST))
+          .toEqual({ sky: { type: "bool", probability: 0.9 } });
+    });
   });
 });
 

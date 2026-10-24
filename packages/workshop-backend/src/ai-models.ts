@@ -37,6 +37,7 @@ import {
 } from "./ai-gateway.js";
 import { completeText } from "./ai-invoke.js";
 import { bindingUsageGate } from "./ai-model-usage-gate.js";
+import { emitUsageEvent, usageTokens } from "./usage-events.js";
 import { resolveEntitlements } from "./entitlements.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
 import {
@@ -1192,7 +1193,17 @@ export class LanguageModelGatekeeper
     });
     let usageGate = bindingUsageGate(
         this.env, this.ctx.props.ownerUserId, this.ctx.exports.UserDurableObject);
-    return new LanguageModelBindingImpl(model, usageGate);
+    // Meter the binding's one-shot calls (#17's seam): the owner is in scope here, and the
+    // hook fires only on completions (never errors), fire-and-forget at the port (OSS unbound:
+    // no-op). pi reports usage per request; completeText would otherwise discard it.
+    let onUsage = this.ctx.props.ownerUserId === undefined ? undefined
+        : (usage: Usage) => emitUsageEvent(this.env, {
+              modelId: model.model.id,
+              tokens: usageTokens(usage),
+              userId: this.ctx.props.ownerUserId!,
+              surface: "binding",
+            });
+    return new LanguageModelBindingImpl(model, usageGate, onUsage);
   }
 
   applyAction(action: number): Promise<void> {
@@ -1218,7 +1229,8 @@ export class LanguageModelGatekeeper
 
 @validateRpc()
 class LanguageModelBindingImpl extends RpcTarget implements LanguageModelBinding {
-  constructor(private model: ModelHandle, private usageGate: () => Promise<void>) {
+  constructor(private model: ModelHandle, private usageGate: () => Promise<void>,
+      private onUsage?: (usage: Usage) => void) {
     super();
   }
 
@@ -1231,6 +1243,7 @@ class LanguageModelBindingImpl extends RpcTarget implements LanguageModelBinding
       prompt: options.prompt,
       systemPrompt: options.systemPrompt,
       cache: true,
+      onUsage: this.onUsage,
     });
   }
 }
@@ -1263,8 +1276,19 @@ export class DecisionModelGatekeeper
     await refuseRevokedModel(this.env, this.ctx.props);
     let usageGate = bindingUsageGate(
         this.env, this.ctx.props.ownerUserId, this.ctx.exports.UserDurableObject);
+    // Meter the binding's classifier calls as the LLM binding meters run() (#17's seam): the
+    // owner is in scope here, and decide() would otherwise discard the usage pi reports on the
+    // result. Fire-and-forget at the port (OSS unbound: no-op); config.model is the catalog id
+    // the classifier catalog is keyed by, so it is the id a price table resolves.
+    let onUsage = this.ctx.props.ownerUserId === undefined ? undefined
+        : (usage: Usage) => emitUsageEvent(this.env, {
+              modelId: config.model,
+              tokens: usageTokens(usage),
+              userId: this.ctx.props.ownerUserId!,
+              surface: "binding",
+            });
     return new DecisionModelBindingImpl(
-        getDecisionModel(this.env, config, initiator, metadata), usageGate);
+        getDecisionModel(this.env, config, initiator, metadata), usageGate, onUsage);
   }
 
   applyAction(action: number): Promise<void> {
@@ -1290,13 +1314,18 @@ export class DecisionModelGatekeeper
 
 @validateRpc()
 class DecisionModelBindingImpl extends RpcTarget implements DecisionModelBinding {
-  constructor(private model: DecisionModel, private usageGate: () => Promise<void>) {
+  constructor(private model: DecisionModel, private usageGate: () => Promise<void>,
+      private onUsage?: (usage: Usage) => void) {
     super();
   }
 
   async decide(request: DecisionRequest): Promise<Record<string, DecisionAnswer>> {
     await this.usageGate();
     let result = await this.model(request);
+    // Meter the call whenever the service reported token counts — before the failure check
+    // below, since pi keeps usage on a result whose answers failed to parse ("was still
+    // billed") and the tokens were spent either way. Fire-and-forget, like run()'s hook.
+    if (result.usage !== undefined) this.onUsage?.(result.usage);
     // pi reports a failure in the result; gadget code expects a rejection, as completeText()
     // gives the LLM binding.
     if (result.stopReason !== "stop") throw new Error(result.errorMessage);
