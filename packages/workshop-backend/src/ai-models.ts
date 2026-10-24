@@ -37,6 +37,7 @@ import {
 } from "./ai-gateway.js";
 import { completeText } from "./ai-invoke.js";
 import { bindingUsageGate } from "./ai-model-usage-gate.js";
+import { resolveEntitlements } from "./entitlements.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
 import {
   estimateSharedHeadTokens, hasGpt56PromptCaching, splitSystemPrompt,
@@ -1111,7 +1112,9 @@ export type AiModelGatekeeperProps = {
   metadata?: GatewayMetadataContext,
   /**
    * The workspace owner whose LLM allowance the binding's calls count against, set at mint.
-   * Undefined only on bindings minted before spend gating existed (see bindingUsageGate).
+   * Also the user whose plan re-approves the binding's model tier on every session (see
+   * refuseRevokedModel). Undefined only on bindings minted before spend gating existed (see
+   * bindingUsageGate).
    */
   ownerUserId?: string,
 };
@@ -1120,12 +1123,31 @@ export type AiModelGatekeeperProps = {
  * Throws if the deployment no longer lets a model binding run its model. A session starts on each
  * call of the binding, so a binding minted before an admin disabled its gateway model stops working
  * at its next call. While users may not add their own models, so does a binding for any other
- * model: one a user added, or one the admin added and removed.
+ * model: one a user added, or one the admin added and removed. A durable binding also outlives the
+ * plan it was minted under, so when it names a workspace owner (ownerUserId) its model's catalog
+ * tier is re-checked against that owner's plan on every session — mirroring the #requireModel
+ * refusal a chat naming the model gets (see UserDurableObject) — and a downgrade stops the binding
+ * at its next call rather than running a premium tier forever.
  */
 async function refuseRevokedModel(env: Cloudflare.Env, props: AiModelGatekeeperProps) {
   let models = await getGatewayModels(env);
-  if (models?.get(props.config.model)?.provider === props.config.provider) {
-    models.refuseDisabled(props.config.model);
+  let entry = models?.get(props.config.model);
+  if (entry?.provider === props.config.provider) {
+    models!.refuseDisabled(props.config.model);
+    if (props.ownerUserId !== undefined) {
+      let answer = await resolveEntitlements(env, props.ownerUserId);
+      if (answer.status === "resolved") {
+        if (entry.tier !== undefined &&
+            !answer.entitlements.allowedModelTiers.includes(entry.tier)) {
+          throw new Error(`The "${entry.name}" model isn't available on your plan.`);
+        }
+      } else if (answer.status === "unavailable" && entry.tier !== undefined) {
+        // A bound plan service that failed reads as the empty tier set, as it does for the
+        // chat-side gate (see #allowedModelTiers); "unbound" is an OSS deployment, where no
+        // gate applies at all.
+        throw new Error(`The "${entry.name}" model isn't available on your plan.`);
+      }
+    }
   } else {
     models?.refuseUserModel(props.displayName);
   }

@@ -1316,8 +1316,9 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       // `defaultGadgetId` can be cached in memory after it is first read.
       defaultGadgetId: <WorkpieceId | undefined>undefined,
 
-      // External-message Gadgets claim ownership before registering in the owner's UserDO. If that
-      // registration fails, this keeps the owner-table write retryable.
+      // Gadgets register in the owner's UserDO before any workspace state is written, so nothing
+      // sets this for new workspaces anymore; it remains only to complete registration of
+      // pre-fix workspaces that were created before their (cap-refused) registration.
       ownerRegistrationPending: false,
 
       codeVersion: 0,

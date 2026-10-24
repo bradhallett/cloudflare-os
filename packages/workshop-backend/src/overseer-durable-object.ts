@@ -296,14 +296,23 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       };
     }
 
-    // Create the Gadget if it doesn't exist yet.
+    // Create the Gadget if it doesn't exist yet. Registering it with its (about-to-be) owner
+    // comes FIRST: the registry row is the same plan-capped write a browser newGadget makes, so
+    // an at-cap plan is refused here — before this Durable Object holds any workspace state it
+    // could be locked out of. newGadget is idempotent per workspace, so a message retried after
+    // a crash between the two writes completes rather than being re-refused by its own row.
     let ownerId = this.impl.ownerId;
     if (!ownerId) {
+      let caller = this.impl.users.get(this.impl.users.idFromString(callerId));
+      try {
+        await caller.newGadget(this.ctx.id.toString(), input.title);
+      } catch (err) {
+        return { accepted: false, message: stringifyError(err) };
+      }
       this.impl.ownerId = callerId;
       this.impl.ownerProfileId = callerProfile.id;
       this.impl.storage.ownerId.put(callerId);
       this.impl.storage.title.put(input.title);
-      this.impl.storage.ownerRegistrationPending.put(true);
       this.#initializeNewWorkspace();
       ownerId = callerId;
       this.impl.recordGadgetAnalytics({
@@ -362,7 +371,10 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       leaveSession = this.impl.joinSession("build");
     }
 
-    // Complete pending registration in the owner's UserDO.
+    // Complete a registration left pending by a claim that predates the register-first order
+    // above (or died between its writes). The workspace already exists, so this is the
+    // cap-exempt ensureGadgetRegistered: a plan cap must never lock an owner out of a workspace
+    // this object already holds.
     if (this.impl.storage.ownerRegistrationPending.get()) {
       let owner = this.impl.users.get(this.impl.users.idFromString(ownerId));
       await owner.ensureGadgetRegistered(this.ctx.id.toString(), this.impl.storage.title.get());

@@ -183,6 +183,7 @@ describe("GatewayModels", () => {
     expect(models.get("claude-opus-5-5")).toStrictEqual({
       provider: "anthropic", id: "claude-opus-5-5", name: "Claude Opus 5.5",
       contextWindow: 1000000, mode: "enabled", defaultMode: "enabled", added: false,
+      tier: "premium",
     });
     expect(models.get("gpt-6-sol")).toMatchObject(
         { outputLimit: 128000, mode: "hidden", defaultMode: "hidden", added: false });
@@ -363,6 +364,7 @@ describe("GatewayModels", () => {
       expect(models.get("claude-opus-5-5")).toStrictEqual({
         provider: "anthropic", id: "claude-opus-5-5", name: "Claude Opus 5.5",
         contextWindow: 1000000, mode: "enabled", defaultMode: "enabled", added: false,
+        tier: "premium",
         settings: { reasoning: "low" },
       });
       expect(models.resolve("claude-opus-5-5")?.config)
