@@ -14,7 +14,7 @@ import { UserDurableObject } from "./user";
 import { recordAnalytics } from "./analytics";
 import type { ProductAnalyticsGadgetInput } from "./analytics";
 import { AutoApprovalDrainer } from "./auto-approval";
-import { createWorkshopLogger } from "./observability";
+import { createWorkshopLogger, type WorkshopLogger } from "./observability";
 import type { LiveChatContext, SessionKind } from "./overseer-support";
 import { AGENT_KEEPALIVE_ALARM_MS, AGENT_RESPONSE_DELIVERED_RETENTION_MS, CHAT_CHANGE_RETIRED_TTL_MS } from "./overseer-support";
 import { ChatCacheWarmer } from "./chat-cache-warming";
@@ -30,16 +30,39 @@ const logger = createWorkshopLogger("workshop.overseer");
  * the former single-file overseer.ts. This layer only depends on layers before it.
  */
 export abstract class OverseerCore {
+  #logger: WorkshopLogger;
+
+  /** This workspace's owning org; undefined on user-owned workspaces (see `ownerSubject`). */
+  #owningOrgId?: string;
+
   constructor(public ctx: DurableObjectState, public env: Cloudflare.Env) {
-    this.logger = logger.with({ gadgetId: ctx.id.toString() });
+    this.#logger = logger.with({ gadgetId: ctx.id.toString() });
     this.storage = makeOverseerStorage(ctx.storage);
     this.gitStore = new GitStore(this.storage.gitObjects);
     this.users = this.ctx.exports.UserDurableObject;
     this.ownerId = this.storage.ownerId.get();
+    const subject = this.storage.ownerSubject.get();
+    if (subject?.type === "org") this.adoptOwningOrg(subject.id);
   }
   public storage: OverseerStorage;
 
-  readonly logger: ReturnType<typeof createWorkshopLogger>;
+  /**
+   * The workspace's logger: its id always, plus its owning org's id once the workspace is
+   * org-owned -- the org observability convention, `logger.with({orgId})` on org-owned surfaces.
+   */
+  get logger(): WorkshopLogger {
+    return this.#logger;
+  }
+
+  /**
+   * Adopts `orgId` as this workspace's owning org: folds it into the logger and stamps it on the
+   * workspace's later activity events. Ownership is one-way (see transferToOrg), so never un-set.
+   */
+  adoptOwningOrg(orgId: string): void {
+    this.#owningOrgId = orgId;
+    this.#logger = logger.with({ gadgetId: this.ctx.id.toString(), orgId });
+  }
+
 
   /**
    * Identifies this DO instance. Sent to chat subscribers so they can detect a full server
@@ -801,6 +824,8 @@ export abstract class OverseerCore {
       ...event,
       gadget_id: this.ctx.id.toString(),
       gadget_owner_user_id: this.ownerId,
+      // Org context exists only on org-owned workspaces; a user-owned one records no org.
+      ...(this.#owningOrgId !== undefined ? { gadget_org_id: this.#owningOrgId } : {}),
     });
   }
 

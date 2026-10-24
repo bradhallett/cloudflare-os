@@ -1630,8 +1630,10 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
     await this.impl.ctx.exports.OrgDurableObject.getByName(orgId)
         .addOwnedGadget(this.clientProfileId, gadgetId);
     this.impl.storage.ownerSubject.put({ type: "org", id: orgId });
+    // From here on the workspace's logger and activity events carry the owning org.
+    this.impl.adoptOwningOrg(orgId);
     this.impl.logger.info("transferred workspace to an organization", {
-      event: "workspace.transfer.org.completed", orgId,
+      event: "workspace.transfer.org.completed",
     });
     // Everyone -- the transferring owner included -- is now authorized through the org's
     // membership, so sever all live sessions (this one too); each client reopens and re-checks.
