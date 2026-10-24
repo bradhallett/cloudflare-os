@@ -330,7 +330,9 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
     const org = this.#org();
     const member = this.storage.members.get(userId);
     if (member === undefined) throw new Error("You are not a member of this organization.");
-    if (wouldLoseLastOwner(this.#accessFor(userId), member.role)) {
+    // A pending invitation is never the last owner being protected above: an invited owner can
+    // always decline, even while the org has exactly one active owner.
+    if (isActiveMember(member) && wouldLoseLastOwner(this.#accessFor(userId), member.role)) {
       throw new Error(
           "An organization must keep at least one owner; hand ownership over first.");
     }

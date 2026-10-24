@@ -281,6 +281,19 @@ describe("org membership", () => {
     expect(await myMemberships(BOB)).toEqual([]);
   });
 
+  it("a pending invited owner can decline while a sole active owner remains", async () => {
+    const { alice: ALICE, bob: BOB } = people();
+    const { id } = await createOrg("Acme", ALICE);
+    await org(id).inviteMember(ALICE, BOB, "owner");
+
+    // Bob leaving is declining the invitation: his pending record was never an active owner,
+    // so Alice's sole ownership does not refuse him.
+    await org(id).memberLeave(BOB);
+    expect(await org(id).getMember(BOB)).toBeNull();
+    expect(await myMemberships(BOB)).toEqual([]);
+    expect(await org(id).getMember(ALICE)).toMatchObject({ role: "owner", status: "active" });
+  });
+
   it("an expired invited owner is swept without touching the last active member record", async () => {
     const { alice: ALICE, bob: BOB } = people();
     const { id } = await createOrg("Acme", ALICE);
