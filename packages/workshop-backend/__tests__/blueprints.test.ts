@@ -20,19 +20,23 @@ import {
   buildReleasePack, buildSnapshotRelease, encodeReleaseCommit, listReleaseFiles, readReleasePack,
   releaseMergeHeader, releasesMergedBy, type GitObjectMap,
 } from "../src/blueprint-release";
+import type { OrgDurableObject } from "../src/org.js";
 import {
   buildPackBytes, concatBytes, encodeGitCommit, encodeGitTree, gitObjectOid, parseGitCommitRefs,
   type GitCommitHeader,
 } from "../src/git-codec";
 import type { OverseerDurableObject } from "../src/overseer.js";
 import type { UserDurableObject } from "../src/user.js";
-import { parseBlueprintKvRecord } from "../src/storage-schema/blueprints-kv";
+import {
+  blueprintKvKey, parseBlueprintKvRecord,
+} from "../src/storage-schema/blueprints-kv";
 import { BUNDLED_BLUEPRINTS } from "../src/generated/bundled-blueprints";
 
 declare module "cloudflare:workers" {
   interface ProvidedEnv {
     TEST_OVERSEER: DurableObjectNamespace<OverseerDurableObject>;
     TEST_USER: DurableObjectNamespace<UserDurableObject>;
+    TEST_ORG: DurableObjectNamespace<OrgDurableObject>;
   }
 }
 
@@ -85,7 +89,9 @@ let counter = 0;
 // Opens the real OverseerClientInterface (as the owner, build role) over a fresh Overseer. The
 // owner id is planted directly rather than going through open()'s first-open initialization,
 // and the two open()-time side effects that call out to the owner's user DO are stubbed.
-async function withWorkspace(fn: (workspace: Workspace) => Promise<void>): Promise<void> {
+// `orgIds` is the owner's org index, for the tests of org-owned blueprints.
+async function withWorkspace(
+    fn: (workspace: Workspace) => Promise<void>, orgIds: string[] = []): Promise<void> {
   let stub = env.TEST_OVERSEER.getByName(`blueprints-${++counter}`);
   await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
     let impl = (instance as unknown as { impl: any }).impl;
@@ -99,13 +105,14 @@ async function withWorkspace(fn: (workspace: Workspace) => Promise<void>): Promi
       getChatContext: async (modelId: string | null) =>
           ({ profile: OWNER, ...(modelId ? { aiModel: AI_MODEL } : {}) }),
       listGatekeeperVendors: async () => [],  // asked at the start of every agent turn
-      listOrgMemberships: async () => [],  // no orgs own anything in these tests
+      listOrgMemberships: async () => orgIds.map(orgId => ({ orgId })),  // the mirrored index
       updateBlueprint: async () => false,  // not featured
       deleteBlueprint: async () => {},
       setGadgetLastActive: async () => {},
     };
     impl.users = {
-      idFromString: (id: string) => ({ name: OWNER.id, toString: () => id }),
+      // As workerd's real idFromString: an id that carries no `.name`.
+      idFromString: (id: string) => ({ toString: () => id }),
       idFromName: (name: string) => ({ name }),
       get: () => owner,
     };
@@ -1586,6 +1593,30 @@ describe("applying a blueprint to a gadget", () => {
       });
     });
   });
+
+  it("applies an org's blueprint to a gadget as a member, through the real idFromString shape",
+      async () => {
+        let orgId = `blueprints-org-${++counter}`;
+        await env.TEST_ORG.getByName(orgId).initializeOrg("Acme", OWNER.id);
+        let owner = { type: "org" as const, id: orgId };
+        let pack = await buildSnapshotRelease(new Map(Object.entries(V1)));
+        let metadata = metadataFor("Org-owned", { commitId: pack.commitId });
+        await env.BLUEPRINT_CONTENT.put(
+            blueprintContentKey(owner, "org-applied", metadata),
+            concatBytes(await buildPackBytes([...pack.objects.values()])));
+        // Org-owned: stored in the org's KV scope, invisible to the public by-id read.
+        kv.set(blueprintKvKey(owner, "org-applied"), JSON.stringify({ metadata, owner }));
+
+        await withWorkspace(async workspace => {
+          let { impl } = workspace;
+          await commitToGadget(impl, V2);
+          // The fake user-DO namespace mints ids the way workerd's idFromString does, with no
+          // `.name` (see withWorkspace): applying must resolve the blueprint through the user
+          // identifier the org actually keys members by, which the org answers for live.
+          let chatId = await propose(workspace, "org-applied", { allowUnrelated: true });
+          expect(proposal(impl, chatId).merge.kind).toBe("fastForward");
+        }, [orgId]);
+      }, 30000);
 
   it("withdraws a proposal that is reverted or whose chat is deleted", async () => {
     let alice = await publishVersions("Alice's", [V1, V2]);

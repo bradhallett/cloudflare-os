@@ -3,6 +3,8 @@ import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, Redacted
 import { ActionDescription, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperUserSelection, GatekeeperUserSelectionExchange, RedeemedGatekeeperUserSelection } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { botKey, normalizeBotDefinition } from "./bot-config.js";
+import { isActiveMember } from "./org-access.js";
+import { retryOnDoReset } from "./do-retry.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
@@ -1486,8 +1488,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     let existing = this.storage.libraryBlueprints.get(id);
+    let orgOwner = kvRecord.owner?.type === "org" ? kvRecord.owner.id : undefined;
     if (existing) {
       existing.metadata = kvRecord.metadata;
+      existing.orgOwner = orgOwner;
       this.storage.libraryBlueprints.put(existing);
       return;
     }
@@ -1497,6 +1501,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       metadata: kvRecord.metadata,
       addedAt: new Date(),
       uploaded: false,
+      // The org whose member this blueprint belongs to, if any: the listing's live gate.
+      orgOwner,
     });
   }
 
@@ -1619,7 +1625,26 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async listLibraryBlueprints(): Promise<BlueprintLibrarySummary[]> {
     let result: BlueprintLibrarySummary[] = [];
     let pinnedBlueprintIds = new Set(this.storage.pinnedBlueprints.get());
+    // An org-owned entry is gated live, like every org read (the lazy-revocation contract,
+    // docs/tenancy.md): the record names the org whose member added it, and the listing asks
+    // that org again, so a removed member's entry is withheld. The record is kept -- a re-add
+    // restores the listing, and opening re-resolves regardless -- and records written before
+    // the gate name no org, so they list as they always did.
+    let me = this.ctx.id.name!;
+    let memberOf = new Map<string, Promise<boolean>>();
     for (let record of this.storage.libraryBlueprints.list()) {
+      if (record.orgOwner !== undefined) {
+        let gate = memberOf.get(record.orgOwner);
+        if (gate === undefined) {
+          // A pure read, retried across an org-DO reset; an unreadable org answers as if
+          // removed, so the listing fails closed.
+          gate = retryOnDoReset(() =>
+              this.ctx.exports.OrgDurableObject.getByName(record.orgOwner!).getMember(me))
+              .then(isActiveMember, () => false);
+          memberOf.set(record.orgOwner, gate);
+        }
+        if (!(await gate)) continue;
+      }
       result.push({
         id: record.id,
         metadata: record.metadata,
