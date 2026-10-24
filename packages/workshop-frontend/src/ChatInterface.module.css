@@ -203,3 +203,24 @@
     transform: none;
   }
 }
+
+/* A resolved decision badge enters with a short pop so the pending controls visibly become the
+   outcome rather than swapping text in place. Gated on no-preference so reduced motion degrades
+   to a static badge. */
+@media (prefers-reduced-motion: no-preference) {
+  .resolvedBadge {
+    animation: resolved-badge-in 200ms ease-out;
+  }
+}
+
+@keyframes resolved-badge-in {
+  from {
+    opacity: 0;
+    transform: scale(0.8);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}

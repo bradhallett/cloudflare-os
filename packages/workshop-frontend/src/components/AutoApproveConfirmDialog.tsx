@@ -1,6 +1,8 @@
 import { Dialog } from '@cloudflare/kumo'
-import { X } from '@phosphor-icons/react'
+import { useButtonFeedback } from '@gadgets/ui'
+import { Check, X } from '@phosphor-icons/react'
 import { WorkshopButton, WorkshopIconButton } from './WorkshopControls'
+import { FeedbackSpinner } from './ResolveButton'
 
 interface AutoApproveConfirmDialogProps {
   open: boolean
@@ -10,7 +12,8 @@ interface AutoApproveConfirmDialogProps {
   resourceTitle: string
   isProcessing?: boolean
   onOpenChange: (open: boolean) => void
-  onConfirm: () => void
+  /** Enables the rule; resolves `false` when enabling failed (already reported via a toast). */
+  onConfirm: () => PromiseLike<boolean> | boolean
 }
 
 /**
@@ -25,6 +28,8 @@ export default function AutoApproveConfirmDialog({
   onOpenChange,
   onConfirm,
 }: AutoApproveConfirmDialogProps) {
+  const feedback = useButtonFeedback()
+  const { status, ...holdProps } = feedback.buttonProps
   return (
     <Dialog.Root
       open={open}
@@ -71,11 +76,30 @@ export default function AutoApproveConfirmDialog({
           />
           <WorkshopButton
             tone="primary"
-            onClick={onConfirm}
+            {...holdProps}
+            onClick={() =>
+              feedback.track(
+                Promise.resolve(onConfirm()).then((enabled) => {
+                  if (!enabled) throw undefined
+                }),
+              )}
             disabled={isProcessing}
+            data-feedback={status}
             className="!h-9 min-w-[64px]"
           >
-            {isProcessing ? 'Enabling...' : 'Always approve'}
+            {status === 'loading' ? (
+              <>
+                <FeedbackSpinner className="border-kumo-inverse border-t-transparent" />
+                Enabling…
+              </>
+            ) : status === 'error' ? 'Failed' : status === 'success' ? (
+              <>
+                <Check size={13} aria-hidden="true" />
+                Enabled
+              </>
+            ) : (
+              'Always approve'
+            )}
           </WorkshopButton>
         </div>
       </Dialog>
