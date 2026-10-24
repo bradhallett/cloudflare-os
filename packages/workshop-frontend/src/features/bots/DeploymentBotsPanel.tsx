@@ -1,9 +1,10 @@
 // Admin panel for deployment-wide bots: declared once here, offered in every user's chat intake.
 // CRUD through AdminApi; each write is followed by a re-read so the list is the server's.
 
-import { useEffect, useState } from 'react'
-import { useKumoToastManager } from '@cloudflare/kumo'
+import { useEffect, useRef, useState } from 'react'
+import { useInvalidShake } from '@gadgets/ui'
 import { PencilSimple, Plus, Trash } from '@phosphor-icons/react'
+import { useKumoToastManager } from '@cloudflare/kumo'
 import type { RpcStub } from 'capnweb'
 import type { AdminApi, AiChatAuthorInfo, BotDefinition, BotSkillChoice } from '@gadgets/workshop-shared/api'
 import { useAuthenticatedApi } from '../../AuthContext'
@@ -117,6 +118,12 @@ export const DeploymentBotsPanel = ({ admin }: { admin: RpcStub<AdminApi> }) => 
   const modelLabel = (def: BotDefinition): string =>
     models.find((model) => model.id === def.modelId)?.name ?? def.modelId
 
+  // The id input is shaken when Configure is attempted on an invalid id (aria-invalid is already
+  // live); the form is what the hook listens for attempts on.
+  const idInputRef = useRef<HTMLInputElement>(null)
+  useInvalidShake(idInputRef)
+  const idInvalid = newId !== '' && (slugError(newId) !== undefined || idTaken(newId))
+
   // The editor is open for an existing bot, or for a new one once its id passes the client checks.
   const editorOpen = editor !== null
     && (editor.mode === 'edit'
@@ -195,11 +202,21 @@ export const DeploymentBotsPanel = ({ admin }: { admin: RpcStub<AdminApi> }) => 
           )}
 
           {editor?.mode === 'add' ? (
-            <div className="grid gap-2 rounded-lg border border-kumo-line bg-kumo-base px-4 py-3">
+            <form
+              noValidate
+              className="grid gap-2 rounded-lg border border-kumo-line bg-kumo-base px-4 py-3"
+              onSubmit={(event) => {
+                event.preventDefault()
+                if (!busy && !configuring && newId !== '' && slugError(newId) === undefined && !idTaken(newId)) {
+                  setConfiguring(true)
+                }
+              }}
+            >
               <label className="grid gap-1.5">
                 <span className="text-[13px] font-medium text-kumo-default">Bot id</span>
                 <div className="flex items-center gap-2">
                   <WorkshopInput
+                    ref={idInputRef}
                     value={newId}
                     disabled={busy || configuring}
                     onChange={(event) => {
@@ -208,31 +225,32 @@ export const DeploymentBotsPanel = ({ admin }: { admin: RpcStub<AdminApi> }) => 
                       setEditor({ mode: 'add', id: next })
                     }}
                     placeholder="research-assistant"
-                    aria-invalid={slugError(newId) !== undefined || idTaken(newId)}
+                    aria-invalid={idInvalid}
+                    aria-describedby={idInvalid ? 'deployment-bot-id-error' : 'deployment-bot-id-hint'}
                   />
                   <WorkshopButton
                     tone="primary"
+                    type="submit"
                     className="!h-9 shrink-0"
-                    disabled={busy || configuring || newId === '' || slugError(newId) !== undefined || idTaken(newId)}
-                    onClick={() => setConfiguring(true)}
+                    disabled={busy || configuring}
                   >
                     <Plus size={13} weight="bold" />
                     Configure
                   </WorkshopButton>
                 </div>
                 {slugError(newId) ? (
-                  <span className="text-[11px] leading-4 text-kumo-danger">{slugError(newId)}</span>
+                  <span id="deployment-bot-id-error" className="text-[11px] leading-4 text-kumo-danger">{slugError(newId)}</span>
                 ) : idTaken(newId) ? (
-                  <span className="text-[11px] leading-4 text-kumo-danger">
+                  <span id="deployment-bot-id-error" className="text-[11px] leading-4 text-kumo-danger">
                     A deployment bot with this id already exists.
                   </span>
                 ) : (
-                  <span className="text-[11px] leading-4 text-kumo-inactive">
+                  <span id="deployment-bot-id-hint" className="text-[11px] leading-4 text-kumo-inactive">
                     Users see the bot’s name; the id is its stable identifier.
                   </span>
                 )}
               </label>
-            </div>
+            </form>
           ) : (
             <WorkshopButton
               tone="primary"
