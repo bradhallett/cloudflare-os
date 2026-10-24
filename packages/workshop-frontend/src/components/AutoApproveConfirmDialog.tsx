@@ -89,7 +89,7 @@ export default function AutoApproveConfirmDialog({
           >
             {status === 'loading' ? (
               <>
-                <FeedbackSpinner className="border-white border-t-transparent" />
+                <FeedbackSpinner className="border-kumo-inverse border-t-transparent" />
                 Enabling…
               </>
             ) : status === 'error' ? 'Failed' : status === 'success' ? (

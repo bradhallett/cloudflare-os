@@ -1,4 +1,5 @@
 import { cloudflareTest } from "@cloudflare/vitest-plugin";
+import { COMPATIBILITY_DATE } from "@gadgets/scripts/worker-config";
 import capnwebValidate from "capnweb-validate/vite";
 import { defineConfig } from "vitest/config";
 
@@ -6,6 +7,35 @@ const EXPECTED_OPEN_ERROR_CODES = new Set([
   "WORKSPACE_NOT_FOUND",
   "WORKSPACE_ACCESS_DENIED",
 ]);
+
+// Records the member-sync snapshots and answers the read paths of the optional SAAS_COMMERCE
+// port, so the commerce RPC tests exercise the real service-binding seam end to end (see
+// __integration__/commerce-rpc.test.ts). Canned answers only; it holds no state of its own
+// beyond what the tests read back.
+const commerceStub = `
+import { WorkerEntrypoint } from "cloudflare:workers";
+const memberSyncs = [];
+const checkouts = [];
+export class CommerceStub extends WorkerEntrypoint {
+  listPlans() { return [{ id: "pro", name: "Pro" }]; }
+  getOrgBilling() {
+    return {
+      plan: "pro", seats: 5, assignedSeats: 2, subscriptionStatus: "active",
+      monthlySpendCapUsd: 50, overageAllowed: false,
+      usage: {
+        cycleStart: new Date(0), inputTokens: 101, cacheReadTokens: 13,
+        cacheWriteTokens: 17, outputTokens: 19, estimatedCostUsd: 0.5,
+      },
+    };
+  }
+  startCheckout(query) { checkouts.push(query); return { url: "https://checkout.example/s/" + query.orgId }; }
+  createPortalSession(query) { return { url: "https://portal.example/p/" + query.orgId }; }
+  orgMembersChanged(snapshot) { memberSyncs.push(snapshot); }
+  memberSyncs() { return memberSyncs; }
+  checkouts() { return checkouts; }
+  reset() { memberSyncs.length = 0; checkouts.length = 0; }
+}
+`
 
 export default defineConfig({
   esbuild: {
@@ -18,6 +48,24 @@ export default defineConfig({
       remoteBindings: false,
       wrangler: {
         configPath: "./wrangler.jsonc",
+      },
+      // The commerce seam needs what wrangler.jsonc deliberately leaves unset (an OSS
+      // deployment binds neither): the port itself, and the origin billing flows return to.
+      // Nothing else in this suite reads either binding.
+      miniflare: {
+        compatibilityDate: COMPATIBILITY_DATE,
+        serviceBindings: {
+          SAAS_COMMERCE: { name: "commerce-stub", entrypoint: "CommerceStub" },
+        },
+        workers: [
+          {
+            name: "commerce-stub",
+            modules: true,
+            script: commerceStub,
+            compatibilityDate: COMPATIBILITY_DATE,
+          },
+        ],
+        bindings: { PUBLIC_BASE_URL: "https://workshop.example/" },
       },
     }),
   ],

@@ -90,12 +90,12 @@ async function viewerAndPicked(pickedName = "Picked") {
     createUser(viewer, "Viewer"),
     createUser(picked, pickedName),
   ]);
-  await shareAnOrg(viewer, picked);
+  const orgId = await shareAnOrg(viewer, picked);
   const [appAccount, pickedAccount] = await Promise.all([
     testHooks.addAccount(viewer, "context", `${viewer}-context`, { providesUi: true }),
     testHooks.addAccount(picked, "context", `${picked}-context`),
   ]);
-  return { viewer, picked, appAccount, pickedAccount, testHooks };
+  return { viewer, picked, appAccount, pickedAccount, testHooks, orgId };
 }
 
 describe("gatekeeper user picker selection tickets", () => {
@@ -215,6 +215,37 @@ describe("gatekeeper user picker selection tickets", () => {
       .resolves.toEqual({ error: "This selection is no longer available. Please select the user again." });
     await expect(testHooks.redeem(viewer, appAccount, stranded.ticket))
       .resolves.toEqual({ error: expect.any(String) });
+  });
+
+  it("lets a member of two orgs pick a co-member of either", async () => {
+    const viewer = uniqueUser("view");
+    const memberA = uniqueUser("membera");
+    const memberB = uniqueUser("memberb");
+    const testHooks = hooks();
+    await Promise.all([
+      createUser(viewer, "Viewer"),
+      createUser(memberA, "Member A"),
+      createUser(memberB, "Member B"),
+    ]);
+    const orgA = await shareAnOrg(viewer, memberA);
+    const orgB = await shareAnOrg(viewer, memberB);
+    const appAccount = await testHooks.addAccount(viewer, "context", `${viewer}-context`, { providesUi: true });
+    await testHooks.addAccount(memberA, "context", `${memberA}-context`);
+    await testHooks.addAccount(memberB, "context", `${memberB}-context`);
+
+    // The scope unions both orgs: each member is pickable, justified by only their own org.
+    for (const [person, orgId] of [[memberA, orgA], [memberB, orgB]] as const) {
+      const selection = minted(await testHooks.pick(viewer, appAccount, person));
+      await inUser(viewer, user => {
+        const record = Array.from(user.storage.pendingUserSelections.list())
+          .find(({ selectedUserId }) => selectedUserId === person);
+        expect(record).toMatchObject({ selectedUserId: person, orgIds: [orgId] });
+      });
+      await expect(testHooks.redeem(viewer, appAccount, selection.ticket)).resolves.toEqual([{
+        identity: `${person}-context`,
+        displayName: person === memberA ? "Member A" : "Member B",
+      }]);
+    }
   });
 
   it("justifies a pick by an existing share relationship, live-checked at redemption", async () => {
@@ -452,5 +483,33 @@ describe("gatekeeper user picker selection tickets", () => {
       expect(await user.ctx.storage.getAlarm()).toBeNull();
     });
     await expect(testHooks.redeem(viewer, appAccount, swept.ticket)).resolves.toEqual(rejected);
+  });
+
+  it("reports the picked person's live org memberships with every redeemed account", async () => {
+    const { viewer, picked, appAccount, testHooks, orgId } = await viewerAndPicked();
+    // A second org the picked person joined, and one that only ever invited them: only active
+    // memberships may reach a gatekeeper, since org-keyed grants resolve against them.
+    const otherOwner = uniqueUser("owner");
+    await createUser(otherOwner, "Other Owner");
+    const secondOrg = await shareAnOrg(otherOwner, picked);
+    const pendingOrg = `org-${crypto.randomUUID()}`;
+    await env.TEST_ORG.getByName(pendingOrg).initializeOrg("Pending Org", otherOwner);
+    await env.TEST_ORG.getByName(pendingOrg).inviteMember(otherOwner, picked);
+    await testHooks.addAccount(picked, "context", `${picked}-second`);
+
+    const selection = minted(await testHooks.pick(viewer, appAccount, picked));
+    // Duplicated across the picked person's account results, and only active orgs: the pending
+    // invitation is absent, and each array is the live org-authority answer, not a stale index.
+    const memberships = [`${orgId}:member`, `${secondOrg}:member`].toSorted();
+    await expect(testHooks.redeemMemberships(viewer, appAccount, selection.ticket)).resolves.toEqual([
+      memberships, memberships,
+    ]);
+
+    // The opening user's own memberships reach the app in the AppUiContext, likewise live.
+    const forContext = minted(await testHooks.pick(viewer, appAccount, picked));
+    await expect(testHooks.openAppUi(viewer, appAccount, `${viewer}-context`, forContext.ticket))
+      .resolves.toBeUndefined();
+    await expect(testHooks.accountCalls(`${viewer}-context`)).resolves.toContain(
+      `contextOrgs(false, ${orgId}:owner)`);
   });
 });

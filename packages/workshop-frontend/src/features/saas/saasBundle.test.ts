@@ -37,8 +37,9 @@ async function buildAssets(saas: boolean): Promise<{ names: string[]; sources: s
   return { names, sources: names.map((name: string) => readFileSync(join(outDir, 'assets', name), 'utf8')) }
 }
 
-/** SaaS surface strings: the shell's marker, the flag's name, the runtime channel's field. */
-const SAAS_MARKERS = /saas-shell|VITE_SAAS|saasEnabled/
+/** SaaS surface strings: every surface's marker, the flag's name, the runtime channel's field. */
+const SAAS_MARKERS =
+    /saas-shell|VITE_SAAS|saasEnabled|saas-signup-funnel|saas-checkout-return|saas-org-settings|saas-upgrade-prompt|saas-org-switcher/
 
 describe('SaaS build flag in the production bundle', () => {
   it(

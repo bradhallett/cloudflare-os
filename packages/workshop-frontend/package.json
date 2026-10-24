@@ -10,6 +10,7 @@
     "test:run:browser": "vitest run -c vitest.browser.config.ts"
   },
   "dependencies": {
+    "@gadgets/ui": "workspace:*",
     "@cloudflare/kumo": "^2.14.0",
     "@codemirror/commands": "^6.11.1",
     "@codemirror/lang-cpp": "^6.0.3",

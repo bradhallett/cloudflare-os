@@ -1,6 +1,6 @@
 import { useKumoToastManager } from '@cloudflare/kumo'
 import { useAuthenticatedApi } from './AuthContext'
-import { useState, useEffect, useRef } from 'react'
+import { Suspense, useState, useEffect, useRef } from 'react'
 import { AiChatAuthorInfo, validateCommitEmail } from '@gadgets/workshop-shared/api'
 import { hashPassword } from './passwordHash'
 import { CF_ACCESS_MODE } from './useAuth'
@@ -8,6 +8,7 @@ import { User, Pencil, Check, X, Lock, Camera, Copy, Eye, EyeSlash } from '@phos
 import { useAvatar, invalidateAvatarCache } from './useAvatar'
 import { compressAvatar, avatarBlobUrl } from './avatarUtils'
 import UsageSettings from './components/billing/UsageSettings'
+import { OrgBillingSection } from './features/saas/commerceGate'
 import { useDocumentTitle } from './useDocumentTitle'
 import { isImeComposing } from './keyboardEvent'
 
@@ -193,7 +194,7 @@ const CommitEmailRow = ({ initialCommitEmail }: { initialCommitEmail?: string })
   )
 }
 
-export default function SettingsPage() {
+export default function SettingsPage({ org }: { org?: string }) {
   useDocumentTitle('Profile')
 
   const { authenticatedApi } = useAuthenticatedApi()
@@ -491,6 +492,15 @@ export default function SettingsPage() {
 
         {/* Usage & billing — only when the Cloudflare limits flow is enabled server-side */}
         <UsageSettings />
+
+        {/* Organization billing (SaaS builds only) — plan, seats, portal, usage. The gate is
+            null in OSS builds, so this renders nothing and pulls no chunk. `org` is the live
+            ?org= search parameter, which picks the billing tab. */}
+        {OrgBillingSection && (
+          <Suspense fallback={null}>
+            <OrgBillingSection org={org} />
+          </Suspense>
+        )}
 
         {/* Security — only for password accounts (hidden under CF Access or gatekeeper sign-in) */}
         {!CF_ACCESS_MODE && hasPassword === true && (

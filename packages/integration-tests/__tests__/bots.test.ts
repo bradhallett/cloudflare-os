@@ -790,8 +790,11 @@ it("a re-executed delegateToBot call returns the existing child instead of dupli
   await harness.redeployWorkshop();
 
   await withOwnerWorkspace(harness.url, username, async ws2 => {
+    // The sweep that resumes the turn is alarm-driven, not client-driven, so it can already have
+    // run the re-prompt *and* the scripted final reply by the time this polls; "at least" is what
+    // survives that, and the assertions below pin the exact end state.
     await waitFor("the parent's turn to resume and re-prompt", async () =>
-        parentModel.requests.length === 2 || null, 60_000);
+        parentModel.requests.length >= 2 || null, 60_000);
     const [resumedChild] = await chatsWithBotName(ws2, "Writer");
     await waitForIdleChat(ws2, resumedChild!.id);
     await waitForIdleChat(ws2, chatId);

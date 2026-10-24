@@ -22,6 +22,8 @@ workspace it names, so per-entity queries read their own index. The column layou
 import-free `metrics-schema.ts` (also exported as `@gadgets/observability/metrics-schema`), so query
 code names columns rather than `blobN`. The read side is checked in as
 `@gadgets/observability/metrics-queries`: canonical SQL (daily activity, active users, per-type
-counts, per-workspace history) for the Analytics Engine SQL API — POST the query to
+counts, per-workspace history, and per-org rollups — active seats, gatekeeper usage, model usage,
+which `docs/org-observability.md` documents) for the Analytics Engine SQL API — POST the query to
 `https://api.cloudflare.com/client/v4/accounts/<account_id>/analytics_engine/sql` with an Account
-Analytics Read bearer token — or paste it into a dashboard widget's SQL editor.
+Analytics Read bearer token — or paste it into a dashboard widget's SQL editor. An event that
+names an owning org carries an `orgId` column and one extra org index copy.

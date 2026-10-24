@@ -91,6 +91,21 @@ export interface DurableObjectMigration {
 }
 
 /**
+ * A Durable Object binding declaration in a wrangler config's `durable_objects` stanza. Wrangler
+ * spells the binding name `name` here rather than `binding`; a binding without `script_name`
+ * targets a class the declaring worker exports itself (and wrangler infers those from
+ * `migrations`, so a config-declared one is normally cross-script).
+ */
+export interface DurableObjectBindingDecl {
+  /** Binding name the calling worker reads. */
+  name: string;
+  /** Durable Object class the binding targets. */
+  class_name: string;
+  /** Script exporting the class; becomes a `$WORKER_NAME(<pkg>)` placeholder. */
+  script_name?: string;
+}
+
+/**
  * The subset of a deployable worker's `wrangler.jsonc` this pipeline reads. Shared by the manifest
  * generator, `build-release.ts` and the preview-config generator, so all three agree on the shape.
  * Deliberately partial and loose: `buildWorkerEntry` fails closed on any key not in
@@ -117,6 +132,8 @@ export interface WranglerConfig {
   worker_loaders?: BindingDecl[];
   /** Service bindings; targets become `$WORKER_NAME(<pkg>)` placeholders. */
   services?: ServiceBinding[];
+  /** Durable Object bindings; cross-script targets become `$WORKER_NAME(<pkg>)` placeholders. */
+  durable_objects?: { bindings: DurableObjectBindingDecl[] };
   /** Browser Rendering binding (Gadget PDF exports). */
   browser?: BindingDecl;
   /** This Worker version's metadata (the backend's, so a session can tell it is out of date). */
@@ -276,6 +293,10 @@ const HANDLED_CONFIG_KEYS = new Set([
   // gatekeeper-context's Artifacts binding is closed-beta and cannot be provisioned in arbitrary
   // user accounts; it is dropped from customer manifests (the gatekeeper degrades gracefully).
   "artifacts",
+  // Cross-script Durable Object bindings (an overlay worker binding another worker's DO class,
+  // e.g. saas-billing → gatekeeper-workos's OrgSyncDurableObject). The target script_name is
+  // templated exactly like a service binding's target.
+  "durable_objects",
 ]);
 
 const ARTIFACTS_CUT_ALLOWED = new Set(["gatekeeper-context"]);
@@ -508,6 +529,16 @@ export function buildWorkerEntry(
       name: svc.binding,
       service: `$WORKER_NAME(${svc.service})`,
       ...(svc.entrypoint ? { entrypoint: svc.entrypoint } : {}),
+    });
+  }
+  for (const dob of config.durable_objects?.bindings ?? []) {
+    bindings.push({
+      type: "durable_object_namespace",
+      name: dob.name,
+      class_name: dob.class_name,
+      // Same rename-safe placeholder as a service target: the deploy service resolves it to the
+      // owning worker's instance-chosen name. Absent script_name binds a local class as-is.
+      ...(dob.script_name ? { script_name: `$WORKER_NAME(${dob.script_name})` } : {}),
     });
   }
 

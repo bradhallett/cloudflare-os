@@ -59,6 +59,19 @@ export default {
 };
 `
 
+// Records the usage events the Worker emits at the optional SAAS_USAGE_EVENTS port, so tests
+// can read them back through the same service binding the seam fires at (see
+// __tests__/usage-events.test.ts).
+const usageRecorder = `
+import { WorkerEntrypoint } from "cloudflare:workers";
+const events = [];
+export class UsageRecorder extends WorkerEntrypoint {
+  recordUsage(event) { events.push(event); return "queued"; }
+  events() { return events; }
+  reset() { events.length = 0; }
+}
+`
+
 /**
  * Tests run inside workerd (via `@cloudflare/vitest-plugin`) so they exercise the same runtime APIs as
  * production -- e.g. Uint8Array.toHex/fromHex and crypto.subtle used by the sharing module. Most
@@ -77,14 +90,26 @@ export default defineConfig({
         // `allow_irrevocable_stub_storage` as in cloudflare.config.ts: the user DO persists account stubs.
         compatibilityFlags: ['experimental', 'nodejs_compat', 'allow_irrevocable_stub_storage'],
         streamingTails: ['span-recorder'],
-        serviceBindings: { SPAN_RECORDER: { name: 'span-recorder', entrypoint: 'SpanRecorder' } },
-        workers: [{
-          name: 'span-recorder',
-          modules: true,
-          script: spanRecorder,
-          compatibilityDate: COMPATIBILITY_DATE,
-          compatibilityFlags: ['experimental', 'streaming_tail_worker'],
-        }],
+        serviceBindings: {
+          SPAN_RECORDER: { name: 'span-recorder', entrypoint: 'SpanRecorder' },
+          SAAS_USAGE_EVENTS: { name: 'usage-recorder', entrypoint: 'UsageRecorder' },
+        },
+        workers: [
+          {
+            name: 'span-recorder',
+            modules: true,
+            script: spanRecorder,
+            compatibilityDate: COMPATIBILITY_DATE,
+            compatibilityFlags: ['experimental', 'streaming_tail_worker'],
+          },
+          {
+            name: 'usage-recorder',
+            modules: true,
+            script: usageRecorder,
+            compatibilityDate: COMPATIBILITY_DATE,
+            compatibilityFlags: ['experimental'],
+          },
+        ],
         bindings: { PUBLIC_BASE_URL: 'https://workshop.example/' },
         // The overseer loads gadget code through this, so a test can run a real gadget facet.
         workerLoaders: { LOADER: {} },

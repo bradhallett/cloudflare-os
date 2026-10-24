@@ -24,7 +24,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse } from "jsonc-parser";
 import { resolveBinEntry } from "./bin-entry.ts";
-import { gatekeeperBaseUrl, getDevServerConfig } from "./dev-server-config.ts";
+import { devWranglerConfigs, gatekeeperBaseUrl, getDevServerConfig } from "./dev-server-config.ts";
 import { generateWorkerConfigs } from "./generate-worker-configs.ts";
 import { resolveScanRoots, scanRootArgs } from "./scan-roots.ts";
 import { killProcessTree } from "./kill-process-tree.ts";
@@ -652,11 +652,7 @@ for (const pkg of plainWorkers) {
 // Build the wrangler dev command and exec it.
 // ---------------------------------------------------------------------------
 
-const configs = [
-  "wrangler.dev.jsonc",
-  ...gatekeepers.map(gk => join(gk.dir, "wrangler.dev.jsonc")),
-  ...plainWorkers.map(pkg => join(pkg.dir, "wrangler.dev.jsonc")),
-];
+const configs = devWranglerConfigs({ backendDir: WORKSHOP_BACKEND_DIR, gatekeepers, plainWorkers });
 
 const args = configs.flatMap(c => ["-c", c]);
 if (wranglerPort) {

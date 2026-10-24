@@ -160,7 +160,7 @@ describe("ChatComposer", () => {
   it.each([
     { error: new Error("Peer closed WebSocket"), transient: true },
     { error: new Error("send rejected"), transient: false },
-  ])("preserves the draft after a failed send", async ({ error, transient }) => {
+  ])("keeps the draft after a transient send failure, clears it after a definitive one ($transient)", async ({ error, transient }) => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const onSend = vi.fn<Parameters<typeof ChatComposer>[0]["onSend"]>(async () => {
       throw error;
@@ -194,7 +194,9 @@ describe("ChatComposer", () => {
       await Promise.resolve();
     });
 
-    expect(textarea.value).toBe("Keep this draft");
+    // A transient failure leaves the outcome unknown, so the draft stays for another try; a
+    // definitive failure moves the message to the transcript's failed-send bubble.
+    expect(textarea.value).toBe(transient ? "Keep this draft" : "");
     expect(container.textContent?.includes("Connection hiccup")).toBe(transient);
     expect(consoleError).toHaveBeenCalledTimes(transient ? 0 : 1);
     consoleError.mockRestore();
