@@ -45,9 +45,9 @@ export interface UsageEventTokens {
  *   test. Platform-cost only, and skipped once the workspace owner's allowance is spent (see
  *   #allowQuickModelCall); noted in #16.
  * - Agent compaction requests (workshop-backend agent.ts: requestAnthropicCompaction and the
- *   summary completeText). Their spend is attributed to the chat's cost records — the gateway
- *   logs them under the chat like any turn request — but they publish no chat message, so they
- *   cross no seam.
+ *   summary completeText). Their spend never enters the Workshop cost record — usage is
+ *   discarded on both paths — it shows only in the chat's AI Gateway logs, and they publish no
+ *   chat message, so they cross no seam.
  * - Chat cache-warming resends (workshop-backend chat-cache-warming.ts). Billed to the chat's
  *   cost record through addRequestCost (overseer-impl.ts) without crossing addChatMessages.
  */
