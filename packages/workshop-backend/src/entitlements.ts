@@ -1,10 +1,12 @@
 // Adapter for the optional SaaS entitlements port (`SAAS_ENTITLEMENTS`). This is the single
-// place the OSS core consults a hosted SaaS's plan decisions; no vendor code lives here. When
-// the binding is absent — every self-hosted/OSS deployment — each resolver returns the built-in
-// env-configured answer with no RPC, so behavior is identical to pre-port code.
+// place the OSS core consults a hosted SaaS's plan decisions — the usage checker's policy and
+// the plan-enforcement seams (model tiers, connectors, workspace caps); no vendor code lives
+// here. When the binding is absent — every self-hosted/OSS deployment — each resolver returns
+// the built-in env-configured answer (or null, meaning "ungated") with no RPC, so behavior is
+// identical to pre-port code.
 
 import { createLogger } from "@gadgets/observability/logger";
-import type { UsagePolicy } from "@gadgets/workshop-shared/entitlements";
+import { type Entitlements, type UsagePolicy } from "@gadgets/workshop-shared/entitlements";
 import { getMinimumCloudflareBalance } from "./ai-gateway-billing/config.js";
 import { getDailyLlmCallLimit } from "./ai-gateway-billing/limits/config.js";
 
@@ -38,5 +40,24 @@ export async function resolveUsagePolicy(
       event: "entitlements.policy.consult_failed", userId, error: err,
     });
     return envUsagePolicy(env);
+  }
+}
+
+/**
+ * The user's plan entitlements, or null while no entitlements service is bound (every OSS
+ * deployment) — the caller then applies no plan gate, as pre-port code did. Like
+ * {@link resolveUsagePolicy}, a failing port never blocks or throws into the caller: the failure
+ * is logged and null (no gate) applies.
+ */
+export async function resolveEntitlements(
+    env: Cloudflare.Env, userId: string): Promise<Entitlements | null> {
+  if (!env.SAAS_ENTITLEMENTS) return null;
+  try {
+    return await env.SAAS_ENTITLEMENTS.getEntitlements({ userId });
+  } catch (err) {
+    logger.warn("entitlements consult failed; applying no plan gate", {
+      event: "entitlements.consult_failed", userId, error: err,
+    });
+    return null;
   }
 }

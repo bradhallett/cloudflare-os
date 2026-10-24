@@ -24,6 +24,7 @@ import { deleteBlueprintContent } from "./blueprint-archive.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./storage-schema/blueprints-kv.js";
 import { resolveBlueprintForUser } from "./blueprint-access.js";
 import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./admin-config.js";
+import { resolveEntitlements } from "./entitlements.js";
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
 import { CONNECT_FLOW_LIFETIME_MS, handoffTargetOrigin, hashPresentedSecret, hashSecret, newSecretToken, PENDING_HANDOFF_LIFETIME_MS } from "./connect-handoff.js";
 import { deliver, registerDevice } from "./notification-service.js";
@@ -855,15 +856,31 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async listModels(kind: ModelKind = "language"): Promise<AiChatAuthorInfo[]> {
-    return this.#listModels(await getGatewayModels(this.env), kind);
+    return this.#listModels(await getGatewayModels(this.env), kind, await this.#allowedModelTiers());
   }
 
-  #listModels(models: GatewayModels | null, kind: ModelKind): AiChatAuthorInfo[] {
+  // The model tiers the user's plan may run, or null while no entitlements service is bound
+  // (every OSS deployment — no gate, identical to pre-port behavior). A gateway model that
+  // states a catalog tier absent from the set is neither listed nor resolved; a model with no
+  // tier, and any model a user stored themselves, is never tier-gated.
+  async #allowedModelTiers(): Promise<ReadonlySet<string> | null> {
+    let entitlements = await resolveEntitlements(this.env, this.ctx.id.toString());
+    return entitlements && new Set(entitlements.allowedModelTiers);
+  }
+
+  #listModels(models: GatewayModels | null, kind: ModelKind,
+              tiers: ReadonlySet<string> | null): AiChatAuthorInfo[] {
     let result: AiChatAuthorInfo[] = [];
 
-    // When AI Gateway mode is active, include the gateway models the deployment offers.
+    // When AI Gateway mode is active, include the gateway models the deployment offers, less
+    // any the user's plan may not run.
     if (models) {
-      result.push(...models.list(kind));
+      for (let model of models.list(kind)) {
+        let tier = models.get(model.id)?.tier;
+        if (tier === undefined || tiers === null || tiers.has(tier)) {
+          result.push(model);
+        }
+      }
     }
 
     // Also include user-configured models, where users may add their own, skipping any that a
@@ -1069,21 +1086,23 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * chat runs on the bot's declared model. A bot or model that no longer resolves throws visibly
    * here, never a silent fallback to another model. */
   async getChatContext(modelId: string | null, bot?: BotSelection): Promise<UserChatContext> {
-    let models = await getGatewayModels(this.env);
-    let result = this.#getChatContext(bot === undefined ? modelId : null, models);
+    let [models, tiers] = await Promise.all(
+        [getGatewayModels(this.env), this.#allowedModelTiers()]);
+    let result = this.#getChatContext(bot === undefined ? modelId : null, models, tiers);
     if (bot !== undefined) {
       result.bot = await this.#resolveBot(bot);
-      result.aiModel = this.#requireModel(result.bot.modelId, models);
+      result.aiModel = this.#requireModel(result.bot.modelId, models, tiers);
     }
     return result;
   }
 
-  #getChatContext(modelId: string | null, models: GatewayModels | null): UserChatContext {
+  #getChatContext(modelId: string | null, models: GatewayModels | null,
+                 tiers: ReadonlySet<string> | null): UserChatContext {
     let result: UserChatContext = {
       profile: this.storage.profile.get()
     };
     if (modelId) {
-      result.aiModel = this.#requireModel(modelId, models);
+      result.aiModel = this.#requireModel(modelId, models, tiers);
     }
 
     // Resolve the quick model (used for lightweight tasks like title generation).
@@ -1104,10 +1123,20 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   // Resolve a model ID the way chats do (see #resolveModel), refusing visibly -- with the most
   // specific reason the ID doesn't resolve -- when it doesn't. Shared by the plain-model and bot
-  // paths of getChatContext, so a bot's model refuses exactly like a hand-picked one.
-  #requireModel(id: string, models: GatewayModels | null): UserAiModelRecord {
+  // paths of getChatContext, so a bot's model refuses exactly like a hand-picked one. A gateway
+  // model whose catalog tier the user's plan doesn't include refuses here too (see
+  // #allowedModelTiers), so a chat naming one — an existing chat after a downgrade, say — fails
+  // visibly rather than silently running a different model.
+  #requireModel(id: string, models: GatewayModels | null,
+               tiers: ReadonlySet<string> | null): UserAiModelRecord {
     let record = this.#resolveModel(id, models);
-    if (record) return record;
+    if (record) {
+      let tier = models?.get(id)?.tier;
+      if (tier !== undefined && tiers !== null && !tiers.has(tier)) {
+        throw new Error(`The "${record.profile.name}" model isn't available on your plan.`);
+      }
+      return record;
+    }
     models?.refuseDisabled(id);
     // No gateway model has the ID, so a stored model with it is one the deployment keeps
     // users from running.
@@ -1136,15 +1165,16 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     // An existing chat keeps its model while it still resolves, even once no longer offered. A new
     // conversation takes the user's preferred model only while it is still offered, as the web
     // composer does with its stored choice, and otherwise the first available model.
-    let models = await getGatewayModels(this.env);
+    let [models, tiers] = await Promise.all(
+        [getGatewayModels(this.env), this.#allowedModelTiers()]);
     let selectedModelId = existingChatModelId;
     if (selectedModelId === null || !this.#resolveModel(selectedModelId, models)) {
-      let offered = this.#listModels(models, "language");
+      let offered = this.#listModels(models, "language", tiers);
       let preferredModel = this.storage.preferredModel.get();
       selectedModelId = (offered.find(model => model.id === preferredModel) ?? offered[0])?.id ?? null;
     }
 
-    return this.#getChatContext(selectedModelId, models);
+    return this.#getChatContext(selectedModelId, models, tiers);
   }
 
   /**
@@ -1166,27 +1196,34 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * start instead of mysteriously changing agent.
    */
   async listBots(): Promise<BotInfo[]> {
-    let models = await getGatewayModels(this.env);
+    let [models, tiers] = await Promise.all(
+        [getGatewayModels(this.env), this.#allowedModelTiers()]);
     let result: BotInfo[] = [];
     for (let record of this.storage.bots.list()) {
-      result.push(this.#botInfo({scope: "user", id: record.id}, record.def, models));
+      result.push(this.#botInfo({scope: "user", id: record.id}, record.def, models, tiers));
     }
     for (let {id, def} of (await readAdminConfig(this.env)).deploymentBots) {
-      result.push(this.#botInfo({scope: "deployment", id}, def, models));
+      result.push(this.#botInfo({scope: "deployment", id}, def, models, tiers));
     }
     return result;
   }
 
-  #botInfo(selection: BotSelection, def: BotDefinition, models: GatewayModels | null): BotInfo {
+  #botInfo(selection: BotSelection, def: BotDefinition, models: GatewayModels | null,
+           tiers: ReadonlySet<string> | null): BotInfo {
     let model = this.#resolveModel(def.modelId, models);
+    // A model the user's plan may not run makes the bot unavailable exactly like one that no
+    // longer resolves, so the listing never offers a bot its chat would refuse to start.
+    let tier = model ? models?.get(def.modelId)?.tier : undefined;
+    let runnable = model !== undefined &&
+        (tier === undefined || tiers === null || tiers.has(tier));
     return {
       selection,
       name: def.name,
       ...(def.description ? {description: def.description} : {}),
       modelId: def.modelId,
       ...(model ? {modelName: model.profile.name} : {}),
-      available: model !== undefined,
-      ...(model ? {} : {unavailableReason: "Model not available to you"}),
+      available: runnable,
+      ...(runnable ? {} : {unavailableReason: "Model not available to you"}),
     };
   }
 
@@ -1322,6 +1359,17 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async newGadget(id: string, title: string): Promise<void> {
+    // A bound SaaS's plan may cap how many workspaces a user owns. Counted here are the rows
+    // this method writes — records without an `owner` are the user's own; one shared with them
+    // never counts. ensureGadgetRegistered() deliberately bypasses this: it registers a
+    // workspace that already exists, which a cap must not lock its owner out of.
+    let cap = (await resolveEntitlements(this.env, this.ctx.id.toString()))?.maxWorkspaces;
+    if (cap !== undefined) {
+      let owned = [...this.storage.gadgets.list()].filter(record => !record.owner).length;
+      if (owned >= cap) {
+        throw new Error(`You've reached your plan's limit of ${cap} workspaces.`);
+      }
+    }
     let created = new Date();
     this.storage.gadgets.put({id, title, created});
   }
@@ -2727,7 +2775,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   // instantiation, and the agent's createExternalResource -- never from gadget code). An ambient
   // gatekeeper an admin set to "disabled" is blocked here too. Blocking here prevents minting a
   // capability to a disabled resource even if the request bypasses the (separately filtered)
-  // picker/agent listings.
+  // picker/agent listings. A bound SaaS's plan composes with these: a vendor the plan doesn't
+  // offer is refused the same way, with the admin's settings checked first so an admin-disabled
+  // gatekeeper keeps its message when both apply.
   async #assertResourceEnabled(vendorId: string, resource: SupportedResource) {
     let config = await readAdminConfig(this.env);
     let normalized = vendorId.toLowerCase();
@@ -2739,6 +2789,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (isResourceDisabled(config, normalized, resource.urlPattern)) {
       throw new Error(
           `The "${resource.title}" resource is disabled on this deployment by an administrator.`);
+    }
+    let entitlements = await resolveEntitlements(this.env, this.ctx.id.toString());
+    if (entitlements && !entitlements.allowedGatekeepers.includes(normalized)) {
+      throw new Error(`The "${vendorId}" connector isn't available on your plan.`);
     }
   }
 

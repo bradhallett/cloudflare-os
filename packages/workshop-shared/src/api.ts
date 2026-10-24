@@ -28,6 +28,7 @@ import { AccountDescription, ActionKind, ActionDescription, AgentCatalog, Avatar
 import type { CodeChange } from "./code-change.js";
 import type { GitOid } from "./gatekeeper.js";
 import type { UiFeatureFlags } from "./feature-flags.js";
+import type { ModelTier } from "./entitlements.js";
 
 export const SERVICE_SALT = new Uint8Array([
   0xd9, 0x4e, 0x54, 0x1d, 0x29, 0xc1, 0x03, 0x74, 0x73, 0x7e, 0xb3, 0xe3, 0x34, 0x6d, 0x8f, 0x21
@@ -2061,6 +2062,9 @@ export type GatewayModel = {
    * own ID, where each stated fact comes ahead of what `behavesLike` lends.
    */
   capabilities?: GatewayModelCapabilities;
+
+  /** The model's coarse plan tier, as SUGGESTED_MODELS states one (see SuggestedModel.tier). */
+  tier?: ModelTier;
 };
 
 /** A model a deployment provides through AI Gateway, as its admin sees it. */
@@ -2280,6 +2284,14 @@ type SuggestedModel = {
    */
   hidden?: true;
 
+  /**
+   * The model's coarse class (e.g. "standard", "premium"), compared against the model tiers a
+   * bound SaaS entitlements service allows (see @gadgets/workshop-shared/entitlements). Opaque
+   * descriptive data: inert on a deployment with no such service bound, and a model that states
+   * no tier is never tier-gated.
+   */
+  tier?: ModelTier;
+
   /** The model's kind; absent means `"language"`. */
   kind?: ModelKind;
 };
@@ -2289,70 +2301,69 @@ const SUGGESTED_MODEL_CATALOG = {
   "cloudflare": {
     "@cf/moonshotai/kimi-k2.7-code": {
       name: "Kimi K2.7 Code (Workers AI)", contextWindow: 262144,
-      outputLimit: WORKERS_AI_OUTPUT_LIMIT,
+      outputLimit: WORKERS_AI_OUTPUT_LIMIT, tier: "standard",
     },
     "@cf/zai-org/glm-5.2": {
       name: "GLM 5.2 (Workers AI)", contextWindow: 262144, outputLimit: WORKERS_AI_OUTPUT_LIMIT,
+      tier: "standard",
     },
     "@cf/zai-org/glm-5.3-flash": {
       name: "GLM 5.3 Flash (Workers AI)", contextWindow: 1048576,
-      outputLimit: WORKERS_AI_OUTPUT_LIMIT,
+      outputLimit: WORKERS_AI_OUTPUT_LIMIT, tier: "standard",
     },
     "@cf/deepseek-ai/deepseek-v4-pro-0813": {
       name: "DeepSeek V4 Pro 0813 (Workers AI)", contextWindow: 1048576,
-      outputLimit: WORKERS_AI_OUTPUT_LIMIT,
+      outputLimit: WORKERS_AI_OUTPUT_LIMIT, tier: "standard",
     },
-    "@cf/cloudflare/clef": {name: "Clef (Workers AI)", contextWindow: 65536, kind: "decision"},
+    "@cf/cloudflare/clef": {
+      name: "Clef (Workers AI)", contextWindow: 65536, kind: "decision", tier: "standard",
+    },
     "@cf/cloudflare/clef-flash": {
-      name: "Clef Flash (Workers AI)", contextWindow: 65536, kind: "decision",
+      name: "Clef Flash (Workers AI)", contextWindow: 65536, kind: "decision", tier: "standard",
     },
   },
   "anthropic": {
-    "claude-opus-5-5": {name: "Claude Opus 5.5", contextWindow: 1000000},
-    "claude-sonnet-5-5": {name: "Claude Sonnet 5.5", contextWindow: 1000000},
-    "claude-fable-5-1": {name: "Claude Fable 5.1", contextWindow: 1000000},
-    "claude-opus-5": {name: "Claude Opus 5", contextWindow: 1000000, hidden: true},
-    "claude-sonnet-5": {name: "Claude Sonnet 5", contextWindow: 1000000, hidden: true},
-    "claude-haiku-4-5": {name: "Claude Haiku 4.5", contextWindow: 200000},
+    "claude-opus-5-5": {name: "Claude Opus 5.5", contextWindow: 1000000, tier: "premium"},
+    "claude-sonnet-5-5": {name: "Claude Sonnet 5.5", contextWindow: 1000000, tier: "premium"},
+    "claude-fable-5-1": {name: "Claude Fable 5.1", contextWindow: 1000000, tier: "premium"},
+    "claude-opus-5": {name: "Claude Opus 5", contextWindow: 1000000, hidden: true, tier: "premium"},
+    "claude-sonnet-5": {name: "Claude Sonnet 5", contextWindow: 1000000, hidden: true, tier: "premium"},
+    "claude-haiku-4-5": {name: "Claude Haiku 4.5", contextWindow: 200000, tier: "standard"},
   },
   "openai": {
     // pi's GPT-6 catalog reports a 272K window, but these models support 1.05M. Use 272K as the
     // preferred compaction budget, not as the hard context limit.
     "gpt-6.1-sol": {
       name: "GPT-6.1 Sol", contextWindow: 1050000, outputLimit: 128000,
-      compactionInputBudget: 272000,
+      compactionInputBudget: 272000, tier: "premium",
     },
     "gpt-6-sol": {
       name: "GPT-6 Sol", contextWindow: 1050000, outputLimit: 128000,
-      compactionInputBudget: 272000,
-      hidden: true,
+      compactionInputBudget: 272000, hidden: true, tier: "premium",
     },
     "gpt-6-luna": {
       name: "GPT-6 Luna", contextWindow: 1050000, outputLimit: 128000,
-      compactionInputBudget: 272000,
+      compactionInputBudget: 272000, tier: "premium",
     },
     "gpt-6-astra": {
       name: "GPT-6 Astra", contextWindow: 1050000, outputLimit: 128000,
-      compactionInputBudget: 272000,
+      compactionInputBudget: 272000, tier: "premium",
     },
     "gpt-5.6-sol": {
       name: "GPT 5.6 Sol", contextWindow: 1050000, outputLimit: 128000,
-      compactionInputBudget: 272000,
-      hidden: true,
+      compactionInputBudget: 272000, hidden: true, tier: "standard",
     },
     "gpt-5.6-luna": {
       name: "GPT 5.6 Luna", contextWindow: 1050000, outputLimit: 128000,
-      compactionInputBudget: 272000,
-      hidden: true,
+      compactionInputBudget: 272000, hidden: true, tier: "standard",
     },
     "gpt-5.6-terra": {
       name: "GPT 5.6 Terra", contextWindow: 1050000, outputLimit: 128000,
-      compactionInputBudget: 272000,
-      hidden: true,
+      compactionInputBudget: 272000, hidden: true, tier: "standard",
     },
   },
   "google": {
-    "gemini-3.6-flash": {name: "Gemini 3.6 Flash", contextWindow: 1048576},
+    "gemini-3.6-flash": {name: "Gemini 3.6 Flash", contextWindow: 1048576, tier: "standard"},
   },
   "ollama": {
   },

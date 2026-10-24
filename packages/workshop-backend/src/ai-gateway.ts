@@ -215,7 +215,8 @@ export class GatewayModels {
     for (let [provider, catalog] of Object.entries(SUGGESTED_MODELS)) {
       if (!this.providers.has(provider)) continue;
       for (let [id, model] of Object.entries(catalog)) {
-        add({ provider: provider as AiModelProvider, id, name: model.name, ...tokenLimits(model) },
+        add({ provider: provider as AiModelProvider, id, name: model.name, ...tokenLimits(model),
+              ...(model.tier && { tier: model.tier }) },
             model.hidden ? "hidden" : "enabled", false);
       }
       if (!GATEWAY_PROVIDERS.has(provider)) continue;

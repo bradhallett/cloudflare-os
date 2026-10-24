@@ -41,6 +41,11 @@ export interface Entitlements {
   allowedModelTiers: ModelTier[];
   /** Gatekeeper vendor ids the plan may connect; an unlisted gatekeeper is not offered. */
   allowedGatekeepers: string[];
+  /**
+   * Maximum workspaces the user may own. Absent when the plan sets no cap. Sharing a workspace
+   * with a user never counts toward their cap.
+   */
+  maxWorkspaces?: number;
 }
 
 /**
