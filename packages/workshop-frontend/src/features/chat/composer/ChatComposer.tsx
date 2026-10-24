@@ -197,6 +197,7 @@ export const ChatComposer = ({
     addFiles,
     clearSentAttachments,
     removeAttachment,
+    retryAttachment,
   } = useComposerAttachments({
     getOverseer,
     onError: (message) => toasts.add({ title: message, variant: "error" }),
@@ -800,6 +801,7 @@ export const ChatComposer = ({
           attachments={pendingAttachments}
           disabled={isSending}
           onRemove={removeAttachment}
+          onRetry={retryAttachment}
         />
         {/* Textarea */}
         <div className="relative px-4 pb-2.5 pt-3">

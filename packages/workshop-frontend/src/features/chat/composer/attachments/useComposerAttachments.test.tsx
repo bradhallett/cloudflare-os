@@ -133,4 +133,86 @@ describe("useComposerAttachments", () => {
     await act(async () => finishUpload("1".repeat(40)));
     expect(uploadBlob).toHaveBeenCalledTimes(1);
   });
+
+  it("retries a failed upload and recovers without removing and re-adding the file", async () => {
+    let failUpload = true;
+    const uploadBlob = vi.fn<Overseer["uploadBlob"]>(async () => {
+      if (failUpload) throw new Error("storage unavailable");
+      return (++testState.nextId).toString(16).padStart(40, "0");
+    });
+    const overseer = { uploadBlob } as unknown as RpcStub<Overseer>;
+    const onError = vi.fn<(message: string) => void>();
+    let attachments: ComposerAttachment[] = [];
+    let addFiles!: (files: File[]) => Promise<void>;
+    let retryAttachment!: (id: string) => void;
+
+    vi.stubGlobal("crypto", { randomUUID: () => `local-${++testState.nextId}` });
+    const Harness = () => {
+      const attachmentState = useComposerAttachments({
+        getOverseer: () => overseer,
+        onError,
+      });
+      ({ addFiles, retryAttachment } = attachmentState);
+      attachments = attachmentState.attachments;
+      return null;
+    };
+
+    container = document.createElement("div");
+    root = createRoot(container);
+    await act(async () => root!.render(<Harness />));
+
+    await act(async () => addFiles([
+      new File(["one"], "one.txt", { type: "text/plain" }),
+    ]));
+    await waitFor(() => attachments[0]?.uploadState === "error");
+    expect(attachments[0].error).toBe("storage unavailable");
+    // The blob is retained after the failure, which is what makes retry possible.
+    expect(attachments[0].blob.size).toBe(4);
+    expect(onError).toHaveBeenCalledExactlyOnceWith("storage unavailable");
+
+    failUpload = false;
+    await act(async () => retryAttachment(attachments[0].id));
+    await waitFor(() => attachments[0]?.uploadState === "ready");
+    expect(uploadBlob).toHaveBeenCalledTimes(2);
+    expect(attachments[0].error).toBeUndefined();
+    expect(attachments[0].ref).toEqual({
+      oid: expect.stringMatching(/^[0-9a-f]{40}$/), mimeType: "text/plain", name: "one.txt",
+    });
+  });
+
+  it("ignores retry for an attachment that is not in the error state", async () => {
+    const uploadBlob = vi.fn<Overseer["uploadBlob"]>(
+      async () => (++testState.nextId).toString(16).padStart(40, "0"),
+    );
+    const overseer = { uploadBlob } as unknown as RpcStub<Overseer>;
+    let attachments: ComposerAttachment[] = [];
+    let addFiles!: (files: File[]) => Promise<void>;
+    let retryAttachment!: (id: string) => void;
+
+    vi.stubGlobal("crypto", { randomUUID: () => `local-${++testState.nextId}` });
+    const Harness = () => {
+      const attachmentState = useComposerAttachments({
+        getOverseer: () => overseer,
+        onError: vi.fn<(message: string) => void>(),
+      });
+      ({ addFiles, retryAttachment } = attachmentState);
+      attachments = attachmentState.attachments;
+      return null;
+    };
+
+    container = document.createElement("div");
+    root = createRoot(container);
+    await act(async () => root!.render(<Harness />));
+
+    await act(async () => addFiles([
+      new File(["one"], "one.txt", { type: "text/plain" }),
+    ]));
+    await waitFor(() => attachments[0]?.uploadState === "ready");
+
+    act(() => retryAttachment(attachments[0].id));
+    act(() => retryAttachment("missing"));
+
+    expect(uploadBlob).toHaveBeenCalledTimes(1);
+    expect(attachments[0].uploadState).toBe("ready");
+  });
 });
