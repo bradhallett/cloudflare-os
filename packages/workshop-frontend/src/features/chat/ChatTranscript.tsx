@@ -53,7 +53,11 @@ import {
 } from "./transcript/CreatedWorkpieceChatCard";
 import { ThinkingTraceRow } from "./transcript/ThinkingTraceRow";
 import { ToolGroupRow } from "./transcript/ToolGroupRow";
+import { ToolRunningIndicator } from "./transcript/ToolRunningIndicator";
 import { SlashCommandMention } from "./transcript/SlashCommandMention";
+import { ChatTranscriptEmptyState } from "./transcript/ChatTranscriptEmptyState";
+import { FailedSendRow } from "./transcript/FailedSendRow";
+import type { FailedChatSend } from "./transcript/failedSends";
 import { WorkIcon } from "./transcript/WorkIcon";
 import {
   ActionCard,
@@ -135,6 +139,10 @@ export interface ChatTranscriptProps {
   currentProvisionalState: ProvisionalChatState | null;
   provisionalToolCalls: ProvisionalToolCallState[];
   isCompacting: boolean;
+  /** Re-sends a failed user send's exact payload (the row's owner drops it on success). */
+  onRetryFailedSend: (send: FailedChatSend) => void;
+  /** Drops a failed user send's message for good. */
+  onDismissFailedSend: (send: FailedChatSend) => void;
   currentMessages: AiChatMessage[];
   queuedSteers: { text: string; author: AiChatAuthorInfo }[] | undefined;
 }
@@ -202,6 +210,8 @@ export function ChatTranscript({
   provisionalToolCalls,
   isCompacting,
   currentMessages,
+  onRetryFailedSend,
+  onDismissFailedSend,
   queuedSteers,
 }: ChatTranscriptProps) {
   return (
@@ -211,9 +221,18 @@ export function ChatTranscript({
                     <div className="w-5 h-5 border-2 border-kumo-brand border-t-transparent rounded-full animate-spin" />
                   </div>
                 ) : (
+                  // role=log gives polite announcements for appended entries; busy for the whole
+                  // turn (activeAgent is steady, unlike the provisional state, which flickers
+                  // empty between the turn's model calls) holds them until the message finalizes.
                   <div
+                    role="log"
+                    aria-busy={isAgentActive}
                     className={`flex flex-col px-3 pt-5 sm:px-6 sm:pt-8 ${pendingConsoleLogCount > 0 ? "pb-16" : "pb-8"} ${useConstrainedChatWidth ? "mx-auto w-full max-w-[920px]" : ""}`}
                   >
+                    {displayEntries.length === 0 && !isAgentActive && (
+                      <ChatTranscriptEmptyState />
+                    )}
+
                     {isLoadingEarlier && (
                       <div className="mx-auto mb-6 text-[12px] leading-4 font-medium text-kumo-inactive">
                         Loading earlier messages…
@@ -469,6 +488,19 @@ export function ChatTranscript({
                                 onOpen={() => onOpenGadget(created.workpieceId)}
                               />
                             ))}
+                          </div>
+                        );
+                      }
+
+                      if (entry.type === "failedSend") {
+                        return (
+                          <div key={entry.key} className={entryTopClass}>
+                            <FailedSendRow
+                              send={entry.send}
+                              getOverseer={getOverseer}
+                              onRetry={onRetryFailedSend}
+                              onDismiss={onDismissFailedSend}
+                            />
                           </div>
                         );
                       }
@@ -957,13 +989,13 @@ export function ChatTranscript({
                       return (
                         <div className={`group/agent min-w-0 w-full max-w-[860px] space-y-2 ${provisionalTopClass}`}>
                           {isCompacting && (
-                            <div className={`inline-flex px-1.5 py-1 text-[14px] leading-5 tracking-[-0.25px] ${styles.thinkingShimmer}`}>
+                            <div className="inline-flex shimmer px-1.5 py-1 text-[14px] leading-5 tracking-[-0.25px] text-kumo-inactive shimmer-duration-1800">
                               Compacting…
                             </div>
                           )}
 
                           {showThinking && (
-                            <div className={`inline-flex px-1.5 py-1 text-[14px] leading-5 tracking-[-0.25px] ${styles.thinkingShimmer}`}>
+                            <div className="inline-flex shimmer px-1.5 py-1 text-[14px] leading-5 tracking-[-0.25px] text-kumo-inactive shimmer-duration-1800">
                               Thinking
                             </div>
                           )}
@@ -980,7 +1012,7 @@ export function ChatTranscript({
 
                           {provisionalToolCalls.length > 0 && (() => {
                             const first = provisionalToolCalls[0];
-                            const { label, detailLines } =
+                            const { label, detailLines, running } =
                               buildProvisionalToolSummary(provisionalToolCalls);
                             const expansionKey = `group-${first.toolCallId}`;
                             const isExpanded = expandedToolCalls.has(expansionKey);
@@ -1002,6 +1034,7 @@ export function ChatTranscript({
                                     <span className="min-w-0 flex-1">
                                       <span className="flex min-w-0 items-center gap-2 text-[14px] leading-5 tracking-[-0.25px]">
                                         <span className="min-w-0 truncate">{label}</span>
+                                        {running && <ToolRunningIndicator />}
                                         <CaretRight
                                           size={13}
                                           weight="bold"

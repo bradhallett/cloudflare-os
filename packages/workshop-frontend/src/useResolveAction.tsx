@@ -24,15 +24,17 @@ export function useResolveAction(
 
   const resolve = useCallback(async (
     actionId: number, decision: ActionDecision, approval?: CreationApproval,
-  ) => {
+  ): Promise<boolean> => {
     setProcessing(previous => new Set(previous).add(actionId))
     try {
       if (decision === 'approve') await overseer.approveAction(actionId, approval)
       else await overseer.rejectAction(actionId)
       onResolvedRef.current?.(actionId, decision === 'approve' ? 'approved' : 'rejected')
+      return true
     } catch (error) {
       console.error(`Failed to ${decision} action:`, error)
       toasts.add({ title: `Failed to ${decision} action`, variant: 'error' })
+      return false
     } finally {
       setProcessing(previous => {
         const next = new Set(previous)
@@ -42,9 +44,13 @@ export function useResolveAction(
     }
   }, [overseer, setProcessing, toasts])
 
-  const resolveAction = useCallback(async (action: ActionLogEntry, decision: ActionDecision) => {
+  // Approving a creation first asks which account to create it in, so that click opens the modal
+  // instead of deciding; the promise (and its outcome) only exists once the choice is made.
+  const resolveAction = useCallback(async (
+    action: ActionLogEntry, decision: ActionDecision,
+  ): Promise<boolean | void> => {
     if (decision === 'approve' && action.type === 'action' && action.creation) setCreation(action)
-    else await resolve(action.id, decision)
+    else return resolve(action.id, decision)
   }, [resolve])
 
   const creationAccountModal = creation && (

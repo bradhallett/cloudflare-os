@@ -96,6 +96,7 @@ const stashedTickets = new Map<string, string>();
  */
 export class FakeGatekeeperAccount extends WorkerEntrypoint<Cloudflare.Env, {
   name: string; failRevoke?: boolean; failDescribe?: boolean; providesUi?: boolean;
+  singleton?: { tsType: string };
 }> {
   #record(call: string) {
     const calls = accountCalls.get(this.ctx.props.name) ?? [];
@@ -110,7 +111,17 @@ export class FakeGatekeeperAccount extends WorkerEntrypoint<Cloudflare.Env, {
       displayName: this.ctx.props.name,
       uniqueName: this.ctx.props.name,
       ...(this.ctx.props.providesUi ? { providesUi: { title: this.ctx.props.name } } : {}),
+      ...(this.ctx.props.singleton ? { singleton: this.ctx.props.singleton } : {}),
     };
+  }
+
+  /**
+   * The ambient-singleton mint (UserDurableObject.getSingletonGatekeeperClass) calls this when
+   * the description declares a singleton; the value only needs to be non-null for the tests.
+   */
+  async getSingletonGatekeeperClass(): Promise<{ fakeSessionClass: true }> {
+    this.#record("getSingletonGatekeeperClass");
+    return { fakeSessionClass: true };
   }
 
   async revoke(): Promise<void> {
@@ -162,6 +173,10 @@ export class FakeGatekeeperAccount extends WorkerEntrypoint<Cloudflare.Env, {
       }
     }
     this.#record(`startAppUi(${context.isAdmin}, ${outcome})`);
+    // The opening user's org memberships as the Workshop reported them in the AppUiContext
+    // (`orgId:role` pairs), the producer a gatekeeper resolves org-keyed grants against.
+    this.#record(`contextOrgs(${context.isAdmin}, ${(context.orgMemberships ?? [])
+      .map(({ orgId, role }) => `${orgId}:${role}`).join("|")})`);
     return { iframeHtml: "<!doctype html>", ui: new RpcStub(new RpcTarget()) };
   }
 
@@ -235,6 +250,27 @@ export class GatekeeperUserPickerTestHooks extends DurableObject<Cloudflare.Env>
     }
   }
 
+  /**
+   * The org memberships the Workshop reports about each redeemed selection for `ticket`
+   * (RedeemedGatekeeperUserSelection.orgMemberships, one array per account result, duplicated
+   * across them), as sorted `orgId:role` pairs — the fresh snapshot a gatekeeper records so
+   * org-keyed grants resolve from the moment the share lands. A rejection is `{ error }`.
+   */
+  async redeemMemberships(
+      viewerId: string, accountId: number, ticket: string,
+  ): Promise<string[][] | { error: string }> {
+    const selectorUserId = this.ctx.exports.UserDurableObject.idFromName(viewerId).toString();
+    const exchange = this.ctx.exports.GatekeeperUserSelectionExchangeImpl({
+      props: { selectorUserId, appAccountId: accountId },
+    });
+    try {
+      const results = await exchange.redeem(ticket);
+      return results.map(({ orgMemberships }) =>
+          (orgMemberships ?? []).map(({ orgId, role }) => `${orgId}:${role}`).toSorted());
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : String(error) };
+    }
+  }
   /**
    * Open `viewerId`'s app UI for `accountId` the way getGatekeeperApp does, with `ticket` stashed
    * for the fake account to redeem through the exchange it is handed; the outcome lands in the

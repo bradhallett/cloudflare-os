@@ -6,6 +6,7 @@ import ReconnectingChip from '../ReconnectingChip'
 import { useConnectionLost } from '../../RpcContext'
 import Sidebar from './Sidebar'
 import CommandPalette from './CommandPalette'
+import { matchesHotkey } from '@gadgets/ui/hotkey'
 import { OPEN_COMMAND_PALETTE_EVENT } from './commandPaletteBus'
 
 const STORAGE_KEY_COLLAPSED = 'gadgets:sidebar-collapsed'
@@ -92,7 +93,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // event so it doesn't have to prop-drill into the palette.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+      if (matchesHotkey(e, 'mod+k')) {
         e.preventDefault()
         setPaletteOpen((o) => !o)
       }

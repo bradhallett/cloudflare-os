@@ -5,7 +5,9 @@
 // would leave the org with no owner is refused (the org goes on ownerless only if the last owner's
 // account is ever deleted out from under it, which no API here does).
 
-import type { OrgInvitePolicy, OrgMember, OrgMemberStatus, OrgRole } from "@gadgets/workshop-shared/api";
+import type {
+  CollaboratorRole, OrgInvitePolicy, OrgMember, OrgMemberStatus, OrgRole,
+} from "@gadgets/workshop-shared/api";
 
 /** Roles ranked low to high; a member may never act above, or grant a role above, their own. */
 const ROLE_RANK: Record<OrgRole, number> = { member: 0, admin: 1, owner: 2 };
@@ -18,7 +20,7 @@ export type OrgAccess = {
   role: OrgRole | null;
   /** The user's membership status, or null when they are not a member. */
   status: OrgMemberStatus | null;
-  /** How many members currently hold the owner role. */
+  /** How many *active* members currently hold the owner role. */
   ownerCount: number;
   invitePolicy: OrgInvitePolicy;
 };
@@ -69,11 +71,12 @@ export function canUpdateSettings(access: OrgAccess): boolean {
 
 /**
  * Whether the user may remove the member holding `targetRole` (never the target's own last-owner
- * protection — see wouldLoseLastOwner). Owners remove anyone, admins remove members, and an
- * ordinary member removes only themself, which is what leaveOrg() does.
+ * protection — see wouldLoseLastOwner). Owners remove anyone (a co-owner included), admins
+ * remove members, and an ordinary member removes only themself, which is what leaveOrg() does.
  */
 export function canRemoveMember(access: OrgAccess, targetRole: OrgRole): boolean {
   if (!isActingMember(access) || access.role === null) return false;
+  if (access.role === "owner") return true;
   return ROLE_RANK[access.role] > ROLE_RANK[targetRole];
 }
 
@@ -83,4 +86,23 @@ export function canRemoveMember(access: OrgAccess, targetRole: OrgRole): boolean
  */
 export function wouldLoseLastOwner(access: OrgAccess, targetRole: OrgRole): boolean {
   return targetRole === "owner" && access.ownerCount <= 1;
+}
+
+/**
+ * Whether the user may move resources into (and so also manage resources of) the org: its
+ * workspace transfers and org-owned-workspace deletions. Owners and admins; a plain member,
+ * pending invitee, or non-member may not.
+ */
+export function canManageOrgAssets(access: OrgAccess): boolean {
+  return isActingMember(access) && ROLE_RANK[access.role!] >= ROLE_RANK["admin"];
+}
+
+/**
+ * The baseline role an org role grants on a workspace the org owns: owners and admins manage it
+ * (build), members use it. The single mapping from org authority to sharing-graph access -- the
+ * sharing module seeds its graph with it, and the org compares it to decide when a role change
+ * narrows a member's workspace entitlement.
+ */
+export function gadgetBaselineRole(orgRole: OrgRole): CollaboratorRole {
+  return orgRole === "member" ? "use" : "build";
 }

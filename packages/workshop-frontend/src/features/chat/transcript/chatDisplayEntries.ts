@@ -14,6 +14,7 @@ import {
   type ObservationChatMessage,
 } from "./messageTypes";
 import { buildToolCallGroups, type ToolCallGroup, type ToolOutputResolver } from "./toolCalls";
+import type { FailedChatSend } from "./failedSends";
 
 /** A compaction checkpoint reported with a history page. */
 export type CompactionBoundary = NonNullable<AiChatHistoryPage["compacted"]>;
@@ -73,6 +74,16 @@ export type ChatDisplayEntry =
       toolCallGroups: ToolCallGroup[];
       lastMessageSequence: number;
       lastMessageTimestamp: Date;
+    }
+  | {
+      /**
+       * A user send the server definitively rejected (see FailedChatSend). Client-local: it stands
+       * in for the durable message that never arrived, rendered as a destructive bubble with a
+       * retry. Always newest — appended after everything the server recorded.
+       */
+      type: "failedSend";
+      key: string;
+      send: FailedChatSend;
     }
   | {
       type: "savedChanges";
@@ -169,7 +180,8 @@ function transcriptToolCalls(toolCalls: AiToolCall[]): AiToolCall[] {
 /**
  * Groups a chat's raw messages into the rows the transcript renders: user/agent messages with
  * their work folded in, standalone work runs, saved edits, blueprint proposals, and compaction
- * markers.
+ * markers. `failedSends` — client-local sends the server rejected, already filtered to this chat —
+ * follow as destructive bubbles; they are newer than any durable message by construction.
  */
 export function buildChatDisplayEntries(
   messages: AiChatMessage[],
@@ -177,6 +189,7 @@ export function buildChatDisplayEntries(
   // Loaded compaction boundaries, oldest first.
   boundaries: readonly CompactionBoundary[] = [],
   outputOf?: ToolOutputResolver,
+  failedSends?: readonly FailedChatSend[],
 ): ChatDisplayEntry[] {
   // Catalog changes are for the agent alone (see the "catalogChange" message).
   messages = messages.filter(msg => msg.type !== "catalogChange");
@@ -406,6 +419,10 @@ export function buildChatDisplayEntries(
     i++;
   }
 
+  for (const send of failedSends ?? []) {
+    result.push({type: "failedSend", key: `failed-${send.id}`, send});
+  }
+
   return result;
 }
 
@@ -420,18 +437,20 @@ function userMessageAuthor(entry: ChatDisplayEntry | undefined): AiChatAuthorInf
     : null;
 }
 
-/** Whether `entry` renders as one of the user's own messages. */
+/** Whether `entry` renders as one of the user's own messages (a failed send renders as one). */
 export function isUserMessageEntry(entry: ChatDisplayEntry): boolean {
-  return userMessageAuthor(entry) !== null;
+  return entry.type === "failedSend" || userMessageAuthor(entry) !== null;
 }
 
 // Consecutive messages from one user read as one group, as in any chat app: a small gap between
-// them, and their name and time once, under the last.
+// them, and their name and time once, under the last. A failed send is never grouped: it carries
+// its own failed-state row, and groups whatever came before it.
 /** Whether consecutive entries read as one user's grouped messages. */
 export function continuesUserGroup(
   prev: ChatDisplayEntry | undefined,
   curr: ChatDisplayEntry | undefined,
 ): boolean {
+  if (prev?.type === "failedSend" || curr?.type === "failedSend") return false;
   const author = userMessageAuthor(prev);
   return author !== null && author.id === userMessageAuthor(curr)?.id;
 }
@@ -481,7 +500,7 @@ export const EARLIER_PAGE_PREFETCH_PX = 600;
 function isPureWorkRowEntry(entry: ChatDisplayEntry): boolean {
   if (entry.type === "workRun") return true;
   if (entry.type === "modelChange" || entry.type === "compactionBoundary" ||
-      entry.type === "compactionCut") return false;
+      entry.type === "compactionCut" || entry.type === "failedSend") return false;
   const m = entry.message;
   return (
     m.type === "action" ||

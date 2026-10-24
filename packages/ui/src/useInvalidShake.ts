@@ -50,10 +50,16 @@ function isInvalid(control: ShakeControl) {
  * `prefers-reduced-motion: reduce` nothing is set. The control must belong to a
  * `<form>`; without one the hook does nothing.
  *
- * The motion itself comes from CSS: import `@gadgets/ui/button-shake.css` (or
- * copy its `button-shake` keyframes) and style the control with
- * `data-shake:motion-safe:animate-button-shake` or an equivalent
- * `[data-shake]` animation rule.
+ * The attribute is set on the control's nearest `[data-slot=input-group]`
+ * ancestor when there is one — the root of an input-group component such as
+ * Kumo's `InputGroup`, so the whole group (input, icon, borders) shakes as one
+ * unit — and on the control itself otherwise. Key the animation on
+ * `[data-shake]`, not on the control, so it follows whichever element carries
+ * the attribute.
+ *
+ * The motion itself comes from CSS: import `@gadgets/ui/button-shake.css`,
+ * whose `[data-shake]` rule animates the marked element, or supply an
+ * equivalent `[data-shake]` animation rule of your own.
  *
  * @param ref The form control to watch.
  * @param enabled Whether to shake. Defaults to true.

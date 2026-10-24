@@ -1,7 +1,9 @@
+import { Suspense } from 'react'
 import { useNavigate } from '@tanstack/react-router'
 import { DropdownMenu } from '@cloudflare/kumo'
 import { useAuthenticatedApi } from '../AuthContext'
 import { useAvatar } from '../useAvatar'
+import { OrgSwitcherMenu } from '../features/saas/commerceGate'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER, MENU_POSITIONER_STYLE } from './menuStyles'
 
 export default function UserMenu() {
@@ -50,6 +52,13 @@ export default function UserMenu() {
         >
           Bots
         </DropdownMenu.Item>
+        {/* The org switcher (SaaS builds only): one item per org, linking to its billing tab.
+            The gate is null in OSS builds, so this renders nothing and pulls no chunk. */}
+        {OrgSwitcherMenu ? (
+          <Suspense fallback={null}>
+            <OrgSwitcherMenu />
+          </Suspense>
+        ) : null}
         {isAdmin && (
           <DropdownMenu.Item
             onClick={() => navigate({ to: '/admin' })}

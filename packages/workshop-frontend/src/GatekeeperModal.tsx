@@ -18,6 +18,7 @@ import {
   AiChatAuthorInfo,
   GatekeeperClient,
   Overseer,
+  type PlanRefusalCode,
 } from '@gadgets/workshop-shared/api'
 import { SupportedResource, VendorDescription, matchesResourceUrlPattern } from '@gadgets/workshop-shared/gatekeeper'
 import { ResourceConfiguratorFrame } from '@gadgets/workshop-shared/gatekeeper'
@@ -41,6 +42,8 @@ import { AccountsSubscriberAdapter } from './accountsSubscriber'
 import { useDialogSelectPortalContainer } from './useDialogSelectPortalContainer'
 import { openConnectWindow } from './connectHandoff'
 import { AuthPopupCancelledError } from './features/native-app/authPopup'
+import { SaasUpgradeModal, planRefusalPrompt } from './features/saas/commerceGate'
+import { Suspense } from 'react'
 
 export interface GatekeeperModalProps {
   open: boolean
@@ -226,6 +229,8 @@ export default function GatekeeperModal({
   const toasts = useKumoToastManager()
 
   const [selectedConnectionId, setSelectedConnectionId] = useState<ConnectionTypeId | null>(null)
+  // The plan refusal (if any) that replaced a connect-flow error toast with the upgrade prompt.
+  const [refusal, setRefusal] = useState<PlanRefusalCode | null>(null)
   const [searchText, setSearchText] = useState('')
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set())
   const [creating, setCreating] = useState(false)
@@ -647,6 +652,9 @@ export default function GatekeeperModal({
       toasts.add({ title: outcome === 'connected' ? 'Account connected.' : 'Complete the account connection in the pop-up window.', variant: 'success' })
     } catch (error) {
       if (error instanceof AuthPopupCancelledError) return
+      // A plan refusal opens the upgrade prompt instead of the generic error toast.
+      const refusal = planRefusalPrompt(error)
+      if (refusal) { setRefusal(refusal); return }
       console.error('Failed to initiate connection:', error)
       reportIssue('gatekeeper.connect-start', error, { gatekeeperVendorId: vendorId })
       toasts.add({ title: error instanceof Error ? error.message : 'Could not complete connection flow', variant: 'error' })
@@ -669,6 +677,8 @@ export default function GatekeeperModal({
       // the account's flag then clears and the configurator loads automatically.
     } catch (error) {
       if (error instanceof AuthPopupCancelledError) return
+      const refusal = planRefusalPrompt(error)
+      if (refusal) { setRefusal(refusal); return }
       console.error('Failed to request additional access:', error)
       reportIssue('gatekeeper.resource-grant', error, {
         gatekeeperVendorId: selectedConnection?.vendorId,
@@ -686,6 +696,8 @@ export default function GatekeeperModal({
       toasts.add({ title: outcome === 'connected' ? 'Account reconnected.' : 'Complete the account reconnect in the pop-up window.', variant: 'success' })
     } catch (error) {
       if (error instanceof AuthPopupCancelledError) return
+      const refusal = planRefusalPrompt(error)
+      if (refusal) { setRefusal(refusal); return }
       console.error('Failed to initiate reconnect:', error)
       reportIssue('gatekeeper.reconnect-start', error, {
         gatekeeperVendorId: selectedConnection?.vendorId,
@@ -836,6 +848,7 @@ export default function GatekeeperModal({
     : 'Create connection'
 
   return (
+    <>
     <Dialog.Root open={open} onOpenChange={(o) => { if (!o) onClose() }}>
       <Dialog
         className="responsive-dialog !z-[1000] !top-[clamp(28px,10vh,96px)] !flex !max-h-[calc((100vh_-_clamp(28px,10vh,96px)_-_28px)_*_0.9)] !w-[min(760px,calc(100vw-32px))] !-translate-y-0 flex-col overflow-hidden bg-kumo-base p-0"
@@ -1015,6 +1028,14 @@ export default function GatekeeperModal({
         )}
       </Dialog>
     </Dialog.Root>
+    {/* The upgrade prompt for a refused connect (SaaS builds only); the gate is null — and this
+        renders nothing — in OSS builds. */}
+    {SaasUpgradeModal && refusal && (
+      <Suspense fallback={null}>
+        <SaasUpgradeModal open onClose={() => setRefusal(null)} reason={refusal} />
+      </Suspense>
+    )}
+    </>
   )
 }
 

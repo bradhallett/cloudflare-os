@@ -1,7 +1,9 @@
 import { useState, useEffect, useRef, type ChangeEvent } from 'react'
 import { RpcStub } from 'capnweb'
 import { useNavigate, useSearch } from '@tanstack/react-router'
-import { Switch, Textarea, Input, Button, Tabs, Loader, useKumoToastManager } from '@cloudflare/kumo'
+import { Textarea, Input, Button, Tabs, Loader, useKumoToastManager } from '@cloudflare/kumo'
+import { PendingSwitch } from '@gadgets/ui'
+import '@gadgets/ui/pending-switch.css'
 import { Hexagon, MagnifyingGlass, ShieldWarning, UserPlus } from '@phosphor-icons/react'
 import { useAuthenticatedApi } from './AuthContext'
 import { AdminApi, AdminFormat, AdminResourceVendor, AdminSettingsView, AmbientGatekeeperMode, DeploymentUpdateStatus, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_ANNOUNCEMENT_LENGTH, MAX_SITE_NAME_LENGTH, DEFAULT_SITE_NAME, BannerColor, BANNER_COLORS, DEFAULT_BANNER_COLOR } from '@gadgets/workshop-shared/api'
@@ -82,11 +84,9 @@ export default function AdminPage() {
 
   // Whether new account signups are allowed.
   const [signupsEnabled, setSignupsEnabled] = useState(true)
-  const [savingSignups, setSavingSignups] = useState(false)
 
   // Whether users may search the user directory to find collaborators.
   const [userSearchEnabled, setUserSearchEnabled] = useState(false)
-  const [savingUserSearch, setSavingUserSearch] = useState(false)
 
   // Gatekeeper resource config, and the set of resource keys ("vendorId\u0000urlPattern") busy toggling.
   const [resourceVendors, setResourceVendors] = useState<AdminResourceVendor[]>([])
@@ -204,20 +204,23 @@ export default function AdminPage() {
     setResourceVendors(view.resourceVendors)
   }
 
+  // The gatekeeper/resource toggles commit only once their write goes through: the PendingSwitch
+  // shows the new value optimistically while the write is in flight and falls back to the state
+  // here, which stays what the server last reported. `resourceBusy` still guards the row-header
+  // and mode-button paths, which have no switch of their own.
   const handleResourceToggle = async (vendorId: string, urlPattern: string, enabled: boolean) => {
     if (!admin) return
     const key = resourceKey(vendorId, urlPattern)
     setResourceBusy((prev) => new Set(prev).add(key))
-    // Optimistic update.
-    setResourceVendors((prev) =>
-      prev.map((v) =>
-        v.vendorId !== vendorId || v.autoProvisions
-          ? v
-          : { ...v, resources: v.resources.map((r) => (r.urlPattern === urlPattern ? { ...r, enabled } : r)) }
-      )
-    )
     try {
       await admin.api.setResourceEnabled(vendorId, urlPattern, enabled)
+      setResourceVendors((prev) =>
+        prev.map((v) =>
+          v.vendorId !== vendorId || v.autoProvisions
+            ? v
+            : { ...v, resources: v.resources.map((r) => (r.urlPattern === urlPattern ? { ...r, enabled } : r)) }
+        )
+      )
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Update failed'
       toasts.add({ title: message, variant: 'error' })
@@ -235,11 +238,11 @@ export default function AdminPage() {
     if (!admin) return
     const key = `gk\u0000${vendorId}`
     setResourceBusy((prev) => new Set(prev).add(key))
-    setResourceVendors((prev) =>
-      prev.map((v) => (v.vendorId === vendorId && !v.autoProvisions ? { ...v, enabled } : v))
-    )
     try {
       await admin.api.setGatekeeperMode(vendorId, enabled ? 'enabled' : 'disabled')
+      setResourceVendors((prev) =>
+        prev.map((v) => (v.vendorId === vendorId && !v.autoProvisions ? { ...v, enabled } : v))
+      )
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Update failed'
       toasts.add({ title: message, variant: 'error' })
@@ -325,33 +328,27 @@ export default function AdminPage() {
     }
   }
 
+  // The sign-up and user-search switches are PendingSwitches: the new value shows optimistically
+  // and reverts when the write fails, so the state here commits only on success.
   const handleSignupsToggle = async (enabled: boolean) => {
     if (!admin) return
-    setSavingSignups(true)
-    setSignupsEnabled(enabled) // optimistic
     try {
       await admin.api.setSignupsEnabled(enabled)
+      setSignupsEnabled(enabled)
     } catch (err) {
-      setSignupsEnabled(!enabled) // revert
       const message = err instanceof Error ? err.message : 'Update failed'
       toasts.add({ title: message, variant: 'error' })
-    } finally {
-      setSavingSignups(false)
     }
   }
 
   const handleUserSearchToggle = async (enabled: boolean) => {
     if (!admin) return
-    setSavingUserSearch(true)
-    setUserSearchEnabled(enabled) // optimistic
     try {
       await admin.api.setUserSearchEnabled(enabled)
+      setUserSearchEnabled(enabled)
     } catch (err) {
-      setUserSearchEnabled(!enabled) // revert
       const message = err instanceof Error ? err.message : 'Update failed'
       toasts.add({ title: message, variant: 'error' })
-    } finally {
-      setSavingUserSearch(false)
     }
   }
 
@@ -529,11 +526,10 @@ export default function AdminPage() {
                   When off, existing users can still log in but no new accounts can be created.
                 </p>
               </div>
-              <Switch
+              <PendingSwitch
                 aria-label="Allow new sign-ups"
                 checked={signupsEnabled}
-                disabled={savingSignups}
-                onCheckedChange={handleSignupsToggle}
+                onChange={handleSignupsToggle}
               />
             </div>
           </div>
@@ -551,11 +547,10 @@ export default function AdminPage() {
                   user&rsquo;s next connection.
                 </p>
               </div>
-              <Switch
+              <PendingSwitch
                 aria-label="Allow user search"
                 checked={userSearchEnabled}
-                disabled={savingUserSearch}
-                onCheckedChange={handleUserSearchToggle}
+                onChange={handleUserSearchToggle}
               />
             </div>
           </div>
@@ -1018,10 +1013,9 @@ export default function AdminPage() {
                     {vendor.enabled ? 'Enabled' : 'Off'}
                   </span>
                   <span onClick={(e) => e.stopPropagation()}>
-                    <Switch
+                    <PendingSwitch
                       checked={vendor.enabled}
-                      disabled={resourceBusy.has(gkKey)}
-                      onCheckedChange={(enabled) => handleGatekeeperToggle(vendor.vendorId, enabled)}
+                      onChange={(enabled) => handleGatekeeperToggle(vendor.vendorId, enabled)}
                     />
                   </span>
                 </div>
@@ -1053,10 +1047,9 @@ export default function AdminPage() {
                             <p className="text-xs text-kumo-subtle mt-0.5">{resource.description}</p>
                           </div>
                           <span onClick={(e) => e.stopPropagation()}>
-                            <Switch
+                            <PendingSwitch
                               checked={resource.enabled}
-                              disabled={resourceBusy.has(key)}
-                              onCheckedChange={(enabled) =>
+                              onChange={(enabled) =>
                                 handleResourceToggle(vendor.vendorId, resource.urlPattern, enabled)
                               }
                             />
