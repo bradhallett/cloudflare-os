@@ -118,4 +118,18 @@ describe("useButtonFeedback", () => {
     expect(hook.value.status).toBe("idle");
     hook.unmount();
   });
+
+  it("reset clears a reported error along with the status", async () => {
+    const reason = new Error("nope");
+    const hook = mountHook(use, {});
+    hook.value.track(Promise.reject(reason));
+    await advance(100);
+    expect(hook.value.status).toBe("error");
+    expect(hook.value.error).toBe(reason);
+
+    act(() => hook.value.reset());
+    expect(hook.value.status).toBe("idle");
+    expect(hook.value.error).toBeUndefined();
+    hook.unmount();
+  });
 });
