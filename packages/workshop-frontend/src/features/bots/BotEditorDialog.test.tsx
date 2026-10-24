@@ -76,10 +76,10 @@ vi.mock("../../components/WorkshopControls", () => ({
   WorkshopInputArea: (props: Record<string, unknown> & { value?: string }) => (
     <textarea {...props} />
   ),
-  WorkshopButton: ({ children, disabled, onClick }: {
-    children: ReactNode; disabled?: boolean; onClick?: () => void
+  WorkshopButton: ({ children, disabled, onClick, type }: {
+    children: ReactNode; disabled?: boolean; onClick?: () => void; type?: "submit" | "button"
   }) => (
-    <button type="button" disabled={disabled} onClick={onClick}>{children}</button>
+    <button type={type ?? "button"} disabled={disabled} onClick={onClick}>{children}</button>
   ),
   WorkshopIconButton: ({ children }: { children: ReactNode }) => <button type="button">{children}</button>,
 }));
@@ -107,42 +107,6 @@ afterEach(() => {
   container = null;
 })
 
-function renderDialog(initial?: BotDefinition): {
-  saveButton: () => HTMLButtonElement
-  nameInput: () => HTMLInputElement
-  descriptionInput: () => HTMLInputElement
-  modelSelect: () => HTMLSelectElement
-  checkbox: (labelText: string) => HTMLInputElement
-} {
-  container = document.createElement("div");
-  document.body.append(container);
-  root = createRoot(container);
-  act(() => root!.render(
-    <BotEditorDialog
-      models={models}
-      skills={skills}
-      initial={initial}
-      title="New bot"
-      onSave={() => {}}
-      onClose={() => {}}
-    />,
-  ))
-  const button = (text: string): HTMLButtonElement =>
-    [...container!.querySelectorAll("button")].find((b) => b.textContent === text)!
-  const inputByPlaceholder = (placeholder: string): HTMLInputElement =>
-    container!.querySelector(`input[placeholder="${placeholder}"]`) as HTMLInputElement
-  return {
-    saveButton: () => button("Save"),
-    nameInput: () => inputByPlaceholder("Research assistant"),
-    descriptionInput: () => inputByPlaceholder("What this bot is for, in one line"),
-    modelSelect: () => container!.querySelector("select")!,
-    checkbox: (labelText: string): HTMLInputElement =>
-      [...container!.querySelectorAll("label")]
-        .find((label) => label.textContent?.includes(labelText))!
-        .querySelector("input")!,
-  }
-}
-
 // React's controlled inputs swallow programmatic writes made through the value/checked property
 // directly; route them through the prototype setter so the dispatched event is seen as a change.
 function setNativeValue(
@@ -163,12 +127,37 @@ function setNativeValue(
 
 
 describe("BotEditorDialog", () => {
-  it("disables Save until a name is given (the model defaults to the first offered)", () => {
-    const view = renderDialog();
-    expect(view.saveButton().disabled).toBe(true);
-    act(() => setNativeValue(view.nameInput(), "Helper"))
-    expect(view.saveButton().disabled).toBe(false);
-  })
+  it("shows a linked, announced name error on a Save attempt with an empty name, and clears it on input", async () => {
+    const onSave = vi.fn<(def: BotDefinition) => Promise<void>>()
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    act(() => root!.render(
+      <BotEditorDialog
+        models={models}
+        skills={skills}
+        title="New bot"
+        onSave={onSave}
+        onClose={() => {}}
+      />,
+    ))
+    const nameInput = container.querySelector<HTMLInputElement>('input[placeholder="Research assistant"]')!
+    // Save stays clickable with an empty name: the attempt is what reveals the error.
+    const save = [...container.querySelectorAll("button")].find((b) => b.textContent === "Save")!
+    expect(save.disabled).toBe(false);
+    await act(async () => save.click());
+    expect(onSave).not.toHaveBeenCalled();
+    const error = container.querySelector("#bot-editor-name-error")!;
+    expect(error.getAttribute("role")).toBe("alert");
+    expect(error.textContent).toBe("Give the bot a name.");
+    expect(nameInput.getAttribute("aria-invalid")).toBe("true");
+    expect(nameInput.getAttribute("aria-describedby")).toBe("bot-editor-name-error");
+    act(() => setNativeValue(nameInput, "Helper"));
+    expect(container.querySelector("#bot-editor-name-error")).toBeNull();
+    expect(nameInput.getAttribute("aria-invalid")).toBe("false");
+    await act(async () => save.click());
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ name: "Helper" }));
+  });
 
   it("hands back a trimmed name, no description for a blank one, and picked skills", async () => {
     const onSave = vi.fn<(def: BotDefinition) => Promise<void>>()
@@ -264,4 +253,42 @@ describe("BotEditorDialog", () => {
         .querySelector("input")!
     expect(searchNotes.disabled).toBe(true)
   })
+
+  it("shakes the name input once after a Save attempt finds it empty (not under reduced motion)", () => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "performance", "requestAnimationFrame", "cancelAnimationFrame"],
+    });
+    const matchMedia = vi.fn<(query: string) => { matches: boolean }>().mockReturnValue({
+      matches: false,
+    });
+    vi.stubGlobal("matchMedia", matchMedia);
+    try {
+      container = document.createElement("div");
+      document.body.append(container);
+      root = createRoot(container);
+      act(() => root!.render(
+        <BotEditorDialog
+          models={models}
+          skills={skills}
+          title="New bot"
+          onSave={() => {}}
+          onClose={() => {}}
+        />,
+      ))
+      const nameInput = container.querySelector<HTMLInputElement>('input[placeholder="Research assistant"]')!;
+      const save = [...container.querySelectorAll("button")].find((b) => b.textContent === "Save")!;
+      // No shake before any attempt, even once the field is invalid.
+      act(() => nameInput.setAttribute("aria-invalid", "true"));
+      act(() => vi.advanceTimersByTime(1000));
+      expect(nameInput.hasAttribute("data-shake")).toBe(false);
+      act(() => save.click());
+      act(() => vi.advanceTimersByTime(50)); // run the requestAnimationFrame check
+      expect(nameInput.hasAttribute("data-shake")).toBe(true);
+      act(() => vi.advanceTimersByTime(500));
+      expect(nameInput.hasAttribute("data-shake")).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
 })

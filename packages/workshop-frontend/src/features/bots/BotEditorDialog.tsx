@@ -2,8 +2,9 @@
 // skills it may activate. User bots (/bots) and deployment bots (/admin) both edit through it;
 // only who saves differs, so the dialog hands back a BotDefinition and nothing else.
 
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { Checkbox, Dialog, Select, useKumoToastManager } from '@cloudflare/kumo'
+import { useInvalidShake } from '@gadgets/ui'
 import { X } from '@phosphor-icons/react'
 import type { AiChatAuthorInfo } from '@gadgets/workshop-shared/api'
 import {
@@ -94,24 +95,41 @@ export const BotEditorDialog = ({
   // Enter submits nothing: the dialog's contract is explicit Save, and Enter in a textarea must
   // keep its newline. Escape closes through Dialog.Root's own handling.
 
-  const [saving, setSaving] = useState(false)
-  const controlsDisabled = busy || saving
-  const canSave = name.trim() !== '' && modelId !== null && !controlsDisabled
-  const submit = async () => {
-    if (!canSave || modelId === null) return
-    setSaving(true)
-    try {
-      await onSave({
-        name: name.trim(),
-        description: botDescription.trim() === '' ? undefined : botDescription.trim(),
-        instructions,
-        modelId,
-        skills: [...selected.values()],
-      })
-    } finally {
-      setSaving(false)
+  // Field errors stay out of sight until a Save is attempted, so an untouched form isn't red
+  // (the same convention as AddGatewayModelForm).
+  const [errorsShown, setErrorsShown] = useState(false)
+  const nameError = name.trim() === '' ? 'Give the bot a name.' : undefined
+  const modelError = modelId === null ? 'Pick a model for the bot to run.' : undefined
+  const shownNameError = errorsShown ? nameError : undefined
+  const shownModelError = errorsShown ? modelError : undefined
+
+   const [saving, setSaving] = useState(false)
+   const controlsDisabled = busy || saving
+  const nameInputRef = useRef<HTMLInputElement>(null)
+  // Shakes the name field after a Save attempt finds it invalid (aria-invalid), never while
+  // typing; the form below is what the hook listens for attempts on.
+  useInvalidShake(nameInputRef)
+   const submit = async () => {
+    if (controlsDisabled) return
+    if (nameError !== undefined || modelError !== undefined) {
+      setErrorsShown(true)
+      if (nameError !== undefined) nameInputRef.current?.focus()
+      return
     }
-  }
+    const def: BotDefinition = {
+      name: name.trim(),
+      description: botDescription.trim() === '' ? undefined : botDescription.trim(),
+      instructions,
+      modelId,
+      skills: [...selected.values()],
+    }
+     setSaving(true)
+     try {
+      await onSave(def)
+     } finally {
+       setSaving(false)
+     }
+   }
 
   return (
     <Dialog.Root
@@ -142,19 +160,35 @@ export const BotEditorDialog = ({
             )}
           />
         </div>
-
+        {/* A form so Save submits and useInvalidShake sees submit attempts; validation is the
+            dialog's own (noValidate), and a submit runs the same path as the Save button. */}
+        <form
+          noValidate
+          onSubmit={(event) => {
+            event.preventDefault()
+            void submit()
+          }}
+        >
         <div className="max-h-[60vh] overflow-y-auto px-5 py-4">
           <div className="grid gap-4">
             <label className="grid gap-1.5">
               <span className="text-[13px] font-medium text-kumo-default">Name</span>
               <WorkshopInput
+                ref={nameInputRef}
                 value={name}
                 maxLength={MAX_BOT_NAME_LENGTH}
                 disabled={controlsDisabled}
                 onChange={(event) => setName(event.target.value)}
                 placeholder="Research assistant"
+                aria-invalid={shownNameError !== undefined}
+                aria-describedby={shownNameError !== undefined ? 'bot-editor-name-error' : undefined}
                 autoFocus
               />
+              {shownNameError !== undefined && (
+                <span id="bot-editor-name-error" role="alert" className="text-[11px] leading-4 text-kumo-danger">
+                  {shownNameError}
+                </span>
+              )}
             </label>
 
             <label className="grid gap-1.5">
@@ -203,6 +237,11 @@ export const BotEditorDialog = ({
                 <Select.Option value={modelId}>{modelId}</Select.Option>
               )}
             </Select>
+            {shownModelError !== undefined && (
+              <span role="alert" className="text-[11px] leading-4 text-kumo-danger">
+                {shownModelError}
+              </span>
+            )}
 
             <fieldset className="grid gap-2" disabled={controlsDisabled}>
               <legend className="text-[13px] font-medium text-kumo-default">Skills</legend>
@@ -259,20 +298,21 @@ export const BotEditorDialog = ({
         <div className="flex items-center justify-end gap-2 border-t border-kumo-line bg-kumo-base px-5 py-3">
           <Dialog.Close
             render={(props) => (
-              <WorkshopButton {...props} className="!h-9" disabled={controlsDisabled}>
+              <WorkshopButton {...props} type="button" className="!h-9" disabled={controlsDisabled}>
                 Cancel
               </WorkshopButton>
             )}
           />
           <WorkshopButton
             tone="primary"
-            onClick={() => void submit()}
-            disabled={!canSave}
+            type="submit"
+            disabled={controlsDisabled}
             className="!h-9 min-w-[72px]"
           >
             {saving ? 'Saving…' : saveLabel}
           </WorkshopButton>
         </div>
+        </form>
       </Dialog>
     </Dialog.Root>
   )
