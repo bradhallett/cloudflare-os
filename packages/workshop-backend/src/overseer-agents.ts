@@ -1,5 +1,5 @@
 import { RpcStub } from "capnweb";
-import { WorkpieceId, AiChatAuthorInfo, CapsuleSpecifier, CollaboratorRole, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, MessageFormatRef, ChatAttachmentHandle, SlashCommandRequest, BotSelection } from "@gadgets/workshop-shared/api";
+import { WorkpieceId, AiChatAuthorInfo, CapsuleSpecifier, CollaboratorRole, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, MessageFormatRef, ChatAttachmentHandle, SlashCommandRequest, BotSelection, getPlanRefusalCode } from "@gadgets/workshop-shared/api";
 import type { FileContent } from "@gadgets/workshop-shared/code-change";
 import type { CachedRequest } from "./ai-models";
 import { Gatekeeper, GatekeeperUserVerifier, createObservationRefusedError } from "@gadgets/workshop-shared/gatekeeper";
@@ -899,7 +899,9 @@ export abstract class OverseerAgents extends OverseerMainline {
         durationMs: Date.now() - startedAt,
       });
 
-      failure = {message: errorMessage};
+      // A plan-enforcement refusal keeps its machine-readable code on the failure, so the client
+      // can offer an upgrade at the enforcement point instead of a bare error.
+      failure = {message: errorMessage, code: getPlanRefusalCode(err)};
     } finally {
       if (owns()) {
         // If this turn billed the user's own Cloudflare account, refresh their cached balance now (in
