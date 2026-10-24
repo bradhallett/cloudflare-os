@@ -29,6 +29,8 @@ import {
 } from "./mergeConflicts";
 import type { ChatCache, Toasts } from "./useChatSubscription";
 import type { MessageState } from "./transcript/chatDisplayEntries";
+import type { FailedChatSend } from "./transcript/failedSends";
+import { failedSendFromRejection } from "./transcript/failedSends";
 
 /** The accept-flow GatekeeperModal's pre-seeded connection request (see AiChatMetadata). */
 interface ConnectionAccept {
@@ -92,6 +94,8 @@ export interface UseChatActionsArgs {
   connectionAcceptRef: { current: ConnectionAccept | null };
   setConnectionAccept: Dispatch<SetStateAction<ConnectionAccept | null>>;
   setProcessingConnections: Dispatch<SetStateAction<Set<string>>>;
+  /** Records user sends the server definitively rejected, for the transcript's retry bubbles. */
+  setFailedSends: Dispatch<SetStateAction<FailedChatSend[]>>;
 }
 
 /**
@@ -141,6 +145,7 @@ export function useChatActions({
   connectionAcceptRef,
   setConnectionAccept,
   setProcessingConnections,
+  setFailedSends,
 }: UseChatActionsArgs) {
   // Handle sending a message (always called from ChatComposer with explicit messageText)
   const handleSend = async (
@@ -184,6 +189,14 @@ export function useChatActions({
           variant: "error",
         });
       }
+      // A definitively rejected send leaves no server record, so the transcript holds it as a
+      // failed-send bubble instead (transient failures stay with the composer's hiccup banner).
+      const failedSend = failedSendFromRejection(
+        selectedChatId,
+        { message, modelId: model, capsules, attachments, formats, bot },
+        err,
+      );
+      if (failedSend) setFailedSends((prev) => [...prev, failedSend]);
       throw err;
     }
   };
