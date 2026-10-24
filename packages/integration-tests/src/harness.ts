@@ -145,7 +145,8 @@ export type Harness = {
    * `patchWorkshop` takes the place of the patch the harness was started with.
    *
    * Storage and `url` are kept. Every Worker restarts, which breaks the RPC sessions open at the
-   * time, so only a suite that started its own harness should call this.
+   * time, so only a suite that started its own harness should call this. Resolves only once the
+   * new build answers the endpoint again, so a connect made right after cannot race the restart.
    */
   redeployWorkshop(patchWorkshop?: (config: WorkerConfig) => void): Promise<void>;
 };
@@ -175,11 +176,31 @@ export async function startHarness(opts: {
   const server = createTestHarness(options(opts.patchWorkshop));
 
   const { url } = await server.listen();
+  const redeployWorkshop = async (patchWorkshop?: (config: WorkerConfig) => void) => {
+    await server.update(options(patchWorkshop));
+    // server.update() resolves when the swap is issued, not when the new build is serving, and a
+    // WebSocket opened in that window dies with "WebSocket connection failed." (a CI flake in
+    // bots.test.ts). Any HTTP answer from /api proves the endpoint is live again; without the
+    // Upgrade header a healthy Workshop answers 4xx, which counts.
+    const deadline = Date.now() + 30_000;
+    for (;;) {
+      try {
+        const response = await fetch(new URL("/api", url), { signal: AbortSignal.timeout(2_000) });
+        await response.body?.cancel();
+        return;
+      } catch {
+        if (Date.now() > deadline) throw new Error("the redeployed Workshop never answered");
+        const { promise, resolve } = Promise.withResolvers<void>();
+        setTimeout(resolve, 100);
+        await promise;
+      }
+    }
+  };
   return {
     server,
     url,
     fetchWorker: (name, ...args) => server.getWorker(name).fetch(...args),
-    redeployWorkshop: patchWorkshop => server.update(options(patchWorkshop)),
+    redeployWorkshop,
   };
 }
 
