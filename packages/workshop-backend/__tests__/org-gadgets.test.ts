@@ -220,10 +220,22 @@ describe("org-owned workspaces", () => {
       // Carol's live session must survive both refused operations untouched.
       using asCarol = await ws.open(ws.userIds.carol, CAROL);
       expect(asCarol).toBeInstanceOf(UseOverseerInterface);
-      await expect(env.TEST_ORG.getByName(orgId).removeMember(ALICE, ALICE)).rejects.toThrow(
-          "at least one owner");
-      await expect(env.TEST_ORG.getByName(orgId).memberLeave(ALICE)).rejects.toThrow(
-          "at least one owner");
+      // Caught promise-style: a bare expected rejection of an RPC promise leaves the harness
+      // an unhandled-rejection log that fails the run (see the transfer test below).
+      let refused = "";
+      try {
+        await env.TEST_ORG.getByName(orgId).removeMember(ALICE, ALICE);
+      } catch (error) {
+        refused = error instanceof Error ? error.message : String(error);
+      }
+      expect(refused).toMatch(/at least one owner/);
+      refused = "";
+      try {
+        await env.TEST_ORG.getByName(orgId).memberLeave(ALICE);
+      } catch (error) {
+        refused = error instanceof Error ? error.message : String(error);
+      }
+      expect(refused).toMatch(/at least one owner/);
       expect(ws.restarts).toEqual([]);
       expect(asCarol).toBeInstanceOf(UseOverseerInterface);
 
