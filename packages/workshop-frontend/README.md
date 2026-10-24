@@ -74,3 +74,18 @@ VITE_CF_ACCESS_MODE=true
 ```
 
 The backend also needs to be configured with the `CF_ACCESS_ISS` and `CF_ACCESS_AUD` environment variables (see the workshop-backend package) for the JWT verification to work.
+
+## SaaS builds
+
+The frontend is an OSS build by default. Setting `VITE_SAAS=true` at build time adds the SaaS-only
+surfaces: everything under `/saas` renders in a lazily-loaded shell (`src/features/saas/`), which
+is its own chunk. Without the flag the gate folds away at build time, so OSS bundles contain no
+SaaS code, strings, or chunks at all (`saasBundle.test.ts` keeps that true).
+
+```sh
+VITE_SAAS=true pnpm exec vp run build
+```
+
+The flag is compile-time only. A SaaS build can also ask the server at runtime whether the
+deployment runs in SaaS mode — `useSaasEnabled()` reads `ServerConfig.saasEnabled`, which the
+backend sets from its `SAAS_MODE` environment variable.

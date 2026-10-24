@@ -7,12 +7,15 @@
 //   --use-workers-ai-binding   Include the Workers AI binding in workshop-backend and in the
 //                               gatekeepers that declare one (requires Cloudflare login).
 //   --port PORT                 Listen on PORT instead of 8787. Overrides VITE_BACKEND_HOST.
+//   --scan-root <dir>           Also scan <dir> for deployable packages (repeatable), e.g. a
+//                               private overlay workspace's packages dir.
 //
 // Env:
 //   VITE_BACKEND_HOST=localhost:9000  Also pass --port 9000 to wrangler dev.
+//   WORKER_SCAN_ROOTS                 Extra scan roots, path.delimiter-separated (as --scan-root).
 
 import {
-  existsSync, readFileSync, writeFileSync, readdirSync, statSync,
+  existsSync, readFileSync, writeFileSync,
 } from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
 import { connect } from "node:net";
@@ -23,23 +26,16 @@ import { parse } from "jsonc-parser";
 import { resolveBinEntry } from "./bin-entry.ts";
 import { gatekeeperBaseUrl, getDevServerConfig } from "./dev-server-config.ts";
 import { generateWorkerConfigs } from "./generate-worker-configs.ts";
+import { resolveScanRoots, scanRootArgs } from "./scan-roots.ts";
 import { killProcessTree } from "./kill-process-tree.ts";
 import { pnpmCommand } from "./pnpm-command.ts";
-import { gatekeeperBindingName, type ServiceBinding, type WranglerBuild } from "./release/manifest-lib.ts";
+import { gatekeeperBindingName, isGatekeeperPackage, readDeployablePackages, type ServiceBinding, type WranglerBuild } from "./release/manifest-lib.ts";
 import { vpRunEnv } from "./vp/concurrency.ts";
 
 const SCRIPTS_DIR = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(SCRIPTS_DIR, "..");
 const PACKAGES_DIR = join(ROOT, "packages");
 const WORKSHOP_BACKEND_DIR = join(PACKAGES_DIR, "workshop-backend");
-
-/** A gatekeeper package as {@link findGatekeepers} discovers it. */
-interface Gatekeeper {
-  /** Package directory name, which is also the worker name. */
-  name: string;
-  /** Absolute path to the package directory. */
-  dir: string;
-}
 
 // Load a root `.dev.vars` file (KEY=VALUE lines) into process.env for local development. Existing
 // shell environment values take precedence. This file is gitignored and may hold local secrets.
@@ -94,35 +90,29 @@ if (process.env.CLOUDFLARE_OS_DEPLOYMENT) {
 }
 
 // ---------------------------------------------------------------------------
-// Discover gatekeeper packages.
+// Discover deployable packages.
 // ---------------------------------------------------------------------------
-function findGatekeepers(parentDir: string): Gatekeeper[] {
-  try {
-    return readdirSync(parentDir)
-        .filter(name => name.startsWith("gatekeeper-"))
-        .filter(name => {
-      try {
-        return statSync(join(parentDir, name, "wrangler.jsonc")).isFile();
-      } catch {
-        return false;
-      }
-    })
-        .map(name => ({ name, dir: join(parentDir, name) }));
-  } catch {
-    return [];
-  }
-}
+// Roots: the repo's packages/ dir plus any overlay roots (--scan-root / WORKER_SCAN_ROOTS, see
+// scan-roots.ts), so a private workspace's workers join the same dev process.
+// readDeployablePackages marks the overlay ones; non-gatekeeper names among them still classify
+// (as plain workers) where a core package would fail closed at release time.
+const scanRoots = resolveScanRoots(scanRootArgs(process.argv.slice(2)));
 
 // The committed wrangler.jsonc files are generated from cloudflare.config.ts; regenerate them so a
 // TypeScript edit reaches `pnpm dev-server` without a separate step.
-await generateWorkerConfigs({ check: false });
+await generateWorkerConfigs({ check: false, scanRoots });
 
-const gatekeepers = findGatekeepers(PACKAGES_DIR);
+const packages = readDeployablePackages(scanRoots);
+const gatekeepers = packages.filter((pkg) => isGatekeeperPackage(pkg.name));
+// Overlay workers that are not gatekeepers: no router route, no vendor binding — they run in the
+// same multiworker process with a plain wrangler.dev.jsonc (see below).
+const plainWorkers = packages.filter((pkg) => pkg.overlay === true && !isGatekeeperPackage(pkg.name));
 
-// The Context Library (packages/gatekeeper-context) is discovered by findGatekeepers and bound
-// like any other gatekeeper (GATEKEEPER_CONTEXT -> GatekeeperVendor). Its describe() reports
+// The Context Library (packages/gatekeeper-context) is discovered with the other gatekeepers and
+// bound like any other gatekeeper (GATEKEEPER_CONTEXT -> GatekeeperVendor). Its describe() reports
 // autoProvisionsAccount, so core auto-provisions one Context account per user. The only extra
 // wiring it needs is a sharingDomain in its binding props (see below).
+
 const CONTEXT_GATEKEEPER_NAME = "gatekeeper-context";
 
 // What Wrangler picks for itself when no --port is derived, so also what we poll.
@@ -553,6 +543,26 @@ for (const gk of gatekeepers) {
 }
 
 // ---------------------------------------------------------------------------
+// Generate plain overlay workers' wrangler.dev.jsonc — same treatment as the gatekeepers' minus
+// the gatekeeper wiring: the multi-config wrangler runs from the repo root, so the build command
+// needs its package cwd, and a Workers AI binding stays opt-in the same way. Core has no plain
+// workers; this loop only ever runs for --scan-root / WORKER_SCAN_ROOTS packages.
+// ---------------------------------------------------------------------------
+for (const pkg of plainWorkers) {
+  const srcPath = join(pkg.dir, "wrangler.jsonc");
+  const config = parse(readFileSync(srcPath, "utf8"));
+  config.build = devBuildConfig(config.build, pkg.dir);
+  if (config.ai) {
+    if (useWorkersAi) config.ai.remote = true;
+    else delete config.ai;
+  }
+  const outPath = join(pkg.dir, "wrangler.dev.jsonc");
+  writeFileSync(outPath, JSON.stringify(config, null, 2) + "\n");
+  console.log(`generated: ${outPath}`);
+}
+
+
+// ---------------------------------------------------------------------------
 // Generate packages/workshop-backend/wrangler.dev.jsonc (with gatekeeper
 // service bindings using the GatekeeperVendor entrypoint).
 // ---------------------------------------------------------------------------
@@ -644,8 +654,8 @@ for (const gk of gatekeepers) {
 
 const configs = [
   "wrangler.dev.jsonc",
-  join("packages", "workshop-backend", "wrangler.dev.jsonc"),
   ...gatekeepers.map(gk => join(gk.dir, "wrangler.dev.jsonc")),
+  ...plainWorkers.map(pkg => join(pkg.dir, "wrangler.dev.jsonc")),
 ];
 
 const args = configs.flatMap(c => ["-c", c]);

@@ -6,10 +6,11 @@ import { act, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { newMessagePortRpcSession, RpcPromise, RpcTarget, type RpcStub } from "capnweb";
-import type { AuthenticatedApi, ServerConfig, UserDirectoryRecord } from "@gadgets/workshop-shared/api";
+import type { AuthenticatedApi, OrgMembership, ServerConfig, UserDirectoryRecord } from "@gadgets/workshop-shared/api";
 import type { GatekeeperUserSelection } from "@gadgets/workshop-shared/gatekeeper";
 import type * as Kumo from '@cloudflare/kumo';
 import type * as UserSearch from "../user-directory/UserSearchCombobox";
+import type * as AuthContextModule from "../../AuthContext";
 import { ServerConfigContext } from "../../ServerConfigContext";
 import GatekeeperUserPickerDialog from "./GatekeeperUserPickerDialog";
 
@@ -41,11 +42,19 @@ vi.mock("../../components/WorkshopControls", () => ({
 
 vi.mock("../../components/PersonAvatar", () => ({ PersonAvatar: () => null }));
 
+// The dialog reads the signed-in user's org memberships (whoami) to explain the picker's scope.
+const auth = vi.hoisted(() => ({ orgs: [] as OrgMembership[] }));
+vi.mock("../../AuthContext", async (importOriginal) => {
+  const actual = await importOriginal<typeof AuthContextModule>();
+  return { ...actual, useOptionalAuthenticatedApi: () => ({ currentUser: { orgs: auth.orgs } }) };
+});
+
 type CapturedProps = {
   search(query: string): RpcPromise<UserDirectoryRecord[]>;
   onSelect(user: UserDirectoryRecord): void;
   onValueChange(value: string): void;
   onSubmit(): void;
+  scopeNote?: string;
 };
 
 const ALICE: UserDirectoryRecord = { id: "alice@example.com", name: "Alice" };
@@ -77,7 +86,7 @@ describe("GatekeeperUserPickerDialog", () => {
     for (const session of sessions) session[Symbol.dispose]();
     sessions.length = 0;
     container?.remove();
-    captured.props = null;
+    auth.orgs = [];
     vi.useRealTimers();
     Reflect.deleteProperty(Element.prototype, "scrollIntoView");
   });
@@ -133,6 +142,22 @@ describe("GatekeeperUserPickerDialog", () => {
   const closeButton = () => container!.querySelector<HTMLButtonElement>('[aria-label="Close person picker"]')!;
   const doneButton = () => Array.from(container!.querySelectorAll('button'))
     .find(button => button.textContent === 'Done')!;
+
+  it("describes the picker's scope from the user's org memberships", async () => {
+    const { props } = await mount(mintFor, undefined, { searchEnabled: true });
+    expect(props().scopeNote).toBe("You can select people you share workspaces with.");
+    expect(container!.textContent).toContain("You can select people you share workspaces with.");
+  });
+
+  it("names the user's organizations in the scope note", async () => {
+    auth.orgs = [
+      { orgId: "org-a", role: "member", status: "active" },
+      { orgId: "org-b", role: "owner", status: "active" },
+    ];
+    const { props } = await mount(mintFor, undefined, { searchEnabled: true });
+    expect(props().scopeNote).toBe(
+      "You can select members of your 2 organizations and people you share workspaces with.");
+  });
 
   it("mints a ticket for each pick and delivers it to the app before the picker closes", async () => {
     const { searchUsers, createSelection, onSelected, onClose, props } = await mount(
