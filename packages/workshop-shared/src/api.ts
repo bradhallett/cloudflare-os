@@ -3564,6 +3564,16 @@ export interface Overseer extends RpcTarget {
    * can present checkboxes for which to keep vs. remove.
    */
   previewRevokeShareLink(linkId: string): Promise<AffectedCollaborator[]>;
+
+  /**
+   * Transfer ownership of this workspace to the organization `orgId`, which becomes the root of
+   * its sharing graph: the org's active members keep access at a role derived from their org role
+   * (owners/admins build, members use), re-checked live at every open(), and an owner/admin of the
+   * org gains the sharing-management authority the user owner had. Only the workspace's current
+   * (user) owner may call this, and only into an org they administer. One-way: a workspace cannot
+   * be transferred back out of an org.
+   */
+  transferToOrg(orgId: string): Promise<void>;
 }
 
 export type AiChatMetadata = {

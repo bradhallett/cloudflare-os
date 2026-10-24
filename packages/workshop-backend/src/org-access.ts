@@ -5,7 +5,9 @@
 // would leave the org with no owner is refused (the org goes on ownerless only if the last owner's
 // account is ever deleted out from under it, which no API here does).
 
-import type { OrgInvitePolicy, OrgMember, OrgMemberStatus, OrgRole } from "@gadgets/workshop-shared/api";
+import type {
+  CollaboratorRole, OrgInvitePolicy, OrgMember, OrgMemberStatus, OrgRole,
+} from "@gadgets/workshop-shared/api";
 
 /** Roles ranked low to high; a member may never act above, or grant a role above, their own. */
 const ROLE_RANK: Record<OrgRole, number> = { member: 0, admin: 1, owner: 2 };
@@ -84,4 +86,23 @@ export function canRemoveMember(access: OrgAccess, targetRole: OrgRole): boolean
  */
 export function wouldLoseLastOwner(access: OrgAccess, targetRole: OrgRole): boolean {
   return targetRole === "owner" && access.ownerCount <= 1;
+}
+
+/**
+ * Whether the user may move resources into (and so also manage resources of) the org: its
+ * workspace transfers and org-owned-workspace deletions. Owners and admins; a plain member,
+ * pending invitee, or non-member may not.
+ */
+export function canManageOrgAssets(access: OrgAccess): boolean {
+  return isActingMember(access) && ROLE_RANK[access.role!] >= ROLE_RANK["admin"];
+}
+
+/**
+ * The baseline role an org role grants on a workspace the org owns: owners and admins manage it
+ * (build), members use it. The single mapping from org authority to sharing-graph access -- the
+ * sharing module seeds its graph with it, and the org compares it to decide when a role change
+ * narrows a member's workspace entitlement.
+ */
+export function gadgetBaselineRole(orgRole: OrgRole): CollaboratorRole {
+  return orgRole === "member" ? "use" : "build";
 }

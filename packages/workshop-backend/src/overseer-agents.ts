@@ -534,6 +534,9 @@ export abstract class OverseerAgents extends OverseerMainline {
    */
   protected async enforceExcludeObservers(gatekeeperId: number, observerIds: string[]): Promise<void> {
     let sharing = await this.getSharingManager();
+    // One membership snapshot for the whole sweep, so every observer is classified against the
+    // same org (or user-owned null) state.
+    let orgRoles = await this.getOwningOrgRoles();
 
     let unauthorized: ObserverRecord[] = [];
     let outOfScope: string[] = [];
@@ -544,7 +547,7 @@ export abstract class OverseerAgents extends OverseerMainline {
       // unknown and the observation is admitted. Fix: an in-memory pending-id map consulted
       // here, failing closed.
       if (!observer) continue;  // not an active observer -> ignore
-      let role = sharing.getEffectiveRole(observer.profileId);
+      let role = await sharing.getEffectiveRole(observer.profileId, orgRoles);
       if (!role) {
         unauthorized.push(observer);
       } else if (this.#inRoleVerificationScope(gatekeeperId, role)) {
@@ -1289,7 +1292,9 @@ export abstract class OverseerAgents extends OverseerMainline {
         requireRole?: CollaboratorRole;
       } = {}): Promise<CollaboratorRole | null> {
     let sharing = await this.getSharingManager();
-    let role = sharing.getEffectiveRole(profileId);
+    // An org-owned workspace consults its owning org's live membership here (the awaited
+    // getEffectiveRole), so a member removed from the org is denied at their next open.
+    let role = await sharing.getEffectiveRole(profileId);
     if (!role || (opts.requireRole && roleRank(role) < roleRank(opts.requireRole))) return null;
 
     // A session-to-be counts as a session for its role from the moment its role is resolved:

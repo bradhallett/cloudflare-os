@@ -15,8 +15,8 @@ import {
   MAX_ORG_NAME_LENGTH, type OrgMember, type OrgMemberStatus, type OrgRole, type OrgSummary,
 } from "@gadgets/workshop-shared/api";
 import {
-  canManageRoles, canRemoveMember, canUpdateSettings, canViewMembers, isActiveMember,
-  invitableView, wouldLoseLastOwner, type OrgAccess,
+  canManageOrgAssets, canManageRoles, canRemoveMember, canUpdateSettings, canViewMembers,
+  gadgetBaselineRole, isActiveMember, invitableView, wouldLoseLastOwner, type OrgAccess,
 } from "./org-access";
 import { makeOrgStorage, type OrgRecord, type OrgSettings } from "./storage-schema/org-storage";
 
@@ -183,6 +183,18 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
+   * The org's active members — the live membership snapshot behind an org-owned workspace's
+   * sharing graph (see sharing.ts), which baselines each member's access at their org role and
+   * re-reads this at every open. An authority read like getMember(), so it takes no actor: only
+   * this worker's own code can reach it. Pending invitees are excluded; their access never
+   * starts.
+   */
+  async activeMembers(): Promise<OrgMember[]> {
+    this.#org();
+    return [...this.storage.members.list()].filter(m => m.status === "active");
+  }
+
+  /**
    * Every membership of the org — pending invitations included — sorted by user id. Only an
    * active member may read the list.
    */
@@ -297,6 +309,12 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
       event: "org.member.role_changed", orgId: org.id, orgRole: role,
     });
     await this.#mirror(userId, { role: changed.role, status: changed.status });
+    // A demotion to member narrows the member's baseline on every org-owned workspace; sever
+    // their live sessions there so the next open re-checks at the lower role. Promotions and
+    // owner/admin swaps never narrow (both baseline at build), so they disturb nothing.
+    if (gadgetBaselineRole(role) === "use" && gadgetBaselineRole(member.role) === "build") {
+      await this.#severOwnedGadgetSessions();
+    }
     return changed;
   }
 
@@ -320,6 +338,7 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
     this.#deleteMember(member);
     logger.info("removed an org member", { event: "org.member.removed", orgId: org.id });
     await this.#mirror(userId, null);
+    await this.#severOwnedGadgetSessions();
   }
 
   /**
@@ -339,11 +358,62 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
     this.#deleteMember(member);
     logger.info("an org member left", { event: "org.member.left", orgId: org.id });
     await this.#mirror(userId, null);
+    await this.#severOwnedGadgetSessions();
   }
 
   #deleteMember(member: OrgMember): void {
     this.storage.members.delete(member.userId);
     this.storage.invitations.delete(member.userId);
+  }
+
+  /**
+   * Record that the org owns the workspace `gadgetId` (an Overseer DO id): `Overseer.transferToOrg`
+   * calls this after writing its own owner subject. The actor must be an active owner/admin of the
+   * org (org-access.ts), checked here rather than in the caller. Idempotent per workspace: a
+   * retried transfer refreshes the record rather than duplicating it.
+   */
+  async addOwnedGadget(actorId: string, gadgetId: string): Promise<void> {
+    const org = this.#org();
+    if (!canManageOrgAssets(this.#accessFor(actorId))) {
+      throw new Error("Only an owner or admin of this organization may transfer workspaces into it.");
+    }
+    this.storage.ownedGadgets.put({ gadgetId });
+    logger.info("a workspace was transferred into the org", {
+      event: "org.gadget.transferred", orgId: org.id,
+    });
+  }
+
+  /**
+   * Drop a workspace from the org's index: its own Overseer calls this while deleting itself, so
+   * it takes no actor (the workspace already authorized the deletion). Best-effort symmetry with
+   * addOwnedGadget; a lost entry only means a future membership change notifies a dead DO.
+   */
+  async removeOwnedGadget(gadgetId: string): Promise<void> {
+    this.#org();
+    this.storage.ownedGadgets.delete(gadgetId);
+    logger.info("a workspace left the org's index", {
+      event: "org.gadget.unindexed", orgId: this.storage.org.get()?.id,
+    });
+  }
+
+  // Tell every org-owned workspace that a membership ended or narrowed, so each can sever live
+  // sessions (the workspace's own sharing graph stays the authority and re-checks at every
+  // open; the sever is role-counted, so it names no member). Best-effort and awaited inline,
+  // like #mirror: an unreachable workspace costs a logged warning, and the membership change
+  // itself never fails because of it.
+  async #severOwnedGadgetSessions(): Promise<void> {
+    for (const gadget of this.storage.ownedGadgets.list()) {
+      try {
+        await this.ctx.exports.OverseerDurableObject
+            .get(this.ctx.exports.OverseerDurableObject.idFromString(gadget.gadgetId))
+            .severOrgMemberSessions();
+      } catch (error) {
+        logger.warn("failed to notify an org-owned workspace of a membership change", {
+          event: "org.gadget.membership.notify.failed",
+          orgId: this.storage.org.get()?.id, error,
+        });
+      }
+    }
   }
 
   /**

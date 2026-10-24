@@ -87,6 +87,57 @@ Concretely, revoking a share link or removing its creator triggers the same tran
 
 The owner is the implicit root of the permission graph. The owner is never stored in the collaborators table and cannot be removed. All permission chains must ultimately trace back to the owner (or to someone the owner added, or someone *they* added, etc.) for access to be valid.
 
+### Org-owned workspaces: the org as root
+
+The workspace's user owner can transfer it into an organization they administer
+(`transferToOrg`; one-way). From then on the permission graph roots at the org, not at any user:
+
+- **Baselines.** Each *active* org member is seeded at the role their org role grants
+  (org-access.ts): owners/admins at `build`, members at `use`. Pending invitees get nothing.
+  The former user owner becomes an ordinary principal, with no built-in access once their own
+  membership is gone.
+- **Edges extend, never exceed.** Stored edges keep working but only *on top of* the baselines:
+  an edge still grants `min(edge role, sharer's effective role)`, and a sharer's effective role
+  now starts at their baseline. A non-member has no effective role, so their stored edges grant
+  nothing — and so do edges pointing at them.
+- **Lazy revocation at `open()`.** Membership is re-read live (an `activeMembers()` snapshot
+  from the owning org's Durable Object, taken once per operation) whenever the graph is
+  computed. A member removed from the org, or demoted to plain member, simply loses their
+  baseline: their access ends or narrows at the next `open()`, the same lazy revocation as any
+  edge severance, with nothing to clean up.
+- **Severing live sessions.** The org indexes the workspaces it owns (`ownedGadgets`), and
+  every membership removal, leave, or demotion-to-member fans out to them
+  (`severOrgMemberSessions`): each workspace force-restarts — the same `ctx.abort()` restart as
+  a revocation — so live sessions die immediately instead of at their next `open()`. The
+  restart is conservative (it severs all sessions when any collaborator session is live; each
+  client reconnects and re-authorizes), and the fan-out is best-effort: a membership change
+  never fails because one workspace was unreachable, and a missed notification costs only a
+  stale live session that the next `open()` still denies.
+- **Transfer flow.** `transferToOrg` registers the workspace with the org *first* — the org
+  refuses registration unless the caller is one of its owners/admins — and only then writes the
+  durable owner subject. A refusal therefore leaves the workspace exactly as it was, and an
+  eviction between the two writes can leave at worst a harmless org index entry for a workspace
+  that is still user-owned (which severs nothing, and which a retried transfer rewrites) —
+  never an org-owned workspace the org does not know about. After a successful transfer all
+  live sessions are severed, the transferring owner's included: everyone reopens and
+  re-authorizes through the org.
+- **Owner authority moves with the root.** An org owner/admin may delete the workspace (the
+  deletion also drops it from the org's index) and holds the sharing-management authority the
+  user owner had: adding and removing collaborators, and owner-style link management.
+
+Two degeneracies of the model are deliberate:
+
+- **`ownerInvitesOnly` re-roots "owner".** On an org-owned workspace the owner grants that
+  still count under the flag are the direct `user` edges of build-baseline members (org
+  owners/admins; `#mayAuthorOwnerGrant` in sharing.ts). While the flag is set an ordinary
+  member can add no one and an admin's adds take effect, and an admin later demoted to member
+  lazily loses the grants they authored — their edges stop counting at the next graph read,
+  exactly like any baseline drop. Share links stay disabled, as on a user-owned workspace.
+- **You cannot remove someone from a list they are not on.** Removing a member whose access is
+  their baseline alone is refused with a pointer at the org ("remove them from the organization
+  instead") rather than silently severing edges that would change nothing. An edge that *rose*
+  above someone's baseline can still be severed, downgrading them back to it.
+
 ## Lazy revocation
 
 Access is determined by **reachability from the owner**, recomputed live at every `open()` (see "Authorization model" below). Revocation exploits this: rather than eagerly cascading and deleting records, the system only **severs the edges that grant the removed party access** and lets reachability do the rest.
@@ -193,7 +244,9 @@ A gatekeeper whose data source requires each recipient to be granted access indi
 - **Re-adding an intermediary restores nobody else.** If Alice added Bob, Bob added Carol, and Alice removed Bob, re-adding Bob after the flag is set brings back only Bob; Carol needs her own grant from Alice. The lazy undo (see Restoring access) applies only while the flag is unset.
 - **No new links.** `createShareLink` and `newShareLinkKey` throw "Share links are disabled…".
 - **No redemption for people without owner grants.** Redeeming a still-active link throws the same message, coded `OPEN_GADGET_ERROR_CODES.shareLinksDisabled`, for anyone the owner has not added directly, including people who joined through a link before the flag was set. The error page lets them retry once the owner adds them. A direct collaborator reopening an old link is let through, but no edge is added.
-- **Owner-only direct adds.** `addCollaborator` throws for non-owners, whose grants would count for nothing.
+- **Owner-only direct adds.** `addCollaborator` throws for anyone but the workspace's owner
+  authority — the user owner, or on an org-owned workspace an org owner/admin (see
+  "Org-owned workspaces") — whose grants are the only ones that count.
 
 The owner can still list, rename, and revoke links (which no longer grant anything) and remove collaborators. `GadgetMetadata.ownerInvitesOnly` reports the flag, and the Share modal hides link controls (and, for non-owners, the invite box).
 

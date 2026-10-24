@@ -258,12 +258,16 @@ export abstract class OverseerCore {
 
   /**
    * Whether some non-owner session of `role` (or of any role, when omitted) is live right now.
-   * The owner is never an observer, so their session never counts here.
+   * The owner is never an observer, so their session never counts here. Public for the Durable
+   * Object facade: the org-ownership notification path (severOrgMemberSessions) restarts on it,
+   * since sessions are counted by role, not by member, so a membership change that might touch
+   * one live session conservatively restarts them all -- each reconnect re-authorizes.
    */
-  protected hasCollaboratorSession(role?: CollaboratorRole): boolean {
+  hasCollaboratorSession(role?: CollaboratorRole): boolean {
     if (role !== undefined) return this.#liveSessions[role] > 0;
     return Object.entries(this.#liveSessions).some(([kind, n]) => kind !== "owner" && n > 0);
   }
+
 
   /** Subscribe to roster changes. The current roster is delivered immediately via init(). */
   addPresenceSubscriber(subscriber: RpcStub<PresenceSubscriber>): RpcStub<{}> {

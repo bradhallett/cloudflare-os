@@ -86,9 +86,14 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
     this.notifyClosed[Symbol.dispose]();
   }
 
-  // Per-session caller identity for the SharingManager.
-  #sharingCaller(): SharingCaller {
-    return { profileId: this.clientProfileId, isOwner: this.isOwner };
+  // Per-session caller identity for the SharingManager. On an org-owned workspace an active
+  // owner/admin of the org holds the sharing-management authority the user owner had on their
+  // own session; isOwningOrgAdmin resolves that live (false on a user-owned workspace).
+  async #sharingCaller(): Promise<SharingCaller> {
+    return {
+      profileId: this.clientProfileId,
+      isOwner: this.isOwner || await this.impl.isOwningOrgAdmin(this.clientProfileId),
+    };
   }
 
   // What a capability minted into this session counts as toward #hasCollaboratorSession -- the
@@ -319,7 +324,12 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   async deleteSelf(): Promise<void> {
-    if (!this.isOwner) {
+    // The session owner may delete their workspace; once an org owns it, only an owner/admin of
+    // that org may. Read the owning org before the storage goes away.
+    const subject = this.impl.storage.ownerSubject.get();
+    const owningOrgId = subject?.type === "org" ? subject.id : undefined;
+    if (!this.isOwner &&
+        !(owningOrgId !== undefined && await this.impl.isOwningOrgAdmin(this.clientProfileId))) {
       throw new Error("Only the workspace owner can delete it.");
     }
     let startedAt = Date.now();
@@ -341,6 +351,18 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
     await this.impl.ctx.blockConcurrencyWhile(async () => {
       await this.#owner.deleteGadget(this.impl.ctx.id.toString());
       await this.impl.ctx.storage.deleteAll();
+      // The org's owned-gadget index outlived the storage above; drop the workspace from it
+      // best-effort (a lost entry only means a future membership change notifies a dead DO).
+      if (owningOrgId !== undefined) {
+        try {
+          await this.impl.ctx.exports.OrgDurableObject.getByName(owningOrgId)
+              .removeOwnedGadget(this.impl.ctx.id.toString());
+        } catch (err) {
+          this.impl.logger.warn("failed to drop a deleted workspace from its org's index", {
+            event: "workspace.delete.org.index.cleanup.failed", error: err,
+          });
+        }
+      }
       this.impl.recordGadgetAnalytics({
         event_name: "gadget_deleted",
         user_id: this.#clientUser.id.toString(),
@@ -1478,7 +1500,7 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
     }
 
     return (await this.impl.getSharingManager()).addCollaborator({
-      caller: this.#sharingCaller(),
+      caller: await this.#sharingCaller(),
       profile,
       role,
       note,
@@ -1487,12 +1509,12 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async previewRemoveCollaborator(profileId: string): Promise<AffectedCollaborator[]> {
     return (await this.impl.getSharingManager())
-        .previewRemoveCollaborator(this.#sharingCaller(), profileId);
+        .previewRemoveCollaborator(await this.#sharingCaller(), profileId);
   }
 
   async removeCollaborator(profileId: string, keepUsers: string[]): Promise<AffectedCollaborator[]> {
-    let affected = (await this.impl.getSharingManager())
-        .removeCollaborator(this.#sharingCaller(), profileId, keepUsers);
+    let affected = await (await this.impl.getSharingManager())
+        .removeCollaborator(await this.#sharingCaller(), profileId, keepUsers);
     // Schedule the restart in the same synchronous step as the sharing mutation: the revoked
     // collaborator's live sessions must not outlive the cleanup below, which crosses gatekeeper
     // and User-DO round trips that can stall or hang. Only restart if someone actually lost
@@ -1514,12 +1536,12 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async previewRevokeShareLink(linkId: string): Promise<AffectedCollaborator[]> {
     return (await this.impl.getSharingManager())
-        .previewRevokeShareLink(this.#sharingCaller(), linkId);
+        .previewRevokeShareLink(await this.#sharingCaller(), linkId);
   }
 
   async revokeShareLink(linkId: string, keepUsers: string[]): Promise<AffectedCollaborator[]> {
-    let affected = (await this.impl.getSharingManager())
-        .revokeShareLink(this.#sharingCaller(), linkId, keepUsers);
+    let affected = await (await this.impl.getSharingManager())
+        .revokeShareLink(await this.#sharingCaller(), linkId, keepUsers);
     // Restart first, then best-effort cleanup, for the reasons given in removeCollaborator.
     if (affected.length > 0) {
       this.impl.scheduleAccessRestart(
@@ -1535,12 +1557,12 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
   async createShareLink(role: CollaboratorRole, note?: string)
       : Promise<{ key: string; linkId: string }> {
     return (await this.impl.getSharingManager())
-        .createShareLink({ caller: this.#sharingCaller(), role, note });
+        .createShareLink({ caller: await this.#sharingCaller(), role, note });
   }
 
   async newShareLinkKey(linkId: string): Promise<{ key: string }> {
     return (await this.impl.getSharingManager())
-        .newShareLinkKey({ caller: this.#sharingCaller(), linkId });
+        .newShareLinkKey({ caller: await this.#sharingCaller(), linkId });
   }
 
   async listShareLinks(): Promise<ShareLinkInfo[]> {
@@ -1586,6 +1608,37 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async updateShareLink(linkId: string, note?: string): Promise<void> {
     (await this.impl.getSharingManager())
-        .updateShareLink(this.#sharingCaller(), linkId, note);
+        .updateShareLink(await this.#sharingCaller(), linkId, note);
+  }
+
+  async transferToOrg(orgId: string): Promise<void> {
+    // Only the user owner may transfer, and only from a user-owned workspace: an org-owned one
+    // has no user owner any more (see open()), and transfer is one-way by design.
+    if (!this.isOwner) {
+      throw new Error("Only the workspace owner can transfer it to an organization.");
+    }
+    if (this.impl.storage.ownerSubject.get() !== undefined) {
+      throw new Error("This workspace already belongs to an organization.");
+    }
+    const gadgetId = this.impl.ctx.id.toString();
+    // Register with the org before flipping the durable owner subject. Registration is where
+    // the org refuses (unknown org, or the caller is not one of its owners/admins), so a
+    // refusal leaves this workspace exactly as it was -- no rollback window. And if this DO is
+    // evicted between the two writes, the only residue is an org index entry for a workspace
+    // that is still user-owned, which severs nothing (severOrgMemberSessions no-ops without an
+    // org owner subject) and is simply rewritten by a retried transfer.
+    await this.impl.ctx.exports.OrgDurableObject.getByName(orgId)
+        .addOwnedGadget(this.clientProfileId, gadgetId);
+    this.impl.storage.ownerSubject.put({ type: "org", id: orgId });
+    this.impl.logger.info("transferred workspace to an organization", {
+      event: "workspace.transfer.org.completed", orgId,
+    });
+    // Everyone -- the transferring owner included -- is now authorized through the org's
+    // membership, so sever all live sessions (this one too); each client reopens and re-checks.
+    // Fire-and-forget like removeCollaborator: the abort inside fires ~100ms later so this
+    // RPC's own response escapes first, and awaiting it would instead reject the transfer
+    // client-side even though it succeeded.
+    this.impl.scheduleAccessRestart(
+        "Gadget restarted because its ownership moved to an organization.");
   }
 }
