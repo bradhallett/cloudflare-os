@@ -1,0 +1,64 @@
+// The Org Durable Object's storage schema: `makeOrgStorage()` and the record types it stores.
+//
+// Everything an organization persists is declared in this one file, so that a change to the stored
+// shape of an org shows up as a change here. See overseer-storage.ts for the conventions. The
+// `members` collection is the sole authority on membership (org-access.ts interprets it); each
+// member's user DO keeps a mirrored index entry for discovery (UserDurableObject
+// .syncOrgMembership), which every org read re-checks live.
+
+import { collection, createTypedStorage } from "@gadgets/typed-storage";
+import type { OrgInvitePolicy, OrgMember } from "@gadgets/workshop-shared/api";
+
+/**
+ * The organization itself: set once by `OrgDurableObject.initializeOrg()` and immutable after.
+ * `id` is the random id the org was created under, which is also the DO's name.
+ */
+export type OrgRecord = {
+  id: string;
+  name: string;
+  createdAt: Date;
+};
+
+/** Settings the org's owners may change. See `OrgInvitePolicy` in the shared API. */
+export type OrgSettings = {
+  invitePolicy: OrgInvitePolicy;
+};
+
+/**
+ * A pending invitation, keyed by invitee. Deleted on acceptance or revocation; an invitation past
+ * `expiresAt` is unacceptable and swept lazily (with the `invited` member record it shadows).
+ */
+export type OrgInvitationRecord = {
+  inviteeId: string;
+  role: OrgMember["role"];
+  invitedBy: string;
+  invitedAt: Date;
+  expiresAt: Date;
+};
+/** Builds the org storage schema over one org Durable Object's storage. */
+export function makeOrgStorage(storage: DurableObjectStorage) {
+  return createTypedStorage(storage, {
+    collections: {
+      // The org's memberships, keyed by the member's canonical user id. A record with
+      // status "invited" shadows its pending invitation in `invitations`.
+      members: collection<OrgMember>()({
+        primaryKey: "userId",
+        nonUniqueIndexes: {
+          byRole(member: OrgMember) { return member.role; },
+        },
+      }),
+      invitations: collection<OrgInvitationRecord>()({
+        primaryKey: "inviteeId",
+      }),
+    },
+    singletons: {
+      // The org record: null until initializeOrg() runs, and never null after.
+      org: <OrgRecord | null>null,
+      settings: <OrgSettings>{
+        invitePolicy: "admin",
+      },
+    },
+  });
+}
+
+/** The storage object `makeOrgStorage()` returns (its `collections` and `singletons`). */
