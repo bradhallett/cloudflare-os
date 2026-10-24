@@ -27,6 +27,10 @@
       "types": "./src/entitlements.ts",
       "import": "./src/entitlements.ts"
     },
+    "./commerce": {
+      "types": "./src/commerce.ts",
+      "import": "./src/commerce.ts"
+    },
     "./usage-events": {
       "types": "./src/usage-events.ts",
       "import": "./src/usage-events.ts"

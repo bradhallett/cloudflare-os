@@ -12,7 +12,8 @@ import { DurableObject } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import { createWorkshopLogger, type WorkshopLogger } from "./observability";
 import {
-  MAX_ORG_NAME_LENGTH, type OrgMember, type OrgMemberStatus, type OrgRole, type OrgSummary,
+  MAX_ORG_NAME_LENGTH, type OrgCommerceMember, type OrgMember, type OrgMemberStatus,
+  type OrgRole, type OrgSummary,
 } from "@gadgets/workshop-shared/api";
 import {
   canManageOrgAssets, canManageRoles, canRemoveMember, canUpdateSettings, canViewMembers,
@@ -20,6 +21,7 @@ import {
 } from "./org-access";
 import { makeOrgStorage, type OrgRecord, type OrgSettings } from "./storage-schema/org-storage";
 import { resolveEntitlements } from "./entitlements.js";
+import { notifyOrgMembersChanged } from "./commerce.js";
 
 const logger = createWorkshopLogger("workshop.org");
 
@@ -98,12 +100,16 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
    * mirrors the removal to each swept member. Invitations are swept lazily — here, at the start of
    * the reads and mutations that care — rather than from an alarm, because an expired invitation
    * is already unacceptable (acceptInvitation re-checks `expiresAt`).
+   *
+   * A swept invitation releases the seat it had claimed (membership, so seat count, is pushed to
+   * commerce only from here — the port has no pull API), so anything swept also re-syncs.
    */
   async #sweepExpiredInvitations(): Promise<void> {
     const now = Date.now();
     // The snapshot is materialized because the loop awaits (the mirror) mid-iteration, and a
     // second kv.list() (however triggered) would invalidate a still-live iterator.
     const expired = [...this.storage.invitations.list()];
+    let sweptAny = false;
     for (const invitation of expired) {
       if (invitation.expiresAt.getTime() > now) continue;
       this.storage.invitations.delete(invitation.inviteeId);
@@ -112,7 +118,9 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
         event: "org.invitation.expired",
       });
       await this.#mirror(invitation.inviteeId, null);
+      sweptAny = true;
     }
+    if (sweptAny) this.#syncCommerceMembers();
   }
 
   /**
@@ -166,6 +174,7 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
     this.storage.members.put(member);
     this.#log.info("created an organization", { event: "org.created" });
     await this.#mirror(creatorUserId, { role: member.role, status: member.status });
+    this.#syncCommerceMembers();
     return this.#summaryFor(org, this.storage.settings.get(), member);
   }
 
@@ -262,6 +271,7 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
     });
     this.#log.info("invited an org member", { event: "org.member.invited", orgRole: role });
     await this.#mirror(invitee, { role: member.role, status: member.status });
+    this.#syncCommerceMembers();
     return member;
   }
 
@@ -281,6 +291,9 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
       this.storage.invitations.delete(userId);
       this.storage.members.delete(userId);
       await this.#mirror(userId, null);
+      // The invitee's seat was claimed at invite time; releasing the member record must release
+      // it at commerce too (see #sweepExpiredInvitations).
+      this.#syncCommerceMembers();
       throw new Error("That invitation has expired.");
     }
     const joined: OrgMember = { ...member, status: "active", joinedAt: new Date() };
@@ -290,6 +303,7 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
       event: "org.member.joined", orgRole: joined.role,
     });
     await this.#mirror(userId, { role: joined.role, status: joined.status });
+    this.#syncCommerceMembers();
     return this.#summaryFor(org, this.storage.settings.get(), joined);
   }
 
@@ -325,6 +339,7 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
     if (gadgetBaselineRole(role) === "use" && gadgetBaselineRole(member.role) === "build") {
       await this.#severOwnedGadgetSessions();
     }
+    this.#syncCommerceMembers();
     return changed;
   }
 
@@ -349,6 +364,7 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
     this.#log.info("removed an org member", { event: "org.member.removed" });
     await this.#mirror(userId, null);
     await this.#severOwnedGadgetSessions();
+    this.#syncCommerceMembers();
   }
 
   /**
@@ -369,6 +385,24 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
     this.#log.info("an org member left", { event: "org.member.left" });
     await this.#mirror(userId, null);
     await this.#severOwnedGadgetSessions();
+    this.#syncCommerceMembers();
+  }
+
+  /**
+   * Pushes the org's whole membership snapshot (pending invitations included) to the bound
+   * commerce service, fire-and-forget, after every membership change: the service claims and
+   * releases the org's subscription seats from it — an invited member claims their seat
+   * immediately — and keeps its org records in step. A no-op with no service bound; a dropped
+   * push is healed by the service's own reconciliation, the same contract as the usage-events
+   * seam. Called with storage already final, so the snapshot is exactly what changed.
+   */
+  #syncCommerceMembers(): void {
+    const org = this.storage.org.get();
+    if (org === null) return;
+    const members: OrgCommerceMember[] = [...this.storage.members.list()].map(member => ({
+      userId: member.userId, role: member.role, status: member.status,
+    }));
+    notifyOrgMembersChanged(this.env, org.id, org.name, members);
   }
 
   #deleteMember(member: OrgMember): void {

@@ -28,7 +28,7 @@ import { AccountDescription, ActionKind, ActionDescription, AgentCatalog, Avatar
 import type { CodeChange } from "./code-change.js";
 import type { GitOid } from "./gatekeeper.js";
 import type { UiFeatureFlags } from "./feature-flags.js";
-import type { ModelTier } from "./entitlements.js";
+import type { ModelTier, EntitlementsPlanId } from "./entitlements.js";
 
 export const SERVICE_SALT = new Uint8Array([
   0xd9, 0x4e, 0x54, 0x1d, 0x29, 0xc1, 0x03, 0x74, 0x73, 0x7e, 0xb3, 0xe3, 0x34, 0x6d, 0x8f, 0x21
@@ -435,6 +435,39 @@ export const createAuthError = authErrors.create;
 
 /** Reads the machine-readable code from an authentication failure. */
 export const getAuthErrorCode = authErrors.getCode;
+
+/** Stable error codes attached to plan-enforcement refusals (the #16 chokepoints beyond the
+ * usage checker's `usage_limit` chat error: model tiers, gatekeeper connectors, workspace caps).
+ * Clients read them to offer a plan upgrade instead of a bare error. */
+export const PLAN_REFUSAL_CODES = {
+  modelNotOnPlan: "MODEL_NOT_ON_PLAN",
+  connectorNotOnPlan: "CONNECTOR_NOT_ON_PLAN",
+  workspaceCapReached: "WORKSPACE_CAP_REACHED",
+} as const;
+
+/** A plan-enforcement refusal code; the message names the refused thing, so it is composed at
+ * the throw site rather than fixed per code. */
+export type PlanRefusalCode = typeof PLAN_REFUSAL_CODES[keyof typeof PLAN_REFUSAL_CODES];
+
+const planRefusalCodes = new Set<unknown>(Object.values(PLAN_REFUSAL_CODES));
+
+/** Creates a plan-enforcement refusal carrying its machine-readable code. */
+export function createPlanRefusalError(code: PlanRefusalCode, message: string):
+    Error & { code: PlanRefusalCode } {
+  return Object.assign(new Error(message), { code });
+}
+
+/** Reads the plan-refusal code from an error, if it carries one. */
+export function getPlanRefusalCode(error: unknown): PlanRefusalCode | undefined {
+  const candidate = typeof error === "object" && error !== null && "code" in error
+      ? error.code : undefined;
+  return planRefusalCodes.has(candidate) ? candidate as PlanRefusalCode : undefined;
+}
+
+/** Whether `code` is a plan-refusal code — the client-side test for error surfaces. */
+export function isPlanRefusalCode(code: unknown): code is PlanRefusalCode {
+  return planRefusalCodes.has(code);
+}
 
 /**
  * One user as listed in the deployment-wide user directory (see
@@ -1035,6 +1068,37 @@ export interface AuthenticatedApi extends RpcTarget {
   updateOrgSettings(
       orgId: string, settings: { invitePolicy: OrgInvitePolicy }): Promise<OrgSummary>;
 
+  // --- SaaS commerce (org billing; see the OrgBilling* types and @gadgets/workshop-shared/commerce) ---
+
+  /**
+   * The subscription plans this deployment's commerce service offers, for the plan picker.
+   * Empty when no commerce service is bound (self-hosted deployments).
+   */
+  listCommercePlans(): Promise<CommercePlan[]>;
+
+  /**
+   * The org's billing overview for the org settings page: derived plan, licensed and claimed
+   * seats, spend cap, overage allowance, subscription status, and the current billing cycle's
+   * usage (#17's usage report). Active owners and admins only. Throws when no commerce service
+   * is bound.
+   */
+  getOrgBilling(orgId: string): Promise<OrgBillingOverview>;
+
+  /**
+   * Starts a hosted checkout session to subscribe the org to `plan` at `seats` seats, returning
+   * the checkout URL for the browser to redirect to; the checkout host returns the buyer to the
+   * Workshop's SaaS checkout-return page afterwards. Active owners and admins only. Throws when
+   * no commerce service is bound.
+   */
+  startOrgCheckout(orgId: string, plan: string, seats: number): Promise<{ url: string }>;
+
+  /**
+   * Mints a scoped customer-portal URL for the org (payment method, invoices, seat billing) and
+   * returns it for the browser to open. Active owners and admins only. Throws when no commerce
+   * service is bound.
+   */
+  openOrgBillingPortal(orgId: string): Promise<{ url: string }>;
+
   // --- Deployment admin ---
 
   /**
@@ -1145,6 +1209,76 @@ export type OrgMembership = {
 export type WhoamiInfo = AiChatAuthorInfo & {
   /** The user's org memberships at the time of the call (see `OrgMembership`). */
   orgs: OrgMembership[];
+};
+
+// ---------------------------------------------------------------------------
+// SaaS commerce — org billing (see @gadgets/workshop-shared/commerce for the port)
+// ---------------------------------------------------------------------------
+
+/**
+ * A subscription plan the deployment's commerce service offers, as
+ * `AuthenticatedApi.listCommercePlans()` lists it for the plan picker.
+ */
+export type CommercePlan = {
+  /** The plan's opaque id, exactly what `startOrgCheckout()` expects. */
+  id: string;
+  /** Display name (e.g. "Pro"). */
+  name: string;
+};
+
+/**
+ * One member of an org as the commerce member-sync carries them: enough to claim and release
+ * the org's subscription seats (an invited member claims their seat immediately) without
+ * re-deriving membership, which the org Durable Object has already authority-checked.
+ */
+export type OrgCommerceMember = {
+  /** Canonical user identifier (email for Access / sign-in accounts, username otherwise). */
+  userId: string;
+  role: OrgRole;
+  status: OrgMemberStatus;
+};
+
+/** The org's usage in one billing cycle, as `getOrgBilling()` reports it. */
+export type OrgUsageSummary = {
+  /** Start of the billing cycle the totals cover. */
+  cycleStart: Date;
+  /** Prompt tokens not served from a cache, across the org's metered model calls. */
+  inputTokens: number;
+  /** Prompt tokens served from a cache. */
+  cacheReadTokens: number;
+  /** Prompt tokens written to a cache. */
+  cacheWriteTokens: number;
+  /** Completion tokens, reasoning included. */
+  outputTokens: number;
+  /**
+   * The cycle's estimated metered cost (USD) at the billing service's own pinned price table —
+   * an estimate for reconciliation, never the invoice. Null while any metered model is unpriced.
+   */
+  estimatedCostUsd: number | null;
+};
+
+/**
+ * The org's billing state for the org settings page, as `getOrgBilling()` reports it. Mirror of
+ * the derived entitlements plus the subscription's status and the current cycle's usage.
+ */
+export type OrgBillingOverview = {
+  /** The plan the org's subscription currently derives; "free" until one is active. */
+  plan: EntitlementsPlanId;
+  /** Licensed seats on the subscription. */
+  seats: number;
+  /** Seats claimed per the member mirror — active members plus pending invitations. */
+  assignedSeats: number;
+  /** Maximum metered spend (USD) per billing cycle. */
+  monthlySpendCapUsd: number;
+  /** Whether spend past the cap proceeds, billed as metered overage. */
+  overageAllowed: boolean;
+  /**
+   * The subscription's status as the billing service derives it from the vendor's state (e.g.
+   * "active", "trialing", "past_due"; "none" with no subscription). Display-only.
+   */
+  subscriptionStatus: string;
+  /** The current cycle's usage; null while the billing service knows no cycle. */
+  usage: OrgUsageSummary | null;
 };
 
 // ---------------------------------------------------------------------------

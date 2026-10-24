@@ -39,6 +39,10 @@ vi.mock('@cloudflare/kumo', async (importOriginal) => ({
 
 vi.mock('./connectHandoff', () => ({ openConnectWindow }))
 
+// The SaaS upgrade prompt (lazily loaded in this suite's VITE_SAAS describe) navigates on its
+// primary action; nothing else under test here touches the router.
+vi.mock('@tanstack/react-router', () => ({ useNavigate: () => vi.fn<() => void>() }))
+
 vi.mock('./AuthContext', () => ({
   useAuthenticatedApi: () => ({ authenticatedApi: testState.authenticatedApi }),
 }))
@@ -598,6 +602,102 @@ describe('GatekeeperModal resource grant step', () => {
 
       expect(openConnectWindow).not.toHaveBeenCalled()
       expect(testState.toasts).toEqual([{ title: 'Account is gone.', variant: 'error' }])
+    } finally {
+      consoleError.mockRestore()
+    }
+  })
+})
+
+describe('GatekeeperModal plan-refusal upgrade prompt (SaaS build)', () => {
+  // The suite otherwise runs as the OSS bundle (VITE_SAAS unset folds the prompt out of
+  // GatekeeperModal entirely); these tests re-import the module under a stubbed env so the
+  // gate is baked on, exactly as a VITE_SAAS=true build does. The vi.mock registrations above
+  // survive the module reset.
+  let container: HTMLDivElement | undefined
+  let root: Root | undefined
+
+  afterEach(async () => {
+    await act(async () => root?.unmount())
+    container?.remove()
+    container = undefined
+    testState.authenticatedApi = null
+    testState.toasts = []
+    openConnectWindow.mockReset()
+    vi.unstubAllEnvs()
+    vi.resetModules()
+  })
+
+  async function renderSaaSModal() {
+    vi.stubEnv('VITE_SAAS', 'true')
+    vi.resetModules()
+    const { default: GatekeeperModalSaaS } = await import('./GatekeeperModal')
+
+    // The upgrade prompt asks whoami for an admin-able org on open (this caller has none, so
+    // the prompt's primary action points at the signup funnel); connectAccount starts the
+    // OAuth flow that the mocked openConnectWindow stands in for.
+    testState.authenticatedApi = {
+      ...authenticatedApi(),
+      whoami: async () => ({ orgs: [] }),
+      connectAccount: async () => FLOW,
+    } as unknown as RpcStub<AuthenticatedApi>
+    container = document.createElement('div')
+    document.body.appendChild(container)
+    root = createRoot(container)
+    await act(async () => root!.render(<GatekeeperModalSaaS
+      open
+      onClose={() => {}}
+      getOverseer={() => { throw new Error('not called') }}
+      onCreated={() => Promise.resolve()}
+      initialVendorId="catalog"
+      initialResourceUrlPattern={RESOURCE.urlPattern}
+    />))
+  }
+
+  // The account chooser's bottom button — the one that starts a fresh connect flow.
+  async function clickConnectAccount() {
+    const connect = await vi.waitFor(() => {
+      const button = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+        .find((candidate) => /^Connect |^Use another /.test(candidate.textContent ?? ''))
+      if (!button || button.disabled) throw new Error('connect button not ready')
+      return button
+    })
+    await act(async () => connect.click())
+  }
+
+  it('a plan refusal opens the upgrade prompt instead of an error toast', async () => {
+    vi.stubGlobal('ResizeObserver', class {
+      observe() {}
+      disconnect() {}
+    })
+    const { createPlanRefusalError } = await import('@gadgets/workshop-shared/api')
+    openConnectWindow.mockRejectedValueOnce(
+      createPlanRefusalError('CONNECTOR_NOT_ON_PLAN', 'That connector is not on your plan.'))
+    await renderSaaSModal()
+
+    await clickConnectAccount()
+
+    await vi.waitFor(() => {
+      expect(document.body.querySelector('[data-testid="saas-upgrade-prompt"]')).not.toBeNull()
+      expect(document.body.textContent).toContain("That connector isn't available on your plan")
+    })
+    expect(testState.toasts).toEqual([])
+  })
+
+  it('a plain error keeps the generic toast; no prompt', async () => {
+    vi.stubGlobal('ResizeObserver', class {
+      observe() {}
+      disconnect() {}
+    })
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      openConnectWindow.mockRejectedValueOnce(new Error('Popup blocked.'))
+      await renderSaaSModal()
+
+      await clickConnectAccount()
+
+      await vi.waitFor(() =>
+        expect(testState.toasts).toEqual([{ title: 'Popup blocked.', variant: 'error' }]))
+      expect(document.body.querySelector('[data-testid="saas-upgrade-prompt"]')).toBeNull()
     } finally {
       consoleError.mockRestore()
     }
