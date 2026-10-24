@@ -60,7 +60,6 @@ export const useHierarchicalListRowInteractions = ({
   collapsible,
   expanded,
   selected,
-  coarsePointer,
   rootItems,
   dragAndDrop,
   interaction,

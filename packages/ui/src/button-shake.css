@@ -1,0 +1,34 @@
+/*
+ * Ported from HextaUI (https://hextaui.com/docs/use-invalid-shake),
+ * https://github.com/preetsuthar17/hextaui — MIT License, Copyright (c) HextaUI.
+ *
+ * Animation for the `data-shake` attribute set by `useInvalidShake`. Guarded by
+ * `prefers-reduced-motion: no-preference`, so reduced-motion users see no
+ * animation (and the hook itself also never sets the attribute).
+ */
+
+@keyframes button-shake {
+  10%,
+  90% {
+    translate: -1px 0;
+  }
+  20%,
+  80% {
+    translate: 2px 0;
+  }
+  30%,
+  50%,
+  70% {
+    translate: -4px 0;
+  }
+  40%,
+  60% {
+    translate: 4px 0;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  [data-shake] {
+    animation: button-shake 400ms ease-in-out;
+  }
+}
