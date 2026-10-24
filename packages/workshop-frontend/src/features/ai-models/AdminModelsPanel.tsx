@@ -4,7 +4,9 @@
 // server reported rather than what was just chosen.
 
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
-import { Select, Switch, useKumoToastManager } from '@cloudflare/kumo'
+import { Select, useKumoToastManager } from '@cloudflare/kumo'
+import { PendingSwitch } from '@gadgets/ui'
+import '@gadgets/ui/pending-switch.css'
 import { GATEWAY_MODEL_MODES, REASONING_LEVELS } from '@gadgets/workshop-shared/api'
 import type {
   AdminApi,
@@ -63,23 +65,26 @@ const SettingRow = ({ label, help, children }: {
   </div>
 )
 
-const SettingSwitch = ({ label, checked, disabled, onChange, children }: {
+const SettingSwitch = ({ label, checked, disabled, onChange, onError, children }: {
   label: string
   checked: boolean
   disabled: boolean
-  onChange: (checked: boolean) => void
+  onChange: (checked: boolean) => Promise<void>
+  /** Reports the write's failure; the switch itself reverts to the server value. */
+  onError: (error: unknown) => void
   /** What the setting does, which also describes the switch. */
   children: ReactNode
 }) => {
   const help = useId()
   return (
     <SettingRow label={label} help={{ id: help, text: children }}>
-      <Switch
+      <PendingSwitch
         aria-label={label}
         aria-describedby={help}
         checked={checked}
         disabled={disabled}
-        onCheckedChange={onChange}
+        onChange={onChange}
+        onError={onError}
       />
     </SettingRow>
   )
@@ -220,13 +225,11 @@ export const AdminModelsPanel = ({ admin, gatewayModels, onChanged }: {
       modelTests.clearTests()
     }).catch((err) => reportFailure(`Couldn’t update “${DEFAULT_REASONING_LABEL}”`, err))
 
-  const changeUserModels = (enabled: boolean) =>
-    write(() => admin.setUserModelsEnabled(enabled))
-      .catch((err) => reportFailure(`Couldn’t update “${USER_MODELS_LABEL}”`, err))
+  // These two reject on failure, so their SettingSwitches revert to the server value; the toast
+  // comes from each switch's onError.
+  const changeUserModels = (enabled: boolean) => write(() => admin.setUserModelsEnabled(enabled))
 
-  const changeModelsDevSuggestions = (enabled: boolean) =>
-    write(() => admin.setModelsDevSuggestions(enabled))
-      .catch((err) => reportFailure(`Couldn’t update “${MODELS_DEV_LABEL}”`, err))
+  const changeModelsDevSuggestions = (enabled: boolean) => write(() => admin.setModelsDevSuggestions(enabled))
 
   const changeProviderEnabled = (provider: AiModelProvider, enabled: boolean) =>
     write(() => admin.setGatewayProviderEnabled(provider, enabled))
@@ -296,6 +299,7 @@ export const AdminModelsPanel = ({ admin, gatewayModels, onChanged }: {
         checked={userModelsEnabled}
         disabled={busy}
         onChange={changeUserModels}
+        onError={(err) => reportFailure(`Couldn’t update “${USER_MODELS_LABEL}”`, err)}
       >
         When on, users can add models under their own IDs on their Providers page, and those run
         through this deployment’s gateway. When off, only the models listed here can be used, and
@@ -405,6 +409,7 @@ export const AdminModelsPanel = ({ admin, gatewayModels, onChanged }: {
                 checked={gatewayModels.modelsDevSuggestions}
                 disabled={busy}
                 onChange={changeModelsDevSuggestions}
+                onError={(err) => reportFailure(`Couldn’t update “${MODELS_DEV_LABEL}”`, err)}
               >
                 While you add a model, your browser downloads models.dev’s public model list to
                 suggest model IDs, names, limits and what a model can do. A suggestion only fills

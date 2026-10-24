@@ -1,11 +1,17 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, it } from "node:test";
+import { parse } from "jsonc-parser";
 
 import {
+  devWranglerConfigs,
   gatekeeperBaseUrl,
   getDevServerConfig,
   getWranglerPortFromBackendHost,
 } from "./dev-server-config.ts";
+import { isGatekeeperPackage, readDeployablePackages } from "./release/manifest-lib.ts";
+import { resolveScanRoots } from "./scan-roots.ts";
 
 describe("gatekeeperBaseUrl", () => {
   it("mounts a single-word gatekeeper at its own name", () => {
@@ -93,4 +99,84 @@ describe("getDevServerConfig", () => {
       assert.throws(() => getDevServerConfig(args), /--port must be an integer between 1 and 65535/);
     });
   }
+});
+
+describe("devWranglerConfigs", () => {
+  it("spawns the workshop backend beside the dev-router, before the gatekeepers", () => {
+    assert.deepEqual(
+        devWranglerConfigs({
+          backendDir: "/repo/packages/workshop-backend",
+          gatekeepers: [{ dir: "/repo/packages/gatekeeper-github" }],
+          plainWorkers: [],
+        }),
+        [
+          "wrangler.dev.jsonc",
+          "/repo/packages/workshop-backend/wrangler.dev.jsonc",
+          "/repo/packages/gatekeeper-github/wrangler.dev.jsonc",
+        ]);
+  });
+
+  // The regression this pins: 553a48c5 rebuilt this list from the package scan's gatekeeper and
+  // overlay-plain-worker filters, which select everything except the backend, and every /api
+  // request came back 503 "Worker workshop-backend not found". The backend is a core package that
+  // no filter ever selects, so the empty-scan case is the one that must still spawn it.
+  it("still spawns the backend when the scan finds no other workers", () => {
+    assert.deepEqual(
+        devWranglerConfigs({
+          backendDir: "/repo/packages/workshop-backend",
+          gatekeepers: [],
+          plainWorkers: [],
+        }),
+        ["wrangler.dev.jsonc", "/repo/packages/workshop-backend/wrangler.dev.jsonc"]);
+  });
+
+  it("spawns overlay plain workers after the gatekeepers", () => {
+    assert.deepEqual(
+        devWranglerConfigs({
+          backendDir: "/repo/packages/workshop-backend",
+          gatekeepers: [{ dir: "/repo/packages/gatekeeper-x" }],
+          plainWorkers: [{ dir: "/overlay/saas-billing" }],
+        }),
+        [
+          "wrangler.dev.jsonc",
+          "/repo/packages/workshop-backend/wrangler.dev.jsonc",
+          "/repo/packages/gatekeeper-x/wrangler.dev.jsonc",
+          "/overlay/saas-billing/wrangler.dev.jsonc",
+        ]);
+  });
+
+  it("spawns every worker the dev-router binds on a clean core checkout", () => {
+    // A service binding whose target worker is not in the same multi-config `wrangler dev`
+    // session answers every request with 503 "Worker ... not found", so every worker the router
+    // binds must have its config in the -c list: the backend, from the committed wrangler.jsonc,
+    // and each gatekeeper, bound at startup from the same scan.
+    const packages = readDeployablePackages(resolveScanRoots([]));
+    const backend = packages.find((pkg) => pkg.name === "workshop-backend");
+    assert.ok(backend, "the core package scan does not find workshop-backend");
+    const gatekeepers = packages.filter((pkg) => isGatekeeperPackage(pkg.name));
+    const plainWorkers =
+        packages.filter((pkg) => pkg.overlay === true && !isGatekeeperPackage(pkg.name));
+    const configs = devWranglerConfigs({ backendDir: backend.dir, gatekeepers, plainWorkers });
+
+    const router = parse(readFileSync("wrangler.jsonc", "utf8")) as {
+      services?: { service: string }[];
+    };
+    const boundWorkers = [
+      ...(router.services?.map((service) => service.service) ?? []),
+      ...gatekeepers.map((gk) => gk.name),
+    ];
+    assert.ok(
+        boundWorkers.includes("workshop-backend"),
+        "the dev-router no longer binds WORKSHOP_BACKEND, so this test has gone vacuous");
+
+    for (const name of boundWorkers) {
+      const pkg = packages.find((p) => p.name === name);
+      assert.ok(pkg, `the dev-router binds ${name}, which the package scan does not find`);
+      const devConfig = join(pkg.dir, "wrangler.dev.jsonc");
+      assert.ok(
+          configs.includes(devConfig),
+          `the dev-router binds ${name} but the dev session does not spawn it: ` +
+          `${devConfig} is not in the -c list`);
+    }
+  });
 });

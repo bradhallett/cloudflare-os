@@ -39,11 +39,11 @@ function withQuota(
   let stub = env.TEST_OVERSEER.getByName(`quick-model-gate-${++doCounter}`);
   return runInDurableObject(stub, async (instance: OverseerDurableObject) => {
     let impl = (instance as unknown as { impl: any }).impl;
+    // The impl's logger is a getter-only accessor, so capture its failure events the way they
+    // are emitted: as one indexed console object per call (see logger-core.ts).
     let events: string[] = [];
-    impl.logger = {
-      warn: (_msg: string, fields: { event: string }) => { events.push(fields.event); },
-      debug: () => {}, info: () => {}, error: () => {},
-    };
+    const warn = console.warn;
+    console.warn = (entry: { event: string }) => { events.push(entry.event); };
     let consumed = 0;
     impl.ownerId = OWNER_USER_ID;
     impl.env = { ...impl.env, ENABLE_CLOUDFLARE_LIMITS: "true" };
@@ -59,7 +59,11 @@ function withQuota(
         },
       }),
     };
-    await fn(impl);
+    try {
+      await fn(impl);
+    } finally {
+      console.warn = warn;
+    }
     return { consumed, events };
   });
 }

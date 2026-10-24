@@ -30,10 +30,11 @@ export const COMMON_SLOTS = {
   present: "double2",
 } as const satisfies Record<string, BlobSlot | DoubleSlot>;
 
-/** Family-specific columns of `activity/v1`, after the common ones. blob10..20 are reserved. */
+/** Family-specific columns of `activity/v1`, after the common ones. blob11..20 are reserved. */
 export const ACTIVITY_V1_SLOTS = {
   detail: "blob8",
   gadgetRef: "blob9",
+  orgId: "blob10",
 } as const satisfies Record<string, BlobSlot>;
 
 /** The blob1 value of every `activity/v1` point. */
@@ -60,10 +61,10 @@ export type ActivityEventType = (typeof ACTIVITY_EVENT_TYPES)[number];
 
 /**
  * The entities an event is copied to, one point each. The actor copy is canonical: every event
- * has exactly one, so count events there. The owner and workspace copies exist only so
- * per-entity queries (one workspace's history) read their own index.
+ * has exactly one, so count events there. The owner, workspace, and org copies exist only so
+ * per-entity queries (one workspace's history, one org's rollups) read their own index.
  */
-export const METRIC_SCOPES = ["actor", "owner", "workspace"] as const;
+export const METRIC_SCOPES = ["actor", "owner", "workspace", "org"] as const;
 
 /** The entity a metric point is indexed under. */
 export type MetricScope = (typeof METRIC_SCOPES)[number];

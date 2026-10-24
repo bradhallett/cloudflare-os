@@ -11,8 +11,13 @@ import {
   activityByEventType,
   activeUsersByDay,
   mostActiveWorkspaces,
+  orgActiveSeatsByDay,
+  orgGatekeeperUsageByDay,
+  orgModelUsageByDay,
   workspaceHistory,
 } from "../src/metrics-queries.js";
+
+const ORG = "d".repeat(16);
 
 // Every query the module builds; workspaceHistory returns raw rows instead.
 const QUERIES = {
@@ -20,6 +25,9 @@ const QUERIES = {
   activeUsersByDay: activeUsersByDay(30),
   activityByEventType: activityByEventType(30),
   mostActiveWorkspaces: mostActiveWorkspaces(30, 10),
+  orgActiveSeatsByDay: orgActiveSeatsByDay(ORG, 30),
+  orgGatekeeperUsageByDay: orgGatekeeperUsageByDay(ORG, 30),
+  orgModelUsageByDay: orgModelUsageByDay(ORG, 30),
 };
 
 // Additive counts, which the SQL dialect corrects for sampling via sum(_sample_interval); the
@@ -28,7 +36,10 @@ const ADDITIVE = {
   activityByDay: QUERIES.activityByDay,
   activityByEventType: QUERIES.activityByEventType,
   mostActiveWorkspaces: QUERIES.mostActiveWorkspaces,
+  orgGatekeeperUsageByDay: QUERIES.orgGatekeeperUsageByDay,
+  orgModelUsageByDay: QUERIES.orgModelUsageByDay,
 };
+
 
 // The slot columns the activity/v1 family actually defines, mapped back to their field names.
 const KNOWN_SLOTS: Record<string, string> = Object.fromEntries(
@@ -103,9 +114,10 @@ describe("metrics-queries", () => {
   });
 
   it("escapes single quotes in interpolated ids", () => {
-    const query = workspaceHistory("ab'cd");
-    expect(query).toContain(`'${activityIndex("workspace", "ws_ab''cd")}'`);
-    expect(query).not.toContain("ws_ab'cd'");
+    expect(workspaceHistory("ab'cd")).toContain(`'${activityIndex("workspace", "ws_ab''cd")}'`);
+    expect(orgActiveSeatsByDay("ab'cd", 30))
+        .toContain(`'${activityIndex("org", "org_ab''cd")}'`);
+    expect(workspaceHistory("ab'cd")).not.toContain("ws_ab'cd'");
   });
 
   it("builds the golden daily-activity query", () => {
@@ -115,6 +127,39 @@ describe("metrics-queries", () => {
           "    sum(_sample_interval) AS events",
           `FROM gadgets_metrics_v1`,
           `WHERE ${canon} AND timestamp > now() - INTERVAL '30' DAY`,
+          "GROUP BY day",
+          "ORDER BY day ASC",
+        ].join("\n"));
+  });
+
+  it("counts per-org rollups over the org copy the encoder writes", () => {
+    // An event naming an org has exactly one org-indexed point, whatever else it names.
+    const points = encodeActivityPoints({
+      eventType: "workspace.interaction", actorId: "a".repeat(64), orgId: ORG,
+      detail: "chat_message_sent",
+    });
+    const orgPoints = points.filter((point) =>
+      point.blobs?.[0] === "activity/v1"
+          && typeof point.indexes?.[0] === "string"
+          && point.indexes[0]!.startsWith(`${activityIndex("org")}|`));
+    expect(orgPoints).toHaveLength(1);
+
+    for (const query of [QUERIES.orgActiveSeatsByDay, QUERIES.orgGatekeeperUsageByDay,
+      QUERIES.orgModelUsageByDay]) {
+      expect(query).toContain(`index1 = '${activityIndex("org", `org_${ORG}`)}'`);
+      expect(query).not.toContain(`${COMMON_SLOTS.scope} = 'actor'`);
+    }
+  });
+
+  it("builds the golden org-seats query", () => {
+    expect(orgActiveSeatsByDay("deadbeef", 30)).toBe(
+        [
+          "SELECT formatDateTime(toStartOfInterval(timestamp, INTERVAL '1' DAY), '%Y-%m-%d') AS day,",
+          `    count(DISTINCT ${COMMON_SLOTS.actorId}) AS activeSeats`,
+          "FROM gadgets_metrics_v1",
+          `WHERE blob1 = 'activity/v1' AND index1 = '${activityIndex("org", "org_deadbeef")}'`,
+          `    AND ${COMMON_SLOTS.actorId} != '${UNATTRIBUTED_ACTOR}'`,
+          "    AND timestamp > now() - INTERVAL '30' DAY",
           "GROUP BY day",
           "ORDER BY day ASC",
         ].join("\n"));

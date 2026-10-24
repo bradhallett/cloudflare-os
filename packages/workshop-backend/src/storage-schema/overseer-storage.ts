@@ -36,11 +36,21 @@ import type {
 } from "@gadgets/workshop-shared/gatekeeper";
 import type {ResolvedBotSkill, UnavailableBotSkill} from "../bot-config";
 import type { SpawnCallableOptions } from "../agent-spawner-binding";
+import type { BlueprintOwnerSubject } from "./blueprints-kv";
 
 // =======================================================================================
 // Workpieces
 
 export type GatekeeperClass = DurableObjectClass<Gatekeeper<any>>;
+
+/**
+ * Who owns a workspace: the user DO it runs as, or the organization it was transferred to (see
+ * `transferToOrg`). Aliased to the blueprint owner subject, whose {type, id} grammar and org
+ * scoping (storage-schema/blueprints-kv.ts) a workspace and its published blueprints share: the
+ * org's Durable Object is the authority on its membership, and an org-owned workspace's sharing
+ * graph roots itself there (sharing.ts).
+ */
+export type WorkspaceOwnerSubject = BlueprintOwnerSubject;
 
 /**
  * A gatekeeper (connection) workpiece. IDs are allocated from the shared workpiece counter (see
@@ -1242,6 +1252,11 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       // Initialized on first startup.
       ownerId: <string | undefined>undefined,
 
+      // The workspace's owner subject. Absent on every workspace created before orgs, and on
+      // every user-owned one since: read it as {type: 'user', id: ownerId}. Set to
+      // {type: 'org', id} by transferToOrg, one-way (an org-owned workspace never goes back).
+      ownerSubject: <WorkspaceOwnerSubject | undefined>undefined,
+
       // Version of this DO's storage schema, gating lazy migrations. Used to trigger migrations
       // at construction time.
       //   0 = Workspace from before multi-gadget mode was introduced (unless `ownerId` is absent,
@@ -1301,8 +1316,9 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       // `defaultGadgetId` can be cached in memory after it is first read.
       defaultGadgetId: <WorkpieceId | undefined>undefined,
 
-      // External-message Gadgets claim ownership before registering in the owner's UserDO. If that
-      // registration fails, this keeps the owner-table write retryable.
+      // Gadgets register in the owner's UserDO before any workspace state is written, so nothing
+      // sets this for new workspaces anymore; it remains only to complete registration of
+      // pre-fix workspaces that were created before their (cap-refused) registration.
       ownerRegistrationPending: false,
 
       codeVersion: 0,

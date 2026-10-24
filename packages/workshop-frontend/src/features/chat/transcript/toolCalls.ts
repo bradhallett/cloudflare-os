@@ -360,14 +360,43 @@ function describeProvisionalToolCount(toolName: AiToolCall["toolName"], count: n
 }
 
 /**
+ * Whether a tool call is still waiting for its result. Only a tool that records an `output` can
+ * be told apart from a finished call (a writeFile's record looks the same done or not), so calls
+ * of the other tools count as finished; an errored call is finished too -- the Error pill speaks
+ * for it, so running and error never co-occur.
+ */
+export function isToolCallRunning(tc: AiToolCall): boolean {
+  if (tc.error) return false;
+  switch (tc.toolName) {
+    case "grep":
+    case "describeBinding":
+    case "setGadgetBinding":
+    case "createGadget":
+    case "createWorktree":
+    case "executeCode":
+    case "webFetch":
+    case "listBlueprints":
+    case "listConnectableResources":
+    case "requestConnection":
+    case "activateSkill":
+    case "delegateToBot":
+    case "messageBot":
+    case "createExternalResource":
+      return tc.output === undefined;
+    default:
+      return false;
+  }
+}
+
+/**
  * Builds the label + detail lines for the in-progress tool-call row.
  */
 export function buildProvisionalToolSummary(
   calls: ProvisionalToolCallState[],
-): { label: string; detailLines: string[] } {
+): { label: string; detailLines: string[]; running: boolean } {
 
   if (calls.length === 1 && calls[0].outputFormat) {
-    return { label: `Creating ${calls[0].outputFormat.noun}`, detailLines: [] };
+    return { label: `Creating ${calls[0].outputFormat.noun}`, detailLines: [], running: !calls[0].finished };
   }
   const toolNames = Array.from(
     new Set(calls.map((c) => c.toolName).filter((n): n is AiToolCall["toolName"] => !!n)),
@@ -377,7 +406,7 @@ export function buildProvisionalToolSummary(
   );
 
   if (toolNames.length === 0) {
-    return { label: "Using tool", detailLines: [] };
+    return { label: "Using tool", detailLines: [], running: !calls[calls.length - 1].finished };
   }
 
   if (toolNames.length > 1) {
@@ -390,6 +419,7 @@ export function buildProvisionalToolSummary(
     return {
       label: parts.map((part, i) => (i === 0 ? part : lowerFirst(part))).join(", "),
       detailLines,
+      running: !calls[calls.length - 1].finished,
     };
   }
 
@@ -399,6 +429,7 @@ export function buildProvisionalToolSummary(
     return {
       label: target ? `${getProvisionalToolVerb(toolName)} ${target}` : getProvisionalToolLabel(toolName),
       detailLines: [],
+      running: !calls[0].finished,
     };
   }
 
@@ -406,7 +437,7 @@ export function buildProvisionalToolSummary(
     detailLines.length === 1
       ? `${getProvisionalToolVerb(toolName)} ${detailLines[0]}`
       : describeProvisionalToolCount(toolName, calls.length);
-  return { label, detailLines };
+  return { label, detailLines, running: !calls[calls.length - 1].finished };
 }
 
 /**
@@ -421,6 +452,8 @@ export type ToolCallGroup = {
   calls: AiToolCall[];
   observations: ObservationChatMessage[];
   hasError: boolean;
+  /** Whether the group's latest call is still waiting for its result (a spinner, not an Error pill). */
+  running: boolean;
 };
 
 /**
@@ -483,6 +516,7 @@ export function buildToolCallGroups(
     calls: toolCalls,
     observations,
     hasError: toolCalls.some((tc) => Boolean(tc.error)),
+    running: toolCalls.length > 0 && isToolCallRunning(toolCalls[toolCalls.length - 1]),
   }];
 }
 

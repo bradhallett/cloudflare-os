@@ -11,6 +11,7 @@ import { sanitizeBlueprintOutput } from "./blueprint-archive";
 import { releaseMergeHeader } from "./blueprint-release";
 import { encodeGitTree, gitObjectOid } from "./git-codec";
 import { resolveBlueprintForUser } from "./blueprint-access";
+import { retryOnDoReset } from "./do-retry";
 import type { UserChatContext } from "./user";
 import { OverseerBindings } from "./overseer-bindings";
 import { acceptWriteError } from "./overseer-support";
@@ -40,12 +41,15 @@ export abstract class OverseerBlueprints extends OverseerBindings {
       : Promise<ApplyBlueprintResult> {
     let author = userMeta.profile;
     // The blueprint may belong to one of the applying user's orgs, so this is the member-gated
-    // read, not the public by-id one.
+    // read, not the public by-id one. Orgs key members by the user identifier -- the user DO's
+    // name, which `author.id` is -- not by DO id: the id idFromString() mints carries no `.name`
+    // in workerd, so deriving it from `clientUserId` would ask the org about `undefined`.
     let user = this.users.idFromString(clientUserId);
     let kvRecord = await resolveBlueprintForUser(
         this.env, this.ctx.exports.OrgDurableObject,
-        (await this.users.get(user).listOrgMemberships()).map(entry => entry.orgId),
-        user.name!, blueprintId);
+        (await retryOnDoReset(() => this.users.get(user).listOrgMemberships()))
+            .map(entry => entry.orgId),
+        author.id, blueprintId);
     if (!kvRecord) throw new Error("Blueprint not found.");
     let {metadata} = kvRecord;
     let release = await this.loadBlueprint(blueprintId, metadata, kvRecord.owner);

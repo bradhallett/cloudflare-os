@@ -323,7 +323,7 @@ describe('send and retry failures', () => {
     vi.spyOn(console, 'debug').mockImplementation(() => {})
   })
 
-  it('says why a message could not be sent and keeps it in the composer', async () => {
+  it('says why a message could not be sent and moves it to the transcript as a failed send', async () => {
     const server = makeOverseer()
     withChatApi(server, undefined, [openChat])
     Object.assign(server.overseer as object, {
@@ -335,7 +335,11 @@ describe('send and retry failures', () => {
 
     expect(addToast).toHaveBeenCalledExactlyOnceWith(
         { title: 'Failed to send message', description: disabledModel, variant: 'error' })
-    expect(textarea.value).toBe('Summarize the report')
+    // The composer gave up the draft: the failed message now lives in the transcript's
+    // destructive bubble, from which it can be retried or removed.
+    expect(textarea.value).toBe('')
+    expect(document.body.textContent).toContain('Not sent')
+    expect(document.body.textContent).toContain('Summarize the report')
   })
 
   it('says why a conversation could not be started', async () => {

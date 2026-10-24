@@ -41,10 +41,20 @@ a stale index entry — so a lost or late mirror costs staleness, never authorit
 ## Lazy revocation
 
 Removing a membership revokes nothing downstream. Org-derived access (org-owned gadgets, Context
-Library org grants, SCIM-provisioned members) holds its grant and **re-checks** the org —
-`OrgDurableObject.getMember(userId)` is the authority read — when access matters. A removed
-member's access therefore ends at the next check, without cascading deletes across resource
-owners, and a later re-add restores it seamlessly.
+Library org grants, SCIM-provisioned members) holds its grant and **re-checks** the org when
+access matters. A removed member's access therefore ends at the next check, without cascading
+deletes across resource owners, and a later re-add restores it seamlessly. The authority read
+differs by surface: the Context Library holds **no service binding to the org authority**, so the
+Workshop pushes each account's membership snapshot to it (in `AppUiContext.orgMemberships` when a
+management UI opens, and with every redeemed picker selection), and Context re-checks grants
+against that snapshot live; SCIM-provisioned members ask `getMember(userId)`; and an org-owned
+*workspace* snapshots the org's whole active membership (`activeMembers()`) into its sharing
+graph's baselines at every `open()` (docs/sharing.md) — and the org additionally fans every
+membership removal, leave, or demotion out through its `ownedGadgets` index, so those workspaces'
+live sessions are severed at once rather than at each user's next open. Deprovisioning a user
+ends their memberships directly (`memberLeave` per org, pending invitations declined), the one
+case that cannot wait for a lazy re-check, because the account will never open a session again
+(docs/org-threat-model.md).
 
 ## Org-scoped user directory
 
@@ -67,4 +77,6 @@ removed member's pending picks die at redemption. A ticket justified by a share 
 Org events are logged under the `workshop.org` component (`org.created`, `org.member.invited`,
 `org.member.joined`, `org.member.role_changed`, `org.member.removed`, `org.member.left`,
 `org.settings.updated`) carrying `orgId` and, where one was granted or changed, `orgRole`. Member
-user ids never enter org logs.
+user ids never enter org logs. Org-owned workspaces carry their org the same way: the workspace
+logger folds in the owning org, and its activity events record an org dimension with per-org
+rollup queries — see [`org-observability.md`](org-observability.md).

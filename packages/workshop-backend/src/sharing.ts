@@ -16,15 +16,26 @@
 // (unless `ownerInvitesOnly` is set, when only the owner's direct grants count).
 // (Records and revoked keys accumulate in storage; a future GC could reclaim long-dead entries.)
 //
+// ORG-OWNED WORKSPACES: a workspace transferred to an org (see `transferToOrg`) roots the same
+// graph at the org instead of the user owner. Each active member starts at the role their org
+// role grants (owners/admins "build", members "use" -- org-access.ts baselines), and stored edges
+// still extend access transitively but only on top of those baselines, so removing someone from
+// the org (or demoting them to member) simply drops their baseline and their access ends at the
+// next open(), exactly like any other lazy revocation. The `ownerInvitesOnly` flag follows the
+// same root: on an org-owned workspace the "owner" whose direct grants still count is any member
+// at the build baseline (org owners/admins -- see #mayAuthorOwnerGrant), so a sensitive
+// org-owned workspace stays sharable by its admins and closed to everyone else's grants.
+//
 // NOTE: The sensitive-data (`containsRestrictedData`) policy intentionally does NOT live here; the
 // Overseer enforces it. This module only answers questions about the sharing graph. The one
 // exception is the `ownerInvitesOnly` flag, which the Overseer supplies as a hook: once it is set,
-// only direct grants from the owner count, so it narrows which edges `computeEffectiveRoles`
-// follows and must be checked synchronously with each grant's storage write.
+// only direct grants from the workspace's owner authority count, so it narrows which edges
+// `computeEffectiveRoles` follows and must be checked synchronously with each grant's storage write.
 
 import { AiChatAuthorInfo, CollaboratorInfo, PermissionEdge, CollaboratorRole, AffectedCollaborator,
-    createOpenGadgetError, OPEN_GADGET_ERROR_CODES } from "@gadgets/workshop-shared/api";
+    createOpenGadgetError, OPEN_GADGET_ERROR_CODES, OrgRole } from "@gadgets/workshop-shared/api";
 import { Collection, NonUniqueIndex } from "@gadgets/typed-storage";
+import { gadgetBaselineRole } from "./org-access";
 import type { CollaboratorRecord, ShareKeyRecord, ShareLinkRecord }
     from "./storage-schema/overseer-storage";
 
@@ -111,11 +122,19 @@ export class SharingManager {
    * `ObservationDescription.ownerInvitesOnly`). `computeEffectiveRoles` reads it to count only
    * direct owner grants once it is set. Grants call it after their last await, right before the
    * storage write, so an observation that sets the flag mid-call cannot slip a grant through.
+   *
+   * `owningOrgRoles` returns the live membership snapshot of the org that owns this workspace
+   * (member canonical user id → org role), or null while a user owns it. Supplied as a callback
+   * so this module stays RPC-free (the Overseer talks to the org DO). Methods that authorize read
+   * it first and thread the snapshot through the synchronous graph computation, so one open()
+   * sees one consistent membership. A snapshot that is a map (even empty) means org-owned: the
+   * graph roots at the org, not at `ownerProfileId`.
    */
   constructor(
       private storage: SharingStorage,
       private ownerProfileId: string,
-      private ownerInvitesOnly: () => boolean) {}
+      private ownerInvitesOnly: () => boolean,
+      private owningOrgRoles: () => Promise<ReadonlyMap<string, OrgRole> | null>) {}
 
   // Throw if share links are disabled by `ownerInvitesOnly`. Redemption refusals surface
   // from open(), so they carry the `shareLinksDisabled` open-gadget code; link management throws
@@ -148,12 +167,22 @@ export class SharingManager {
   }
 
   /**
-   * The effective role of `profileId` -- the maximum role reachable from the owner through valid
-   * permission edges -- or undefined if the user has no access. The owner always has "build".
+   * The effective role of `profileId` -- the maximum role reachable from the workspace's owner
+   * through valid permission edges -- or undefined if the user has no access. The user owner
+   * always has "build"; on an org-owned workspace they are instead subject to their org
+   * membership like anyone else.
+   *
+   * Awaited membership: an org-owned workspace consults its owning org live (the constructor's
+   * `owningOrgRoles` callback). Pass `orgRoles` to reuse a snapshot already fetched for the same
+   * operation -- a Map for org-owned, null for user-owned -- so one authorization reads one
+   * consistent membership.
    */
-  getEffectiveRole(profileId: string): CollaboratorRole | undefined {
-    if (profileId === this.ownerProfileId) return "build";
-    return this.computeEffectiveRoles().get(profileId);
+  async getEffectiveRole(
+      profileId: string,
+      orgRoles?: ReadonlyMap<string, OrgRole> | null): Promise<CollaboratorRole | undefined> {
+    if (orgRoles === undefined) orgRoles = await this.owningOrgRoles();
+    if (!orgRoles && profileId === this.ownerProfileId) return "build";
+    return this.computeEffectiveRoles({ orgRoles }).get(profileId);
   }
 
   /**
@@ -196,7 +225,7 @@ export class SharingManager {
     if (this.ownerInvitesOnly()) {
       // Only direct owner grants count (see computeEffectiveRoles), so the link can grant nothing.
       // Let someone who already has access through the owner re-open with it; refuse anyone else.
-      if (!this.getEffectiveRole(opts.profileId)) {
+      if (!await this.getEffectiveRole(opts.profileId)) {
         this.#requireShareLinksAllowed({ redeeming: true });
       }
       return;
@@ -242,8 +271,8 @@ export class SharingManager {
    * revocation model, removed collaborators linger in storage with no reachable role; they are
    * omitted here (they reappear if re-added).
    */
-  listCollaborators(): CollaboratorInfo[] {
-    let roles = this.computeEffectiveRoles();
+  async listCollaborators(): Promise<CollaboratorInfo[]> {
+    let roles = this.computeEffectiveRoles({ orgRoles: await this.owningOrgRoles() });
     let result: CollaboratorInfo[] = [];
     for (let record of this.storage.collaborators.list()) {
       let role = roles.get(record.profile.id);
@@ -260,26 +289,31 @@ export class SharingManager {
   /**
    * Add a collaborator with a `user` edge from the caller, granting `role`. The caller is
    * responsible for resolving `profile` (via RPC) and for any policy checks. The caller may not
-   * grant a role higher than their own effective role. Once `ownerInvitesOnly` is set, only the
-   * owner may call this.
+   * grant a role higher than their own effective role. Once `ownerInvitesOnly` is set, only a
+   * holder of the workspace's owner authority may call this -- the user owner, or on an
+   * org-owned workspace an org owner/admin whose baseline is still build (#mayAuthorOwnerGrant,
+   * the same authors whose edges the graph then counts), so a stored grant always takes effect.
    */
-  addCollaborator(opts: {
+  async addCollaborator(opts: {
     caller: SharingCaller;
     profile: AiChatAuthorInfo;
     role: CollaboratorRole;
     note?: string;
-  }): CollaboratorInfo {
-    // Don't add the owner as a collaborator.
-    if (opts.profile.id === this.ownerProfileId) {
+  }): Promise<CollaboratorInfo> {
+    let orgRoles = await this.owningOrgRoles();
+    // Don't add the owner as a collaborator (an org-owned workspace has no such user: the former
+    // owner is an ordinary principal under the org).
+    if (!orgRoles && opts.profile.id === this.ownerProfileId) {
       throw new Error("Cannot add the workspace owner as a collaborator.");
     }
 
-    if (this.ownerInvitesOnly() && !opts.caller.isOwner) {
+    if (this.ownerInvitesOnly() &&
+        !this.#mayAuthorOwnerGrant(opts.caller.profileId, orgRoles)) {
       throw new Error(
           "Only the workspace owner can add people to a workspace that contains sensitive data.");
     }
 
-    let callerRole = this.#requireCallerRole(opts.caller);
+    let callerRole = this.#requireCallerRole(opts.caller, orgRoles);
     if (roleRank(opts.role) > roleRank(callerRole)) {
       throw new Error("You cannot grant a role higher than your own.");
     }
@@ -308,7 +342,7 @@ export class SharingManager {
       return {
         profile: existing.profile,
         addedBy: existing.addedBy,
-        role: this.computeEffectiveRoles().get(existing.profile.id) ?? opts.role,
+        role: this.computeEffectiveRoles({ orgRoles }).get(existing.profile.id) ?? opts.role,
       };
     }
 
@@ -320,19 +354,21 @@ export class SharingManager {
     return {
       profile: record.profile,
       addedBy: record.addedBy,
-      role: this.computeEffectiveRoles().get(record.profile.id) ?? opts.role,
+      role: this.computeEffectiveRoles({ orgRoles }).get(record.profile.id) ?? opts.role,
     };
   }
 
-  previewRemoveCollaborator(caller: SharingCaller, profileId: string): AffectedCollaborator[] {
+  async previewRemoveCollaborator(
+      caller: SharingCaller, profileId: string): Promise<AffectedCollaborator[]> {
     let target = this.storage.collaborators.get(profileId);
     if (!target) return [];
 
-    let baseline = this.computeEffectiveRoles();
+    let orgRoles = await this.owningOrgRoles();
+    let baseline = this.computeEffectiveRoles({ orgRoles });
     let modified = caller.isOwner
-        ? this.computeEffectiveRoles({ removedUser: profileId })
+        ? this.computeEffectiveRoles({ orgRoles, severedTarget: profileId })
         : this.computeEffectiveRoles({
-            removedEdge: { target: profileId, sharer: caller.profileId } });
+            orgRoles, removedEdge: { target: profileId, sharer: caller.profileId } });
 
     return this.#computeAffected(baseline, modified);
   }
@@ -353,9 +389,15 @@ export class SharingManager {
    * be downgraded is granted a fresh edge from the caller at their prior role (see
    * `#reRootKeptUsers`). Returns the collaborators whose access actually changed (removed or
    * downgraded), excluding kept users.
+   *
+   * On an org-owned workspace this refuses, with a pointer at the org, when the target is an org
+   * member whose access would not change: their baseline survives any edge severance, so a plain
+   * collaborator whose only role is their org role must be removed from the org, not from this
+   * list. A non-member's parallel user edges are still severable normally, even when redundant.
    */
-  removeCollaborator(
-      caller: SharingCaller, profileId: string, keepUsers: string[]): AffectedCollaborator[] {
+  async removeCollaborator(
+      caller: SharingCaller, profileId: string, keepUsers: string[]): Promise<AffectedCollaborator[]> {
+    let orgRoles = await this.owningOrgRoles();
     let target = this.storage.collaborators.get(profileId);
     if (!target) {
       throw new Error("User is not a collaborator.");
@@ -371,7 +413,20 @@ export class SharingManager {
       }
     }
 
-    let baseline = this.computeEffectiveRoles();
+    let baseline = this.computeEffectiveRoles({ orgRoles });
+
+    // The role the target keeps once the chosen edges are severed (both hypotheticals match the
+    // severance below exactly).
+    let kept = this.computeEffectiveRoles(caller.isOwner
+        ? { orgRoles, severedTarget: profileId }
+        : { orgRoles, removedEdge: { target: profileId, sharer: caller.profileId } })
+        .get(profileId);
+    let had = baseline.get(profileId);
+    if (orgRoles?.has(profileId) && kept !== undefined && had !== undefined
+        && roleRank(kept) >= roleRank(had)) {
+      throw new Error(
+          "That person's access comes from their organization's membership; remove them from the organization instead.");
+    }
 
     // Sever the edges that grant the target access. The record is retained even if it becomes
     // empty, so the target's own outgoing grants survive and the removal can be undone.
@@ -383,9 +438,9 @@ export class SharingManager {
     }
     this.storage.collaborators.put(target);
 
-    this.#reRootKeptUsers(caller, baseline, new Set(keepUsers));
+    this.#reRootKeptUsers(caller, baseline, new Set(keepUsers), orgRoles);
 
-    return this.#computeAffected(baseline, this.computeEffectiveRoles());
+    return this.#computeAffected(baseline, this.computeEffectiveRoles({ orgRoles }));
   }
 
   // ---------------------------------------------------------------------------------------
@@ -411,7 +466,7 @@ export class SharingManager {
   async createShareLink(
       opts: { caller: SharingCaller; role: CollaboratorRole; note?: string })
       : Promise<{ key: string; linkId: string }> {
-    let callerRole = this.#requireCallerRole(opts.caller);
+    let callerRole = this.#requireCallerRole(opts.caller, await this.owningOrgRoles());
     if (roleRank(opts.role) > roleRank(callerRole)) {
       throw new Error("You cannot grant a role higher than your own.");
     }
@@ -439,7 +494,7 @@ export class SharingManager {
 
     // Re-check the ceiling: the caller's role may have dropped below the link's since it was
     // created, and a fresh key must never grant more than the caller currently has.
-    let callerRole = this.#requireCallerRole(opts.caller);
+    let callerRole = this.#requireCallerRole(opts.caller, await this.owningOrgRoles());
     if (roleRank(link.role ?? "build") > roleRank(callerRole)) {
       throw new Error("You cannot grant a role higher than your own.");
     }
@@ -485,14 +540,16 @@ export class SharingManager {
     this.storage.shareKeys.put(link);
   }
 
-  previewRevokeShareLink(caller: SharingCaller, linkId: string): AffectedCollaborator[] {
+  async previewRevokeShareLink(
+      caller: SharingCaller, linkId: string): Promise<AffectedCollaborator[]> {
     let link = asLink(this.storage.shareKeys.get(linkId));
     if (!link) return [];
     this.#requireLinkManager(caller, link, "revoke");
     if (link.revoked) return [];
 
-    let baseline = this.computeEffectiveRoles();
-    let modified = this.computeEffectiveRoles({ revokedLinkId: linkId });
+    let orgRoles = await this.owningOrgRoles();
+    let baseline = this.computeEffectiveRoles({ orgRoles });
+    let modified = this.computeEffectiveRoles({ orgRoles, revokedLinkId: linkId });
     return this.#computeAffected(baseline, modified);
   }
 
@@ -507,12 +564,13 @@ export class SharingManager {
    * `keepUsers` is optional re-root sugar, identical to removeCollaborator. Returns the
    * collaborators whose access actually changed (removed or downgraded), excluding kept users.
    */
-  revokeShareLink(
-      caller: SharingCaller, linkId: string, keepUsers: string[]): AffectedCollaborator[] {
+  async revokeShareLink(
+      caller: SharingCaller, linkId: string, keepUsers: string[]): Promise<AffectedCollaborator[]> {
     let link = this.#requireLink(linkId);
     this.#requireLinkManager(caller, link, "revoke");
 
-    let baseline = this.computeEffectiveRoles();
+    let orgRoles = await this.owningOrgRoles();
+    let baseline = this.computeEffectiveRoles({ orgRoles });
 
     link.revoked = true;
     this.storage.shareKeys.put(link);
@@ -520,17 +578,18 @@ export class SharingManager {
     // Revoking makes the copies useless, and nothing references them, so delete them.
     this.storage.shareKeys.byAlias.delete(link.id);
 
-    this.#reRootKeptUsers(caller, baseline, new Set(keepUsers));
+    this.#reRootKeptUsers(caller, baseline, new Set(keepUsers), orgRoles);
 
-    return this.#computeAffected(baseline, this.computeEffectiveRoles());
+    return this.#computeAffected(baseline, this.computeEffectiveRoles({ orgRoles }));
   }
 
   // ---------------------------------------------------------------------------------------
   // Permission-graph engine
 
   /**
-   * Compute the effective role of every collaborator -- the maximum role reachable from the owner
-   * through valid permission edges. A collaborator absent from the returned map has no access.
+   * Compute the effective role of every principal -- the maximum role reachable from the
+   * workspace's owner through valid permission edges. A principal absent from the returned map
+   * has no access.
    *
    * The owner is the implicit root at "build". Each edge grants min(edge role, sharer's effective
    * role):
@@ -539,23 +598,36 @@ export class SharingManager {
    *     by the creator's effective role.
    *
    * Optional modifications model a hypothetical change, used by the preview methods:
-   *   - `removedUser`: a profileId treated as removed (excluded from the graph entirely).
+   *   - `severedTarget`: a profileId whose own incoming edges are all treated as severed (an
+   *     owner-style removal). The record stays, so on an org-owned workspace the member keeps
+   *     their baseline and their dependents stay bounded by it.
    *   - `removedEdge`: a single user edge (target ← sharer) treated as removed.
    *   - `revokedLinkId`: a link treated as revoked (its edges contribute nothing).
+   *   - `orgRoles`: the owning org's live membership (see the constructor's `owningOrgRoles`). A
+   *     Map means the workspace is org-owned: each active member is seeded at the role their org
+   *     role grants (org-access.ts), the user owner stops being the root, and stored edges only
+   *     extend access on top of the baselines -- so a member's removal from the org (or demotion
+   *     to member) ends or narrows their access here, lazily, like any other revocation. null
+   *     means user-owned (the default when omitted).
    *
-   * Once `ownerInvitesOnly` is set, only direct grants from the owner count: every `shareKey` edge
-   * (even for a link the owner created) and every `user` edge from anyone but the owner is
-   * skipped. People who reached the workspace any other way lose access, and a collaborator whose
-   * owner edge grants less than they reached transitively is downgraded to it.
+   * Once `ownerInvitesOnly` is set, only direct grants from the workspace's owner authority
+   * count: every `shareKey` edge (even for a link that authority created) and every `user`
+   * edge from anyone else is skipped (see `#mayAuthorOwnerGrant`). People who reached the
+   * workspace any other way lose access, and a collaborator whose owner edge grants less than
+   * they reached transitively is downgraded to it. On an org-owned workspace the owner
+   * authority is the build baseline: org owners'/admins' user edges count, an ordinary
+   * member's do not, and an admin's demotion ends the grants they authored at the next read.
    */
   computeEffectiveRoles(opts: {
-    removedUser?: string | null;
+    severedTarget?: string | null;
     removedEdge?: { target: string; sharer: string } | null;
     revokedLinkId?: string | null;
+    orgRoles?: ReadonlyMap<string, OrgRole> | null;
   } = {}): Map<string, CollaboratorRole> {
-    let removedUser = opts.removedUser ?? null;
+    let severedTarget = opts.severedTarget ?? null;
     let removedEdge = opts.removedEdge ?? null;
     let revokedLinkId = opts.revokedLinkId ?? null;
+    let orgRoles = opts.orgRoles ?? null;
     let ownerGrantsOnly = this.ownerInvitesOnly();
 
     // Map linkId → {creator, role}, excluding revoked links (the persisted `revoked` flag, and the
@@ -569,20 +641,30 @@ export class SharingManager {
       });
     }
 
-    // All collaborators except the removed user.
+    // All collaborator records -- including a severed target's, which must stay reachable as a
+    // sharer for its own dependents (at whatever role it retains).
     let allCollabs = new Map<string, CollaboratorRecord>();
     for (let record of this.storage.collaborators.list()) {
-      if (record.profile.id !== removedUser) {
-        allCollabs.set(record.profile.id, record);
-      }
+      allCollabs.set(record.profile.id, record);
     }
 
     // Roles known so far.
     let eff = new Map<string, CollaboratorRole>();
 
-    // Effective role of a potential sharer (the owner is the root at "build").
+    // An org-owned workspace roots its graph at the org: every active member starts at the role
+    // their org role grants, and edges only build on those baselines. (Pending invitees are
+    // absent from the snapshot, so their access never starts.)
+    if (orgRoles) {
+      for (let [userId, orgRole] of orgRoles) {
+        eff.set(userId, gadgetBaselineRole(orgRole));
+      }
+    }
+
+    // Effective role of a potential sharer. The user owner is the root at "build" on a
+    // user-owned workspace; on an org-owned one they are an ordinary principal, granted only
+    // what their own membership (or an edge) gives.
     let sharerRole = (id: string): CollaboratorRole | undefined =>
-        id === this.ownerProfileId ? "build" : eff.get(id);
+        !orgRoles && id === this.ownerProfileId ? "build" : eff.get(id);
 
     // Fixed-point iteration. Roles only increase, so this converges.
     let changed = true;
@@ -590,6 +672,8 @@ export class SharingManager {
       changed = false;
       for (let [id, record] of allCollabs) {
         let best: CollaboratorRole | undefined = eff.get(id);
+        // An owner-style severance clears this target's own incoming edges entirely.
+        if (id === severedTarget) continue;
         for (let edge of record.addedBy) {
           let granted: CollaboratorRole | undefined;
           if (edge.type === "shareKey") {
@@ -605,8 +689,9 @@ export class SharingManager {
                 edge.sharer === removedEdge.sharer) {
               continue;
             }
-            if (edge.sharer === removedUser) continue;
-            if (ownerGrantsOnly && edge.sharer !== this.ownerProfileId) continue;
+            // (A severed target keeps whatever role remains, so its own dependents stay
+            // bounded by that -- no sharer exclusion here.)
+            if (ownerGrantsOnly && !this.#mayAuthorOwnerGrant(edge.sharer, orgRoles)) continue;
             let upstream = sharerRole(edge.sharer);
             if (!upstream) continue;
             granted = minRole(edgeGrantedRole(edge), upstream);
@@ -625,11 +710,27 @@ export class SharingManager {
     return eff;
   }
 
+  // Whether `sharer`'s direct user edges count as owner grants once `ownerInvitesOnly` is set:
+  // the user owner on a user-owned workspace, or -- on an org-owned one, which has no user
+  // owner -- an active member at the build baseline (org owners/admins: the roles org-access.ts
+  // baselines at build, and the only ones that may move workspaces into the org). An admin's
+  // later demotion therefore also lazily revokes the grants they authored: the edges stop
+  // counting at the next graph read, exactly like any other baseline drop.
+  #mayAuthorOwnerGrant(sharer: string, orgRoles: ReadonlyMap<string, OrgRole> | null): boolean {
+    if (!orgRoles) return sharer === this.ownerProfileId;
+    let orgRole = orgRoles.get(sharer);
+    return orgRole !== undefined && gadgetBaselineRole(orgRole) === "build";
+  }
+
   // The caller's effective role, throwing if the caller has no access at all (which should not
-  // happen for an authorized session).
-  #requireCallerRole(caller: SharingCaller): CollaboratorRole {
-    if (caller.isOwner) return "build";
-    let role = this.computeEffectiveRoles().get(caller.profileId);
+  // happen for an authorized session). On an org-owned workspace the caller's own membership is
+  // the ceiling even when they hold owner authority in the session (`isOwner` covers org admins,
+  // whose baseline is "build" anyway) -- the former user owner who is not a member shares
+  // nothing.
+  #requireCallerRole(
+      caller: SharingCaller, orgRoles: ReadonlyMap<string, OrgRole> | null): CollaboratorRole {
+    if (!orgRoles && caller.isOwner) return "build";
+    let role = this.computeEffectiveRoles({ orgRoles }).get(caller.profileId);
     if (!role) {
       throw new Error("You do not have permission to share this workspace.");
     }
@@ -641,8 +742,9 @@ export class SharingManager {
    * `baseline`, the effective roles computed just before the flag was set.
    */
   computeAffectedByOwnerInvitesOnly(
-      baseline: Map<string, CollaboratorRole>): AffectedCollaborator[] {
-    return this.#computeAffected(baseline, this.computeEffectiveRoles());
+      baseline: Map<string, CollaboratorRole>,
+      orgRoles: ReadonlyMap<string, OrgRole> | null = null): AffectedCollaborator[] {
+    return this.#computeAffected(baseline, this.computeEffectiveRoles({ orgRoles }));
   }
 
   // Diff two effective-role maps, returning the collaborators whose access changed. A user is
@@ -675,11 +777,12 @@ export class SharingManager {
   // fresh `user` edge from the caller at their prior role (bounded by what the caller can grant),
   // so they retain their access independently of the severed path.
   #reRootKeptUsers(
-      caller: SharingCaller, baseline: Map<string, CollaboratorRole>, keepSet: Set<string>): void {
+      caller: SharingCaller, baseline: Map<string, CollaboratorRole>, keepSet: Set<string>,
+      orgRoles: ReadonlyMap<string, OrgRole> | null): void {
     if (keepSet.size === 0) return;
 
-    let callerRole = this.#requireCallerRole(caller);
-    let afterSever = this.computeEffectiveRoles();
+    let callerRole = this.#requireCallerRole(caller, orgRoles);
+    let afterSever = this.computeEffectiveRoles({ orgRoles });
 
     for (let id of keepSet) {
       let prior = baseline.get(id);

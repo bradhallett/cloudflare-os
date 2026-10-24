@@ -1,14 +1,15 @@
-import { type ComponentProps, type ReactNode } from "react";
+import { Suspense, type ComponentProps, type ReactNode } from "react";
 import { Dialog } from "@cloudflare/kumo";
 import { X } from "@phosphor-icons/react";
 import { RpcStub } from "capnweb";
-import type { Overseer } from "@gadgets/workshop-shared/api";
+import type { Overseer, PlanRefusalCode } from "@gadgets/workshop-shared/api";
 import type { ActionKind } from "@gadgets/workshop-shared/gatekeeper";
 import GatekeeperModal from "../../GatekeeperModal";
 import DeleteConfirmationDialog from "../../components/DeleteConfirmationDialog";
 import AutoApproveConfirmDialog from "../../components/AutoApproveConfirmDialog";
 import { WorkshopButton, WorkshopIconButton } from "../../components/WorkshopControls";
 import OutOfCreditsModal from "../../components/billing/OutOfCreditsModal";
+import { SaasUpgradeModal } from "../saas/commerceGate";
 import type { UnresolvedConflict } from "./mergeConflicts";
 import { UnresolvedConflictsDialog } from "./UnresolvedConflictsDialog";
 import type { AutoApproveTarget } from "./transcript/ActionCard";
@@ -60,8 +61,9 @@ export interface ChatDialogsProps {
   handleConnectionCreated: GatekeeperCreated;
   usageModalOpen: boolean;
   setUsageModalOpen: (open: boolean) => void;
+  /** What opened the usage modal — the usage_limit surface or a plan-refusal code. */
+  usageModalReason: "usage_limit" | PlanRefusalCode;
 }
-
 /**
  * The chat's modal layer: the stale-accept (update-from-mainline) dialog, unresolved-conflict
  * dialog, delete confirmation, auto-approve confirmation, the creation account modal, the
@@ -92,6 +94,7 @@ export function ChatDialogs({
   handleConnectionCreated,
   usageModalOpen,
   setUsageModalOpen,
+  usageModalReason,
 }: ChatDialogsProps) {
   return (
     <>
@@ -191,9 +194,9 @@ export function ChatDialogs({
           }}
           onConfirm={async () => {
             const { actionId, gatekeeperId, actionKind } = autoApproveConfirm;
-            if (await alwaysApproveTag(actionId, gatekeeperId, actionKind)) {
-              setAutoApproveConfirm(null);
-            }
+            const enabled = await alwaysApproveTag(actionId, gatekeeperId, actionKind);
+            if (enabled) setAutoApproveConfirm(null);
+            return enabled;
           }}
         />
       )}
@@ -211,10 +214,22 @@ export function ChatDialogs({
         initialResourceUrl={connectionAccept?.resourceUrl}
         initialResourceUrlPattern={connectionAccept?.resourceUrlPattern}
       />
-      <OutOfCreditsModal
-        open={usageModalOpen}
-        onClose={() => setUsageModalOpen(false)}
-      />
+      {/* In a SaaS build the upgrade prompt replaces the out-of-credits modal at the same
+          enforcement surface; the gate folds this choice to the OSS modal in OSS builds. */}
+      {SaasUpgradeModal ? (
+        <Suspense fallback={null}>
+          <SaasUpgradeModal
+            open={usageModalOpen}
+            onClose={() => setUsageModalOpen(false)}
+            reason={usageModalReason}
+          />
+        </Suspense>
+      ) : (
+        <OutOfCreditsModal
+          open={usageModalOpen}
+          onClose={() => setUsageModalOpen(false)}
+        />
+      )}
     </>
   );
 }

@@ -326,8 +326,8 @@ export function ChatListPanel({
                           </span>
                         )}
                         {!isRenaming && chat.activeAgent ? (
-                          <span className="inline-flex flex-shrink-0 cursor-pointer items-center gap-1 text-[11px] leading-4 font-medium text-kumo-brand">
-                            <span className="h-1.5 w-1.5 rounded-full bg-kumo-brand animate-pulse" />
+                          <span className="inline-flex shimmer flex-shrink-0 cursor-pointer items-center gap-1 text-[11px] leading-4 font-medium text-kumo-brand">
+                            <span className="h-1.5 w-1.5 rounded-full bg-kumo-brand" />
                             Working
                           </span>
                         ) : !isRenaming && chatHasProposedChanges(chat) ? (

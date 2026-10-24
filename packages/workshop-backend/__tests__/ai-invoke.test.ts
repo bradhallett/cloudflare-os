@@ -112,4 +112,44 @@ describe("completeText", () => {
     expect(bodies.map(body => JSON.stringify(body).includes(`"cache_control"`)))
         .toEqual([false, true]);
   });
+
+  // The onUsage hook is the usage-metering seam for one-shot binding calls: it must receive
+  // exactly the usage the provider reported on a successful completion, and never fire for a
+  // failed one, whose tokens are not billable.
+  it("hands the provider-reported usage to onUsage after a completion", async () => {
+    const event = (payload: object) => `data: ${JSON.stringify({
+      id: "completion", object: "chat.completion.chunk", created: 0, model: MODEL, ...payload,
+    })}\n\n`;
+    const fetch = vi.fn(async () => new Response(
+        event({ choices: [{ index: 0, delta: { role: "assistant", content: "OK" }, finish_reason: null }] }) +
+        event({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }) +
+        event({ choices: [], usage: {
+          prompt_tokens: 100, prompt_tokens_details: { cached_tokens: 10 },
+          completion_tokens: 5,
+        } }) +
+        "data: [DONE]\n\n",
+        { headers: { "content-type": "text/event-stream" } }));
+    const handle = getModel({
+      CF_AI_GATEWAY: "platform-gateway",
+      CF_AI_GATEWAY_ACCOUNT_ID: "account-id",
+      CF_AI_GATEWAY_PROVIDERS: "cloudflare,anthropic",
+      WORKERS_AI: { fetch },
+    } as unknown as Cloudflare.Env,
+        { provider: "cloudflare", model: MODEL, apiToken: "" },
+        { type: "user", id: "user-123", name: "User" });
+    const onUsage = vi.fn();
+    expect(await completeText(handle, { prompt: "hello", onUsage })).toBe("OK");
+    expect(onUsage).toHaveBeenCalledTimes(1);
+    // pi splits the provider's counts into its classes: uncached prompt, cache reads, writes.
+    expect(onUsage.mock.calls[0]![0]).toMatchObject(
+        { input: 90, cacheRead: 10, cacheWrite: 0, output: 5, totalTokens: 105 });
+  });
+
+  it("never fires onUsage for a failed request", async () => {
+    const { handle } = answering();
+    const onUsage = vi.fn();
+    await expect(completeText(handle, { prompt: "hello", onUsage, signal: AbortSignal.abort() }))
+        .rejects.toThrow();
+    expect(onUsage).not.toHaveBeenCalled();
+  });
 });

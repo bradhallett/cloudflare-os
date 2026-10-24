@@ -197,6 +197,7 @@ export const ChatComposer = ({
     addFiles,
     clearSentAttachments,
     removeAttachment,
+    retryAttachment,
   } = useComposerAttachments({
     getOverseer,
     onError: (message) => toasts.add({ title: message, variant: "error" }),
@@ -560,11 +561,24 @@ export const ChatComposer = ({
             ? undefined
             : selectedBot ?? "none";
 
-      await onSend(message, selectedModel?.id ?? null,
-          capsuleSpecifiers,
-          readyAttachments.length ? readyAttachments : undefined,
-          formatRefs,
-          sendBot);
+      try {
+        await onSend(message, selectedModel?.id ?? null,
+            capsuleSpecifiers,
+            readyAttachments.length ? readyAttachments : undefined,
+            formatRefs,
+            sendBot);
+      } catch (err) {
+        // A definitive failure in a chat with a transcript hands the message to the transcript's
+        // failed-send bubble, so the draft clears exactly as a success would; a transient failure
+        // (outcome unknown) and the new-chat composer (no transcript to hold it) keep the draft.
+        if (!isTransientRpcError(err) && chatKey != null) {
+          clearSentAttachments(attachmentsSnapshot);
+          if (completeDraftSend(draftSend)) {
+            replaceComposerDocument({ text: "", capsules: [], formats: [], command: null });
+          }
+        }
+        throw err;
+      }
       clearSentAttachments(attachmentsSnapshot);
       if (!completeDraftSend(draftSend)) return;
       replaceComposerDocument({ text: "", capsules: [], formats: [], command: null });
@@ -800,6 +814,7 @@ export const ChatComposer = ({
           attachments={pendingAttachments}
           disabled={isSending}
           onRemove={removeAttachment}
+          onRetry={retryAttachment}
         />
         {/* Textarea */}
         <div className="relative px-4 pb-2.5 pt-3">

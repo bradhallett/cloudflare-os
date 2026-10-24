@@ -1,8 +1,9 @@
 import { memo } from "react";
 import type { AiToolCall } from "@gadgets/workshop-shared/api";
 import { CaretRight } from "@phosphor-icons/react";
-import { getToolCallSummary, getToolIcon, type ToolOutputResolver } from "./toolCalls";
+import { getToolCallSummary, getToolIcon, isToolCallRunning, type ToolOutputResolver } from "./toolCalls";
 import { ToolCallDetails } from "./ToolCallDetails";
+import { ToolRunningIndicator } from "./ToolRunningIndicator";
 import { WorkIcon } from "./WorkIcon";
 
 /** One tool call inside an expanded work-run group. */
@@ -20,6 +21,7 @@ export const NestedToolCallRow = memo(function NestedToolCallRow({
   const key = `call-${tc.toolCallId}`;
   const summary = getToolCallSummary(tc, outputOf);
   const label = `${summary.verb}${summary.target ? ` ${summary.target}` : ""}`;
+  const running = isToolCallRunning(tc);
   const Icon = getToolIcon(tc.toolName, outputOf?.(tc));
 
   return (
@@ -35,6 +37,7 @@ export const NestedToolCallRow = memo(function NestedToolCallRow({
         </span>
         <span className="flex min-w-0 flex-1 items-center gap-2 text-[14px] leading-5 tracking-[-0.25px]">
           <span className="min-w-0 truncate">{label}</span>
+          {running && <ToolRunningIndicator />}
           {tc.error && (
             <span className="flex-shrink-0 rounded-full bg-kumo-danger-tint px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.04em] text-kumo-danger">
               Error

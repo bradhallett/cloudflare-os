@@ -1,6 +1,6 @@
 import type { ActionLogEntry } from "@gadgets/workshop-shared/api";
 import { ActionKind } from "@gadgets/workshop-shared/gatekeeper";
-import { CaretRight, LinkSimple, MagnifyingGlass, ShieldCheck } from "@phosphor-icons/react";
+import { CaretRight, Check, LinkSimple, MagnifyingGlass, ShieldCheck, X } from "@phosphor-icons/react";
 import { Tooltip } from "@cloudflare/kumo";
 import { ActionFields, entryFields } from "../../../components/ActionFields";
 import { GatekeeperIcon } from "../../../components/GatekeeperIcon";
@@ -9,7 +9,7 @@ import {
   IncompleteDescriptionNotice,
   isDescriptionIncomplete,
 } from "../../../components/IncompleteDescriptionNotice";
-import { AlwaysApproveButton, ResolveButton } from "../../../components/ResolveButton";
+import { AlwaysApproveButton, ResolveButton, type ResolveClickResult } from "../../../components/ResolveButton";
 import { RestrictedApprovalNotice } from "../../../components/RestrictedApprovalNotice";
 import { safeExternalUrl } from "../../../utils/safeExternalUrl";
 import styles from "../../../ChatInterface.module.css";
@@ -48,7 +48,7 @@ export function ActionCard({
   open: boolean;
   isProcessing: boolean;
   onToggleExpansion: (actionId: number) => void;
-  onResolve: (log: ActionLogEntry, decision: ActionDecision) => void;
+  onResolve: (log: ActionLogEntry, decision: ActionDecision) => ResolveClickResult;
   onAlwaysApprove: (target: AutoApproveTarget) => void;
   isTagAutoApproved: (gatekeeperId: number, tag: string) => boolean;
   onToggleHook: (actionId: number, hookId: number, enabled: boolean) => void;
@@ -353,7 +353,14 @@ export function ActionCard({
           <span className="flex min-w-0 flex-1 items-center gap-2">
             <span className="min-w-0 truncate">{log.description.title}</span>
             {stateLabel && (
-              <span className={`flex-shrink-0 text-[12px] font-medium ${stateLabelCls}`}>
+              <span
+                className={`flex flex-shrink-0 items-center gap-0.5 text-[12px] font-medium ${stateLabelCls} ${styles.resolvedBadge}`}
+              >
+                {isApproved ? (
+                  <Check size={11} weight="bold" aria-hidden="true" />
+                ) : (
+                  <X size={11} weight="bold" aria-hidden="true" />
+                )}
                 {stateLabel}
               </span>
             )}
