@@ -92,8 +92,9 @@ export const BotEditorDialog = ({
     })
   }
 
-  // Enter submits nothing: the dialog's contract is explicit Save, and Enter in a textarea must
-  // keep its newline. Escape closes through Dialog.Root's own handling.
+  // Enter in Name or Description submits — these are single-line inputs inside the form, and
+  // Enter-as-save is the native affordance, deliberate here. Enter in the Instructions textarea
+  // keeps its newline, and Escape closes through Dialog.Root's own handling.
 
   // Field errors stay out of sight until a Save is attempted, so an untouched form isn't red
   // (the same convention as AddGatewayModelForm).
@@ -103,17 +104,20 @@ export const BotEditorDialog = ({
   const shownNameError = errorsShown ? nameError : undefined
   const shownModelError = errorsShown ? modelError : undefined
 
-   const [saving, setSaving] = useState(false)
-   const controlsDisabled = busy || saving
+  const [saving, setSaving] = useState(false)
+  const controlsDisabled = busy || saving
   const nameInputRef = useRef<HTMLInputElement>(null)
+  const modelTriggerRef = useRef<HTMLButtonElement>(null)
   // Shakes the name field after a Save attempt finds it invalid (aria-invalid), never while
-  // typing; the form below is what the hook listens for attempts on.
+  // typing; the form below is what the hook listens for attempts on. The model select renders a
+  // button trigger the hook cannot watch, so it gets focus and the announced error instead.
   useInvalidShake(nameInputRef)
-   const submit = async () => {
+  const submit = async () => {
     if (controlsDisabled) return
     if (nameError !== undefined || modelError !== undefined) {
       setErrorsShown(true)
       if (nameError !== undefined) nameInputRef.current?.focus()
+      else modelTriggerRef.current?.focus()
       return
     }
     const def: BotDefinition = {
@@ -123,13 +127,13 @@ export const BotEditorDialog = ({
       modelId,
       skills: [...selected.values()],
     }
-     setSaving(true)
-     try {
+    setSaving(true)
+    try {
       await onSave(def)
-     } finally {
-       setSaving(false)
-     }
-   }
+    } finally {
+      setSaving(false)
+    }
+  }
 
   return (
     <Dialog.Root
@@ -226,6 +230,14 @@ export const BotEditorDialog = ({
                 if (value !== null) setModelId(value)
               }}
               renderValue={(value) => (value === null ? 'No model' : labelOf(value))}
+              render={(triggerProps) => (
+                <button
+                  {...triggerProps}
+                  ref={modelTriggerRef}
+                  aria-invalid={shownModelError !== undefined}
+                  aria-describedby={shownModelError !== undefined ? 'bot-editor-model-error' : undefined}
+                />
+              )}
             >
               {models.map((model) => (
                 <Select.Option key={model.id} value={model.id}>
@@ -238,7 +250,7 @@ export const BotEditorDialog = ({
               )}
             </Select>
             {shownModelError !== undefined && (
-              <span role="alert" className="text-[11px] leading-4 text-kumo-danger">
+              <span id="bot-editor-model-error" role="alert" className="text-[11px] leading-4 text-kumo-danger">
                 {shownModelError}
               </span>
             )}

@@ -38,13 +38,13 @@ vi.mock("@cloudflare/kumo", () => {
       {label}
     </label>
   )
-  const Select = ({ label, value, disabled, onValueChange, children }: {
+  const Select = ({ label, value, disabled, onValueChange, render, children }: {
     label?: ReactNode; value: string | null; disabled?: boolean;
     onValueChange?: (value: string | null, details: { reason: string }) => void;
+    render?: (props: Record<string, unknown>) => ReactNode;
     children: ReactNode
-  }) => (
-    <label>
-      {label}
+  }) => {
+    const control = (
       <select
         disabled={disabled}
         value={value ?? undefined}
@@ -52,8 +52,15 @@ vi.mock("@cloudflare/kumo", () => {
       >
         {children}
       </select>
-    </label>
-  )
+    )
+    return (
+      <label>
+        {label}
+        {/* render replaces the trigger, as Base UI's does; the native select stands in for it. */}
+        {render ? render({ children: control }) : control}
+      </label>
+    )
+  }
   Select.Option = ({ value, children }: { value: string | null; children: ReactNode }) => (
     <option value={value ?? undefined}>{children}</option>
   )
@@ -157,6 +164,35 @@ describe("BotEditorDialog", () => {
     expect(nameInput.getAttribute("aria-invalid")).toBe("false");
     await act(async () => save.click());
     expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ name: "Helper" }));
+  });
+
+  it("announces and focuses the model error when a Save attempt finds no model picked", async () => {
+    const onSave = vi.fn<(def: BotDefinition) => Promise<void>>()
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    act(() => root!.render(
+      <BotEditorDialog
+        models={[]}
+        skills={skills}
+        title="New bot"
+        onSave={onSave}
+        onClose={() => {}}
+      />,
+    ))
+    const nameInput = container.querySelector<HTMLInputElement>('input[placeholder="Research assistant"]')!
+    act(() => setNativeValue(nameInput, "Helper"));
+    const save = [...container.querySelectorAll("button")].find((b) => b.textContent === "Save")!
+    await act(async () => save.click());
+    expect(onSave).not.toHaveBeenCalled();
+    const error = container.querySelector("#bot-editor-model-error")!;
+    expect(error.getAttribute("role")).toBe("alert");
+    expect(error.textContent).toBe("Pick a model for the bot to run.");
+    const modelTrigger = [...container.querySelectorAll("button")].find((b) =>
+      b.getAttribute("aria-describedby") === "bot-editor-model-error")!;
+    expect(modelTrigger.getAttribute("aria-invalid")).toBe("true");
+    // The invalid model select is where the user lands, since the name is already valid.
+    expect(document.activeElement).toBe(modelTrigger);
   });
 
   it("hands back a trimmed name, no description for a blank one, and picked skills", async () => {
