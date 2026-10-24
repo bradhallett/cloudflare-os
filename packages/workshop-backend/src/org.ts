@@ -378,7 +378,8 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
 
   /**
    * Record that the org owns the workspace `gadgetId` (an Overseer DO id): `Overseer.transferToOrg`
-   * calls this after writing its own owner subject. The actor must be an active owner/admin of the
+   * calls this before writing its own owner subject (register-first, so no window exists where
+   * the org records a workspace the UserDO does not). The actor must be an active owner/admin of
    * org (org-access.ts), checked here rather than in the caller. Idempotent per workspace: a
    * retried transfer refreshes the record rather than duplicating it.
    *
