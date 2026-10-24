@@ -31,6 +31,7 @@ export default function CheckoutReturn() {
     const authed: RpcStub<AuthenticatedApi> = publicApi.authenticate(token)
     let cancelled = false
     let polls = 0
+    let timer: ReturnType<typeof setTimeout> | undefined
     const poll = () => {
       polls++
       authed.getOrgBilling(orgId.current!)
@@ -42,17 +43,23 @@ export default function CheckoutReturn() {
           } else if (polls >= GIVE_UP_AFTER_POLLS) {
             setStatus('failed')
           } else {
-            setTimeout(poll, POLL_MS)
+            timer = setTimeout(poll, POLL_MS)
           }
         })
         .catch(() => {
           if (cancelled) return
           if (polls >= GIVE_UP_AFTER_POLLS) setStatus('failed')
-          else setTimeout(poll, POLL_MS)
+          else timer = setTimeout(poll, POLL_MS)
         })
     }
     poll()
-    return () => { cancelled = true }
+    // Unmounting stops the poll timer and releases the server-side stub (dispose is idempotent,
+    // so a poll in flight when the cleanup runs settles into `cancelled` and drops it).
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+      authed[Symbol.dispose]()
+    }
   }, [publicApi, token])
 
   return (

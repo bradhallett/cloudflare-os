@@ -100,12 +100,16 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
    * mirrors the removal to each swept member. Invitations are swept lazily — here, at the start of
    * the reads and mutations that care — rather than from an alarm, because an expired invitation
    * is already unacceptable (acceptInvitation re-checks `expiresAt`).
+   *
+   * A swept invitation releases the seat it had claimed (membership, so seat count, is pushed to
+   * commerce only from here — the port has no pull API), so anything swept also re-syncs.
    */
   async #sweepExpiredInvitations(): Promise<void> {
     const now = Date.now();
     // The snapshot is materialized because the loop awaits (the mirror) mid-iteration, and a
     // second kv.list() (however triggered) would invalidate a still-live iterator.
     const expired = [...this.storage.invitations.list()];
+    let sweptAny = false;
     for (const invitation of expired) {
       if (invitation.expiresAt.getTime() > now) continue;
       this.storage.invitations.delete(invitation.inviteeId);
@@ -114,7 +118,9 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
         event: "org.invitation.expired",
       });
       await this.#mirror(invitation.inviteeId, null);
+      sweptAny = true;
     }
+    if (sweptAny) this.#syncCommerceMembers();
   }
 
   /**
@@ -285,6 +291,9 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
       this.storage.invitations.delete(userId);
       this.storage.members.delete(userId);
       await this.#mirror(userId, null);
+      // The invitee's seat was claimed at invite time; releasing the member record must release
+      // it at commerce too (see #sweepExpiredInvitations).
+      this.#syncCommerceMembers();
       throw new Error("That invitation has expired.");
     }
     const joined: OrgMember = { ...member, status: "active", joinedAt: new Date() };

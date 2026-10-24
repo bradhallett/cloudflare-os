@@ -100,13 +100,15 @@ describe('SaaS commerce surfaces', () => {
     role: 'owner', status: 'active', ...over,
   })
 
-  // A public stub whose authenticate() answers the funnel's pipelined calls.
+  // A public stub whose authenticate() answers the funnel's pipelined calls. The returned
+  // authenticated stub is disposable, as the real one is.
   function publicStub(authed: Partial<Record<string, unknown>>): { stub: RpcStub<PublicApi>; api: typeof authed } {
     localStorage.setItem('authToken', 'token-1')
+    const disposable = { ...authed, [Symbol.dispose]: () => {} }
     return {
       api: authed,
       stub: {
-        authenticate: vi.fn<() => unknown>().mockReturnValue(authed),
+        authenticate: vi.fn<() => unknown>().mockReturnValue(disposable),
         createAccount: vi.fn<(...args: unknown[]) => Promise<string>>().mockResolvedValue('token-1'),
         login: vi.fn<(...args: unknown[]) => Promise<string>>().mockResolvedValue('token-1'),
       } as unknown as RpcStub<PublicApi>,

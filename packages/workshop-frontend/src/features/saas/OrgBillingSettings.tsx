@@ -38,15 +38,19 @@ function OrgBillingPanel({ org, onCheckoutStart }: {
 
   const isAdmin = org.status === 'active' && (org.role === 'owner' || org.role === 'admin')
 
+  // Billing is admin-only on the server (getOrgBilling re-checks live), so a member is never
+  // asked for it — a refusal would otherwise render as the misleading "free plan" fallback.
   const refresh = useCallback(() => {
     const version = ++refreshVersion.current
-    authenticatedApi.getOrgBilling(org.id)
-      .then((b) => { if (version === refreshVersion.current) setBilling(b) })
-      .catch(() => { if (version === refreshVersion.current) setBilling(null) })
+    if (isAdmin) {
+      authenticatedApi.getOrgBilling(org.id)
+        .then((b) => { if (version === refreshVersion.current) setBilling(b) })
+        .catch(() => { if (version === refreshVersion.current) setBilling(null) })
+    }
     authenticatedApi.getOrgMembers(org.id)
       .then((m) => { if (version === refreshVersion.current) setMembers(m) })
       .catch(() => { if (version === refreshVersion.current) setMembers(null) })
-  }, [authenticatedApi, org.id])
+  }, [authenticatedApi, org.id, isAdmin])
 
   useEffect(refresh, [refresh])
 
@@ -95,20 +99,30 @@ function OrgBillingPanel({ org, onCheckoutStart }: {
 
   return (
     <div className="flex flex-col gap-4 rounded-xl border border-kumo-line bg-kumo-base p-5">
-      {/* Plan card */}
+      {/* Plan card: admins see the plan and its controls; a member sees that billing is managed
+          elsewhere, never a made-up "Free plan" for the overview the RPC refuses them. */}
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <p className="text-[15px] font-medium text-kumo-default">
-            {(billing?.plan ?? 'free').replace(/^./, (c) => c.toUpperCase())} plan
-          </p>
-          <p className="mt-0.5 text-[13px] text-kumo-subtle">
-            {billing
-              ? billing.plan === 'free'
-                ? 'No subscription yet.'
-                : `${billing.subscriptionStatus} · $${billing.monthlySpendCapUsd}/mo cap${billing.overageAllowed ? ' · overage allowed' : ''}`
-              : '…'}
-          </p>
-        </div>
+        {isAdmin ? (
+          <div>
+            <p className="text-[15px] font-medium text-kumo-default">
+              {(billing?.plan ?? 'free').replace(/^./, (c) => c.toUpperCase())} plan
+            </p>
+            <p className="mt-0.5 text-[13px] text-kumo-subtle">
+              {billing
+                ? billing.plan === 'free'
+                  ? 'No subscription yet.'
+                  : `${billing.subscriptionStatus} · $${billing.monthlySpendCapUsd}/mo cap${billing.overageAllowed ? ' · overage allowed' : ''}`
+                : '…'}
+            </p>
+          </div>
+        ) : (
+          <div>
+            <p className="text-[15px] font-medium text-kumo-default">Billing</p>
+            <p className="mt-0.5 text-[13px] text-kumo-subtle">
+              Managed by this organization's owners and admins.
+            </p>
+          </div>
+        )}
         {isAdmin && billing?.plan === 'free' && (
           <Button variant="primary" size="sm" onClick={() => onCheckoutStart(org.id)}>
             Upgrade
@@ -124,9 +138,11 @@ function OrgBillingPanel({ org, onCheckoutStart }: {
       {/* Seats */}
       <div>
         <p className="text-[12px] font-medium uppercase tracking-[0.08em] text-kumo-inactive">Seats</p>
-        <p className="mt-1 text-[13px] text-kumo-subtle">
-          {billing ? `${billing.assignedSeats} of ${billing.seats} licensed seats claimed (invitations claim immediately).` : '…'}
-        </p>
+        {isAdmin && (
+          <p className="mt-1 text-[13px] text-kumo-subtle">
+            {billing ? `${billing.assignedSeats} of ${billing.seats} licensed seats claimed (invitations claim immediately).` : '…'}
+          </p>
+        )}
         <ul className="mt-2 divide-y divide-kumo-line">
           {(members ?? []).map((member) => (
             <li key={member.userId} className="flex items-center gap-2 py-2 text-[14px]">
@@ -165,29 +181,33 @@ function OrgBillingPanel({ org, onCheckoutStart }: {
         {!isAdmin && <p className="mt-2 text-[12px] text-kumo-inactive">Only owners and admins can manage seats and billing.</p>}
       </div>
 
-      {/* Usage */}
-      <div>
-        <p className="text-[12px] font-medium uppercase tracking-[0.08em] text-kumo-inactive">Usage this cycle</p>
-        {billing?.usage ? (
-          <p className="mt-1 text-[13px] text-kumo-subtle">
-            {billing.usage.inputTokens.toLocaleString()} in · {billing.usage.cacheReadTokens.toLocaleString()} cached ·{' '}
-            {billing.usage.outputTokens.toLocaleString()} out tokens
-            {billing.usage.estimatedCostUsd !== null && <> · ~${billing.usage.estimatedCostUsd.toFixed(2)} metered</>}
-          </p>
-        ) : (
-          <p className="mt-1 text-[13px] text-kumo-subtle">No metered usage yet this cycle.</p>
-        )}
-      </div>
+      {/* Usage: the admin's overview of the current cycle. */}
+      {isAdmin && (
+        <div>
+          <p className="text-[12px] font-medium uppercase tracking-[0.08em] text-kumo-inactive">Usage this cycle</p>
+          {billing?.usage ? (
+            <p className="mt-1 text-[13px] text-kumo-subtle">
+              {billing.usage.inputTokens.toLocaleString()} in · {billing.usage.cacheReadTokens.toLocaleString()} cached ·{' '}
+              {billing.usage.outputTokens.toLocaleString()} out tokens
+              {billing.usage.estimatedCostUsd !== null && <> · ~${billing.usage.estimatedCostUsd.toFixed(2)} metered</>}
+            </p>
+          ) : (
+            <p className="mt-1 text-[13px] text-kumo-subtle">No metered usage yet this cycle.</p>
+          )}
+        </div>
+      )}
     </div>
   )
 }
 
 /**
- * The org billing section: one tab per org (a person may be in many), the `?org=` search
- * parameter picks the initially-selected tab — the link the org switcher and the upgrade prompt
- * follow. Renders nothing unless the server runs SaaS mode and the caller is in at least one org.
+ * The org billing section: one tab per org (a person may be in many), with the `?org=` search
+ * parameter picking the selected tab — live, not just at mount: the org switcher and the upgrade
+ * prompt navigate with it, and a search-only navigation re-renders this component, so the
+ * parameter arrives as a prop and the panel follows it. Renders nothing unless the server runs
+ * SaaS mode and the caller is in at least one org.
  */
-export default function OrgBillingSettings() {
+export default function OrgBillingSettings({ org: requestedOrg }: { org?: string }) {
   const saasEnabled = useSaasEnabled()
   const { authenticatedApi } = useAuthenticatedApi()
   const navigate = useNavigate()
@@ -199,10 +219,6 @@ export default function OrgBillingSettings() {
   const [busy, setBusy] = useState(false)
   const refreshVersion = useRef(0)
 
-  // The ?org= parameter only seeds the tab; selection is local state afterwards.
-  const initialOrg = new URLSearchParams(window.location.search).get('org')
-  const [selected, setSelected] = useState(initialOrg)
-
   useEffect(() => {
     if (!saasEnabled) return
     const version = ++refreshVersion.current
@@ -210,8 +226,6 @@ export default function OrgBillingSettings() {
       .then((list) => {
         if (version !== refreshVersion.current) return
         setOrgs(list)
-        setSelected((current) =>
-          current && list.some((org) => org.id === current) ? current : (list[0]?.id ?? null))
       })
       .catch(() => { if (version === refreshVersion.current) setOrgs([]) })
   }, [saasEnabled, authenticatedApi])
@@ -233,7 +247,9 @@ export default function OrgBillingSettings() {
 
   if (!saasEnabled || orgs === null || orgs.length === 0) return null
 
-  const org = orgs.find((entry) => entry.id === selected) ?? orgs[0]
+  // Which org's panel shows: the ?org= parameter when it names a membership, else the first org.
+  // Derived, never stored — a stale tab is exactly what seeding it once at mount produced.
+  const org = orgs.find((entry) => entry.id === requestedOrg) ?? orgs[0]
 
   const startCheckout = async (planId: string) => {
     if (upgradingOrg === null || busy) return
@@ -274,7 +290,7 @@ export default function OrgBillingSettings() {
         </div>
       )}
 
-      <OrgBillingPanel org={org} onCheckoutStart={(orgId) => setUpgradingOrg(orgId)} />
+      <OrgBillingPanel key={org.id} org={org} onCheckoutStart={(orgId) => setUpgradingOrg(orgId)} />
 
       {upgradingOrg !== null && (
         <div className="flex flex-col gap-3 rounded-xl border border-kumo-line bg-kumo-base p-5">

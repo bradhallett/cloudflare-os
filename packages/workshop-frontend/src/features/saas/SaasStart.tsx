@@ -50,6 +50,10 @@ export default function SaasStart() {
     () => (token === null ? null : publicApi.authenticate(token)),
     [publicApi, token])
 
+  // A fresh token replaces the stub above; release the old one's server-side resources when it
+  // goes (dispose is idempotent, so the unmount path is safe even after a replacement).
+  useEffect(() => () => { authed?.[Symbol.dispose]() }, [authed])
+
   // A stored session that still answers skips the account step; a stale one falls back to it.
   useEffect(() => {
     if (authed === null) return

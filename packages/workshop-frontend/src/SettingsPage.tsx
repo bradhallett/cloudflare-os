@@ -194,7 +194,7 @@ const CommitEmailRow = ({ initialCommitEmail }: { initialCommitEmail?: string })
   )
 }
 
-export default function SettingsPage() {
+export default function SettingsPage({ org }: { org?: string }) {
   useDocumentTitle('Profile')
 
   const { authenticatedApi } = useAuthenticatedApi()
@@ -494,10 +494,11 @@ export default function SettingsPage() {
         <UsageSettings />
 
         {/* Organization billing (SaaS builds only) — plan, seats, portal, usage. The gate is
-            null in OSS builds, so this renders nothing and pulls no chunk. */}
+            null in OSS builds, so this renders nothing and pulls no chunk. `org` is the live
+            ?org= search parameter, which picks the billing tab. */}
         {OrgBillingSection && (
           <Suspense fallback={null}>
-            <OrgBillingSection />
+            <OrgBillingSection org={org} />
           </Suspense>
         )}
 
