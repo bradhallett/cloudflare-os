@@ -390,10 +390,10 @@ export class SharingManager {
    * `#reRootKeptUsers`). Returns the collaborators whose access actually changed (removed or
    * downgraded), excluding kept users.
    *
-   * On an org-owned workspace this refuses, with a pointer at the org, when severing edges would
-   * change nothing because the target's access is their membership baseline alone: a plain
+   * On an org-owned workspace this refuses, with a pointer at the org, when the target is an org
+   * member whose access would not change: their baseline survives any edge severance, so a plain
    * collaborator whose only role is their org role must be removed from the org, not from this
-   * list (their baseline survives any edge severance).
+   * list. A non-member's parallel user edges are still severable normally, even when redundant.
    */
   async removeCollaborator(
       caller: SharingCaller, profileId: string, keepUsers: string[]): Promise<AffectedCollaborator[]> {
@@ -422,7 +422,8 @@ export class SharingManager {
         : { orgRoles, removedEdge: { target: profileId, sharer: caller.profileId } })
         .get(profileId);
     let had = baseline.get(profileId);
-    if (orgRoles && kept !== undefined && had !== undefined && roleRank(kept) >= roleRank(had)) {
+    if (orgRoles?.has(profileId) && kept !== undefined && had !== undefined
+        && roleRank(kept) >= roleRank(had)) {
       throw new Error(
           "That person's access comes from their organization's membership; remove them from the organization instead.");
     }
