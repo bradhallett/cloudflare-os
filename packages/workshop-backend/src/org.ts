@@ -15,8 +15,8 @@ import {
   MAX_ORG_NAME_LENGTH, type OrgMember, type OrgMemberStatus, type OrgRole, type OrgSummary,
 } from "@gadgets/workshop-shared/api";
 import {
-  canManageRoles, canRemoveMember, canUpdateSettings, canViewMembers, invitableView,
-  wouldLoseLastOwner, type OrgAccess,
+  canManageRoles, canRemoveMember, canUpdateSettings, canViewMembers, isActiveMember,
+  invitableView, wouldLoseLastOwner, type OrgAccess,
 } from "./org-access";
 import { makeOrgStorage, type OrgRecord, type OrgSettings } from "./storage-schema/org-storage";
 
@@ -53,14 +53,20 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
     return org;
   }
 
-  /** This org's access answer for `userId` (see org-access.ts). */
+  /**
+   * This org's access answer for `userId` (see org-access.ts). The owner count is computed here,
+   * once, so every owner-protection check sees the same rule: only *active* owners count, since a
+   * pending (or expired-but-unswept) invited owner can still decline or be swept, and counting
+   * them would let the sole active owner leave or demote themself against a phantom second owner.
+   */
   #accessFor(userId: string): OrgAccess {
     const member = this.storage.members.get(userId);
     return {
       exists: true,
       role: member?.role ?? null,
       status: member?.status ?? null,
-      ownerCount: [...this.storage.members.byRole.get("owner")].length,
+      ownerCount: [...this.storage.members.byRole.get("owner")]
+          .filter((m) => m.status === "active").length,
       invitePolicy: this.storage.settings.get().invitePolicy,
     };
   }
@@ -83,7 +89,10 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
    */
   async #sweepExpiredInvitations(): Promise<void> {
     const now = Date.now();
-    for (const invitation of this.storage.invitations.list()) {
+    // The snapshot is materialized because the loop awaits (the mirror) mid-iteration, and a
+    // second kv.list() (however triggered) would invalidate a still-live iterator.
+    const expired = [...this.storage.invitations.list()];
+    for (const invitation of expired) {
       if (invitation.expiresAt.getTime() > now) continue;
       this.storage.invitations.delete(invitation.inviteeId);
       this.storage.members.delete(invitation.inviteeId);
@@ -97,9 +106,10 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
 
   /**
    * Report `userId`'s membership into their user DO's index. Best-effort: the index only drives
-   * listMyOrgs, which re-checks each org live, so a lost mirror costs staleness, not authority.
-   * Awaited inline (inside this DO's serialized input gate) so two mutations cannot mirror in the
-   * opposite order to the one they happened.
+   * listMyOrgs, which re-checks each org live, so a lost or late mirror costs staleness, not
+   * authority. Awaited inline so a mutation does not return before its own mirror is sent, but
+   * the input gate opens while the cross-DO call is in flight, so a concurrent mutation's mirror
+   * can still arrive first — reordering is narrowed, not guaranteed.
    */
   async #mirror(
       userId: string,
@@ -273,7 +283,9 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
     }
     const member = this.storage.members.get(userId);
     if (member === undefined) throw new Error("No such member.");
-    if (wouldLoseLastOwner(this.#accessFor(actorId), member.role) && role !== "owner") {
+    // Only a standing owner can be the last owner: demoting a *pending* owner invitation's
+    // granted role never trips the protection, because the invitee was never an active owner.
+    if (isActiveMember(member) && wouldLoseLastOwner(this.#accessFor(actorId), member.role) && role !== "owner") {
       throw new Error(
           "An organization must keep at least one owner; hand ownership over first.");
     }
@@ -301,7 +313,7 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
     if (!canRemoveMember(this.#accessFor(actorId), member.role)) {
       throw new Error("You may not remove that member.");
     }
-    if (wouldLoseLastOwner(this.#accessFor(actorId), member.role)) {
+    if (isActiveMember(member) && wouldLoseLastOwner(this.#accessFor(actorId), member.role)) {
       throw new Error(
           "An organization must keep at least one owner; hand ownership over first.");
     }
@@ -318,7 +330,9 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
     const org = this.#org();
     const member = this.storage.members.get(userId);
     if (member === undefined) throw new Error("You are not a member of this organization.");
-    if (wouldLoseLastOwner(this.#accessFor(userId), member.role)) {
+    // A pending invitation is never the last owner being protected above: an invited owner can
+    // always decline, even while the org has exactly one active owner.
+    if (isActiveMember(member) && wouldLoseLastOwner(this.#accessFor(userId), member.role)) {
       throw new Error(
           "An organization must keep at least one owner; hand ownership over first.");
     }

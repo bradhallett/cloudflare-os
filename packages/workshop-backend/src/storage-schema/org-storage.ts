@@ -61,4 +61,3 @@ export function makeOrgStorage(storage: DurableObjectStorage) {
   });
 }
 
-/** The storage object `makeOrgStorage()` returns (its `collections` and `singletons`). */
