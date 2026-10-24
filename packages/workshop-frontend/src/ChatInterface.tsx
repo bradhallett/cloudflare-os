@@ -1010,7 +1010,10 @@ function ChatInterface({
               <div
                 ref={messagesContainerRef}
                 onScroll={handleMessagesScroll}
-                className="chat-panel min-h-0 flex-1 overscroll-contain overflow-y-auto"
+                role="region"
+                aria-label="Conversation transcript"
+                tabIndex={0}
+                className="chat-panel min-h-0 flex-1 overscroll-contain overflow-y-auto focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-ring focus-visible:ring-inset"
               >
                 <ChatTranscript
                   isLoading={isLoading}

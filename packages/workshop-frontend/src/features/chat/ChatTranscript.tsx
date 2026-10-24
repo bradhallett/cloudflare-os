@@ -211,7 +211,12 @@ export function ChatTranscript({
                     <div className="w-5 h-5 border-2 border-kumo-brand border-t-transparent rounded-full animate-spin" />
                   </div>
                 ) : (
+                  // role=log gives polite announcements for appended entries; busy for the whole
+                  // turn (activeAgent is steady, unlike the provisional state, which flickers
+                  // empty between the turn's model calls) holds them until the message finalizes.
                   <div
+                    role="log"
+                    aria-busy={isAgentActive}
                     className={`flex flex-col px-3 pt-5 sm:px-6 sm:pt-8 ${pendingConsoleLogCount > 0 ? "pb-16" : "pb-8"} ${useConstrainedChatWidth ? "mx-auto w-full max-w-[920px]" : ""}`}
                   >
                     {isLoadingEarlier && (
