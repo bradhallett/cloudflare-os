@@ -6,7 +6,7 @@ import { ActionLogEntry, Overseer, actionChangeTime } from '@gadgets/workshop-sh
 import { ActionKind } from '@gadgets/workshop-shared/gatekeeper'
 import { GatekeeperIcon } from './components/GatekeeperIcon'
 import { HookToggle, hookToggleFailureToast } from './components/HookToggle'
-import { AlwaysApproveButton, ResolveButton } from './components/ResolveButton'
+import { AlwaysApproveButton, ResolveButton, type ResolveClickResult } from './components/ResolveButton'
 import { WorkshopButton } from './components/WorkshopControls'
 import { useActions } from './useActions'
 import { useActionHistory } from './useActionHistory'
@@ -255,8 +255,8 @@ export default function Activity({
                   expanded={expandedActionId === record.id}
                   processing={processingActions.has(record.id)}
                   onToggle={() => toggleExpanded(record.id)}
-                  onApprove={() => void resolveAction(record, 'approve')}
-                  onReject={() => void resolveAction(record, 'deny')}
+                  onApprove={() => resolveAction(record, 'approve')}
+                  onReject={() => resolveAction(record, 'deny')}
                   onAlwaysApprove={
                     autoApproveTarget &&
                     !isTagAutoApproved(autoApproveTarget.gatekeeperId, autoApproveTarget.actionKind.tag)
@@ -459,9 +459,9 @@ export default function Activity({
           onOpenChange={open => { if (!open) setConfirmAutoApprove(null) }}
           onConfirm={async () => {
             const { actionId, gatekeeperId, actionKind } = confirmAutoApprove
-            if (await alwaysApproveTag(actionId, gatekeeperId, actionKind)) {
-              setConfirmAutoApprove(null)
-            }
+            const enabled = await alwaysApproveTag(actionId, gatekeeperId, actionKind)
+            if (enabled) setConfirmAutoApprove(null)
+            return enabled
           }}
         />
       )}
@@ -637,8 +637,8 @@ function ReviewRequest({
   expanded: boolean
   processing: boolean
   onToggle: () => void
-  onApprove: () => void
-  onReject: () => void
+  onApprove: () => ResolveClickResult
+  onReject: () => ResolveClickResult
   onAlwaysApprove?: () => void
 }) {
   const resourceUrl = safeExternalUrl(record.resourceUrl)

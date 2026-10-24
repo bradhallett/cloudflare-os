@@ -191,9 +191,9 @@ export function ChatDialogs({
           }}
           onConfirm={async () => {
             const { actionId, gatekeeperId, actionKind } = autoApproveConfirm;
-            if (await alwaysApproveTag(actionId, gatekeeperId, actionKind)) {
-              setAutoApproveConfirm(null);
-            }
+            const enabled = await alwaysApproveTag(actionId, gatekeeperId, actionKind);
+            if (enabled) setAutoApproveConfirm(null);
+            return enabled;
           }}
         />
       )}
