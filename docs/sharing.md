@@ -202,7 +202,11 @@ every sign-in path (password, gatekeeper, Cloudflare Access) refuse the account 
 For workspaces, the user's Durable Object sweeps its own gadgets index -- every workspace shared
 *with* them -- and asks each Overseer to sever their edges (`severCollaboratorAccess`), an
 owner-style removal that force-restarts each workspace that actually lost them, so their live
-chat sessions die with the restart.
+chat sessions die with the restart. The sweep also ends their **organization memberships**
+(`memberLeave` per org, declining pending invitations), so directory scopes, picker
+justifications and org-owned workspace baselines stop naming them; the org's own last-owner
+protection still refuses a sole owner's leave, leaving an inert record naming a closed account
+(docs/tenancy.md, docs/org-threat-model.md).
 
 Two lazy residuals are accepted there, consistent with the model above:
 
