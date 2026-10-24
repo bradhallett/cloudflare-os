@@ -22,6 +22,7 @@ import { defaultBlueprintBindingTitle } from "./overseer-binding-info";
 import type { CodeModeEntrypoint } from "./overseer-harness";
 import { CODE_MODE_HARNESS, RestoreForgerImpl } from "./overseer-harness";
 import { OverseerCore } from "./overseer-core";
+import { emitUsageEvent, usageTokens } from "./usage-events";
 
 /**
  * OverseerPublishing: binding metadata, blueprint releases and propagation, agent chat messages and costs, code mode, and vendor listings.
@@ -589,6 +590,31 @@ export abstract class OverseerPublishing extends OverseerFacets {
           (meta.promptTokens ?? 0) + usage.input + usage.cacheRead + usage.cacheWrite;
       meta.cacheReadTokens = (meta.cacheReadTokens ?? 0) + usage.cacheRead;
       meta.cacheWriteTokens = (meta.cacheWriteTokens ?? 0) + usage.cacheWrite;
+    }
+
+    // #17's usage-metering seam: fire-and-forget to the bound SAAS_USAGE_EVENTS port (a
+    // synchronous no-op, not even an RPC, on every unbound/OSS deployment). The tokens were
+    // consumed at the provider the moment the request completed, so emission belongs at this
+    // accounting barrier whether or not the surrounding storage transaction later commits; a
+    // replayed input re-emits the same gateway-keyed id and the service deduplicates it.
+    if (usage !== undefined && usage.totalTokens > 0 && this.ownerId !== undefined) {
+      let model: string | undefined;
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].modelData !== undefined) {
+          model = msgs[i].modelData!.model;
+          break;
+        }
+      }
+      if (model !== undefined) {
+        emitUsageEvent(this.env, {
+          modelId: model,
+          tokens: usageTokens(usage),
+          userId: this.ownerId,
+          chatId,
+          ...(aiGatewayLogId !== undefined ? {aiGatewayLogId} : {}),
+          surface: "chat",
+        });
+      }
     }
 
     meta.lastActive = this.getChatTimestamp();

@@ -37,6 +37,7 @@ import {
 } from "./ai-gateway.js";
 import { completeText } from "./ai-invoke.js";
 import { bindingUsageGate } from "./ai-model-usage-gate.js";
+import { emitUsageEvent, usageTokens } from "./usage-events.js";
 import { resolveEntitlements } from "./entitlements.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
 import {
@@ -1192,7 +1193,17 @@ export class LanguageModelGatekeeper
     });
     let usageGate = bindingUsageGate(
         this.env, this.ctx.props.ownerUserId, this.ctx.exports.UserDurableObject);
-    return new LanguageModelBindingImpl(model, usageGate);
+    // Meter the binding's one-shot calls (#17's seam): the owner is in scope here, and the
+    // hook fires only on completions (never errors), fire-and-forget at the port (OSS unbound:
+    // no-op). pi reports usage per request; completeText would otherwise discard it.
+    let onUsage = this.ctx.props.ownerUserId === undefined ? undefined
+        : (usage: Usage) => emitUsageEvent(this.env, {
+              modelId: model.model.id,
+              tokens: usageTokens(usage),
+              userId: this.ctx.props.ownerUserId!,
+              surface: "binding",
+            });
+    return new LanguageModelBindingImpl(model, usageGate, onUsage);
   }
 
   applyAction(action: number): Promise<void> {
@@ -1218,7 +1229,8 @@ export class LanguageModelGatekeeper
 
 @validateRpc()
 class LanguageModelBindingImpl extends RpcTarget implements LanguageModelBinding {
-  constructor(private model: ModelHandle, private usageGate: () => Promise<void>) {
+  constructor(private model: ModelHandle, private usageGate: () => Promise<void>,
+      private onUsage?: (usage: Usage) => void) {
     super();
   }
 
@@ -1231,6 +1243,7 @@ class LanguageModelBindingImpl extends RpcTarget implements LanguageModelBinding
       prompt: options.prompt,
       systemPrompt: options.systemPrompt,
       cache: true,
+      onUsage: this.onUsage,
     });
   }
 }

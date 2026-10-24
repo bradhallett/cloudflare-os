@@ -72,6 +72,13 @@ export async function completeText(handle: ModelHandle, args: {
    * cache write.
    */
   cache?: boolean;
+  /**
+   * Receives the completed request's Usage record, for callers that meter token consumption
+   * (the agent loop reads it off the streamed message instead). Called synchronously after a
+   * successful completion — never on an error or abort — and its return value is ignored: a
+   * metering hook must never change the completion's outcome.
+   */
+  onUsage?: (usage: Usage) => void;
 }): Promise<string> {
   const messages: Message[] = args.messages ??
       [{ role: "user", content: args.prompt ?? "", timestamp: Date.now() }];
@@ -92,6 +99,7 @@ export async function completeText(handle: ModelHandle, args: {
     const errorMessage = message.errorMessage ?? "The model request failed.";
     throw new AgentTurnError(errorMessage, httpStatusFromError(errorMessage, handle.lastResponse));
   }
+  args.onUsage?.(message.usage);
   return message.content
       .filter(block => block.type === "text")
       .map(block => block.text)
