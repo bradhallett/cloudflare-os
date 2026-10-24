@@ -119,9 +119,11 @@ export async function checkUsageAndBalance(
 
   // A blocked decision is the one point a bound plan's overage policy matters: a plan that allows
   // spend past the included allowance proceeds on the platform (the SaaS meters it), so only
-  // hard-capped plans ever see the block. Unbound — every OSS deployment — nothing changes.
-  if (!decision.allowed &&
-      (await resolveEntitlements(env, userId))?.overageAllowed === true) {
+  // hard-capped plans ever see the block. Unbound — every OSS deployment — nothing changes, and a
+  // bound port that fails keeps the block (overage is refused rather than granted by an outage).
+  let entitlements = !decision.allowed ? await resolveEntitlements(env, userId) : undefined;
+  if (!decision.allowed && entitlements?.status === "resolved" &&
+      entitlements.entitlements.overageAllowed === true) {
     return {
       allowed: true,
       shouldUseByok: false,

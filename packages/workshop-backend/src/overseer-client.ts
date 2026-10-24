@@ -1621,14 +1621,15 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
       throw new Error("This workspace already belongs to an organization.");
     }
     const gadgetId = this.impl.ctx.id.toString();
-    // Register with the org before flipping the durable owner subject. Registration is where
-    // the org refuses (unknown org, or the caller is not one of its owners/admins), so a
-    // refusal leaves this workspace exactly as it was -- no rollback window. And if this DO is
+    // Register with the org before flipping the durable owner subject. Registration is where the
+    // org refuses (unknown org, the caller is not one of its owners/admins, or — with the
+    // workspace's user owner named — the org is at its plan's workspace cap, see addOwnedGadget),
+    // so a refusal leaves this workspace exactly as it was--no rollback window. And if this DO is
     // evicted between the two writes, the only residue is an org index entry for a workspace
     // that is still user-owned, which severs nothing (severOrgMemberSessions no-ops without an
     // org owner subject) and is simply rewritten by a retried transfer.
     await this.impl.ctx.exports.OrgDurableObject.getByName(orgId)
-        .addOwnedGadget(this.clientProfileId, gadgetId);
+        .addOwnedGadget(this.clientProfileId, gadgetId, this.impl.ownerId!);
     this.impl.storage.ownerSubject.put({ type: "org", id: orgId });
     // From here on the workspace's logger and activity events carry the owning org.
     this.impl.adoptOwningOrg(orgId);

@@ -862,10 +862,25 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   // The model tiers the user's plan may run, or null while no entitlements service is bound
   // (every OSS deployment — no gate, identical to pre-port behavior). A gateway model that
   // states a catalog tier absent from the set is neither listed nor resolved; a model with no
-  // tier, and any model a user stored themselves, is never tier-gated.
+  // tier, and any model a user stored themselves, is never tier-gated. A bound service that
+  // fails yields the empty set — no tiered model runs — so an outage fails closed.
   async #allowedModelTiers(): Promise<ReadonlySet<string> | null> {
-    let entitlements = await resolveEntitlements(this.env, this.ctx.id.toString());
-    return entitlements && new Set(entitlements.allowedModelTiers);
+    let answer = await resolveEntitlements(this.env, this.ctx.id.toString());
+    if (answer.status === "unbound") return null;
+    if (answer.status === "unavailable") return new Set();
+    return new Set(answer.entitlements.allowedModelTiers);
+  }
+
+  // The gatekeeper vendors the user's plan may connect, or null while no entitlements service
+  // is bound (no gate, as pre-port behavior and every OSS deployment). A bound service that
+  // fails yields the empty set — every vendor is withheld — so an outage fails closed. Shared
+  // by the connector surfaces (listing, connect, ambient provisioning and surfacing) and
+  // #assertResourceEnabled, the same way #allowedModelTiers serves the model surfaces.
+  async #allowedGatekeepers(): Promise<ReadonlySet<string> | null> {
+    let answer = await resolveEntitlements(this.env, this.ctx.id.toString());
+    if (answer.status === "unbound") return null;
+    if (answer.status === "unavailable") return new Set();
+    return new Set(answer.entitlements.allowedGatekeepers.map(id => id.toLowerCase()));
   }
 
   #listModels(models: GatewayModels | null, kind: ModelKind,
@@ -1359,11 +1374,22 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async newGadget(id: string, title: string): Promise<void> {
-    // A bound SaaS's plan may cap how many workspaces a user owns. Counted here are the rows
-    // this method writes — records without an `owner` are the user's own; one shared with them
-    // never counts. ensureGadgetRegistered() deliberately bypasses this: it registers a
-    // workspace that already exists, which a cap must not lock its owner out of.
-    let cap = (await resolveEntitlements(this.env, this.ctx.id.toString()))?.maxWorkspaces;
+    // Idempotent: a retried creation of the same workspace is completing one that already
+    // counts, not adding another, so it is never re-refused by the cap below (an external
+    // message that died between registering a workspace and claiming it retries through here).
+    if (this.storage.gadgets.get(id)) return;
+
+    // A bound SaaS's plan may cap how many workspaces a user owns; counted are only the rows
+    // without an `owner` — the user's own, never ones shared with them. A bound service that
+    // fails refuses creation (fail closed): an outage must not hand out workspaces past a cap
+    // it couldn't read. The cap governs *creating* a workspace only; registering one that
+    // already exists is ensureGadgetRegistered(), which is never capped.
+    let answer = await resolveEntitlements(this.env, this.ctx.id.toString());
+    if (answer.status === "unavailable") {
+      throw new Error(
+          "Your plan couldn't be verified, so the workspace wasn't created. Please try again.");
+    }
+    let cap = answer.status === "resolved" ? answer.entitlements.maxWorkspaces : undefined;
     if (cap !== undefined) {
       let owned = [...this.storage.gadgets.list()].filter(record => !record.owner).length;
       if (owned >= cap) {
@@ -1375,8 +1401,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async ensureGadgetRegistered(id: string, title: string): Promise<void> {
+    // Registers a workspace that already exists — its Overseer holds state — so the plan's
+    // workspace cap never applies here: refusing could not undo the workspace, and the cap
+    // decision belongs before the workspace is created (newGadget, which the external-message
+    // path consults before claiming one).
     if (this.storage.gadgets.get(id)) return;
-    await this.newGadget(id, title);
+    this.storage.gadgets.put({id, title, created: new Date()});
   }
 
   async setGadgetLastActive(id: string, time: Date, totalCost: number | undefined): Promise<void> {
@@ -1762,16 +1792,21 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       userId: this.storage.profile.get().id
     };
 
-    // Admin-disabled resources/gatekeepers are filtered out here, which also covers the agent (the
-    // Overseer's connectable-vendor/resource list is sourced from this method).
+    // Admin-disabled resources/gatekeepers are filtered out here, and so is any vendor the
+    // user's plan doesn't offer, which also covers the agent (the Overseer's
+    // connectable-vendor/resource list is sourced from this method).
     let config = await readAdminConfig(this.env);
     let disabledGatekeeperSet = new Set(config.disabledGatekeepers);
+    let planAllowed = await this.#allowedGatekeepers();
 
     let promises: Promise<GatekeeperVendorInfo | null>[] = [];
 
     for (let [id, vendor] of this.vendors) {
       if (disabledGatekeeperSet.has(id)) {
         continue;  // Whole gatekeeper disabled by admin.
+      }
+      if (planAllowed !== null && !planAllowed.has(id.toLowerCase())) {
+        continue;  // Not on the user's plan.
       }
       promises.push((async () => {
         if (filter && !(await checkGatekeeperVendorFilter(vendor, id, filter))) {
@@ -1808,8 +1843,15 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (!vendor) {
       throw new Error("No such service: " + vendorId);
     }
-    if ((await readAdminConfig(this.env)).disabledGatekeepers.includes(vendorId.toLowerCase())) {
+    let normalized = vendorId.toLowerCase();
+    if ((await readAdminConfig(this.env)).disabledGatekeepers.includes(normalized)) {
       throw new Error(`The "${vendorId}" gatekeeper is disabled on this deployment.`);
+    }
+    // The plan gate mirrors #assertResourceEnabled's ordering (admin first), so a connect never
+    // completes an OAuth flow only to fail at the first gatekeeper mint.
+    let allowed = await this.#allowedGatekeepers();
+    if (allowed !== null && !allowed.has(normalized)) {
+      throw new Error(`The "${vendorId}" connector isn't available on your plan.`);
     }
 
     let accountId = this.storage.nextAccountId.get();
@@ -1880,15 +1922,18 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * The ambient gatekeepers the user can opt into now: mode "optional" and not yet added. Backs the
-   * Connectors "Available" section. ("enabled" ones are already provisioned; "disabled" ones aren't
-   * offered.)
+   * The ambient gatekeepers the user can opt into now: mode "optional", not yet added, and on
+   * the user's plan. Backs the Connectors "Available" section. ("enabled" ones are already
+   * provisioned; "disabled" ones, and ones the plan doesn't offer, aren't listed — the same
+   * dormancy treatment listProvidedAccounts gives an already-added account.)
    */
   async listAddableGatekeepers(): Promise<GatekeeperVendorInfo[]> {
     let config = await readAdminConfig(this.env);
+    let planAllowed = await this.#allowedGatekeepers();
     return (await this.#ambientVendors())
         .filter(({vendorId}) =>
             ambientGatekeeperMode(config, vendorId) === "optional" && !this.#hasAccountForVendor(vendorId))
+        .filter(({vendorId}) => planAllowed === null || planAllowed.has(vendorId.toLowerCase()))
         // Same shape as listGatekeeperVendors; ambient gatekeepers expose no resources.
         .map(({vendorId, description}) => ({id: vendorId, description, supportedResources: []}));
   }
@@ -1917,6 +1962,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
     if (ambientGatekeeperMode(await readAdminConfig(this.env), vendorId) === "disabled") {
       throw new Error(`The "${vendorId}" gatekeeper is disabled on this deployment.`);
+    }
+    // The plan gate mirrors admin-disabled (and #assertResourceEnabled's ordering), so an
+    // ambient vendor the plan doesn't offer can't be opted into directly either.
+    let allowed = await this.#allowedGatekeepers();
+    if (allowed !== null && !allowed.has(vendorId)) {
+      throw new Error(`The "${vendorId}" connector isn't available on your plan.`);
     }
 
     let description = await vendor.describe();
@@ -1971,11 +2022,15 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     let config = await readAdminConfig(this.env);
+    let planAllowed = await this.#allowedGatekeepers();
     for (let {vendorId, vendor} of await this.#ambientVendors()) {
       if (provisioned.has(vendorId)) continue;
       // Only "enabled" (forced) vendors are auto-provisioned for everyone. "optional" vendors are
       // added on demand by the user (provisionAmbientAccount); "disabled" ones never.
       if (!shouldAutoProvisionAccount(config, vendorId)) continue;
+      // A vendor the user's plan doesn't offer is never auto-provisioned either (the plan gate
+      // provisionAmbientAccount applies on demand).
+      if (planAllowed !== null && !planAllowed.has(vendorId.toLowerCase())) continue;
 
       try {
         await this.#createAutoProvisionedAccount(vendorId, vendor);
@@ -1997,12 +2052,17 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async listProvidedAccounts(): Promise<ProvidedAccountInfo[]> {
     await this.#ensureAutoProvisionedAccounts();
     let config = await readAdminConfig(this.env);
+    let planAllowed = await this.#allowedGatekeepers();
     let result: ProvidedAccountInfo[] = [];
     for (let rec of this.#connectedAccountRecords()) {
       if (!rec.description.singleton && !rec.description.providesUi) continue;
       // A "disabled" ambient gatekeeper's account stays dormant: don't surface its singleton capsule
-      // or management UI. (Its data is preserved, so re-enabling restores it.)
+      // or management UI. (Its data is preserved, so re-enabling restores it.) A plan that doesn't
+      // offer the vendor dorms it the same way — the account record stays, so disconnecting and
+      // re-upgrading both keep working.
       if (rec.autoProvisioned && ambientGatekeeperMode(config, rec.vendorId) === "disabled") continue;
+      if (rec.autoProvisioned && planAllowed !== null &&
+          !planAllowed.has(rec.vendorId.toLowerCase())) continue;
       result.push({ accountId: rec.id, vendorId: rec.vendorId, description: rec.description });
     }
     return result;
@@ -2013,6 +2073,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * this gatekeeper into the owner's gadgets (as a Facet) like any other gatekeeper, so the session
    * and catalog run gadget-side in the gatekeeper's own worker — no further round-trips through this
    * DO. The account capability stays encapsulated here; only the class reference crosses out.
+   * Returns null while the user's plan doesn't offer the vendor, mirroring the dormancy
+   * listProvidedAccounts applies: the account stays, but it is not bound into new chats.
    */
   async getSingletonGatekeeperClass(accountId: number)
       : Promise<DurableObjectClass<Gatekeeper<any>> | null> {
@@ -2020,6 +2082,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     // Present only when description.singleton is set; gate on that, then call through the derived
     // SingletonAccountStub view (see its definition for why the cast is needed).
     if (!record?.description.singleton) return null;
+    let allowed = await this.#allowedGatekeepers();
+    if (allowed !== null && !allowed.has(record.vendorId.toLowerCase())) return null;
     return (record.account as unknown as SingletonAccountStub).getSingletonGatekeeperClass();
   }
 
@@ -2048,8 +2112,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   // The account record behind one of this user's gatekeeper apps, or undefined
   // if `accountId` is not a UI-providing account the deployment currently
-  // offers (the same test listProvidedAccounts applies, since a "disabled"
-  // ambient gatekeeper's account stays dormant).
+  // offers (the same tests listProvidedAccounts applies, since a "disabled"
+  // ambient gatekeeper's account, or one the user's plan doesn't offer, stays
+  // dormant).
   async #uiAccountRecord(accountId: number): Promise<ConnectedAccountRecord | undefined> {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record?.description.providesUi) return undefined;
@@ -2058,6 +2123,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (record.autoProvisioned) {
       if (ambientGatekeeperMode(config, record.vendorId) === "disabled") return undefined;
     }
+    // A plan that doesn't offer the vendor dorms the account here too (see
+    // listProvidedAccounts), so its management UI is unreachable while the record stays.
+    let allowed = await this.#allowedGatekeepers();
+    if (allowed !== null && !allowed.has(record.vendorId.toLowerCase())) return undefined;
     return record;
   }
 
@@ -2790,8 +2859,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       throw new Error(
           `The "${resource.title}" resource is disabled on this deployment by an administrator.`);
     }
-    let entitlements = await resolveEntitlements(this.env, this.ctx.id.toString());
-    if (entitlements && !entitlements.allowedGatekeepers.includes(normalized)) {
+    let allowed = await this.#allowedGatekeepers();
+    if (allowed !== null && !allowed.has(normalized)) {
       throw new Error(`The "${vendorId}" connector isn't available on your plan.`);
     }
   }

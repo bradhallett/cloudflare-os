@@ -19,6 +19,7 @@ import {
   gadgetBaselineRole, isActiveMember, invitableView, wouldLoseLastOwner, type OrgAccess,
 } from "./org-access";
 import { makeOrgStorage, type OrgRecord, type OrgSettings } from "./storage-schema/org-storage";
+import { resolveEntitlements } from "./entitlements.js";
 
 const logger = createWorkshopLogger("workshop.org");
 
@@ -380,11 +381,40 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
    * calls this after writing its own owner subject. The actor must be an active owner/admin of the
    * org (org-access.ts), checked here rather than in the caller. Idempotent per workspace: a
    * retried transfer refreshes the record rather than duplicating it.
+   *
+   * `transferringUserId` (the workspace's user owner, passed by transferToOrg) applies the plan's
+   * workspace cap to the org's own count: this transfer is the moment a workspace *becomes*
+   * org-owned, so it is where an org-wide cap is enforced (a user's own creations are capped in
+   * their UserDurableObject instead). The cap is read from the transferring user's plan — the
+   * entitlements port answers per user, and a SaaS that models orgs as tenants gives every member
+   * the same number. Refused, like any other failure here, before any write: the workspace stays
+   * exactly as it was.
    */
-  async addOwnedGadget(actorId: string, gadgetId: string): Promise<void> {
+  async addOwnedGadget(
+      actorId: string, gadgetId: string, transferringUserId?: string): Promise<void> {
     this.#org();
     if (!canManageOrgAssets(this.#accessFor(actorId))) {
       throw new Error("Only an owner or admin of this organization may transfer workspaces into it.");
+    }
+    if (transferringUserId !== undefined) {
+      let answer = await resolveEntitlements(this.env, transferringUserId);
+      // "unavailable" — a bound plan service that failed — refuses the transfer: fail closed,
+      // as the personal-creation cap does (see UserDurableObject.newGadget).
+      if (answer.status === "unavailable") {
+        throw new Error(
+            "Your plan couldn't be verified, so the workspace wasn't transferred. Please try again.");
+      }
+      let cap = answer.status === "resolved" ? answer.entitlements.maxWorkspaces : undefined;
+      if (cap !== undefined) {
+        // Count the org's owned workspaces, excluding this one: a retried transfer must not be
+        // refused by the index entry its own crashed attempt left behind.
+        let owned = [...this.storage.ownedGadgets.list()]
+            .filter(gadget => gadget.gadgetId !== gadgetId).length;
+        if (owned >= cap) {
+          throw new Error(
+              `This organization has reached its plan's limit of ${cap} workspaces.`);
+        }
+      }
     }
     this.storage.ownedGadgets.put({ gadgetId });
     this.#log.info("a workspace was transferred into the org", {
