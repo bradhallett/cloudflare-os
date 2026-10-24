@@ -306,11 +306,11 @@ describe("computeEffectiveRoles", () => {
     expect(await mgr.getEffectiveRole("b")).toBe("build");
   });
 
-  it("excludes a removed user and drops their sole dependents", async () => {
+  it("severs a target's own edges and drops their sole dependents", async () => {
     let { storage, mgr } = makeManager();
     seedCollaborator(storage, "a", [userEdge(OWNER)]);
     seedCollaborator(storage, "b", [userEdge("a")]);
-    let roles = mgr.computeEffectiveRoles({ removedUser: "a" });
+    let roles = mgr.computeEffectiveRoles({ severedTarget: "a" });
     expect(roles.has("a")).toBe(false);
     expect(roles.has("b")).toBe(false);
   });
@@ -983,20 +983,68 @@ describe("org-owned workspaces", () => {
     expect(await mgr.getEffectiveRole("member")).toBe("use");
   });
 
-  it("counts only member baselines once ownerInvitesOnly is set", async () => {
-    let { storage, snapshot, flags, mgr } = makeOrgManager({ admin: "admin" });
+  it("counts build-baseline members' edges as owner grants once ownerInvitesOnly is set", async () => {
+    let { storage, snapshot, flags, mgr } = makeOrgManager({ admin: "admin", member: "member" });
     seedCollaborator(storage, "pal", [userEdge("admin", "build")]);
+    seedCollaborator(storage, "chum", [userEdge("member", "build")]);
     let baseline = mgr.computeEffectiveRoles({ orgRoles: snapshot });
     expect(baseline.get("pal")).toBe("build");
+    expect(baseline.get("chum")).toBe("use");
 
     flags.ownerInvitesOnly = true;
 
-    // An org-owned workspace has no owner-authored edges to keep: only baselines count.
+    // The admin's direct grant counts as an owner grant; the member's does not.
     expect(await mgr.getEffectiveRole("admin")).toBe("build");
-    expect(await mgr.getEffectiveRole("pal")).toBeUndefined();
+    expect(await mgr.getEffectiveRole("pal")).toBe("build");
     expect(mgr.computeAffectedByOwnerInvitesOnly(baseline, snapshot)).toEqual([
-      expect.objectContaining({ profile: profile("pal"), oldRole: "build" }),
+      expect.objectContaining({ profile: profile("chum"), oldRole: "use" }),
     ]);
+
+    // An admin's demotion ends the grants they authored, lazily, like any baseline drop.
+    snapshot.set("admin", "member");
+    expect(await mgr.getEffectiveRole("admin")).toBe("use");
+    expect(await mgr.getEffectiveRole("pal")).toBeUndefined();
+  });
+
+  it("under ownerInvitesOnly, only build-baseline members may add, and their adds count", async () => {
+    let { snapshot, flags, mgr } = makeOrgManager({ admin: "admin", member: "member" });
+    flags.ownerInvitesOnly = true;
+
+    // A plain member is refused even holding the session's owner flag: the gate reads the org's
+    // live snapshot, the same authority the graph will count the grant against.
+    await expect(mgr.addCollaborator(
+        { caller: { profileId: "member", isOwner: true }, profile: profile("pal"), role: "use" }))
+        .rejects.toThrow(/Only the workspace owner can add people/);
+
+    // An admin's add takes effect, and the returned role is the effective one.
+    let added = await mgr.addCollaborator(
+        { caller: { profileId: "admin", isOwner: true }, profile: profile("pal"), role: "use" });
+    expect(added.role).toBe("use");
+    expect(await mgr.getEffectiveRole("pal")).toBe("use");
+
+    // A since-demoted admin (stale session authority, fresh snapshot) is refused too.
+    snapshot.set("admin", "member");
+    await expect(mgr.addCollaborator(
+        { caller: { profileId: "admin", isOwner: true }, profile: profile("mate"), role: "use" }))
+        .rejects.toThrow(/Only the workspace owner can add people/);
+  });
+
+  it("refuses to remove a member whose access is their baseline alone", async () => {
+    let { storage, mgr } = makeOrgManager({ admin: "admin", member: "member" });
+    // A use edge on top of a use baseline: severing it would change nothing, so refuse.
+    seedCollaborator(storage, "member", [userEdge("admin", "use")]);
+    await expect(mgr.removeCollaborator({ profileId: "admin", isOwner: true }, "member", []))
+        .rejects.toThrow(/organization's membership/);
+
+    // A build edge lifts the member above their baseline: severing downgrades them to it.
+    seedCollaborator(storage, "member", [userEdge("admin", "build")]);
+    let affected = await mgr.removeCollaborator(
+        { profileId: "admin", isOwner: true }, "member", []);
+    expect(affected).toEqual([
+      expect.objectContaining(
+          { profile: profile("member"), oldRole: "build", newRole: "use" }),
+    ]);
+    expect(await mgr.getEffectiveRole("member")).toBe("use");
   });
 
   it("lets a member redeem a share link on top of their baseline", async () => {

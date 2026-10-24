@@ -12,6 +12,7 @@ import type { OrgRole, OrgSummary, Overseer } from "@gadgets/workshop-shared/api
 import type { OrgDurableObject } from "../src/org";
 import { makeOrgStorage } from "../src/storage-schema/org-storage";
 import type { OverseerDurableObject } from "../src/overseer.js";
+import type { UserDurableObject } from "../src/user.js";
 import { UseOverseerInterface } from "../src/overseer-client-use.js";
 
 declare module "cloudflare:workers" {
@@ -66,7 +67,11 @@ async function ownedGadgets(orgId: string): Promise<string[]> {
 }
 
 type Workspace = {
-  impl: TestImpl;
+  impl: TestImpl & {
+    // Reaching `users` (and `impl` itself, in withWorkspace) needs the same unchecked cast
+    // every overseer suite uses: the harness reaches over the DO's real surface.
+    users: DurableObjectNamespace<UserDurableObject>;
+  };
   restarts: string[];
   // Valid user-DO ids to open as: the real users namespace requires them (idFromString).
   userIds: Record<"alice" | "bob" | "carol" | "outsider", string>;
@@ -74,14 +79,16 @@ type Workspace = {
   gadgetId: () => string;
 };
 
-// A fresh user-owned workspace owned by ALICE, with ambient-capsule and restart side effects
-// pinned down the way chat-changes.test.ts does. Everything runs inside the DO, over real
-// storage.
-async function withWorkspace(fn: (ws: Workspace) => Promise<void>): Promise<void> {
+// A fresh user-owned workspace owned by `owner` (default ALICE), with ambient-capsule and restart
+// side effects pinned down the way chat-changes.test.ts does. Everything runs inside the DO, over
+// real storage.
+async function withWorkspace(
+    fn: (ws: Workspace) => Promise<void>,
+    owner: "alice" | "carol" = "alice"): Promise<void> {
   const stub = env.TEST_OVERSEER.getByName(`org-gadgets-${++counter}`);
   await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
     const impl = (instance as unknown as { impl: TestImpl & {
-      users: DurableObjectNamespace;
+      users: DurableObjectNamespace<UserDurableObject>;
     } }).impl;
     const userIds = {
       alice: impl.users.newUniqueId().toString(),
@@ -89,8 +96,8 @@ async function withWorkspace(fn: (ws: Workspace) => Promise<void>): Promise<void
       carol: impl.users.newUniqueId().toString(),
       outsider: impl.users.newUniqueId().toString(),
     };
-    impl.ownerId = userIds.alice;
-    impl.ownerProfileId = ALICE;
+    impl.ownerId = userIds[owner];
+    impl.ownerProfileId = owner === "carol" ? CAROL : ALICE;
     impl.ensureAmbientCapsules = async () => {};
     impl.markOutputsDirty = () => {};
     const restarts: string[] = [];
@@ -193,10 +200,10 @@ describe("org-owned workspaces", () => {
         userIds.alice, ALICE, new NativeRpcStub<() => void>(() => {}));
     await ownerClient.transferToOrg(orgId);
 
-    // The org refuses to index a workspace for a non-member (the transfer-side gate; the
-    // rollback around it is a plain try/catch in transferToOrg). Caught promise-style, the
-    // way org.test.ts asserts refusals: a bare expected rejection leaves the harness an
-    // unhandled-rejection log that fails the run.
+    // The org refuses to index a workspace for a non-admin actor (the same gate a transfer
+    // hits; transferToOrg registers with the org before touching its own state, so a refusal
+    // changes nothing). Caught promise-style, the way org.test.ts asserts refusals: a bare
+    // expected rejection leaves the harness an unhandled-rejection log that fails the run.
     let orgRefusal = "";
     try {
       await Promise.resolve().then(
@@ -237,5 +244,86 @@ describe("org-owned workspaces", () => {
         userIds.bob, BOB, new NativeRpcStub<() => void>(() => {}));
     await asBob.deleteSelf();
     expect(await ownedGadgets(orgId)).toEqual([]);
+  });
+
+  it("a transfer the org refuses leaves the workspace exactly as it was", async () => {
+    const orgId = await createOrg({ [CAROL]: "member" });
+    await withWorkspace(async ws => {
+      using ownerClient = await ws.open(ws.userIds.carol, CAROL);
+
+      // Carol owns the workspace but is only a member of the org, so the org refuses to index
+      // it and the transfer fails -- before any workspace state changed. Caught promise-style,
+      // as above: a bare expected rejection leaves the harness an unhandled-rejection log.
+      const refused = async () => {
+        try {
+          await Promise.resolve().then(() => ownerClient.transferToOrg(orgId));
+        } catch (error) {
+          return error instanceof Error ? error.message : String(error);
+        }
+      };
+      expect(await refused()).toMatch(/Only an owner or admin/);
+      // A repeat refusal is the same refusal, and still changes nothing.
+      expect(await refused()).toMatch(/Only an owner or admin/);
+
+      // Nothing was written and nobody was severed: the workspace is user-owned as before,
+      // Carol's own owner session still works, and no restart was scheduled.
+      expect(ws.impl.storage.ownerSubject.get()).toBeUndefined();
+      expect(ws.restarts).toEqual([]);
+      using reopened = await ws.open(ws.userIds.carol, CAROL);
+      expect(reopened).not.toBeInstanceOf(UseOverseerInterface);
+    }, "carol");
+    expect(await ownedGadgets(orgId)).toEqual([]);
+  });
+
+  it("demoting an admin to member severs and downgrades their live session", async () => {
+    const orgId = await createOrg({ [BOB]: "admin" });
+    await withWorkspace(async ws => {
+      using ownerClient = await ws.open(ws.userIds.alice, ALICE);
+      await ownerClient.transferToOrg(orgId);
+      ws.restarts.length = 0;
+
+      // A live build session for Bob, held open so it counts as a session to sever.
+      using asBob = await ws.open(ws.userIds.bob, BOB);
+      expect(asBob).not.toBeInstanceOf(UseOverseerInterface);
+      expect(ws.restarts).toEqual([]);
+
+      // A promotion (admin -> owner) never narrows a baseline: nothing is severed.
+      await env.TEST_ORG.getByName(orgId).changeMemberRole(ALICE, BOB, "owner");
+      expect(ws.restarts).toEqual([]);
+
+      // Demoting him to member narrows his baseline to use: the live session is severed and
+      // his next open lands at the use interface.
+      await env.TEST_ORG.getByName(orgId).changeMemberRole(ALICE, BOB, "member");
+      expect(ws.restarts).toEqual([
+        "Gadget restarted because your organization membership changed.",
+      ]);
+      using reopened = await ws.open(ws.userIds.bob, BOB);
+      expect(reopened).toBeInstanceOf(UseOverseerInterface);
+    });
+  });
+
+  it("a member's session resolves models from their own account, not the workspace's", async () => {
+    const orgId = await createOrg({ [BOB]: "admin" });
+    await withWorkspace(async ws => {
+      using ownerClient = await ws.open(ws.userIds.alice, ALICE);
+      await ownerClient.transferToOrg(orgId);
+
+      // Each of Alice's and Bob's user DOs gets its own hand-added model (the test deployment
+      // has no AI Gateway, so these are the only models listModels can return).
+      const users = ws.impl.users;
+      await users.get(users.idFromString(ws.userIds.alice)).addModel(
+          { type: "agent", id: "alices-model", name: "Alices Model" },
+          { provider: "openai", model: "alices-model", apiToken: "sk-alice" });
+      await users.get(users.idFromString(ws.userIds.bob)).addModel(
+          { type: "agent", id: "bobs-model", name: "Bobs Model" },
+          { provider: "openai", model: "bobs-model", apiToken: "sk-bob" });
+
+      // Bob's session on the org-owned workspace -- he is not the workspace's user owner --
+      // resolves models through his own user DO.
+      using asBob = await ws.open(ws.userIds.bob, BOB);
+      const models = (await asBob.listModels()).map(m => m.id);
+      expect(models).toContain("bobs-model");
+      expect(models).not.toContain("alices-model");
+    });
   });
 });
