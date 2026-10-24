@@ -82,7 +82,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   async severCollaboratorAccess(profileId: string): Promise<void> {
     let sharing = await this.impl.getSharingManager();
     if (!sharing.isCollaborator(profileId)) return;
-    let affected = sharing.removeCollaborator(
+    let affected = await sharing.removeCollaborator(
         { profileId: await this.impl.getOwnerProfileId(), isOwner: true }, profileId, []);
     if (affected.length > 0) {
       this.impl.scheduleAccessRestart(
@@ -97,6 +97,25 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
               event: "deprovision.collaborator.cleanup.failed", error: err,
             });
           });
+    }
+  }
+
+  /**
+   * The owning org reports that `memberId`'s membership ended or narrowed (removed, left, or
+   * demoted -- see OrgDurableObject.#severOwnedGadgetSessions). Access recompute is lazy like
+   * every revocation here: this only force-restarts live sessions (the existing
+   * entitlement-change path), making every caller's next open() re-check the org's live
+   * membership and land at their new -- possibly absent -- role. Sessions are counted by role,
+   * not by member (hasCollaboratorSession), so the restart is conservative: it severs all of
+   * them when any is live, and each reconnect re-authorizes. An authority call from the org DO,
+   * so it takes no actor. No-op on a user-owned workspace (the org's index cannot name one; a
+   * stale entry costs nothing).
+   */
+  async severOrgMemberSessions(memberId: string): Promise<void> {
+    if (this.impl.storage.ownerSubject.get()?.type !== "org") return;
+    if (this.impl.hasCollaboratorSession()) {
+      this.impl.scheduleAccessRestart(
+          "Gadget restarted because your organization membership changed.");
     }
   }
 
@@ -137,10 +156,14 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       });
     }
 
-    let isOwner = (userId == this.impl.ownerId);
+    let isOperatingOwner = (userId == this.impl.ownerId);
+    // An org-owned workspace (see transferToOrg) has no user owner: every caller -- the
+    // operating owner included -- is authorized through the sharing graph, which baselines each
+    // active org member's role at their org role and re-checks membership live on every open.
+    let isOwner = isOperatingOwner && this.impl.storage.ownerSubject.get()?.type !== "org";
 
     // Cache the owner's profileId in memory when the owner opens.
-    if (isOwner) {
+    if (isOperatingOwner) {
       this.impl.ownerProfileId = profileId;
     }
 
@@ -158,13 +181,13 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     let owner = this.impl.users.get(this.impl.users.idFromString(this.impl.ownerId!));
-    let clientUser = isOwner
+    let clientUser = isOperatingOwner
         ? owner
         : this.impl.users.get(this.impl.users.idFromString(userId));
 
     // Refresh the owner's outputs index. Pushes are best-effort, and workspaces predating the
     // index have never pushed at all, so re-syncing on open is what corrects both.
-    if (isOwner) {
+    if (isOperatingOwner) {
       this.impl.markOutputsDirty();
     }
 
@@ -175,8 +198,9 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       let sharing = await this.impl.getSharingManager();
 
       // If a share key was provided, redeem it. The owner already has full access and should not
-      // appear in the collaborators table.
-      if (shareKey) {
+      // appear in the collaborators table; the operating owner of an org-owned workspace neither
+      // (their access is their org membership, and redeeming would only add a stale edge).
+      if (shareKey && !isOperatingOwner) {
         await sharing.redeemShareKey({
           rawKey: shareKey,
           profileId,
@@ -194,9 +218,10 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       // valid role is confirmed, so it never reveals gatekeeper or resource metadata to an
       // unauthorized user.
       //
-      // An unauthorized caller (no effective role -- never had access, or was removed) gets a
-      // distinct denial without workspace metadata. A removed collaborator who reconnects after
-      // their session is force-restarted lands here and sees the terminal access-denied page.
+      // An unauthorized caller (no effective role -- never had access, was removed, or lost their
+      // org membership) gets a distinct denial without workspace metadata. A removed collaborator
+      // who reconnects after their session is force-restarted lands here and sees the terminal
+      // access-denied page.
       let effectiveRole = await this.impl.authorizeCollaborator(
           profileId, clientUser, {configureCb: configureObservers});
       if (!effectiveRole) {
@@ -206,22 +231,24 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
 
       // Fire-and-forget a call to the collaborator's user DO so the gadget appears on
       // (or is refreshed on) their home page.
-      let title = this.impl.storage.title.get();
-      let gadgetId = this.impl.ctx.id.toString();
-      void (async () => {
-        try {
-          const ownerProfile = await owner.whoami();
-          await clientUser.recordSharedGadgetOpen(gadgetId, title, ownerProfile, role);
-        } catch (err) {
-          this.impl.logger.warn("failed to record shared gadget open", {
-            event: "shared.gadget.open.record.failed", gadgetId, error: err,
-          });
-          return;
-        }
-        // Catch up whatever happened while they were away; changes from here on reach them
-        // through the session fan-out (joinOutputsFanout).
-        await this.impl.syncOutputsTo(clientUser);
-      })();
+      if (!isOperatingOwner) {
+        let title = this.impl.storage.title.get();
+        let gadgetId = this.impl.ctx.id.toString();
+        void (async () => {
+          try {
+            const ownerProfile = await owner.whoami();
+            await clientUser.recordSharedGadgetOpen(gadgetId, title, ownerProfile, role);
+          } catch (err) {
+            this.impl.logger.warn("failed to record shared gadget open", {
+              event: "shared.gadget.open.record.failed", gadgetId, error: err,
+            });
+            return;
+          }
+          // Catch up whatever happened while they were away; changes from here on reach them
+          // through the session fan-out (joinOutputsFanout).
+          await this.impl.syncOutputsTo(clientUser);
+        })();
+      }
     }
 
     this.impl.recordGadgetAnalytics({

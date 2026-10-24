@@ -43,6 +43,16 @@ import type { SpawnCallableOptions } from "../agent-spawner-binding";
 export type GatekeeperClass = DurableObjectClass<Gatekeeper<any>>;
 
 /**
+ * Who owns a workspace: the user DO it runs as, or the organization it was transferred to (see
+ * `transferToOrg`). Same shape as the blueprint owner subject (storage-schema/blueprints-kv.ts);
+ * the org's Durable Object is the authority on its membership, and an org-owned workspace's
+ * sharing graph roots itself there (sharing.ts).
+ */
+export type WorkspaceOwnerSubject =
+    | { type: 'user'; id: string }
+    | { type: 'org'; id: string };
+
+/**
  * A gatekeeper (connection) workpiece. IDs are allocated from the shared workpiece counter (see
  * the `nextGatekeeperId` singleton), so they never collide with gadget IDs.
  */
@@ -1241,6 +1251,11 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
     singletons: {
       // Initialized on first startup.
       ownerId: <string | undefined>undefined,
+
+      // The workspace's owner subject. Absent on every workspace created before orgs, and on
+      // every user-owned one since: read it as {type: 'user', id: ownerId}. Set to
+      // {type: 'org', id} by transferToOrg, one-way (an org-owned workspace never goes back).
+      ownerSubject: <WorkspaceOwnerSubject | undefined>undefined,
 
       // Version of this DO's storage schema, gating lazy migrations. Used to trigger migrations
       // at construction time.

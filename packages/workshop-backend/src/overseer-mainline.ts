@@ -10,7 +10,8 @@ import { listFeaturedBlueprintsFromKv } from "./storage-schema/blueprints-kv";
 import { orgBlueprintsForMember } from "./blueprint-access";
 import { retryOnDoReset } from "./do-retry";
 import { SharingManager } from "./sharing";
-import type { GadgetExportFormat } from "@gadgets/workshop-shared/api";
+import { gadgetBaselineRole } from "./org-access";
+import type { GadgetExportFormat, OrgRole } from "@gadgets/workshop-shared/api";
 import { renderGadgetInBrowser } from "./browser-export";
 import { defaultExportFormats, exportServerFormat, GADGET_EXPORT_ENTRYPOINT, readCustomExportFormats } from "./gadget-export";
 import type { GadgetExportEntrypoint } from "./gadget-export";
@@ -649,13 +650,44 @@ export abstract class OverseerMainline extends OverseerChanges {
   #sharingManager?: SharingManager;
 
   /**
+   * The owning org's live membership (member canonical user id → org role), or null while a
+   * user owns this workspace. The sharing graph baselines each member's access at their org
+   * role and re-reads this on every open; a read that fails throws, failing every authorization
+   * closed rather than degrading to user-owned semantics. Exposed so callers that must compute
+   * several sharing answers from one consistent snapshot (enforceExcludeObservers, the
+   * ownerInvitesOnly sweep) can fetch it once.
+   */
+  async getOwningOrgRoles(): Promise<ReadonlyMap<string, OrgRole> | null> {
+    const subject = this.storage.ownerSubject.get();
+    if (subject?.type !== "org") return null;
+    const members = await this.ctx.exports.OrgDurableObject.getByName(subject.id).activeMembers();
+    return new Map(members.map(m => [m.userId, m.role]));
+  }
+
+  /**
+   * Whether `profileId` may exercise owner-style authority over this workspace through the
+   * owning org: an active owner or admin of it (org-access.ts's baseline mapping -- the same
+   * roles that may move workspaces into the org). False on a user-owned workspace, where only
+   * the session owner holds that authority. Session interfaces (OverseerClientInterface) fold
+   * this into their caller identity for sharing calls.
+   */
+  async isOwningOrgAdmin(profileId: string): Promise<boolean> {
+    const orgRoles = await this.getOwningOrgRoles();
+    const orgRole = orgRoles?.get(profileId);
+    return orgRole !== undefined && gadgetBaselineRole(orgRole) === "build";
+  }
+
+  /**
    * Collaborator authorization / sharing / permission logic. Memoized for the DO instance.
    * Resolving the owner's profile ID may require an RPC on first use; thereafter it's cached.
+   * On an org-owned workspace the sharing graph additionally consults the owning org's live
+   * membership (see getOwningOrgRoles).
    */
   async getSharingManager(): Promise<SharingManager> {
     if (!this.#sharingManager) {
       this.#sharingManager = new SharingManager(
-          this.storage, await this.getOwnerProfileId(), () => this.storage.ownerInvitesOnly.get());
+          this.storage, await this.getOwnerProfileId(), () => this.storage.ownerInvitesOnly.get(),
+          () => this.getOwningOrgRoles());
     }
     return this.#sharingManager;
   }
