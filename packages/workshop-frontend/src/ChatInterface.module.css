@@ -140,34 +140,6 @@
 }
 .markdownContent img { max-width: 100%; height: auto; }
 
-/* ── Streaming placeholder ────────────────────────────────────────────────── */
-.thinkingShimmer {
-  color: var(--text-color-kumo-inactive);
-  background: linear-gradient(
-    90deg,
-    var(--text-color-kumo-inactive) 0%,
-    var(--text-color-kumo-subtle) 45%,
-    var(--text-color-kumo-inactive) 90%
-  );
-  background-size: 220% 100%;
-  background-clip: text;
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  animation: thinking-shimmer 1.8s linear infinite;
-}
-
-@keyframes thinking-shimmer {
-  from { background-position: 140% 0; }
-  to { background-position: -80% 0; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .thinkingShimmer {
-    animation: none;
-    background: none;
-    -webkit-text-fill-color: currentColor;
-  }
-}
 
 /* ── Observation markdown (inline, compact) ───────────────────────────────── */
 .observationMarkdown { line-height: 1.5; }
