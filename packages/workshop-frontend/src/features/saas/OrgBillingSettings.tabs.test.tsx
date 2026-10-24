@@ -150,4 +150,37 @@ describe('the org billing tabs follow the ?org= search parameter', () => {
     const tabs = page.querySelectorAll('button[role="tab"]')
     expect(tabs[1]!.getAttribute('aria-selected')).toBe('true')
   })
+
+  it('an upgrade opened on one org does not bill that org after switching tabs', async () => {
+    // org-1 is on the free plan, so its panel offers the Upgrade button; org-2 is paid.
+    const getOrgBilling = vi.fn<(orgId: string) => Promise<Record<string, unknown>>>()
+      .mockImplementation(async (orgId) => ({
+        plan: orgId === 'org-1' ? 'free' : 'team', seats: 3, assignedSeats: 1,
+        subscriptionStatus: orgId === 'org-1' ? null : 'active', monthlySpendCapUsd: 100,
+        overageAllowed: false, usage: null,
+      }))
+    authState.api = {
+      listMyOrgs: vi.fn<() => Promise<OrgSummary[]>>()
+        .mockResolvedValue([org('org-1', 'Acme'), org('org-2', 'Globex')]),
+      getOrgBilling,
+      getOrgMembers: vi.fn<(orgId: string) => Promise<unknown[]>>().mockResolvedValue([]),
+      listCommercePlans: vi.fn<() => Promise<unknown[]>>()
+        .mockResolvedValue([{ id: 'pro-plan', name: 'Pro' }]),
+    } as unknown as RpcStub<AuthenticatedApi>
+
+    const page = await renderAt('/profile')
+    await until(() => expect(page.textContent).toContain('Free plan'))
+
+    const upgrade = [...page.querySelectorAll('button')].find((b) => b.textContent === 'Upgrade')!
+    await act(async () => upgrade.click())
+    await until(() => expect(page.textContent).toContain('Upgrade Acme'))
+
+    // Switching tabs must hide the upgrade block entirely: it belongs to the org it
+    // upgrades, so it can never offer org-1's checkout under org-2's name.
+    const tabs = page.querySelectorAll('button[role="tab"]')
+    await act(async () => (tabs[1] as HTMLButtonElement).click())
+    await until(() => expect(page.textContent).toContain('Team plan'))
+    expect(page.textContent).not.toContain('Upgrade Acme')
+    expect(page.textContent).not.toContain('Upgrade Globex')
+  })
 })

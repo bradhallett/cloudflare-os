@@ -292,7 +292,10 @@ export default function OrgBillingSettings({ org: requestedOrg }: { org?: string
 
       <OrgBillingPanel key={org.id} org={org} onCheckoutStart={(orgId) => setUpgradingOrg(orgId)} />
 
-      {upgradingOrg !== null && (
+      {upgradingOrg === org.id && (
+        // Keyed to the displayed org: an upgrade opened on another tab must not
+        // render (let alone bill) after ?org= changes — the panel belongs to the
+        // org it upgrades.
         <div className="flex flex-col gap-3 rounded-xl border border-kumo-line bg-kumo-base p-5">
           <p className="text-[15px] font-medium text-kumo-default">Upgrade {org.name}</p>
           <label className="flex items-center gap-2 text-[13px] text-kumo-subtle">
