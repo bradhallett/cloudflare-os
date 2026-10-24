@@ -217,6 +217,37 @@ describe("gatekeeper user picker selection tickets", () => {
       .resolves.toEqual({ error: expect.any(String) });
   });
 
+  it("lets a member of two orgs pick a co-member of either", async () => {
+    const viewer = uniqueUser("view");
+    const memberA = uniqueUser("membera");
+    const memberB = uniqueUser("memberb");
+    const testHooks = hooks();
+    await Promise.all([
+      createUser(viewer, "Viewer"),
+      createUser(memberA, "Member A"),
+      createUser(memberB, "Member B"),
+    ]);
+    const orgA = await shareAnOrg(viewer, memberA);
+    const orgB = await shareAnOrg(viewer, memberB);
+    const appAccount = await testHooks.addAccount(viewer, "context", `${viewer}-context`, { providesUi: true });
+    await testHooks.addAccount(memberA, "context", `${memberA}-context`);
+    await testHooks.addAccount(memberB, "context", `${memberB}-context`);
+
+    // The scope unions both orgs: each member is pickable, justified by only their own org.
+    for (const [person, orgId] of [[memberA, orgA], [memberB, orgB]] as const) {
+      const selection = minted(await testHooks.pick(viewer, appAccount, person));
+      await inUser(viewer, user => {
+        const record = Array.from(user.storage.pendingUserSelections.list())
+          .find(({ selectedUserId }) => selectedUserId === person);
+        expect(record).toMatchObject({ selectedUserId: person, orgIds: [orgId] });
+      });
+      await expect(testHooks.redeem(viewer, appAccount, selection.ticket)).resolves.toEqual([{
+        identity: `${person}-context`,
+        displayName: person === memberA ? "Member A" : "Member B",
+      }]);
+    }
+  });
+
   it("justifies a pick by an existing share relationship, live-checked at redemption", async () => {
     const viewer = uniqueUser("view");
     const owner = uniqueUser("owner");

@@ -145,8 +145,14 @@ describe("GatekeeperUserPickerDialog", () => {
 
   it("describes the picker's scope from the user's org memberships", async () => {
     const { props } = await mount(mintFor, undefined, { searchEnabled: true });
-    expect(props().scopeNote).toBe("You can select people you share workspaces with.");
-    expect(container!.textContent).toContain("You can select people you share workspaces with.");
+    expect(props().scopeNote).toBe("You can select owners of workspaces shared with you.");
+    expect(container!.textContent).toContain("You can select owners of workspaces shared with you.");
+  });
+
+  it("ignores pending invitations when naming the user's organizations", async () => {
+    auth.orgs = [{ orgId: "org-a", role: "member", status: "invited" }];
+    const { props } = await mount(mintFor, undefined, { searchEnabled: true });
+    expect(props().scopeNote).toBe("You can select owners of workspaces shared with you.");
   });
 
   it("names the user's organizations in the scope note", async () => {
@@ -156,7 +162,7 @@ describe("GatekeeperUserPickerDialog", () => {
     ];
     const { props } = await mount(mintFor, undefined, { searchEnabled: true });
     expect(props().scopeNote).toBe(
-      "You can select members of your 2 organizations and people you share workspaces with.");
+      "You can select members of your 2 organizations and owners of workspaces shared with you.");
   });
 
   it("mints a ticket for each pick and delivers it to the app before the picker closes", async () => {
