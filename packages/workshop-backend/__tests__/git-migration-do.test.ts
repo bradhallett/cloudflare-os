@@ -392,7 +392,10 @@ describe("the blueprint-upstream backfill via the Overseer constructor", () => {
 
       let unread = { value: { list: () => { throw new Error("read a chat"); } } };
       let storage = Object.create(impl.storage, { chatMeta: unread, chats: unread });
-      migrateToBlueprintUpstreams(Object.create(impl, { storage: { value: storage } }));
+      // An own `logger`, so the prototype's getter (over a private field of the real class)
+      // never runs against this fake host, which carries none of the instance's private slots.
+      migrateToBlueprintUpstreams(Object.create(
+          impl, { storage: { value: storage }, logger: { value: impl.logger } }));
 
       expect(impl.storage.version.get()).toBe(5);
     });

@@ -10,11 +10,12 @@ import { useInvalidShake } from "./useInvalidShake";
 type Fixture = {
   form: HTMLFormElement;
   control: HTMLSelectElement;
+  group: HTMLDivElement | null;
   submit: HTMLButtonElement;
   unmount: () => void;
 };
 
-function mountFixture(reducedMotion = false): Fixture {
+function mountFixture(reducedMotion = false, inputGroup = false): Fixture {
   const matchMedia = vi.fn().mockReturnValue({
     matches: reducedMotion,
     media: "",
@@ -33,9 +34,17 @@ function mountFixture(reducedMotion = false): Fixture {
     useInvalidShake(ref);
     return (
       <form onSubmit={(event) => event.preventDefault()}>
-        <select ref={ref} required defaultValue="">
-          <option value="" disabled />
-        </select>
+        {inputGroup ? (
+          <div data-slot="input-group">
+            <select ref={ref} required defaultValue="">
+              <option value="" disabled />
+            </select>
+          </div>
+        ) : (
+          <select ref={ref} required defaultValue="">
+            <option value="" disabled />
+          </select>
+        )}
         <button type="submit">Continue</button>
       </form>
     );
@@ -45,6 +54,7 @@ function mountFixture(reducedMotion = false): Fixture {
   return {
     form,
     control: ref.current!,
+    group: container.querySelector("[data-slot=input-group]"),
     submit: form.querySelector("button")!,
     unmount: () => {
       act(() => root.unmount());
@@ -90,12 +100,24 @@ describe("useInvalidShake", () => {
       submit.click();
     });
     advance(50); // run the requestAnimationFrame check
-     expect(control.hasAttribute("data-shake")).toBe(true);
- 
-     // The attribute stays 400ms from the shake, then is removed.
+    expect(control.hasAttribute("data-shake")).toBe(true);
+
+    // The attribute stays 400ms from the shake, then is removed.
     advance(300); // t=350
     expect(control.hasAttribute("data-shake")).toBe(true);
     advance(100); // past the 400ms window
+    expect(control.hasAttribute("data-shake")).toBe(false);
+    unmount();
+  });
+
+  it("shakes the [data-slot=input-group] wrapper instead of the control", () => {
+    const { control, group, submit, unmount } = mountFixture(false, true);
+    act(() => {
+      control.setAttribute("aria-invalid", "true");
+      submit.click();
+    });
+    advance(50); // run the requestAnimationFrame check
+    expect(group?.hasAttribute("data-shake")).toBe(true);
     expect(control.hasAttribute("data-shake")).toBe(false);
     unmount();
   });

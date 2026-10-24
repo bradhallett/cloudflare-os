@@ -2,6 +2,7 @@ import { memo, useEffect, useRef } from "react";
 import type { ChatAttachmentRef } from "@gadgets/workshop-shared/api";
 import { File as FileIcon, X } from "@phosphor-icons/react";
 import { formatAttachmentSize } from "../attachmentFormatting";
+import { matchesHotkey } from "@gadgets/ui/hotkey";
 import { useAttachmentObjectUrl } from "./useAttachmentObjectUrl";
 
 /** Downloads an attachment by its handle. */
@@ -31,7 +32,7 @@ export const AttachmentPreviewModal = memo(function AttachmentPreviewModal(
     if (!attachment) return;
     const previouslyFocused = document.activeElement as HTMLElement | null;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
+      if (matchesHotkey(event, "escape")) {
         onClose();
         return;
       }

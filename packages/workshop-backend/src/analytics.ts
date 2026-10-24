@@ -32,8 +32,14 @@ export type ProductAnalyticsRecord = {
   properties: Record<string, unknown>;
 };
 
-/** Events about a specific gadget. */
-export type ProductAnalyticsGadgetInput =
+/**
+ * Events about a specific gadget. `gadget_org_id` is stamped by recordGadgetAnalytics when the
+ * gadget's workspace is org-owned, and absent on user-owned ones.
+ */
+export type ProductAnalyticsGadgetInput = {
+  /** The organization that owns the gadget's workspace, on org-owned workspaces. */
+  gadget_org_id?: string;
+} & (
   | {
       event_name: "gadget_created";
       user_id: string;
@@ -108,7 +114,8 @@ export type ProductAnalyticsGadgetInput =
       gadget_id?: string;
       gadget_owner_user_id?: string;
       workpiece_id: number;
-    };
+    }
+);
 
 export type ProductAnalyticsInput =
   | {
@@ -220,11 +227,13 @@ export function toActivityMetric(event: ProductAnalyticsInput): ActivityMetricIn
 }
 
 function workspaceIds(
-    event: { user_id?: string; gadget_id?: string; gadget_owner_user_id?: string })
-    : Pick<ActivityMetricInput, "actorId" | "ownerId" | "workspaceId"> {
+    event: { user_id?: string; gadget_id?: string; gadget_owner_user_id?: string;
+      gadget_org_id?: string })
+    : Pick<ActivityMetricInput, "actorId" | "ownerId" | "workspaceId" | "orgId"> {
   return {
     actorId: event.user_id,
     ownerId: event.gadget_owner_user_id,
     workspaceId: event.gadget_id,
+    orgId: event.gadget_org_id,
   };
 }

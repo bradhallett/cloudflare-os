@@ -109,3 +109,74 @@ export function workspaceHistory(workspaceId: string, limit = 50): string {
       `ORDER BY timestamp DESC`,
       `LIMIT ${limit}`);
 }
+
+/**
+ * Rows of one org's own copy of its events, selected by index: `activity/v1` points the encoder
+ * wrote under the org's index because the workspace they name is org-owned. Each such event has
+ * exactly one org point, so additive counts here never double-count. `orgId` is the org's random
+ * id; the query adds the `org_` prefix the encoder writes.
+ */
+function orgRows(orgId: string): string {
+  return `${COMMON_SLOTS.discriminator} = '${ACTIVITY_V1_DISCRIMINATOR}'` +
+      ` AND index1 = ${sqlString(activityIndex("org", `org_${orgId}`))}`;
+}
+
+/** A shared per-UTC-day projection over the trailing `days` whole days. */
+const dayColumn =
+    `formatDateTime(toStartOfInterval(timestamp, INTERVAL '1' DAY), '%Y-%m-%d') AS day`;
+
+/**
+ * Distinct users with at least one event in one org's workspaces per UTC day over the trailing
+ * `days` whole days — the org's seats in use. Like `activeUsersByDay`, a distinct count has no
+ * sample-weighted form in the SQL dialect, so this stays approximate wherever Cloudflare sampled
+ * the index.
+ */
+export function orgActiveSeatsByDay(orgId: string, days: number): string {
+  return lines(
+      `SELECT ${dayColumn},`,
+      `    count(DISTINCT ${COMMON_SLOTS.actorId}) AS activeSeats`,
+      `FROM ${METRIC_DATASET}`,
+      `WHERE ${orgRows(orgId)}`,
+      `    AND ${COMMON_SLOTS.actorId} != ${sqlString(UNATTRIBUTED_ACTOR)}`,
+      `    AND ${sinceDays(days)}`,
+      `GROUP BY day`,
+      `ORDER BY day ASC`);
+}
+
+/**
+ * Gatekeeper connection events in one org's workspaces per UTC day over the trailing `days`
+ * whole days: connections created or removed whose `detail` names the gatekeeper connection type.
+ */
+export function orgGatekeeperUsageByDay(orgId: string, days: number): string {
+  return lines(
+      `SELECT ${dayColumn},`,
+      `    sum(_sample_interval) AS gatekeeperEvents`,
+      `FROM ${METRIC_DATASET}`,
+      `WHERE ${orgRows(orgId)}`,
+      `    AND ${COMMON_SLOTS.eventType} IN ('connection.created', 'connection.removed')`,
+      `    AND ${ACTIVITY_V1_SLOTS.detail} = 'gatekeeper'`,
+      `    AND ${sinceDays(days)}`,
+      `GROUP BY day`,
+      `ORDER BY day ASC`);
+}
+
+/**
+ * Model-driven activity in one org's workspaces per UTC day over the trailing `days` whole days:
+ * chat interactions (each message drives at least one model call) plus model connection changes.
+ * Event-count grade: token and cost accounting arrives with the SaaS usage stream, which carries
+ * the same org dimension.
+ */
+export function orgModelUsageByDay(orgId: string, days: number): string {
+  return lines(
+      `SELECT ${dayColumn},`,
+      `    sum(_sample_interval) AS modelEvents`,
+      `FROM ${METRIC_DATASET}`,
+      `WHERE ${orgRows(orgId)}`,
+      `    AND ((${COMMON_SLOTS.eventType} = 'workspace.interaction'`,
+      `        AND ${ACTIVITY_V1_SLOTS.detail} IN ('chat_started', 'chat_message_sent'))`,
+      `      OR (${COMMON_SLOTS.eventType} IN ('connection.created', 'connection.removed')`,
+      `        AND ${ACTIVITY_V1_SLOTS.detail} = 'ai_model'))`,
+      `    AND ${sinceDays(days)}`,
+      `GROUP BY day`,
+      `ORDER BY day ASC`);
+}

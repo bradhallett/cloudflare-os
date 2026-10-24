@@ -3,6 +3,8 @@ import { validateRpc } from "capnweb-validate";
 import type { JWTPayload } from "jose";
 import { PublicApi, ROUTER_TAG_PROBE_PATH, VERSION_PATH, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, RedactedAiModelConfig, AiGatewayInfo, AiModelProvider, ModelKind, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, UserDirectoryRecord, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, NotificationSubscriber, NotificationMute, type BotDefinition, type BotInfo, type BotSkillChoice, type OrgInvitePolicy, type OrgMember, type OrgRole, type OrgSummary, type WhoamiInfo } from '@gadgets/workshop-shared/api';
 import type { UiFeatureFlags } from "@gadgets/workshop-shared/feature-flags";
+import type { CommercePlan, OrgBillingOverview } from "@gadgets/workshop-shared/api";
+import { commercePort, COMMERCE_UNAVAILABLE } from "./commerce.js";
 import { backendVersion, getServerConfig } from "./deployment-config.js";
 import { isPasswordAuthEnabled, getAuthGatekeeperAllowlist } from "./auth/config.js";
 import { getAuthVendorBinding } from "./auth/auth-vendors.js";
@@ -277,6 +279,65 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   updateOrgSettings(
       orgId: string, settings: { invitePolicy: OrgInvitePolicy }): Promise<OrgSummary> {
     return this.#org(orgId).updateOrgSettings(this.#ownId, settings);
+  }
+
+  // --- SaaS commerce (org billing; see @gadgets/workshop-shared/commerce for the port) ---
+
+  /**
+   * The org as the caller may administer it: an active owner or admin. Every commerce method
+   * resolves this first — the org Durable Object re-checks membership live — so the bound
+   * service only ever receives org ids an org admin presented, and never re-derives authority
+   * from its own state.
+   */
+  async #orgForAdmin(orgId: string): Promise<OrgSummary> {
+    const summary = await this.#org(orgId).describeForMember(this.#ownId);
+    if (summary === null || summary.status !== "active"
+        || (summary.role !== "owner" && summary.role !== "admin")) {
+      throw new Error(
+          "Only an active owner or admin of the organization may manage its billing.");
+    }
+    return summary;
+  }
+
+  /** The bound commerce service, or a clear error when the deployment has none. */
+  #commerce() {
+    const port = commercePort(this.env);
+    if (port === null) throw new Error(COMMERCE_UNAVAILABLE);
+    return port;
+  }
+
+  /** The deployment's origin, which checkout and portal returns are anchored to. */
+  #publicOrigin(): string {
+    if (!this.env.PUBLIC_BASE_URL) {
+      throw new Error("PUBLIC_BASE_URL is not configured, so billing flows cannot return.");
+    }
+    return new URL(this.env.PUBLIC_BASE_URL).origin;
+  }
+
+  listCommercePlans(): Promise<CommercePlan[]> {
+    const port = commercePort(this.env);
+    return port === null ? Promise.resolve([]) : port.listPlans();
+  }
+
+  async getOrgBilling(orgId: string): Promise<OrgBillingOverview> {
+    await this.#orgForAdmin(orgId);
+    return await this.#commerce().getOrgBilling({ orgId });
+  }
+
+  async startOrgCheckout(orgId: string, plan: string, seats: number): Promise<{ url: string }> {
+    await this.#orgForAdmin(orgId);
+    if (!Number.isInteger(seats) || seats < 1) {
+      throw new Error("Seats must be a whole number of at least one.");
+    }
+    const successUrl =
+        `${this.#publicOrigin()}/saas/checkout/return?org=${encodeURIComponent(orgId)}`;
+    return await this.#commerce().startCheckout({ orgId, plan, seats, successUrl });
+  }
+
+  async openOrgBillingPortal(orgId: string): Promise<{ url: string }> {
+    await this.#orgForAdmin(orgId);
+    return await this.#commerce()
+        .createPortalSession({ orgId, returnUrl: `${this.#publicOrigin()}/profile` });
   }
   addModel(profile: AiChatAuthorInfo, config: RedactedAiModelConfig,
            copySecretsFrom?: string): Promise<void> {

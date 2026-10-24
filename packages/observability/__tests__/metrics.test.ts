@@ -48,7 +48,7 @@ describe("encodeActivityPoints", () => {
       indexes: [`activity|actor|usr_${ACTOR}`],
       blobs: [
         "activity/v1", "gadget.created", "actor", `usr_${ACTOR}`, `usr_${OWNER}`,
-        `ws_${WORKSPACE}`, "success", "blueprint", `ws_${WORKSPACE}/7`,
+        `ws_${WORKSPACE}`, "success", "blueprint", `ws_${WORKSPACE}/7`, "",
       ],
       doubles: [0, 0],
     });
@@ -80,8 +80,29 @@ describe("encodeActivityPoints", () => {
     expect(points.map(point => point.indexes![0])).toEqual([`activity|actor|usr_${ACTOR}`]);
     expect(points[0].blobs).toEqual([
       "activity/v1", "user.authenticated", "actor", `usr_${ACTOR}`, "", "", "success",
-      "password", "",
+      "password", "", "",
     ]);
+  });
+
+  it("writes an org copy under the org's index when the event names one", () => {
+    const ORG = "d".repeat(16);
+    const points = encodeActivityPoints({ ...FULL, orgId: ORG });
+    expect(points.map(point => point.indexes![0])).toEqual([
+      `activity|actor|usr_${ACTOR}`,
+      `activity|owner|usr_${OWNER}`,
+      `activity|workspace|ws_${WORKSPACE}`,
+      `activity|org|org_${ORG}`,
+    ]);
+    for (const point of points) {
+      expect(column(point, ACTIVITY_V1_SLOTS.orgId)).toBe(`org_${ORG}`);
+    }
+    expect(column(points[3], COMMON_SLOTS.scope)).toBe("org");
+  });
+
+  it("omits the org copy, and blanks its column, when the event names no org", () => {
+    const [point] = encodeActivityPoints(FULL);
+    expect(point.indexes).toEqual([`activity|actor|usr_${ACTOR}`]);
+    expect(column(point, ACTIVITY_V1_SLOTS.orgId)).toBe("");
   });
 
   it("attributes an event with no actor to the unattributed sentinel", () => {

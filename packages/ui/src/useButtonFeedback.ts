@@ -171,12 +171,13 @@ function useButtonFeedback(options: ButtonFeedbackOptions = {}) {
     [clearTimers, isHeld, later, update],
   );
 
-  /** Cancels timers and returns to idle immediately. */
+  /** Cancels timers, clears a reported error, and returns to idle immediately. */
   const reset = React.useCallback(() => {
     runRef.current += 1;
     clearTimers();
     inFlightRef.current = false;
     resetPendingRef.current = false;
+    setError(undefined);
     update("idle");
   }, [clearTimers, update]);
 

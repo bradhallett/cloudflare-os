@@ -11,6 +11,10 @@
     "./button-shake.css": {
       "import": "./src/button-shake.css"
     },
+    "./hotkey": {
+      "types": "./src/hotkey.ts",
+      "import": "./src/hotkey.ts"
+    },
     "./pending-switch.css": {
       "import": "./src/pending-switch.css"
     },

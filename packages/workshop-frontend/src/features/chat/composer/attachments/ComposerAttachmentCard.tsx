@@ -1,4 +1,5 @@
 import {
+  ArrowClockwiseIcon,
   FileAudioIcon,
   FileCodeIcon,
   FileDocIcon,
@@ -13,8 +14,10 @@ import {
   XIcon,
   type Icon,
 } from "@phosphor-icons/react";
-import { SkeletonLine, Tooltip } from "@cloudflare/kumo";
+import { Button, SkeletonLine, Tooltip } from "@cloudflare/kumo";
+import { useDelayedLoading } from "@gadgets/ui";
 import { attachmentKind, type AttachmentKind } from "./attachmentKind";
+import { splitFileName } from "./splitFileName";
 import type { ComposerAttachment } from "./useComposerAttachments";
 
 // Everything visual about an attachment card lives in this file; the tray only lays cards out.
@@ -46,23 +49,48 @@ const OUTLINE_CLASS =
 const REMOVE_BUTTON_CLASS =
   "absolute right-1.5 top-1.5 flex h-5 w-5 cursor-pointer items-center justify-center rounded-full bg-kumo-base text-kumo-default shadow-sm ring-1 ring-kumo-line hover:bg-kumo-tint focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-ring disabled:cursor-not-allowed disabled:opacity-50 [@media(hover:hover)]:opacity-0 group-hover:opacity-100";
 
+const NAME_TEXT_CLASS =
+  "text-[11px] font-medium leading-[14px] sm:text-[12px] sm:leading-4";
+
+// A long name truncates its base with an ellipsis but never its extension, so `very-long-name.pdf`
+// reads as `very-long-na….pdf` (the full name is on the card's tooltip).
+const AttachmentFileName = ({ name, muted }: { name: string; muted: boolean }) => {
+  const tone = muted ? "text-kumo-subtle" : "text-kumo-default";
+  const parts = splitFileName(name);
+  if (!parts) {
+    return <span className={`break-words line-clamp-2 ${NAME_TEXT_CLASS} ${tone}`}>{name}</span>;
+  }
+  return (
+    <span className={`flex min-w-0 flex-nowrap ${NAME_TEXT_CLASS} ${tone}`}>
+      <span className="min-w-0 truncate">{parts.base}</span>
+      <span className="shrink-0">{parts.extension}</span>
+    </span>
+  );
+};
+
 export const ComposerAttachmentCard = ({
   attachment,
   disabled,
   onRemove,
+  onRetry,
 }: {
   attachment: ComposerAttachment;
   disabled: boolean;
   onRemove: () => void;
+  onRetry: () => void;
 }) => {
   const name = attachment.name ?? "Attached file";
   const KindIcon = KIND_ICONS[attachmentKind(attachment.mimeType, attachment.name)];
   const failed = attachment.uploadState === "error";
+  const uploading = attachment.uploadState === "uploading";
+  // Uploads that finish quickly never flash a skeleton; one slow enough to show it holds it long
+  // enough not to flicker. Until then the card shows its real content.
+  const showSkeleton = useDelayedLoading(uploading);
 
   return (
     <Tooltip content={name} side="top" asChild>
       <div className={CARD_CLASS}>
-        {attachment.uploadState === "uploading" ? (
+        {uploading && showSkeleton ? (
           <>
             <SkeletonLine minWidth={100} maxWidth={100} className="h-full w-full" />
             <span className="sr-only">Uploading {name}</span>
@@ -72,18 +100,26 @@ export const ComposerAttachmentCard = ({
         ) : (
           <div className="flex h-full flex-col justify-between p-2.5 sm:p-3">
             {failed ? (
-              <div className="flex flex-col gap-1">
-                <WarningIcon size={16} className="text-kumo-danger" />
-                <span className="text-[11px] font-medium leading-[14px] text-kumo-danger sm:text-[12px] sm:leading-4">
-                  Upload failed
-                </span>
+              <div className="flex flex-col items-start gap-1">
+                <div className="flex items-center gap-1">
+                  <WarningIcon size={16} className="text-kumo-danger" />
+                  <span className={`${NAME_TEXT_CLASS} text-kumo-danger`}>Upload failed</span>
+                </div>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  shape="square"
+                  size="xs"
+                  icon={ArrowClockwiseIcon}
+                  aria-label={`Retry upload of ${name}`}
+                  disabled={disabled}
+                  onClick={onRetry}
+                />
               </div>
             ) : (
               <KindIcon size={20} className="text-kumo-default" />
             )}
-            <span className={`break-words text-[11px] font-medium leading-[14px] sm:text-[12px] sm:leading-4 ${failed ? "line-clamp-1 text-kumo-subtle sm:line-clamp-2" : "line-clamp-2 text-kumo-default"}`}>
-              {name}
-            </span>
+            <AttachmentFileName name={name} muted={failed} />
           </div>
         )}
         <span aria-hidden="true" className={OUTLINE_CLASS} />
