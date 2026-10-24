@@ -460,8 +460,12 @@ export type DeviceSessionHandoffStart = {
 
 /** Top-level API exposed to the user after they have authenticated. */
 export interface AuthenticatedApi extends RpcTarget {
-  /** Get profile info for the user who is logged in. */
-  whoami(): Promise<AiChatAuthorInfo>;
+  /**
+   * Get profile info for the user who is logged in, plus their organization memberships
+   * (see `WhoamiInfo`). The memberships are the user's mirrored index — a display snapshot;
+   * every org-derived authority re-checks membership where it matters.
+   */
+  whoami(): Promise<WhoamiInfo>;
 
   /**
    * Stage a two-minute, single-use device-session transfer for a native app. The state is an
@@ -487,6 +491,11 @@ export interface AuthenticatedApi extends RpcTarget {
    * their display name or id, for inviting collaborators. Excludes the caller
    * and every user named by `excludeIds`. Returns at most 10 records, earliest
    * substring match first.
+   *
+   * Scoped to the caller's directory scope — the active co-members of every org they belong to,
+   * plus the owners of workspaces shared with them — so one org's members are never enumerable
+   * from another. Adding an out-of-scope collaborator by exact id
+   * (`Overseer.addCollaborator()`) still works; the directory is discovery, not authority.
    *
    * Rejects a `query` longer than 1000 characters or containing a line break,
    * and more than 1000 distinct ids to exclude, the caller's own included.
@@ -952,12 +961,78 @@ export interface AuthenticatedApi extends RpcTarget {
   /**
    * Mint a single-use ticket for a user selected on behalf of a gatekeeper app,
    * redeemable through that gatekeeper app's exchange capability (see
-   * GatekeeperUserSelectionExchangeImpl). Returns null if the selected user is
-   * this user or does not exist.
+   * this user, does not exist, or is outside the caller's directory scope (the
+   * active co-members of their orgs, plus owners of workspaces shared with
+   * them) — the same scope `searchUsers()` covers. The ticket records the orgs
+   * that justified the pick, and redemption re-checks them live, so a pick dies
+   * with the membership it was justified by.
    */
   createGatekeeperUserSelection(
       vendorId: string, selectedUserId: string,
   ): Promise<GatekeeperUserSelection | null>;
+
+  // --- Organizations (see the Org* types below) ---
+
+  /**
+   * Create an organization with the caller as its first owner and only member. The name is
+   * trimmed, and must be non-empty and at most MAX_ORG_NAME_LENGTH characters.
+   */
+  createOrg(name: string): Promise<OrgSummary>;
+
+  /**
+   * The caller's organizations, one entry per membership (one person may be in many). Read from
+   * the user's membership index and re-checked against each org, so an entry disappears once its
+   * membership ends even if the index is briefly stale.
+   */
+  listMyOrgs(): Promise<OrgSummary[]>;
+
+  /**
+   * Every membership of one organization — pending invitations included — sorted by user id.
+   * Only an active member of the org may call this.
+   */
+  getOrgMembers(orgId: string): Promise<OrgMember[]>;
+
+  /**
+   * Invite `userId` (a canonical user id; the person need not have signed in yet) to the org at
+   * `role`, defaulting to "member". Creates — or, for a pending invitation to the same person,
+   * refreshes — an invitation that stays acceptable for seven days. The caller must be an active
+   * member allowed to invite by the org's invite policy, and may not grant a role above their
+   * own. An already-active member cannot be invited.
+   */
+  inviteOrgMember(orgId: string, userId: string, role?: OrgRole): Promise<OrgMember>;
+
+  /**
+   * Accept the caller's pending invitation, making the membership active. Throws when there is
+   * no pending invitation for the caller, or it has expired.
+   */
+  acceptOrgInvitation(orgId: string): Promise<OrgSummary>;
+
+  /**
+   * Change a member's role. Owners only, and the caller may not grant a role above their own.
+   * Refused when it would leave the organization with no owner (the last owner cannot be
+   * demoted).
+   */
+  changeOrgMemberRole(orgId: string, userId: string, role: OrgRole): Promise<OrgMember>;
+
+  /**
+   * Remove a membership, or revoke its pending invitation. Owners may remove anyone; admins may
+   * remove members; a member may remove no one but themself (prefer leaveOrg). Refused when it
+   * would leave the organization with no owner. Removing the caller themself is exactly
+   * leaveOrg().
+   */
+  removeOrgMember(orgId: string, userId: string): Promise<void>;
+
+  /**
+   * The caller leaves the organization: their membership (or pending invitation) is removed.
+   * Refused for a sole owner, who must first hand ownership to someone else.
+   */
+  leaveOrg(orgId: string): Promise<void>;
+
+  /**
+   * Update the org's settings (see OrgInvitePolicy). Owners only.
+   */
+  updateOrgSettings(
+      orgId: string, settings: { invitePolicy: OrgInvitePolicy }): Promise<OrgSummary>;
 
   // --- Deployment admin ---
 
@@ -991,6 +1066,84 @@ export type GatekeeperAppInfo = {
   title: string;
   /** Optional icon. */
   icon?: AvatarImage;
+};
+
+// ---------------------------------------------------------------------------
+// Organizations
+// ---------------------------------------------------------------------------
+
+/**
+ * A member's role in an organization. Owners manage roles and settings; admins manage members;
+ * members belong to the org. An organization always keeps at least one owner.
+ */
+export type OrgRole = "owner" | "admin" | "member";
+
+/** Whether a membership is standing (`active`) or still awaiting the invitee's acceptance. */
+export type OrgMemberStatus = "active" | "invited";
+
+/**
+ * Who may invite new members: `admin` (the default) restricts invitations to owners and admins;
+ * `member` additionally lets every active member invite, at the `member` role only.
+ */
+export type OrgInvitePolicy = "admin" | "member";
+
+/** The longest organization name createOrg() accepts, after trimming. */
+export const MAX_ORG_NAME_LENGTH = 100;
+
+/**
+ * One membership of an organization, as stored by the org itself and returned by
+ * `AuthenticatedApi.getOrgMembers()`.
+ */
+export type OrgMember = {
+  /**
+   * Canonical user identifier of the member (email for Access / sign-in accounts, username for
+   * password accounts). The invitee need not have signed in yet.
+   */
+  userId: string;
+  role: OrgRole;
+  status: OrgMemberStatus;
+  /** The inviting member's user id, or null for the org's creating owner. */
+  invitedBy: string | null;
+  invitedAt: Date;
+  /** When the member accepted their invitation; null while it is pending. */
+  joinedAt: Date | null;
+};
+
+/**
+ * An organization as one member sees it: its record and settings together with the caller's own
+ * membership. Returned by every org method that acts for a particular member.
+ */
+export type OrgSummary = {
+  /** The org's random id, also identifying it in API calls. */
+  id: string;
+  name: string;
+  invitePolicy: OrgInvitePolicy;
+  /** The caller's role in this org. */
+  role: OrgRole;
+  /** The caller's membership status in this org. */
+  status: OrgMemberStatus;
+};
+
+/**
+ * One of the signed-in user's organization memberships, as `whoami()` reports it. Read from the
+ * user's mirrored membership index, so it is a snapshot for display: the org re-checks membership
+ * live wherever it carries authority (search scoping, picker tickets, org methods).
+ */
+export type OrgMembership = {
+  /** The org's random id, as in `OrgSummary.id`. */
+  orgId: string;
+  role: OrgRole;
+  status: OrgMemberStatus;
+};
+
+/**
+ * The signed-in user's own profile and organization memberships, as returned by
+ * `AuthenticatedApi.whoami()`. A wider view of `AiChatAuthorInfo` for the user themself; other
+ * users' profiles never carry memberships.
+ */
+export type WhoamiInfo = AiChatAuthorInfo & {
+  /** The user's org memberships at the time of the call (see `OrgMembership`). */
+  orgs: OrgMembership[];
 };
 
 // ---------------------------------------------------------------------------
@@ -1674,6 +1827,13 @@ export type ServerConfig = {
    * default, e.g. self-hosted), usage is unlimited and the credits UI is hidden.
    */
   cloudflareLimitsEnabled: boolean;
+  /**
+   * Whether this deployment runs in hosted SaaS mode (env-driven, default false). The compile-time
+   * `VITE_SAAS` build flag decides which frontend bundle has SaaS surfaces at all; this value lets
+   * that bundle also learn the backend's mode at runtime.
+   */
+  saasEnabled: boolean;
+
 
   /**
    * Whether new account signups are allowed (admin-configurable, default true). The signup page

@@ -56,6 +56,8 @@ export async function getServerConfig(env: Cloudflare.Env): Promise<ServerConfig
     authVendors,
     passwordAuthEnabled: isPasswordAuthEnabled(env),
     cloudflareLimitsEnabled: isCloudflareLimitsEnabled(env),
+    // Informational only (see ServerConfig.saasEnabled); nothing in the OSS core branches on it.
+    saasEnabled: env.SAAS_MODE === "true",
     signupsEnabled: config.signupsEnabled,
     userSearchEnabled: config.userSearchEnabled,
     siteName: config.siteName,

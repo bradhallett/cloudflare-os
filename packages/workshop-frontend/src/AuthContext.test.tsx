@@ -4,15 +4,15 @@
 import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import type { RpcStub } from 'capnweb'
-import type { AiChatAuthorInfo, AuthenticatedApi } from '@gadgets/workshop-shared/api'
+import type { AuthenticatedApi, WhoamiInfo } from '@gadgets/workshop-shared/api'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AuthProvider, useAuthenticatedApi } from './AuthContext'
 
 ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
-const user: AiChatAuthorInfo = { type: 'user', id: 'tester@example.com', name: 'Tester' }
+const user: WhoamiInfo = { type: 'user', id: 'tester@example.com', name: 'Tester', orgs: [] }
 
-const apiWithWhoami = (whoami: () => Promise<AiChatAuthorInfo>) => ({
+const apiWithWhoami = (whoami: () => Promise<WhoamiInfo>) => ({
   whoami,
   amIAdmin: async () => false,
 }) as RpcStub<AuthenticatedApi>
@@ -26,10 +26,9 @@ describe('AuthProvider', () => {
   afterEach(() => vi.useRealTimers())
 
   it('keeps the current user available while a reconnected API confirms the same account', async () => {
-    let confirmReconnect!: (info: AiChatAuthorInfo) => void
-    const nextIdentity = new Promise<AiChatAuthorInfo>(resolve => { confirmReconnect = resolve })
+    const nextIdentity = Promise.withResolvers<WhoamiInfo>()
     const firstApi = apiWithWhoami(async () => ({ ...user }))
-    const nextApi = apiWithWhoami(() => nextIdentity)
+    const nextApi = apiWithWhoami(() => nextIdentity.promise)
     const container = document.createElement('div')
     const root = createRoot(container)
 
@@ -47,7 +46,7 @@ describe('AuthProvider', () => {
     ))
     expect(container.textContent).toBe(user.id)
 
-    await act(async () => confirmReconnect({ ...user }))
+    await act(async () => nextIdentity.resolve({ ...user }))
     expect(container.textContent).toBe(user.id)
     act(() => root.unmount())
   })

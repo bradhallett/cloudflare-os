@@ -2,11 +2,15 @@
 // (What the BLUEPRINTS KV namespace stores is declared in storage-schema/blueprints-kv.ts.)
 //
 // A blueprint's content lives in the BLUEPRINT_CONTENT bucket, in one of two forms:
-// - A release pack (see blueprint-release.ts) under `<blueprintId>/<commitId>`, for metadata
-//   that names its release commit. A release never changes, so neither does the object.
-// - A snapshot under `<blueprintId>/<version>`, for metadata that names none: the form content
-//   took before releases were commits. It is a gzip-compressed Yjs V2 state update of a doc
-//   whose unnamed root map is filename -> Y.Text.
+// - A release pack (see blueprint-release.ts) under `<scope><blueprintId>/<commitId>`, for
+//   metadata that names its release commit. A release never changes, so neither does the object.
+// - A snapshot under `<scope><blueprintId>/<version>`, for metadata that names none: the form
+//   content took before releases were commits. It is a gzip-compressed Yjs V2 state update of a
+//   doc whose unnamed root map is filename -> Y.Text.
+//
+// `<scope>` is the owner subject's scope segment (`org/<orgId>/` for an org-owned blueprint,
+// "" otherwise; see blueprintScopePrefix). Content written before owner subjects stays where it
+// is: a user-owned blueprint's scope is empty, so its keys are unchanged.
 //
 // `.gadget` archives are streamed as a 24-byte prefix (magic, version, metadata byte length,
 // content byte length), followed by UTF-8 JSON metadata and the content exactly as stored. The
@@ -19,7 +23,9 @@ import {
   buildSnapshotRelease, readReleasePack, validateReleaseObjects, type GitObjectMap,
 } from './blueprint-release.js';
 import { validateGitOid } from './git-codec.js';
-import { reviveBlueprintMetadata } from './storage-schema/blueprints-kv.js';
+import {
+  blueprintScopePrefix, reviveBlueprintMetadata, type BlueprintOwnerSubject,
+} from './storage-schema/blueprints-kv.js';
 
 const BLUEPRINT_ARCHIVE_MAGIC = 0xec2e2d3a2300e317n;
 // The archive version whose content is a snapshot, and the one whose content is a release pack.
@@ -61,9 +67,16 @@ export function sanitizeBlueprintOutput(output: unknown): BlueprintOutput | unde
 
 type BlueprintContentEnv = Pick<Cloudflare.Env, 'BLUEPRINT_CONTENT'>;
 
-/** The BLUEPRINT_CONTENT key of the content that `metadata` describes. */
-export function blueprintContentKey(blueprintId: string, metadata: BlueprintMetadata): string {
-  return `${blueprintId}/${metadata.commitId ?? metadata.version}`;
+/**
+ * The BLUEPRINT_CONTENT key of the content that `metadata` describes. `owner` is the record's
+ * owner subject, which scopes an org-owned blueprint's content into its org's segment.
+ */
+export function blueprintContentKey(
+  owner: BlueprintOwnerSubject | undefined,
+  blueprintId: string,
+  metadata: BlueprintMetadata,
+): string {
+  return `${blueprintScopePrefix(owner)}${blueprintId}/${metadata.commitId ?? metadata.version}`;
 }
 
 /**
@@ -80,10 +93,11 @@ export function blueprintContentKey(blueprintId: string, metadata: BlueprintMeta
  */
 export async function readBlueprintRelease(
   env: BlueprintContentEnv,
+  owner: BlueprintOwnerSubject | undefined,
   blueprintId: string,
   metadata: BlueprintMetadata,
 ): Promise<{commitId: GitOid, objects: GitObjectMap}> {
-  let r2Object = await env.BLUEPRINT_CONTENT.get(blueprintContentKey(blueprintId, metadata));
+  let r2Object = await env.BLUEPRINT_CONTENT.get(blueprintContentKey(owner, blueprintId, metadata));
   if (!r2Object) {
     throw new Error(`The content of blueprint ${blueprintId} is missing.`);
   }
@@ -111,11 +125,13 @@ export async function readBlueprintRelease(
 /** Deletes all of a blueprint's content: every version of it, in either form. */
 export async function deleteBlueprintContent(
   env: BlueprintContentEnv,
+  owner: BlueprintOwnerSubject | undefined,
   blueprintId: string,
 ): Promise<void> {
   let cursor: string | undefined;
   do {
-    let listing = await env.BLUEPRINT_CONTENT.list({ prefix: `${blueprintId}/`, cursor });
+    let listing = await env.BLUEPRINT_CONTENT.list(
+        { prefix: `${blueprintScopePrefix(owner)}${blueprintId}/`, cursor });
     if (listing.objects.length > 0) {
       await env.BLUEPRINT_CONTENT.delete(listing.objects.map(object => object.key));
     }

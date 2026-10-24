@@ -1,4 +1,4 @@
-import { WorkpieceId, ChatGadgetPinState, MergeChangesResult, AiChatMessage, BlueprintMetadata, BlueprintOutput, BlueprintMerge, ApplyBlueprintResult, GadgetUpstream } from "@gadgets/workshop-shared/api";
+import { WorkpieceId, ChatGadgetPinState, MergeChangesResult, AiChatMessage, AiChatAuthorInfo, BlueprintMetadata, BlueprintOutput, BlueprintMerge, ApplyBlueprintResult, GadgetUpstream } from "@gadgets/workshop-shared/api";
 import { requireTextFiles } from "@gadgets/workshop-shared/code-change";
 import type { FileContent } from "@gadgets/workshop-shared/code-change";
 import { chatKeyPrefix } from "./storage-schema/overseer-storage";
@@ -10,7 +10,7 @@ import { chatChangeStatuses } from "./agent-compaction";
 import { sanitizeBlueprintOutput } from "./blueprint-archive";
 import { releaseMergeHeader } from "./blueprint-release";
 import { encodeGitTree, gitObjectOid } from "./git-codec";
-import { readBlueprintKvRecord } from "./storage-schema/blueprints-kv";
+import { resolveBlueprintForUser } from "./blueprint-access";
 import type { UserChatContext } from "./user";
 import { OverseerBindings } from "./overseer-bindings";
 import { acceptWriteError } from "./overseer-support";
@@ -39,10 +39,16 @@ export abstract class OverseerBlueprints extends OverseerBindings {
                        clientUserId: string)
       : Promise<ApplyBlueprintResult> {
     let author = userMeta.profile;
-    let kvRecord = await readBlueprintKvRecord(this.env, blueprintId);
+    // The blueprint may belong to one of the applying user's orgs, so this is the member-gated
+    // read, not the public by-id one.
+    let user = this.users.idFromString(clientUserId);
+    let kvRecord = await resolveBlueprintForUser(
+        this.env, this.ctx.exports.OrgDurableObject,
+        (await this.users.get(user).listOrgMemberships()).map(entry => entry.orgId),
+        user.name!, blueprintId);
     if (!kvRecord) throw new Error("Blueprint not found.");
     let {metadata} = kvRecord;
-    let release = await this.loadBlueprint(blueprintId, metadata);
+    let release = await this.loadBlueprint(blueprintId, metadata, kvRecord.owner);
 
     let record = this.getGadgetRecord(gadgetId);
     let head = record.commitId;
@@ -736,19 +742,25 @@ export abstract class OverseerBlueprints extends OverseerBindings {
    * bindings the blueprint's code expects the agent to wire up, for instantiation as a new gadget
    * by the agent's createGadget tool, and the record of that for the creation's "changes"
    * message (see AiChatMessageBody.blueprintMerges). Blueprint ids are bearer capabilities (like
-   * blueprint share links), so possession of the id is sufficient to read it. Throws
-   * agent-readable errors.
+   * blueprint share links), so possession of the id is sufficient to read one; an org-owned
+   * blueprint is resolved for `initiator`, as their orgs' member alone. Throws agent-readable
+   * errors.
    */
-  async fetchBlueprint(blueprintId: string): Promise<{
+  async fetchBlueprint(initiator: AiChatAuthorInfo, blueprintId: string): Promise<{
     files: Record<string, string>, notes: string, output?: BlueprintOutput,
     merge: Omit<BlueprintMerge, "gadgetId">,
   }> {
-    let kvRecord = await readBlueprintKvRecord(this.env, blueprintId);
+    // The blueprint may belong to one of the initiating user's orgs, so this is the member-gated
+    // read; their user DO holds the org index it resolves through.
+    let orgIds = (await this.users.get(this.users.idFromName(initiator.id)).listOrgMemberships())
+        .map(entry => entry.orgId);
+    let kvRecord = await resolveBlueprintForUser(
+        this.env, this.ctx.exports.OrgDurableObject, orgIds, initiator.id, blueprintId);
     if (!kvRecord) {
       throw new Error(`No such blueprint: ${blueprintId}. Use listBlueprints to see available ` +
           `blueprints.`);
     }
-    let commitId = await this.loadBlueprint(blueprintId, kvRecord.metadata);
+    let commitId = await this.loadBlueprint(blueprintId, kvRecord.metadata, kvRecord.owner);
 
     // Null prototype so a hostile filename like "__proto__" is an ordinary key.
     let files: Record<string, string> = Object.create(null);

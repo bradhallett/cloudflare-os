@@ -5,10 +5,11 @@
 // gitignored (.gitignore) — they are build output, regenerated on every `preview.ts`
 // invocation.
 //
-// This is the preview-side counterpart of scripts/release/manifest-lib.ts: same 18 deployable
-// packages, same binding topology, but resolved to concrete staging values instead of the
-// manifest's `$PLACEHOLDER` templates. Where the deploy service would substitute
-// `$PUBLIC_BASE_URL`, a preview substitutes the router preview's workers.dev URL.
+// This is the preview-side counterpart of scripts/release/manifest-lib.ts: same deployable
+// packages (the repo's plus any extra scan roots — see scan-roots.ts), same binding topology, but
+// resolved to concrete staging values instead of the manifest's `$PLACEHOLDER` templates. Where
+// the deploy service would substitute `$PUBLIC_BASE_URL`, a preview substitutes the router
+// preview's workers.dev URL.
 //
 // Each worker's config has two halves:
 //   - the top level, which describes the *baseline* worker (`wrangler deploy`). Worker Previews
@@ -34,6 +35,7 @@ import {
   type BindingDecl, type DeployablePackage, type ObservabilityConfig, type ServiceBinding,
   type WranglerConfig,
 } from "../release/manifest-lib.ts";
+import { resolveScanRoots, scanRootArgs } from "../scan-roots.ts";
 
 /**
  * A service binding in a preview config. `preview_id` is what points a binding at a *sibling*
@@ -95,7 +97,7 @@ export interface StagingConfig extends WranglerConfig {
   previews?: PreviewOverrides;
 }
 
-type PackageConfig = Pick<DeployablePackage, "name" | "config">;
+type PackageConfig = Pick<DeployablePackage, "name" | "config" | "overlay">;
 
 /** The values every `apply*` function derives its config from. */
 interface PreviewContext {
@@ -378,6 +380,26 @@ function applyRouter(config: StagingConfig, { gatekeepers }: PreviewContext): vo
   };
 }
 
+// A plain overlay worker (see `DeployablePackage.overlay` in manifest-lib.ts): no public URL, no
+// connector surface — its preview needs only the baseline/preview split, with fresh resources per
+// preview and its committed vars passed through.
+function applyPlainWorker(config: StagingConfig): void {
+  config.previews = {
+    observability: previewObservability(config),
+    vars: { ...config.vars },
+    ...(config.unsafe ? { unsafe: config.unsafe } : {}),
+    ...(config.artifacts ? { artifacts: config.artifacts } : {}),
+    ...(config.ai ? { ai: config.ai } : {}),
+    ...(config.browser ? { browser: config.browser } : {}),
+  };
+  const kvNamespaces = previewResourceBindings(config.kv_namespaces);
+  if (kvNamespaces) config.previews.kv_namespaces = kvNamespaces;
+  const r2Buckets = previewResourceBindings(config.r2_buckets);
+  if (r2Buckets) config.previews.r2_buckets = r2Buckets;
+  const workerLoaders = previewResourceBindings(config.worker_loaders);
+  if (workerLoaders) config.previews.worker_loaders = workerLoaders;
+}
+
 /**
  * Build every package's preview config. Pure: `packages` is `[{ name, config }]` with `config`
  * the parsed wrangler.jsonc, and the result is a `Map` from package name to its preview config.
@@ -428,6 +450,7 @@ export function buildPreviewConfigs({
     if (isGatekeeperPackage(pkg.name)) applyGatekeeper(pkg.name, config, context);
     else if (pkg.name === "workshop-backend") applyBackend(config, context);
     else if (pkg.name === "router") applyRouter(config, context);
+    else if (pkg.overlay) applyPlainWorker(config);
     else throw new Error(`cannot build a preview config for package: ${pkg.name}`);
 
     configs.set(pkg.name, config);
@@ -719,6 +742,8 @@ export function writePreviewConfig(pkgDir: string, config: StagingConfig): void 
  */
 export function generatePreviewConfigs(options: {
   previewName?: string;
+  /** Extra scan roots, as `--scan-root` / `WORKER_SCAN_ROOTS` provide on the command line. */
+  scanRoots?: readonly string[];
 } = {}): {
   previewName: string;
   workersDevHost: string;
@@ -727,7 +752,8 @@ export function generatePreviewConfigs(options: {
 } {
   const previewName = options.previewName ?? resolvePreviewName();
   const { accountId, workersDevHost } = resolveTarget();
-  const packages = readDeployablePackages(PACKAGES_DIR);
+  const packages = readDeployablePackages(
+      options.scanRoots ?? resolveScanRoots(scanRootArgs(process.argv.slice(2))));
   const configs = buildPreviewConfigs({
     previewName,
     packages,

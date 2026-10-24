@@ -152,6 +152,13 @@ export interface DeployablePackage {
   dir: string;
   /** The package's parsed wrangler.jsonc. */
   config: WranglerConfig;
+  /**
+   * True when the package was found under an extra scan root (any root after the first given to
+   * {@link readDeployablePackages}; see `resolveScanRoots` in scripts/scan-roots.ts) rather than
+   * the repo's own packages/ dir: an overlay-workspace worker. Such a package classifies as a
+   * plain `worker` when its name matches no core kind, where a core package fails closed.
+   */
+  overlay?: true;
 }
 
 /** One user-supplied value the deploy wizard collects before installing a gatekeeper. */
@@ -178,7 +185,7 @@ export type ManifestBinding = { type: string; name: string } & Record<string, un
 /** Everything the manifest says about one worker in the release. */
 export interface WorkerEntry {
   /** Which role this worker plays in a deployment. */
-  kind: "backend" | "router" | "gatekeeper";
+  kind: "backend" | "router" | "gatekeeper" | "worker";
   /** Gatekeepers only: the path segment the router routes `/gatekeeper/<shortName>/*` on. */
   shortName?: string;
   /** Whether the deploy wizard offers this worker for installation. */
@@ -248,6 +255,8 @@ export interface WorkerBuild {
   modules: CollectedModule[];
   /** Contents of the package's `deploy-inputs.json`, if it has one. */
   deployInputs?: DeployInput[];
+  /** Copied from `DeployablePackage.overlay` by the release build; drives classification. */
+  overlay?: true;
 }
 
 // wrangler.jsonc keys this generator understands. Anything else fails closed — a new config key
@@ -334,22 +343,38 @@ export const DEFAULT_CRED_INPUTS: DeployInput[] = [
 
 const GATEKEEPER_PREFIX = "gatekeeper-";
 
-/** Read every deployable package and its Wrangler configuration, sorted by package name. */
-export function readDeployablePackages(packagesDir: string): DeployablePackage[] {
-  return readdirSync(packagesDir)
-      .filter((name) => {
-    try {
-      return statSync(join(packagesDir, name, "wrangler.jsonc")).isFile();
-    } catch {
-      return false;
+/**
+ * Read every deployable package under the given scan roots, sorted by package name. The first
+ * root is the repo's own `packages/` dir (see `resolveScanRoots` in scripts/scan-roots.ts);
+ * packages found only under later roots are overlay-workspace workers, marked `overlay`.
+ *
+ * The same package name under two roots is rejected: the name is the worker name, the manifest
+ * key and every service binding's target, so one would silently shadow the other.
+ */
+export function readDeployablePackages(scanRoots: readonly string[]): DeployablePackage[] {
+  const packages: DeployablePackage[] = [];
+  const ownerByName = new Map<string, string>();
+  scanRoots.forEach((root, index) => {
+    const overlay = index > 0;
+    for (const name of readdirSync(root).filter((entry) => {
+      try {
+        return statSync(join(root, entry, "wrangler.jsonc")).isFile();
+      } catch {
+        return false;
+      }
+    })) {
+      const owner = ownerByName.get(name);
+      if (owner !== undefined) {
+        throw new Error(`package ${name} appears under both ${owner} and ${root}: the package ` +
+            `name is the worker name, so one would silently shadow the other in the release`);
+      }
+      ownerByName.set(name, root);
+      const dir = join(root, name);
+      const config = parse(readFileSync(join(dir, "wrangler.jsonc"), "utf8")) as WranglerConfig;
+      packages.push({ name, dir, config, ...(overlay ? { overlay: true } : {}) });
     }
-  })
-      .toSorted()
-      .map((name) => {
-    const dir = join(packagesDir, name);
-    const config = parse(readFileSync(join(dir, "wrangler.jsonc"), "utf8")) as WranglerConfig;
-    return { name, dir, config };
   });
+  return packages.toSorted((a, b) => a.name.localeCompare(b.name));
 }
 
 /** True when a deployable package is a gatekeeper worker. */
@@ -417,10 +442,14 @@ export function readDeployInputs(pkgDir: string): DeployInput[] | undefined {
   return JSON.parse(readFileSync(path, "utf8")) as DeployInput[];
 }
 
-function workerKind(pkgName: string): WorkerEntry["kind"] {
+function workerKind(pkgName: string, overlay: boolean): WorkerEntry["kind"] {
   if (pkgName === "workshop-backend") return "backend";
   if (pkgName === "router") return "router";
   if (isGatekeeperPackage(pkgName)) return "gatekeeper";
+  // A private overlay workspace may ship workers that are none of the core kinds; they deploy as
+  // plain workers. Core packages still fail closed: a name that classifies as nothing here is an
+  // unclassified shape, and treating it as a plain worker would hide that.
+  if (overlay) return "worker";
   throw new Error(`cannot classify deployable package: ${pkgName}`);
 }
 
@@ -429,9 +458,9 @@ function workerKind(pkgName: string): WorkerEntry["kind"] {
  * `modules` entries are { name, type, sha256, size } (bytes stripped by the caller).
  */
 export function buildWorkerEntry(
-  { pkgName, config, mainModule, modules, deployInputs }: WorkerBuild,
+  { pkgName, config, mainModule, modules, deployInputs, overlay }: WorkerBuild,
 ): WorkerEntry {
-  const kind = workerKind(pkgName);
+  const kind = workerKind(pkgName, overlay === true);
   const unknownKeys = Object.keys(config).filter((k) => !HANDLED_CONFIG_KEYS.has(k));
   if (unknownKeys.length > 0) {
     throw new Error(`${pkgName}/wrangler.jsonc has key(s) this generator doesn't handle: ` +
@@ -532,7 +561,7 @@ export function buildWorkerEntry(
     // The router routes /gatekeeper/<short>/* by scanning its own GATEKEEPER_* bindings
     // (default entrypoint — it forwards whole HTTP requests, not vendor RPC).
     gatekeeperBindingExpansion = { propsByPackage: {} };
-  } else {
+  } else if (kind === "gatekeeper") {
     vars.BASE_URL = `$PUBLIC_BASE_URL/gatekeeper/${releaseShortName(pkgName)}`;
     installable = !NOT_INSTALLABLE.has(pkgName);
     if (installable) {
@@ -551,6 +580,11 @@ export function buildWorkerEntry(
       throw new Error(`${pkgName} is preinstalled but declares input(s); preinstalls run ` +
           `with no user interaction, so this release would be broken`);
     }
+  } else {
+    // A plain overlay worker ships as declared: not installable (the deploy wizard offers
+    // connectors, not private workers) and no per-kind template vars — its own pipeline binds
+    // and reaches it.
+    installable = false;
   }
 
   return {
