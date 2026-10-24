@@ -87,6 +87,7 @@ function verifier(accountId: string) {
 describe("org grants", () => {
   it("give every recorded member the grant's role, resolved live", async () => {
     let id = await createCollection("alice");
+    await recordMemberships("alice", [{ orgId: "org-1", role: "member" }]);
     await collection(id).shareOrg("alice", "org-1", "editor");
     await recordMemberships("bob", [{ orgId: "org-1", role: "member" }]);
 
@@ -105,6 +106,7 @@ describe("org grants", () => {
 
   it("appear in member listings through the registry's org index, re-checked live", async () => {
     let id = await createCollection("alice");
+    await recordMemberships("alice", [{ orgId: "org-1", role: "member" }]);
     await collection(id).shareOrg("alice", "org-1", "viewer");
     await recordMemberships("bob", [{ orgId: "org-1", role: "member" }]);
 
@@ -120,6 +122,7 @@ describe("org grants", () => {
 
   it("follow grant role changes and membership changes without any re-share", async () => {
     let id = await createCollection("alice");
+    await recordMemberships("alice", [{ orgId: "org-1", role: "member" }]);
     await collection(id).shareOrg("alice", "org-1", "editor");
     await recordMemberships("bob", [{ orgId: "org-1", role: "member" }]);
     await recordMemberships("carol", [{ orgId: "org-1", role: "member" }]);
@@ -143,6 +146,7 @@ describe("org grants", () => {
 
   it("make org owners' admins the managers, plain members their editors", async () => {
     let id = await createCollection("alice");
+    await recordMemberships("alice", [{ orgId: "org-1", role: "member" }]);
     await collection(id).shareOrg("alice", "org-1", "owner");
     await recordMemberships("bob", [{ orgId: "org-1", role: "member" }]);
     await recordMemberships("dana", [{ orgId: "org-1", role: "admin" }]);
@@ -210,6 +214,7 @@ describe("org grants", () => {
     await expect(settled(api("dana").shareContextCollectionWithOrg(id, "org-1", "viewer")))
       .rejects.toThrow("not found");
 
+    await recordMemberships("alice", [{ orgId: "org-1", role: "member" }]);
     await api("alice").shareContextCollectionWithOrg(id, "org-1", "viewer");
     await recordMemberships("bob", [{ orgId: "org-1", role: "member" }]);
     expect((await resolved(id, "bob")).role).toBe("viewer");
@@ -239,8 +244,10 @@ describe("org grants", () => {
     // An account-owned collection: once the org also holds an owner grant, the account owner may
     // leave — the org keeps the collection owned.
     let owned = await createCollection("alice");
+    await recordMemberships("alice", [{ orgId: "org-2", role: "member" }]);
     await collection(owned).shareOrg("alice", "org-2", "owner");
     await collection(owned).removeMember("alice", "alice");
+    await recordMemberships("alice", []);
     let after = await resolved(owned, "alice");
     expect(after.role).toBeNull();
     expect(after.hasOwner).toBe(true);
@@ -258,6 +265,7 @@ describe("org grants", () => {
 
   it("keep a collection alive across a member's disconnection", async () => {
     let id = await createCollection("alice");
+    await recordMemberships("alice", [{ orgId: "org-1", role: "member" }]);
     await collection(id).shareOrg("alice", "org-1", "editor");
     await recordMemberships("bob", [{ orgId: "org-1", role: "member" }]);
 
@@ -275,6 +283,7 @@ describe("org grants", () => {
 
   it("resolve only within the sharing domain the memberships were recorded in", async () => {
     let id = await createCollection("alice");
+    await recordMemberships("alice", [{ orgId: "org-1", role: "member" }]);
     await collection(id).shareOrg("alice", "org-1", "viewer");
     await recordMemberships("bob", [{ orgId: "org-1", role: "member" }]);
     expect((await resolved(id, "bob")).role).toBe("viewer");
@@ -301,6 +310,7 @@ describe("org grants", () => {
 
   it("verify observers with org grants, following membership loss", async () => {
     let id = await createCollection("alice");
+    await recordMemberships("alice", [{ orgId: "org-1", role: "member" }]);
     await collection(id).shareOrg("alice", "org-1", "editor");
     await recordMemberships("bob", [{ orgId: "org-1", role: "member" }]);
     expect(await verifier("bob").hasCollectionsAccess(domain, [id, "unknown"])).toEqual([true, false]);
@@ -310,8 +320,37 @@ describe("org grants", () => {
     expect(await verifier("bob").hasCollectionsAccess(domain, [id])).toEqual([false]);
   });
 
+  it("require the sharer to belong to an org before granting or raising its access", async () => {
+    let id = await createCollection("alice");
+    // An editor with no recorded membership in the target org: the org's name is not theirs to
+    // spend, however they learned it — not directly, not through the management API, and not by
+    // raising a grant someone else made.
+    await collection(id).share("alice", [{ accountId: "mallory", displayName: "Mallory" }], "editor");
+    await recordMemberships("mallory", [{ orgId: "org-2", role: "admin" }]);
+    await expect(settled(collection(id).shareOrg("mallory", "org-1", "viewer")))
+      .rejects.toThrow("belong to an organization");
+    await expect(settled(api("mallory").shareContextCollectionWithOrg(id, "org-1", "viewer")))
+      .rejects.toThrow("belong to an organization");
+
+    // No grant was written: org-1 members still have no access.
+    await recordMemberships("bob", [{ orgId: "org-1", role: "member" }]);
+    expect((await resolved(id, "bob")).role).toBeNull();
+
+    // A recorded member may grant the org; once they leave, raising the grant is refused but
+    // dropping it stays open — a stale grant must never strand.
+    await recordMemberships("mallory", [{ orgId: "org-1", role: "member" }]);
+    await collection(id).shareOrg("mallory", "org-1", "viewer");
+    expect((await resolved(id, "bob")).role).toBe("viewer");
+    await recordMemberships("mallory", []);
+    await expect(settled(collection(id).setMemberRole("mallory", "org-1", "editor")))
+      .rejects.toThrow("belong to an organization");
+    await collection(id).removeMember("mallory", "org-1");
+    expect((await resolved(id, "bob")).role).toBeNull();
+  });
+
   it("do not leak between orgs an account belongs to", async () => {
     let id = await createCollection("alice");
+    await recordMemberships("alice", [{ orgId: "org-1", role: "member" }]);
     await collection(id).shareOrg("alice", "org-1", "editor");
     // Bob belongs to org-2 only: a grant to one org is not a grant to any org.
     await recordMemberships("bob", [{ orgId: "org-2", role: "admin" }]);
@@ -321,6 +360,7 @@ describe("org grants", () => {
   it("honor the strongest of the account's own grant and its orgs' grants", async () => {
     let id = await createCollection("alice");
     await collection(id).share("alice", [{ accountId: "bob", displayName: "Bob" }], "viewer");
+    await recordMemberships("alice", [{ orgId: "org-1", role: "member" }]);
     await collection(id).shareOrg("alice", "org-1", "editor");
     await recordMemberships("bob", [{ orgId: "org-1", role: "member" }]);
     expect((await resolved(id, "bob")).role).toBe("editor");
@@ -338,6 +378,7 @@ describe("org grants", () => {
 
   it("delete the collection when the last grant of either kind goes", async () => {
     let id = await createCollection("alice");
+    await recordMemberships("alice", [{ orgId: "org-1", role: "member" }]);
     await collection(id).shareOrg("alice", "org-1", "owner");
     await recordMemberships("dana", [{ orgId: "org-1", role: "admin" }]);
     // Everyone may view while the owner is still there to say so.

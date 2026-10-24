@@ -510,11 +510,19 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
    * Give an org a role on this private collection. Nothing is written per member: each member's
    * access follows their live org membership (see `getAccess`), and the domain registry indexes
    * the collection under the org so member listings find it, then re-check it live.
+   *
+   * Giving or raising an org's grant requires belonging to that org: the actor's recorded
+   * membership is the only org authority this gatekeeper has (see getResolvedAccess), the same
+   * authority creating an org-owned collection checks, so an editor cannot spend an org's name —
+   * an id learned anywhere — on access for people they could not otherwise reach. Dropping or
+   * lowering a grant stays open to any sharer (see setMemberRole), so a stale grant never
+   * strands.
    */
   async shareOrg(actorId: string, orgId: string, role: ContextCollectionRole): Promise<void> {
     await this.#serializeAccessChange(async () => {
       let actor = await this.getResolvedAccess(actorId);
       this.#authorizeGrantChange(actorId, actor, { type: "org", orgId }, role);
+      await this.#assertActorInOrg(actorId, orgId);
       let previous = this.storage.orgGrants.get(orgId);
       this.storage.orgGrants.put({ orgId, role, grantedAt: previous?.grantedAt ?? new Date() });
       await this.#registry().addOrgCollection(this.#domain(), orgId, this.getMetadata().id);
@@ -532,12 +540,24 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
       if (target.type === "account") {
         this.#putGrant(memberId, role);
       } else {
+        // Raising an org's grant, like granting it, requires belonging to the org; lowering or
+        // dropping it (role === null) stays open to any sharer, so a stale grant never strands.
+        if (role !== null) await this.#assertActorInOrg(actorId, target.orgId);
         let previous = this.storage.orgGrants.get(memberId);
         this.storage.orgGrants.put({ orgId: memberId, role, grantedAt: previous?.grantedAt ?? new Date() });
       }
       // On every change, so repeating a demotion retries a failed revocation.
       this.#assertGitTokensRevoked(await this.#revokeUnauthorizedGitTokens(), memberId);
     });
+  }
+
+  // The actor's recorded org memberships must name `orgId` for them to give or raise that org's
+  // grant (see shareOrg). Read exactly as getResolvedAccess reads it.
+  async #assertActorInOrg(actorId: string, orgId: string): Promise<void> {
+    let memberships = await this.#library(actorId).listOrgMemberships(this.#domain(), actorId);
+    if (!memberships.some(membership => membership.orgId === orgId)) {
+      throw new Error("You must belong to an organization to give it access to this collection.");
+    }
   }
 
   #putGrant(accountId: string, role: ContextCollectionRole, displayName?: string): void {
