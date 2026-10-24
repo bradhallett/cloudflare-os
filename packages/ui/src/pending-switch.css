@@ -1,0 +1,29 @@
+/*
+ * Pending-state styling for PendingSwitch, after HextaUI's Switch
+ * (https://hextaui.com/docs/switch). Kumo's Switch spreads unknown attributes
+ * onto its button and renders its thumb as the button's only child element,
+ * which is what these selectors hang off.
+ */
+
+@keyframes pending-switch-spin {
+  to {
+    rotate: 1turn;
+  }
+}
+
+[data-kumo-component="Switch"][data-pending] {
+  cursor: progress;
+}
+
+[data-kumo-component="Switch"][data-spinner] > div::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 50%;
+  height: 50%;
+  border-radius: 9999px;
+  border: 1.5px solid currentcolor;
+  border-top-color: transparent;
+  animation: pending-switch-spin 700ms linear infinite;
+}
