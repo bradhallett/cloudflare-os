@@ -514,9 +514,8 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
    * Giving or raising an org's grant requires belonging to that org: the actor's recorded
    * membership is the only org authority this gatekeeper has (see getResolvedAccess), the same
    * authority creating an org-owned collection checks, so an editor cannot spend an org's name —
-   * an id learned anywhere — on access for people they could not otherwise reach. Dropping or
-   * lowering a grant stays open to any sharer (see setMemberRole), so a stale grant never
-   * strands.
+   * an id learned anywhere — on access for people they could not otherwise reach. Dropping a
+   * grant to no role stays open to any sharer (see setMemberRole), so a stale grant never strands.
    */
   async shareOrg(actorId: string, orgId: string, role: ContextCollectionRole): Promise<void> {
     await this.#serializeAccessChange(async () => {
@@ -540,8 +539,8 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
       if (target.type === "account") {
         this.#putGrant(memberId, role);
       } else {
-        // Raising an org's grant, like granting it, requires belonging to the org; lowering or
-        // dropping it (role === null) stays open to any sharer, so a stale grant never strands.
+        // Raising an org's grant, like granting it, requires belonging to the org; dropping it
+        // (role === null) stays open to any sharer, so a stale grant never strands.
         if (role !== null) await this.#assertActorInOrg(actorId, target.orgId);
         let previous = this.storage.orgGrants.get(memberId);
         this.storage.orgGrants.put({ orgId: memberId, role, grantedAt: previous?.grantedAt ?? new Date() });

@@ -32,6 +32,10 @@ scope; the directory DO itself accepts an explicit scope only. A picker ticket r
 that justified the pick, and redemption re-checks them live; a ticket justified by a share
 relationship requires that relationship to still stand. A removed member's pending picks die at
 redemption, and a share justified only by a stale index entry finds no live membership to rest on.
+A pick justified only by a share (picker and picked share no org) still delivers the picked
+person's org ids and roles to the picking user's gatekeeper app — the picker's own contract, the
+org ids being opaque strings; such picks are not co-memberships and would not otherwise reveal
+org standing.
 
 ## Share links and `open()` on org-owned workspaces
 
@@ -52,7 +56,7 @@ pushes** — the org memberships delivered in `AppUiContext.orgMemberships` when
 opens and with every redeemed picker selection — because the gatekeeper holds no service binding
 to the org authority. Granting or **raising** an org's grant requires the actor's recorded
 memberships to name that org (an org's name is not spendable by someone who merely learned the
-id); lowering or dropping a grant stays open to any sharer, so a stale grant never strands.
+id); dropping a grant (to no role) stays open to any sharer, so a stale grant never strands.
 Access checks, listings and observer verification all re-read the snapshot live, so a membership
 that ends between pushes loses access at the next check; agent-only reads hold the last snapshot
 until the next UI open — accepted staleness, bounded by that refresh. `getAccountId` resolves a
