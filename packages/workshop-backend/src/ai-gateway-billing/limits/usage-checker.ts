@@ -9,10 +9,10 @@
 
 import { canProceedWithRequest, hasMinimumBalance, LimitWindowKind } from "@gadgets/workshop-shared/limits";
 import { CloudflareUsageInfo } from "@gadgets/workshop-shared/api";
-import { isCloudflareLimitsEnabled, getMinimumCloudflareBalance } from "../config.js";
-import { getDailyLlmCallLimit } from "./config.js";
+import { isCloudflareLimitsEnabled } from "../config.js";
 import { getConnectionStatus, resolveConnection, ByokGatewayRouting } from "../cloudflare/connection-service.js";
 import type { UserDurableObject } from "../../user.js";
+import { resolveUsagePolicy } from "../../entitlements.js";
 
 export interface UsageCheckResult {
   /** Whether the request may proceed. */
@@ -59,18 +59,20 @@ function unlimitedResult(): UsageCheckResult {
  *
  * When limits are disabled, always allows without touching the user object. Otherwise: connected +
  * funded users bill their own gateway and skip the daily counter entirely; everyone else draws on
- * the platform free tier (consuming one call against the user object) until it's exhausted.
+ * the platform free tier (consuming one call against the user object) until it's exhausted. The
+ * limit and minimum balance come from resolveUsagePolicy(): env config when no SaaS entitlements
+ * service is bound (identical to pre-port behavior, no RPC), else the bound port's answer.
  */
 export async function checkUsageAndBalance(
   env: Cloudflare.Env,
   userStub: DurableObjectStub<UserDurableObject>,
+  userId: string,
 ): Promise<UsageCheckResult> {
   if (!isCloudflareLimitsEnabled(env)) {
     return unlimitedResult();
   }
 
-  const limit = getDailyLlmCallLimit(env);
-  const minimumBalance = getMinimumCloudflareBalance(env);
+  const { dailyLlmCallLimit: limit, minimumBalance } = await resolveUsagePolicy(env, userId);
 
   // Resolve the connected-account status up front: it determines billing even within the free tier
   // (connected + funded users always bill their own gateway). `balance` is null when not connected
@@ -134,16 +136,19 @@ export async function checkUsageAndBalance(
 export async function checkOwnerUsage(
   env: Cloudflare.Env, ownerId: string, users: DurableObjectNamespace<UserDurableObject>,
 ): Promise<UsageCheckResult> {
-  return checkUsageAndBalance(env, users.get(users.idFromString(ownerId)));
+  return checkUsageAndBalance(env, users.get(users.idFromString(ownerId)), ownerId);
 }
 
 /**
  * Read the user's current usage + connection status WITHOUT counting a call. Used by the UI to
- * render the usage banner. Returns an "unlimited" snapshot when limits are disabled.
+ * render the usage banner. Returns an "unlimited" snapshot when limits are disabled. The limit
+ * shown is the same one checkUsageAndBalance enforces (env config, or the SaaS entitlements
+ * port's policy when one is bound).
  */
 export async function getUsageInfo(
   env: Cloudflare.Env,
   userStub: DurableObjectStub<UserDurableObject>,
+  userId: string,
 ): Promise<CloudflareUsageInfo> {
   if (!isCloudflareLimitsEnabled(env)) {
     return {
@@ -157,7 +162,7 @@ export async function getUsageInfo(
     };
   }
 
-  const limit = getDailyLlmCallLimit(env);
+  const { dailyLlmCallLimit: limit } = await resolveUsagePolicy(env, userId);
   // These two reads are independent — run them together to halve latency on this UI polling path.
   const [quota, status] = await Promise.all([
     userStub.checkDailyLlmCount(limit),

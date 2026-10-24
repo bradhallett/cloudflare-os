@@ -6,9 +6,21 @@ import { withVitestTask } from "@gadgets/scripts/vitest-task";
  * `withTests` from the configurator config hardcodes a single `vitest run`, and this package needs
  * two projects -- pure logic in Node, and the RpcTarget/DurableObject suite in workerd -- so it
  * composes `withVitestTask` directly. The passes stay separate commands so one can replay from the
- * task cache when only the other's inputs moved.
+ * task cache when only the other's inputs moved. Both passes import generated configurators, so
+ * the test task declares that prerequisite too.
  */
-export default withVitestTask(gatekeeperConfiguratorConfig, [
+const config = withVitestTask(gatekeeperConfiguratorConfig, [
   "vitest run",
   "vitest run -c vitest.worker.config.ts",
 ]);
+
+export default {
+  ...config,
+  run: {
+    ...config.run,
+    tasks: {
+      ...config.run.tasks,
+      test: { ...config.run.tasks.test, dependsOn: ["build:configurator"] },
+    },
+  },
+};
