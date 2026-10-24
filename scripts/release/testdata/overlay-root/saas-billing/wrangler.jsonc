@@ -1,7 +1,8 @@
 // Fixture standing in for a private overlay workspace's plain worker (see manifest-lib.test.ts).
 // Not a real package of this repo: it exercises the extra-scan-root path through
 // readDeployablePackages / buildWorkerEntry, where a non-gatekeeper name classifies as a plain
-// worker instead of failing closed.
+// worker instead of failing closed. Its durable_objects stanza exercises cross-script DO
+// binding templating: script_name resolves to the owning worker, like a service target.
 {
   "name": "saas-billing",
   "main": "src/index.ts",
@@ -14,5 +15,14 @@
       "binding": "WORKSHOP_BACKEND",
       "service": "workshop-backend"
     }
-  ]
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "GATEKEEPER_ORG_SYNC",
+        "class_name": "OrgSyncDurableObject",
+        "script_name": "gatekeeper-workos"
+      }
+    ]
+  }
 }

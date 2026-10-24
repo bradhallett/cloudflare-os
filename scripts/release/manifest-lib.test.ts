@@ -399,6 +399,24 @@ test("overlay packages classify without vendor knowledge in this repo", () => {
   assert.deepEqual(workosEntry.inputs, []);
 });
 
+test("a cross-script Durable Object binding ships with a templated owning worker", () => {
+  const [core, ...overlayRoots] = SCAN_ROOTS;
+  const packages = readDeployablePackages([core, ...overlayRoots, OVERLAY_ROOT]);
+  const billing = packages.find((pkg) => pkg.name === "saas-billing");
+  assert.ok(billing, "fixture saas-billing not found among overlay packages");
+  // Same shape as a service binding's emission: the class passes through untouched, while the
+  // target script_name becomes $WORKER_NAME(<pkg>) so instance renaming cannot break the
+  // binding. deepEqual pins that nothing else leaks into the rendered binding.
+  assert.deepEqual(
+      buildWorkerEntry(syntheticBuild(billing)).bindings.find((b) => b.name === "GATEKEEPER_ORG_SYNC"),
+      {
+        type: "durable_object_namespace",
+        name: "GATEKEEPER_ORG_SYNC",
+        class_name: "OrgSyncDurableObject",
+        script_name: "$WORKER_NAME(gatekeeper-workos)",
+      });
+});
+
 test("a core package name never classifies as a plain worker", () => {
   // Fail-closed: only an overlay root's non-gatekeeper packages may take the plain-worker kind.
   // Otherwise a typo'd core package would silently ship as an unreachable worker.
