@@ -74,6 +74,7 @@ import { reportIssue } from './errorReporting'
 import GadgetExportMenu from './GadgetExportMenu'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER, MENU_POSITIONER_STYLE } from './components/menuStyles'
 import { isImeComposing } from './keyboardEvent'
+import { matchesHotkey } from '@gadgets/ui/hotkey'
 
 const NO_GADGETS: ReadonlySet<WorkpieceId> = new Set()
 
@@ -632,7 +633,7 @@ export default function GadgetEditor() {
   useEffect(() => {
     if (!isGadgetFullscreen) return
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') exitGadgetFullscreen()
+      if (matchesHotkey(e, 'escape')) exitGadgetFullscreen()
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
