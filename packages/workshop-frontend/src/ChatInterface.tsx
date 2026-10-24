@@ -59,6 +59,8 @@ import {
   rhythmTopClass,
 } from "./features/chat/transcript/chatDisplayEntries";
 import { usePendingTurnChanges } from "./features/chat/transcript/usePendingTurnChanges";
+import { useMessageScroller } from "./features/chat/transcript/useMessageScroller";
+import { JumpToLatestPill } from "./features/chat/transcript/JumpToLatestPill";
 import { type AutoApproveTarget } from "./features/chat/transcript/ActionCard";
 import { useChatSubscription } from "./features/chat/useChatSubscription";
 
@@ -335,15 +337,9 @@ function ChatInterface({
     };
   }, [isSidebarResizing]);
 
-  // Ref for auto-scrolling messages
+  // The transcript's scroll container. Reader affordances (follow-the-live-edge with
+  // back-off, missed-row pill, turn anchoring) live in useMessageScroller.
   const messagesContainerRef = useRef<HTMLDivElement>(null);
-  const isScrolledToBottomRef = useRef(true);
-
-  const scrollMessagesToBottom = useCallback(() => {
-    const el = messagesContainerRef.current;
-    if (!el) return;
-    el.scrollTo({ top: el.scrollHeight, behavior: "auto" });
-  }, []);
 
   // Get sorted list of chats from cache
   const chatList = useMemo(
@@ -561,6 +557,15 @@ function ChatInterface({
   // Names the chat's own model in the composer even when the picker no longer offers it.
   const chatAgent = activeAgent ?? inferChatAgentFromMessages(currentMessages);
 
+  // Reader affordances for the transcript. Declared before the follow/anchor effects below so
+  // its entries effect runs first in each commit: it updates follow state (and may anchor a
+  // prompt sent mid-turn) before the follow effect decides whether to scroll.
+  const scroller = useMessageScroller({
+    containerRef: messagesContainerRef,
+    entries: displayEntries,
+    isTurnActive: isAgentActive,
+  });
+
   // Notify parent when agent active state changes
   const onAgentActiveChangeRef = useRef(onAgentActiveChange);
   onAgentActiveChangeRef.current = onAgentActiveChange;
@@ -582,17 +587,14 @@ function ChatInterface({
   // the user on what they were reading instead of jumping them backwards.
   const prependAnchorRef = useRef<number | undefined>(undefined);
 
-  // Track whether user is scrolled to the bottom of the messages area.
+  // Scroll events update the scroller's follow state, and approaching the top pulls in the
+  // previous page, so a compacted thread reads as one continuous scroll rather than making the
+  // user ask for their own history.
   const handleMessagesScroll = useCallback(() => {
+    scroller.handleScroll();
     const el = messagesContainerRef.current;
-    if (!el) return;
-    // Allow a small tolerance for fractional scroll positions and layout rounding.
-    isScrolledToBottomRef.current =
-      el.scrollHeight - el.scrollTop - el.clientHeight <= 8;
-    // Approaching the top pulls in the previous page, so a compacted thread reads as one continuous
-    // scroll rather than making the user ask for their own history.
-    if (el.scrollTop <= EARLIER_PAGE_PREFETCH_PX) loadEarlierRef.current();
-  }, []);
+    if (el && el.scrollTop <= EARLIER_PAGE_PREFETCH_PX) loadEarlierRef.current();
+  }, [scroller.handleScroll]);
 
   useLayoutEffect(() => {
     const el = messagesContainerRef.current;
@@ -606,24 +608,21 @@ function ChatInterface({
     }
   });
 
-  // Auto-scroll to bottom when messages change, but only if already at bottom
+  // Auto-scroll to the live edge when messages change, but only while the reader still follows it.
   useLayoutEffect(() => {
-    if (isScrolledToBottomRef.current) {
-      scrollMessagesToBottom();
-    }
+    scroller.followContent();
   }, [
     currentMessages,
     hasVisibleProvisionalContent,
     isAgentActive,
     queuedSteers?.length,
-    scrollMessagesToBottom,
+    scroller.followContent,
   ]);
 
   // Always scroll to bottom and close transient chat UI when switching chats.
   useLayoutEffect(() => {
-    isScrolledToBottomRef.current = true;
-    scrollMessagesToBottom();
-  }, [selectedChatId, scrollMessagesToBottom]);
+    scroller.resetToBottom();
+  }, [selectedChatId, scroller.resetToBottom]);
   useEffect(() => {
     setDiscardChangesTarget(null);
     setStaleAcceptChatId(null);
@@ -1007,67 +1006,81 @@ function ChatInterface({
                 handleDeleteChat={() => handleDeleteChat()}
               />
               {/* Messages */}
-              <div
-                ref={messagesContainerRef}
-                onScroll={handleMessagesScroll}
-                className="chat-panel min-h-0 flex-1 overscroll-contain overflow-y-auto"
-              >
-                <ChatTranscript
-                  isLoading={isLoading}
-                  isLoadingEarlier={isLoadingEarlier}
-                  pendingConsoleLogCount={pendingConsoleLogCount}
-                  useConstrainedChatWidth={useConstrainedChatWidth}
-                  displayEntries={displayEntries}
-                  entryTopClasses={entryTopClasses}
-                  expandedCompactions={expandedCompactions}
-                  toggleCompactionSummary={toggleCompactionSummary}
-                  currentUser={currentUser}
-                  chatEpoch={chatEpoch}
-                  isAgentActive={isAgentActive}
-                  activeAgent={activeAgent}
-                  lastDurablePendingChange={lastDurablePendingChange}
-                  pendingChangeByTurnItemSeq={pendingChangeByTurnItemSeq}
-                  createdWorkpiecesByTurnItemSeq={createdWorkpiecesByTurnItemSeq}
-                  completedAgentTurnMessageSeqs={completedAgentTurnMessageSeqs}
-                  latestCompletedAgentTurnMessageSeq={latestCompletedAgentTurnMessageSeq}
-                  resolveToolOutput={resolveToolOutput}
-                  expandedToolCalls={expandedToolCalls}
-                  toggleToolCallExpansion={toggleToolCallExpansion}
-                  onOpenGadget={onOpenGadget}
-                  getOverseer={getOverseer}
-                  hideOwnUserName={hideOwnUserName}
-                  downloadChatAttachment={downloadChatAttachment}
-                  showThinkingTraces={showThinkingTraces}
-                  handleCopyMessage={handleCopyMessage}
-                  handleRevertChanges={handleRevertChanges}
-                  messageStates={messageStates}
-                  restricted={restricted}
-                  expandedActions={expandedActions}
-                  processingActions={processingActions}
-                  toggleActionExpansion={toggleActionExpansion}
-                  resolveAction={resolveAction}
-                  setAutoApproveConfirm={setAutoApproveConfirm}
-                  isTagAutoApproved={isTagAutoApproved}
-                  handleToggleHook={handleToggleHook}
-                  processingConnections={processingConnections}
-                  handleAcceptConnection={handleAcceptConnection}
-                  handleDenyConnection={handleDenyConnection}
-                  expandedErrors={expandedErrors}
-                  toggleErrorExpansion={toggleErrorExpansion}
-                  setUsageModalOpen={setUsageModalOpen}
-                  handleRetry={handleRetry}
-                  retryModelId={retryModelId}
-                  lastMessageSequence={lastMessageSequence}
-                  currentRowBuffer={currentRowBuffer}
-                  currentHasUserDraftRows={currentHasUserDraftRows}
-                  handleDiscardDraftChanges={handleDiscardDraftChanges}
-                  handleFinalizeDraftChanges={handleFinalizeDraftChanges}
-                  currentProvisionalState={currentProvisionalState}
-                  provisionalToolCalls={provisionalToolCalls}
-                  isCompacting={isCompacting}
-                  currentMessages={currentMessages}
-                  queuedSteers={queuedSteers}
-                />
+              <div className="relative flex min-h-0 flex-1">
+                <div
+                  ref={messagesContainerRef}
+                  onScroll={handleMessagesScroll}
+                  {...scroller.intentEvents}
+                  tabIndex={0}
+                  role="region"
+                  aria-label="Conversation"
+                  className="chat-panel scroll-fade-y h-full min-h-0 flex-1 overflow-y-auto overscroll-contain outline-none focus-visible:ring-2 focus-visible:ring-kumo-ring focus-visible:ring-inset"
+                >
+                  <ChatTranscript
+                    isLoading={isLoading}
+                    isLoadingEarlier={isLoadingEarlier}
+                    pendingConsoleLogCount={pendingConsoleLogCount}
+                    useConstrainedChatWidth={useConstrainedChatWidth}
+                    displayEntries={displayEntries}
+                    entryTopClasses={entryTopClasses}
+                    expandedCompactions={expandedCompactions}
+                    toggleCompactionSummary={toggleCompactionSummary}
+                    currentUser={currentUser}
+                    chatEpoch={chatEpoch}
+                    isAgentActive={isAgentActive}
+                    activeAgent={activeAgent}
+                    lastDurablePendingChange={lastDurablePendingChange}
+                    pendingChangeByTurnItemSeq={pendingChangeByTurnItemSeq}
+                    createdWorkpiecesByTurnItemSeq={createdWorkpiecesByTurnItemSeq}
+                    completedAgentTurnMessageSeqs={completedAgentTurnMessageSeqs}
+                    latestCompletedAgentTurnMessageSeq={latestCompletedAgentTurnMessageSeq}
+                    resolveToolOutput={resolveToolOutput}
+                    expandedToolCalls={expandedToolCalls}
+                    toggleToolCallExpansion={toggleToolCallExpansion}
+                    onOpenGadget={onOpenGadget}
+                    getOverseer={getOverseer}
+                    hideOwnUserName={hideOwnUserName}
+                    downloadChatAttachment={downloadChatAttachment}
+                    showThinkingTraces={showThinkingTraces}
+                    handleCopyMessage={handleCopyMessage}
+                    handleRevertChanges={handleRevertChanges}
+                    messageStates={messageStates}
+                    restricted={restricted}
+                    expandedActions={expandedActions}
+                    processingActions={processingActions}
+                    toggleActionExpansion={toggleActionExpansion}
+                    resolveAction={resolveAction}
+                    setAutoApproveConfirm={setAutoApproveConfirm}
+                    isTagAutoApproved={isTagAutoApproved}
+                    handleToggleHook={handleToggleHook}
+                    processingConnections={processingConnections}
+                    handleAcceptConnection={handleAcceptConnection}
+                    handleDenyConnection={handleDenyConnection}
+                    expandedErrors={expandedErrors}
+                    toggleErrorExpansion={toggleErrorExpansion}
+                    setUsageModalOpen={setUsageModalOpen}
+                    handleRetry={handleRetry}
+                    retryModelId={retryModelId}
+                    lastMessageSequence={lastMessageSequence}
+                    currentRowBuffer={currentRowBuffer}
+                    currentHasUserDraftRows={currentHasUserDraftRows}
+                    handleDiscardDraftChanges={handleDiscardDraftChanges}
+                    handleFinalizeDraftChanges={handleFinalizeDraftChanges}
+                    currentProvisionalState={currentProvisionalState}
+                    provisionalToolCalls={provisionalToolCalls}
+                    isCompacting={isCompacting}
+                    currentMessages={currentMessages}
+                    queuedSteers={queuedSteers}
+                  />
+                </div>
+                {!scroller.atBottom && (
+                  <div className="pointer-events-none absolute inset-x-0 bottom-3 z-10 flex justify-center">
+                    <JumpToLatestPill
+                      missedCount={scroller.missedCount}
+                      onJump={scroller.jumpToLatest}
+                    />
+                  </div>
+                )}
               </div>
 
               <ChatComposerBar

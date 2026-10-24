@@ -86,7 +86,7 @@ export default function GadgetUseView({
 
         {/* Center: gadget picker (only when there's a real choice) */}
         {gadgets.length > 1 && (
-          <div className="hidden min-w-0 items-center gap-1 overflow-x-auto md:flex">
+          <div className="scroll-fade-x hidden min-w-0 items-center gap-1 overflow-x-auto md:flex">
             {gadgets.map(g => (
               <button
                 key={g.id}
@@ -126,22 +126,24 @@ export default function GadgetUseView({
       </div>
 
       {gadgets.length > 1 && (
-        <div className="flex h-12 shrink-0 items-center gap-1 overflow-x-auto border-b border-kumo-line px-2 md:hidden">
-          {gadgets.map(g => (
-            <button
-              key={g.id}
-              type="button"
-              onClick={() => onSelectGadget(g.id)}
-              aria-current={g.id === selectedGadgetId ? 'true' : undefined}
-              className={`h-9 max-w-[180px] shrink-0 truncate rounded-lg px-3 text-[14px] font-medium ${
-                g.id === selectedGadgetId
-                  ? 'bg-kumo-tint text-kumo-default'
-                  : 'text-kumo-subtle'
-              }`}
-            >
-              {g.title}
-            </button>
-          ))}
+        <div className="flex h-12 shrink-0 items-center border-b border-kumo-line md:hidden">
+          <div className="scroll-fade-x flex h-full items-center gap-1 overflow-x-auto px-2">
+            {gadgets.map(g => (
+              <button
+                key={g.id}
+                type="button"
+                onClick={() => onSelectGadget(g.id)}
+                aria-current={g.id === selectedGadgetId ? 'true' : undefined}
+                className={`h-9 max-w-[180px] shrink-0 truncate rounded-lg px-3 text-[14px] font-medium ${
+                  g.id === selectedGadgetId
+                    ? 'bg-kumo-tint text-kumo-default'
+                    : 'text-kumo-subtle'
+                }`}
+              >
+                {g.title}
+              </button>
+            ))}
+          </div>
         </div>
       )}
 
