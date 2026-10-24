@@ -78,4 +78,7 @@ export const migrations: DurableObjectMigration[] = [
   // login back to the waiting browser.
   { tag: "v2", new_sqlite_classes: ["PendingLogin"] },
   { tag: "v3", new_sqlite_classes: ["UserDirectoryDurableObject"] },
+  // Organizations: one OrgDurableObject per org, holding its members, roles, invitations and
+  // settings (see docs/tenancy.md).
+  { tag: "v4", new_sqlite_classes: ["OrgDurableObject"] },
 ];

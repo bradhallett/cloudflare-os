@@ -1,7 +1,7 @@
 import { RpcStub, RpcTarget, newHttpBatchRpcResponse, newWebSocketRpcSession, RpcSessionOptions } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type { JWTPayload } from "jose";
-import { PublicApi, ROUTER_TAG_PROBE_PATH, VERSION_PATH, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, RedactedAiModelConfig, AiGatewayInfo, AiModelProvider, ModelKind, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, UserDirectoryRecord, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, NotificationSubscriber, NotificationMute, type BotDefinition, type BotInfo, type BotSkillChoice } from '@gadgets/workshop-shared/api';
+import { PublicApi, ROUTER_TAG_PROBE_PATH, VERSION_PATH, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, RedactedAiModelConfig, AiGatewayInfo, AiModelProvider, ModelKind, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, CloudflareUsageInfo, CloudflareAccountOption, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, UserDirectoryRecord, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, NotificationSubscriber, NotificationMute, type BotDefinition, type BotInfo, type BotSkillChoice, type OrgInvitePolicy, type OrgMember, type OrgRole, type OrgSummary, type WhoamiInfo } from '@gadgets/workshop-shared/api';
 import type { UiFeatureFlags } from "@gadgets/workshop-shared/feature-flags";
 import { backendVersion, getServerConfig } from "./deployment-config.js";
 import { isPasswordAuthEnabled, getAuthGatekeeperAllowlist } from "./auth/config.js";
@@ -19,10 +19,12 @@ import { DecisionModelGatekeeper, LanguageModelGatekeeper } from "./ai-models";
 import { getGatewayModels } from "./ai-gateway.js";
 import { AdminSettings, AdminApiImpl } from "./admin-settings.js";
 import { blueprintContentKey, buildBlueprintArchiveStream, sanitizeBlueprintOutput, parseBlueprintArchive, randomBlueprintId } from "./blueprint-archive.js";
-import { BlueprintKvRecord, listFeaturedBlueprintsFromKv, readBlueprintKvRecord } from "./storage-schema/blueprints-kv.js";
+import { BlueprintKvRecord, blueprintKvKey, listFeaturedBlueprintsFromKv, readBlueprintKvRecord } from "./storage-schema/blueprints-kv.js";
 import { GatekeeperConnectCallbackImpl, GatekeeperUserSelectionExchangeImpl, normalizeUsername, UserDurableObject, CLOUDFLARE_VENDOR_ID } from "./user";
+import { resolveBlueprintForUser } from "./blueprint-access.js";
 import { OverseerDurableObject, GatekeeperLoopback, CodeModeTailLoopback, AgentSpawnerGatekeeper, GatekeeperHookLoopback, GadgetTailLoopback, AgentSelfLoopback } from "./overseer";
 import { UserDirectoryDurableObject } from "./user-directory.js";
+import { OrgDurableObject, randomOrgId } from "./org.js";
 import { ExternalMessageGateway } from "./external-message-gateway";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { recordAnalytics } from "./analytics";
@@ -40,6 +42,7 @@ const logger = createWorkshopLogger("workshop.server");
 // Set once we've asked the AdminSettings DO to install the bundled blueprints (see the
 // fetch handler), so later requests skip the call. The DO holds the real answer.
 let bundledBlueprintInstallStarted = false;
+let blueprintOwnershipMigrationStarted = false;
 
 // The router version tag this isolate last reported to the AdminSettings DO, when, and the report
 // itself, settling once the DO has recorded it (see the fetch handler), so a request repeating the
@@ -67,6 +70,9 @@ export { AdminSettings };
 
 // Re-export the deployment-wide user directory Durable Object.
 export { UserDirectoryDurableObject };
+
+// Re-export the organization Durable Object.
+export { OrgDurableObject };
 
 // Re-export entrypoint types from user.ts.
 export { UserDurableObject, GatekeeperConnectCallbackImpl, GatekeeperUserSelectionExchangeImpl };
@@ -149,9 +155,16 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return admins.includes(name);
   }
 
-  whoami(): Promise<AiChatAuthorInfo> {
+  async whoami(): Promise<WhoamiInfo> {
     // Pure-read delegations retry once across a user-DO reset (see retryOnDoReset); writes never do.
-    return retryOnDoReset(() => this.#user.whoami());
+    // The memberships come from the user's mirrored index — a display snapshot for the client;
+    // every org-derived authority (search scoping, picker tickets) re-checks the org live.
+    return retryOnDoReset(async () => {
+      let [profile, memberships] = await Promise.all([
+        this.#user.whoami(), this.#user.listOrgMemberships(),
+      ]);
+      return { ...profile, orgs: memberships };
+    });
   }
   async beginDeviceSessionHandoff(publicKey: string, state: string) {
     if (this.accessSession?.expiresAt !== undefined &&
@@ -170,8 +183,16 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
   async searchUsers(query: string, excludeIds: string[]): Promise<UserDirectoryRecord[]> {
     if (!(await this.#userSearchEnabled())) return [];
+    // The directory holds profiles only; who may be found is this caller's scope (see
+    // UserDirectoryScope), computed live from the orgs that still hold them. An org that cannot
+    // be read contributes nothing, so the scope can only shrink on failure — never widen.
+    let scope = await retryOnDoReset(() => this.#user.getDirectoryScope());
+    let allowed = new Set(scope.partnerIds);
+    for (let org of scope.orgs) {
+      for (let memberId of org.memberIds) allowed.add(memberId);
+    }
     return retryOnDoReset(() => this.ctx.exports.UserDirectoryDurableObject.getByName("")
-        .searchUsers(query, [this.#userId.name!, ...excludeIds]));
+        .searchUsers(query, [this.#ownId, ...excludeIds], [...allowed]));
   }
   changePassword(oldHash: Uint8Array, newHash: Uint8Array): Promise<void> {
     return this.#user.changePassword(oldHash, newHash);
@@ -204,6 +225,58 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
   listBotSkills(): Promise<BotSkillChoice[]> {
     return retryOnDoReset(() => this.#user.listBotSkills());
+  }
+
+  // --- Organizations (see the Org* types in @gadgets/workshop-shared/api) ---
+
+  // The caller's canonical user id (the user DO's name): what org memberships are keyed by.
+  get #ownId(): string {
+    return this.#userId.name!;
+  }
+
+  // A stub for one org's Durable Object, named by the org's random id.
+  #org(orgId: string): DurableObjectStub<OrgDurableObject> {
+    return wrapDoStubForTelemetry(this.ctx.exports.OrgDurableObject.getByName(orgId));
+  }
+
+  // Writes never retry across an org-DO reset (see whoami for the user DO's version of this).
+  createOrg(name: string): Promise<OrgSummary> {
+    return this.#org(randomOrgId()).initializeOrg(name, this.#ownId);
+  }
+  async listMyOrgs(): Promise<OrgSummary[]> {
+    // The user DO's index is discovery only; each org re-checks the membership live, which also
+    // drops stale entries.
+    let entries = await retryOnDoReset(() => this.#user.listOrgMemberships());
+    let me = this.#ownId;
+    let seen = await Promise.all(entries.map(
+        entry => this.#org(entry.orgId).describeForMember(me)));
+    // Inferred null-filter (TS 5.5) keeps the stub-added Disposable in the element type, which
+    // stays assignable to OrgSummary.
+    return seen
+        .filter(org => org !== null)
+        .toSorted((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : a.id < b.id ? -1 : 1);
+  }
+  getOrgMembers(orgId: string): Promise<OrgMember[]> {
+    return retryOnDoReset(() => this.#org(orgId).listMembersFor(this.#ownId));
+  }
+  inviteOrgMember(orgId: string, userId: string, role?: OrgRole): Promise<OrgMember> {
+    return this.#org(orgId).inviteMember(this.#ownId, userId, role ?? "member");
+  }
+  acceptOrgInvitation(orgId: string): Promise<OrgSummary> {
+    return this.#org(orgId).acceptInvitation(this.#ownId);
+  }
+  changeOrgMemberRole(orgId: string, userId: string, role: OrgRole): Promise<OrgMember> {
+    return this.#org(orgId).changeMemberRole(this.#ownId, userId, role);
+  }
+  removeOrgMember(orgId: string, userId: string): Promise<void> {
+    return this.#org(orgId).removeMember(this.#ownId, userId);
+  }
+  leaveOrg(orgId: string): Promise<void> {
+    return this.#org(orgId).memberLeave(this.#ownId);
+  }
+  updateOrgSettings(
+      orgId: string, settings: { invitePolicy: OrgInvitePolicy }): Promise<OrgSummary> {
+    return this.#org(orgId).updateOrgSettings(this.#ownId, settings);
   }
   addModel(profile: AiChatAuthorInfo, config: RedactedAiModelConfig,
            copySecretsFrom?: string): Promise<void> {
@@ -252,7 +325,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   getCloudflareUsage(): Promise<CloudflareUsageInfo> {
-    return getUsageInfo(this.env, this.#user);
+    return getUsageInfo(this.env, this.#user, this.#userId.toString());
   }
 
   listCloudflareAccounts(): Promise<CloudflareAccountOption[]> {
@@ -497,7 +570,10 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     let { metadata, contentLength, content } = await parseBlueprintArchive(archive);
     delete metadata.screenshot;
     let blueprintId = randomBlueprintId();
-    let r2Key = blueprintContentKey(blueprintId, metadata);
+    // An imported blueprint belongs to the importing user, as a workspace-published one belongs
+    // to the workspace's owner.
+    let owner = {type: "user", id: this.#userId.toString()} as const;
+    let r2Key = blueprintContentKey(owner, blueprintId, metadata);
 
     try {
       let fixedLengthStream = new FixedLengthStream(contentLength);
@@ -509,10 +585,10 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
       let kvRecord: BlueprintKvRecord = {
         metadata,
-        ownerId: this.#userId.toString(),
+        owner,
       };
 
-      await this.env.BLUEPRINTS.put(blueprintId, JSON.stringify(kvRecord));
+      await this.env.BLUEPRINTS.put(blueprintKvKey(owner, blueprintId), JSON.stringify(kvRecord));
 
       await this.#user.importBlueprint(blueprintId, metadata);
 
@@ -542,8 +618,12 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     blueprintId: string,
     bindings: Record<string, BlueprintBindingAssignment>
   ): Promise<RpcStub<Overseer>> {
-    // 1. Read blueprint from KV.
-    let kvRecord = await readBlueprintKvRecord(this.env, blueprintId);
+    // 1. Read blueprint from KV. The blueprint may belong to one of the user's orgs, so this is
+    //    the member-gated read: an org's blueprint is openable by its members alone.
+    let orgIds = (await retryOnDoReset(() => this.#user.listOrgMemberships()))
+        .map(entry => entry.orgId);
+    let kvRecord = await resolveBlueprintForUser(
+        this.env, this.ctx.exports.OrgDurableObject, orgIds, this.#ownId, blueprintId);
     if (!kvRecord) throw new Error("Blueprint not found.");
 
     // 2. Create new Overseer DO (same as newGadget()).
@@ -556,7 +636,8 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     let overseerDo = this.overseers.get(this.overseers.idFromString(id));
     await overseerDo.initializeFromBlueprint(blueprintId, kvRecord.metadata,
         deploymentOutputForBlueprint(await readAdminConfig(this.env), blueprintId,
-            sanitizeBlueprintOutput(kvRecord.metadata.output)));
+            sanitizeBlueprintOutput(kvRecord.metadata.output)),
+        kvRecord.owner);
 
     // 4. Create gatekeepers from assignments and bind them into the workspace's (only) gadget.
     let metadata = await overseerResult.getMetadata();
@@ -913,7 +994,8 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     let kvRecord = await readBlueprintKvRecord(this.env, id);
     if (!kvRecord) throw new Error("Blueprint not found.");
 
-    let r2Object = await this.env.BLUEPRINT_CONTENT.get(blueprintContentKey(id, kvRecord.metadata));
+    let r2Object = await this.env.BLUEPRINT_CONTENT.get(
+        blueprintContentKey(kvRecord.owner, id, kvRecord.metadata));
     if (!r2Object) throw new Error("Blueprint content not found in R2.");
 
     let metadata = { ...kvRecord.metadata };
@@ -1020,6 +1102,20 @@ export default {
               bundledBlueprintInstallStarted = false;
               logger.warn("failed to install bundled blueprints", {
                 event: "formats.install.trigger.failed", error: err,
+              });
+            }));
+      }
+
+      // Likewise the one-shot rewrite of pre-subject blueprint records: triggered by API
+      // traffic, fire-and-forget, and idempotent (see ensureBlueprintOwnershipMigrated). Reads
+      // never wait for it, so a failure only leaves the old shape in place for the next try.
+      if (!blueprintOwnershipMigrationStarted) {
+        blueprintOwnershipMigrationStarted = true;
+        ctx.waitUntil(ctx.exports.AdminSettings.getByName("").ensureBlueprintOwnershipMigrated()
+            .catch((err: unknown) => {
+              blueprintOwnershipMigrationStarted = false;
+              logger.warn("failed to migrate blueprint ownership", {
+                event: "blueprints.ownership.migrate.failed", error: err,
               });
             }));
       }

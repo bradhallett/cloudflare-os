@@ -228,10 +228,15 @@ export type ContextCollectionPermissions = {
   canDelete: boolean;
 };
 
-/** One account holding a role on a private collection. */
+/** One account or org holding a role on a private collection. */
 export type ContextCollectionMember = {
-  /** Opaque member identifier, passed back to change or remove this member's role. */
+  /**
+   * Opaque member identifier, passed back to change or remove this member's role. An account
+   * id, or an org id when `subject` is `"org"`.
+   */
   memberId: string;
+  /** Which kind of grant this row is; account unless stated, so older callers read plain ids. */
+  subject?: "account" | "org";
   role: ContextCollectionRole;
   /**
    * The Workshop display name snapshotted when they were added. Absent for the account that
@@ -240,6 +245,8 @@ export type ContextCollectionMember = {
   displayName?: string;
   /** Whether this member is the viewing account. */
   isViewer: boolean;
+  /** When the grant was made, newest first in listings. */
+  grantedAt?: Date;
 };
 
 /** A private collection's sharing state. */
@@ -361,9 +368,13 @@ export interface ContextApi extends RpcTarget {
   /** Gates creating/editing public collections and offering Git-backed collections. */
   getViewerInfo(): Promise<{ isAdmin: boolean; supportsGitCollections: boolean }>;
 
+  /**
+   * Create a collection owned by an org the actor belongs to with the owner or admin role. The
+   * org holds the owner grant; the creator is attributed but holds no account grant.
+   */
   createContextCollection(
     title: string, description: string, visibility: ContextCollectionVisibility, icon?: string,
-    source?: ContextCollectionContent["source"],
+    source?: ContextCollectionContent["source"], ownerOrgId?: string,
   ): Promise<ContextCollectionMetadata>;
   updateContextCollection(collectionId: string, options: {
     title?: string; description?: string; icon?: string; branch?: string;
@@ -409,6 +420,12 @@ export interface ContextApi extends RpcTarget {
    */
   shareContextCollection(
     collectionId: string, ticket: string, role: ContextCollectionRole): Promise<void>;
+  /**
+   * Grant an org a role on a private collection. Every account whose recorded membership in the
+   * org carries at least the grant's effective role may use it, re-resolved live at every check.
+   */
+  shareContextCollectionWithOrg(
+    collectionId: string, orgId: string, role: ContextCollectionRole): Promise<void>;
   setContextCollectionMemberRole(
     collectionId: string, memberId: string, role: ContextCollectionRole): Promise<void>;
   /** Remove a member; removing the viewer's own membership leaves the collection. */

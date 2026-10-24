@@ -7,6 +7,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { join } from "node:path";
 import {
   gatekeeperBindingName, isGatekeeperPackage, readDeployablePackages, releaseShortName,
   type BindingDecl,
@@ -106,7 +107,7 @@ function previewsOf(configs: Map<string, StagingConfig>, name: string): PreviewO
 }
 
 function buildAll() {
-  const packages = readDeployablePackages(PACKAGES_DIR);
+  const packages = readDeployablePackages([PACKAGES_DIR]);
   const configs = buildPreviewConfigs({
     previewName: PREVIEW_NAME,
     packages,
@@ -519,7 +520,7 @@ test("a gatekeeper's OAuth app is optional, but never half of one", () => {
 test("every gatekeeper handed an OAuth app is a package that exists, and reads that pair", () => {
   // The map is keyed by package name, and preview.ts looks each gatekeeper up in it by that name —
   // so a renamed or deleted package makes the upload silently stop happening rather than fail.
-  const names = new Set(readDeployablePackages(PACKAGES_DIR).map((pkg) => pkg.name));
+  const names = new Set(readDeployablePackages([PACKAGES_DIR]).map((pkg) => pkg.name));
   for (const [pkgName, secrets] of GATEKEEPER_SECRETS) {
     assert.ok(names.has(pkgName),
         `resolveGatekeeperSecrets names ${pkgName}, which is not a deployable package`);
@@ -529,4 +530,24 @@ test("every gatekeeper handed an OAuth app is a package that exists, and reads t
     // what the deploy wizard's DEFAULT_CRED_INPUTS asks a real instance for.
     assert.deepEqual(Object.keys(secrets).toSorted(), ["CLIENT_ID", "CLIENT_SECRET"]);
   }
+});
+
+test("a plain overlay worker gets a baseline/preview split with its vars passed through", () => {
+  // An overlay workspace's workers (extra scan roots) are not part of this repo's release; their
+  // fixture stands in for one. It has no connector surface, so its preview is just the standard
+  // split — fresh resources per preview, workers.dev off (only the router is an origin).
+  const overlayRoot = join(import.meta.dirname, "..", "release", "testdata", "overlay-root");
+  const packages = readDeployablePackages([PACKAGES_DIR, overlayRoot]);
+  const billing = packages.find((pkg) => pkg.name === "saas-billing");
+  assert.ok(billing, "fixture overlay package saas-billing not found");
+  const configs = buildPreviewConfigs({
+    previewName: PREVIEW_NAME,
+    packages,
+    accountId: ACCOUNT_ID,
+    workersDevHost: WORKERS_DEV_HOST,
+  });
+  const config = configs.get("saas-billing");
+  assert.ok(config, "saas-billing: no preview config");
+  assert.equal(config.workers_dev, false);
+  assert.equal(config.previews?.vars?.POLAR_WEBHOOK_PATH, "/webhooks/polar");
 });
