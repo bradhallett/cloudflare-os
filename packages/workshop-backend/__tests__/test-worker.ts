@@ -96,6 +96,7 @@ const stashedTickets = new Map<string, string>();
  */
 export class FakeGatekeeperAccount extends WorkerEntrypoint<Cloudflare.Env, {
   name: string; failRevoke?: boolean; failDescribe?: boolean; providesUi?: boolean;
+  singleton?: { tsType: string };
 }> {
   #record(call: string) {
     const calls = accountCalls.get(this.ctx.props.name) ?? [];
@@ -110,7 +111,17 @@ export class FakeGatekeeperAccount extends WorkerEntrypoint<Cloudflare.Env, {
       displayName: this.ctx.props.name,
       uniqueName: this.ctx.props.name,
       ...(this.ctx.props.providesUi ? { providesUi: { title: this.ctx.props.name } } : {}),
+      ...(this.ctx.props.singleton ? { singleton: this.ctx.props.singleton } : {}),
     };
+  }
+
+  /**
+   * The ambient-singleton mint (UserDurableObject.getSingletonGatekeeperClass) calls this when
+   * the description declares a singleton; the value only needs to be non-null for the tests.
+   */
+  async getSingletonGatekeeperClass(): Promise<{ fakeSessionClass: true }> {
+    this.#record("getSingletonGatekeeperClass");
+    return { fakeSessionClass: true };
   }
 
   async revoke(): Promise<void> {

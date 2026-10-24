@@ -217,21 +217,22 @@ describe("checkUsageAndBalance applies the plan's overage policy at the exhauste
 });
 
 describe("resolveEntitlements (SaaS entitlements adapter)", () => {
-  it("returns null when no port is bound, without consulting anything", async () => {
-    expect(await resolveEntitlements(env(), USER_ID)).toBeNull();
+  it("reports unbound when no port is bound, without consulting anything", async () => {
+    expect(await resolveEntitlements(env(), USER_ID)).toEqual({ status: "unbound" });
   });
 
   it("asks the bound port for the user's entitlements", async () => {
     const { queriedEntitlements, port } = fakePort(
         { dailyLlmCallLimit: 3, minimumBalance: 9 }, planEntitlements(true));
     expect(await resolveEntitlements(env({ SAAS_ENTITLEMENTS: port }), USER_ID))
-        .toEqual(planEntitlements(true));
+        .toEqual({ status: "resolved", entitlements: planEntitlements(true) });
     expect(queriedEntitlements).toEqual([USER_ID]);
   });
 
-  it("returns null when the port fails, so no plan gate applies", async () => {
+  it("reports a failed port as unavailable, so the plan gates fail closed", async () => {
     const { port } = fakePort(
         { dailyLlmCallLimit: 3, minimumBalance: 9 }, new Error("entitlements down"));
-    expect(await resolveEntitlements(env({ SAAS_ENTITLEMENTS: port }), USER_ID)).toBeNull();
+    expect(await resolveEntitlements(env({ SAAS_ENTITLEMENTS: port }), USER_ID))
+        .toEqual({ status: "unavailable" });
   });
 });
