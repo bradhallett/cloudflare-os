@@ -41,10 +41,15 @@ a stale index entry — so a lost or late mirror costs staleness, never authorit
 ## Lazy revocation
 
 Removing a membership revokes nothing downstream. Org-derived access (org-owned gadgets, Context
-Library org grants, SCIM-provisioned members) holds its grant and **re-checks** the org —
-`OrgDurableObject.getMember(userId)` is the authority read — when access matters. A removed
-member's access therefore ends at the next check, without cascading deletes across resource
-owners, and a later re-add restores it seamlessly.
+Library org grants, SCIM-provisioned members) holds its grant and **re-checks** the org when
+access matters. A removed member's access therefore ends at the next check, without cascading
+deletes across resource owners, and a later re-add restores it seamlessly. The authority read
+differs by surface: per-user surfaces ask `getMember(userId)` (Context Library grants,
+SCIM-provisioned members), while an org-owned *workspace* snapshots the org's whole active
+membership (`activeMembers()`) into its sharing graph's baselines at every `open()`
+(docs/sharing.md) — and the org additionally fans every membership removal, leave, or demotion
+out through its `ownedGadgets` index, so those workspaces' live sessions are severed at once
+rather than at each user's next open.
 
 ## Org-scoped user directory
 
