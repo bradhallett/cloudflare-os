@@ -863,8 +863,12 @@ export interface GatekeeperUser extends WorkerEntrypoint {
    *
    * The returned class is imbued (via `ctx.props`) with the user's credentials and the resource
    * ID. The returned `resource` indicates which SupportedResource matched the URL.
+   *
+   * `composioPolicy` is the deployment's Composio toolkit policy (see ComposioToolkitPolicy),
+   * passed only when the account's vendor is `composio` so the vendor can bake it into each
+   * facet's props at mint. Every other vendor ignores it.
    */
-  getGatekeeperClassFor(url: string): Promise<{
+  getGatekeeperClassFor(url: string, composioPolicy?: ComposioToolkitPolicy): Promise<{
     class: DurableObjectClass<Gatekeeper<any>>;
     resource: SupportedResource;
   }>;
@@ -980,6 +984,49 @@ export interface GatekeeperUser extends WorkerEntrypoint {
 
   // TODO:
   // - Query whether account has scope to access a particular URL.
+}
+
+/**
+ * The deployment-admin toolkit policy for the Composio vendor: which of Composio's toolkits this
+ * deployment hides, and which are eligible for user-armed auto-apply of write tools. Composio
+ * slugs are exact-match identifiers. The Workshop reads these from its AdminConfig and passes them
+ * at every facet mint (see GatekeeperUser.getGatekeeperClassFor) — the gatekeeper cannot read the
+ * admin config itself, and nothing is baked into account state.
+ */
+export type ComposioToolkitPolicy = {
+  /** Toolkits hidden from every surface (facet mint, catalog, session scope). Excluded wins. */
+  excludedToolkits: string[];
+  /**
+   * Toolkits whose write tools tagged `createHint` or `updateHint` (and not `destructiveHint`)
+   * are eligible for the user-armed auto-apply the connections page offers. Listing one vouches
+   * for all its current and future such tools.
+   */
+  autoApplyToolkits: string[];
+};
+
+/**
+ * One Composio toolkit as the Workshop's admin editor sees it, from
+ * ComposioVendorAdmin.getToolkitInfo(): whether the slug names a real toolkit, and counts of its
+ * tools by the auto-apply eligibility rule above.
+ */
+export type ComposioToolkitInfo = {
+  slug: string;
+  /** Whether the slug matches a toolkit in Composio's live catalog. */
+  exists: boolean;
+  /** Tools tagged `createHint` or `updateHint` and not `destructiveHint`. */
+  eligibleToolCount: number;
+  /** Tools tagged `destructiveHint`. */
+  destructiveToolCount: number;
+};
+
+/**
+ * Vendor extension served by the Composio gatekeeper for the Workshop's admin editor: live
+ * validation of admin-entered toolkit slugs against Composio's catalog, with per-toolkit tool
+ * counts under the auto-apply eligibility rule. Optional because only the Composio vendor
+ * implements it.
+ */
+export interface ComposioVendorAdmin {
+  getToolkitInfo(slugs: string[]): Promise<ComposioToolkitInfo[]>;
 }
 
 /**

@@ -24,7 +24,7 @@
 // Gadget a stub pointing to the Gadget's server-side Durable Object interface.
 
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
-import { AccountDescription, ActionKind, ActionDescription, AgentCatalog, AvatarImage, GatekeeperUiFrame, GatekeeperUserSelection, ObservationDescription, ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorDescription, HookDescription } from "./gatekeeper.js";
+import { AccountDescription, ActionKind, ActionDescription, AgentCatalog, AvatarImage, ComposioToolkitInfo, GatekeeperUiFrame, GatekeeperUserSelection, ObservationDescription, ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorDescription, HookDescription } from "./gatekeeper.js";
 import type { CodeChange } from "./code-change.js";
 import type { GitOid } from "./gatekeeper.js";
 import type { UiFeatureFlags } from "./feature-flags.js";
@@ -1465,6 +1465,17 @@ export type AdminSettingsView = {
   accentColor: string;
   /** Every bound gatekeeper and its resource types, with enabled state (not hidden when disabled). */
   resourceVendors: AdminResourceVendor[];
+  /**
+   * Composio toolkits this deployment hides from every surface. Exact Composio slugs; a dead slug
+   * matches nothing (see AdminApi.getComposioToolkitInfo).
+   */
+  composioExcludedToolkits: string[];
+  /**
+   * Composio toolkits whose create/update-tagged write tools are eligible for user-armed
+   * auto-apply. Listing one vouches for all its current and future such tools; unlisting does not
+   * de-escalate actions already pending.
+   */
+  composioAutoApplyToolkits: string[];
   /** The blueprints promoted as standard output formats, in menu order (including disabled ones). */
   formats: AdminFormat[];
   /** The models the deployment provides through AI Gateway. Absent outside AI Gateway mode. */
@@ -1671,6 +1682,28 @@ export interface AdminApi {
    * it.
    */
   setGatekeeperMode(vendorId: string, mode: AmbientGatekeeperMode): Promise<void>;
+
+  /**
+   * Set the Composio toolkits this deployment hides from every surface. Slugs are exact Composio
+   * toolkit identifiers; entries matching no live toolkit match nothing and are surfaced as
+   * warnings by the admin editor (see getComposioToolkitInfo).
+   */
+  setComposioExcludedToolkits(slugs: string[]): Promise<void>;
+
+  /**
+   * Set the Composio toolkits whose create/update-tagged write tools are eligible for user-armed
+   * auto-apply. An entry vouches for all current and future eligible tools in that toolkit, and
+   * unlisting does not de-escalate actions already pending.
+   */
+  setComposioAutoApplyToolkits(slugs: string[]): Promise<void>;
+
+  /**
+   * Check Composio toolkit slugs against the vendor's live catalog and count each one's tools:
+   * those eligible for auto-apply (tagged createHint or updateHint, not destructiveHint) and those
+   * tagged destructive. Returns null when the Composio gatekeeper isn't bound, so the editor can
+   * say it cannot validate rather than show a wrong answer.
+   */
+  getComposioToolkitInfo(slugs: string[]): Promise<ComposioToolkitInfo[] | null>;
 
   /**
    * Set the top-bar notice (centered text in the top navigation bar). Pass "" to clear. Rejects over

@@ -328,6 +328,13 @@ function strings(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
 }
 
+// Composio toolkit slugs are exact-match identifiers, so they are kept verbatim (no case
+// folding, unlike vendor ids): trimmed, emptied and deduplicated only. A dead slug never matches
+// anything; the admin editor surfaces it as a warning rather than dropping it.
+function toolkitSlugs(value: unknown): string[] {
+  return [...new Set(strings(value).map(slug => slug.trim()).filter(slug => slug !== ""))];
+}
+
 /**
  * Apply defaults to a partial admin config loaded from either authoritative DO
  * storage or its KV mirror.
@@ -378,6 +385,8 @@ export function normalizeAdminConfig(p: Partial<AdminConfig>): AdminConfig {
     accentColor: typeof p.accentColor === "string" ? p.accentColor : "",
     disabledResources,
     disabledGatekeepers: strings(p.disabledGatekeepers).map(v => v.toLowerCase()),
+    composioExcludedToolkits: toolkitSlugs(p.composioExcludedToolkits),
+    composioAutoApplyToolkits: toolkitSlugs(p.composioAutoApplyToolkits),
     ambientGatekeeperModes,
     formats: parseFormats(p.formats),
     deploymentBots: parseDeploymentBots(p.deploymentBots),

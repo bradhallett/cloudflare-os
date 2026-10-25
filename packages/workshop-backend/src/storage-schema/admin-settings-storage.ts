@@ -54,6 +54,20 @@ export type AdminConfig = {
    * vendors that declare autoProvisionsAccount.
    */
   ambientGatekeeperModes: Record<string, AmbientGatekeeperMode>;
+  /**
+   * Composio toolkits this deployment hides from every surface (facet mint, catalog, session
+   * scope). Exact Composio slugs, default [] — the admin decides what to hide; Composio never
+   * silently shadows a native gatekeeper. Passed into the composio vendor at every facet mint (see
+   * user.ts getGatekeeperClassFor).
+   */
+  composioExcludedToolkits: string[];
+  /**
+   * Composio toolkits whose create/update-tagged write tools are eligible for user-armed
+   * auto-apply (see plans/composio-gatekeeper.md §Execution). Default []. An entry vouches for all
+   * current and future eligible tools in that toolkit; unlisting does not de-escalate actions
+   * already pending.
+   */
+  composioAutoApplyToolkits: string[];
 
   /**
    * The blueprints offered as this deployment's standard output formats. What a user gets from
@@ -159,6 +173,8 @@ export const DEFAULT_ADMIN_CONFIG: AdminConfig = {
   disabledResources: {},
   disabledGatekeepers: [],
   ambientGatekeeperModes: {},
+  composioExcludedToolkits: [],
+  composioAutoApplyToolkits: [],
   formats: [],
   deploymentBots: [],
   modelModes: {},

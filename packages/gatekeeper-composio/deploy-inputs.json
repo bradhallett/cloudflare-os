@@ -1,0 +1,7 @@
+[
+  {
+    "name": "COMPOSIO_API_KEY",
+    "kind": "secret",
+    "label": "Composio project API key"
+  }
+]
