@@ -1,0 +1,220 @@
+// The Composio connector's entrypoint: the vendor the Workshop binds as GATEKEEPER_COMPOSIO, the
+// trivial verifier, and the module seam every other module in this package logs and fetches
+// through. The Durable Object classes named in cloudflare.config.ts's migration are re-exported
+// here so the entrypoint exposes everything the runtime registers. README.md explains the design.
+
+import { WorkerEntrypoint } from "cloudflare:workers";
+import { skipRpcValidation, validateRpc } from "capnweb-validate";
+import { createLogger } from "@gadgets/observability/logger";
+import type { McpLog, McpLogFields } from "@gadgets/mcp-shared/log";
+import type {
+  ComposioToolkitInfo,
+  ComposioVendorAdmin,
+  GatekeeperConnectCallback,
+  GatekeeperConnectOptions,
+  GatekeeperUser,
+  GatekeeperUserVerifier,
+  SupportedResource,
+  VendorDescription,
+} from "@gadgets/workshop-shared/gatekeeper";
+import { workerVersionTag } from "@gadgets/workshop-shared/gatekeeper";
+
+import { ComposioApi } from "./composio-api.js";
+import { deploymentApiKey, VENDOR_ID } from "./config.js";
+import { isAutoApplyEligible, ToolkitPolicy } from "./policy.js";
+import TYPES_CODE from "./types.txt";
+export { default as TYPES_CODE } from "./types.txt";
+
+export { ComposioAccount } from "./account.js";
+export {
+  ComposioSingletonGatekeeper,
+  ComposioToolkitGatekeeper,
+} from "./facet.js";
+export { startAppUi } from "./app-ui.js";
+
+// ---------------------------------------------------------------------------
+// Logging and the Composio fetch seam.
+//
+// worker.ts is the package's import leaf, so the logger and the fetch override live here and
+// every sibling imports them. Tests substitute Composio's REST surface through
+// setComposioFetchForTests(): composio-api is the only module that talks HTTP, and it only ever
+// sees the fetch function it is handed.
+
+/**
+ * The field vocabulary this connector logs against: mcp-shared's (so the ActionStore's logger
+ * contract is satisfied) plus the Composio-specific names. Reserved names (secret, token, ...)
+ * are blocked by the logger itself; API keys, session ids, redirect URLs, tool arguments and
+ * response bodies are never logged.
+ */
+export type ComposioLogFields = McpLogFields & {
+  /** The Composio toolkit a line is about, when one is in scope. */
+  toolkitSlug: string;
+  /** "deployment" | "own": which project key an operation runs under. */
+  keyMode: "deployment" | "own";
+  /** A numeric Composio status code (never provider body text). */
+  status: number;
+  /** The continuation chain depth an input_required round reached. */
+  chainDepth: number;
+  /** Generic count (pending actions, admissions, ...) for the event on the line. */
+  count: number;
+};
+
+/** The package's one logger; siblings derive scoped copies with .with(). */
+export const logger = createLogger<ComposioLogFields>({
+  component: "gatekeeper.composio",
+  vendorId: VENDOR_ID,
+});
+
+/**
+ * The logger as mcp-shared's ActionStore sees it. mcp-shared requires its own field vocabulary;
+ * {@link ComposioLogFields} extends it, so the same logger serves both.
+ */
+export const actionStoreLog: McpLog = logger;
+
+let fetchOverride: typeof fetch | undefined;
+let testHooksEnabled = false;
+
+/**
+ * The fetch function every ComposioApi in this package is constructed with. Production leaves
+ * the override unset (the Workers global); tests install a fake REST surface.
+ */
+export function composioFetch(): typeof fetch {
+  return fetchOverride ?? fetch;
+}
+
+/**
+ * Installs (or, with undefined, restores) the fetch function Composio calls go through. Installing
+ * a fake also enables the facets' test-only storage hooks below: a facet created through
+ * `ctx.facets` cannot be re-addressed from a test's namespace binding (its id is not valid for
+ * `idFromString`), so the workerd suite reaches facet SQLite through gated RPC methods instead.
+ */
+export function setComposioFetchForTests(fn: typeof fetch | undefined): void {
+  fetchOverride = fn;
+  testHooksEnabled = fn !== undefined;
+}
+
+/** Whether the test seam is active; production is always false. */
+export function composioTestHooksEnabled(): boolean {
+  return testHooksEnabled;
+}
+
+// ---------------------------------------------------------------------------
+// The one SupportedResource: a grantable pattern matching every per-toolkit instance. Browsing
+// the catalog lives in the gatekeeper app, not here (see plans/composio-gatekeeper.md "Surface").
+
+const TOOLKIT_RESOURCE: SupportedResource = {
+  urlPattern: "composio://toolkit/*",
+  title: "Composio Toolkit",
+  description:
+    "One toolkit from the Composio catalog, such as github or slack. The agent gets that " +
+    "toolkit's tools through the Composio broker; upstream credentials stay at Composio.",
+  grantable: true,
+};
+export { TOOLKIT_RESOURCE };
+@validateRpc()
+export class GatekeeperVendor
+  extends WorkerEntrypoint<Cloudflare.Env>
+  implements ComposioVendorAdmin
+{
+  /** Describes the auto-provisioned Composio vendor. */
+  async describe(): Promise<VendorDescription> {
+    return {
+      displayName: "Composio",
+      url: "https://composio.dev",
+      tagline: "Reach hundreds of apps through one brokered connector",
+      description:
+        "Connect toolkits from Composio's catalog — GitHub, Slack, Linear, Notion, Gmail and " +
+        "hundreds more — so agents can read and act in them. Upstream accounts connect through " +
+        "Composio; this deployment spends its Composio project key unless you bring your own.",
+      autoProvisionsAccount: true,
+      providesAuth: false,
+    };
+  }
+
+  /** The version tag of this Worker's running version, for the deployment's admins. */
+  async versionTag(): Promise<string | undefined> {
+    return workerVersionTag(this.env);
+  }
+
+  /**
+   * Mints a new Composio account. The account is a stateful Durable Object, so the mint names a
+   * stable instance (by a fresh random account id) rather than relying on a props-carrying class
+   * object, which addresses a fresh instance per call — fine for the stateless scheduler/context
+   * accounts, wrong for one that owns SQLite and KV state.
+   */
+  @skipRpcValidation()
+  async createAccount(): Promise<Fetcher<GatekeeperUser>> {
+    return this.ctx.exports.ComposioAccount.getByName(crypto.randomUUID()) as unknown as
+      Fetcher<GatekeeperUser>;
+  }
+
+  connectAccount(
+    _callback: Fetcher<GatekeeperConnectCallback>,
+    _options?: GatekeeperConnectOptions,
+  ): Promise<{ url: string }> {
+    throw new Error("Composio is auto-provisioned and has no OAuth connect flow.");
+  }
+
+  /** Exactly one user-independent grantable resource: the per-toolkit pattern. */
+  async getSupportedResources(_options?: { userId?: string }): Promise<SupportedResource[]> {
+    return [TOOLKIT_RESOURCE];
+  }
+
+  /** The resource getGatekeeperClassFor mints facets for; kept beside the vendor's answer. */
+  static toolkitResource(): SupportedResource {
+    return TOOLKIT_RESOURCE;
+  }
+
+  /** Returns the agent-facing ComposioSession / ComposioToolkitSession declarations. */
+  async getTypeScriptTypes(): Promise<string> {
+    return TYPES_CODE;
+  }
+
+  /**
+   * Live validation of admin-entered toolkit slugs against Composio's catalog, with per-toolkit
+   * counts under the auto-apply eligibility rule. Runs on the deployment key and fails closed
+   * when it is unset — the admin editor would otherwise validate against nothing.
+   */
+  async getToolkitInfo(slugs: string[]): Promise<ComposioToolkitInfo[]> {
+    const api = new ComposioApi(deploymentApiKey(this.env), composioFetch());
+    const known = new Set<string>();
+    await api.forEachToolkit(batch => {
+      for (const toolkit of batch) known.add(toolkit.slug);
+    });
+
+    return await Promise.all(slugs.map(async slug => {
+      if (!known.has(slug)) {
+        return { slug, exists: false, eligibleToolCount: 0, destructiveToolCount: 0 };
+      }
+      // Count under the rule the auto-apply classification applies: the slug itself listed (the
+      // admin is deciding whether to list it), then the affirmative-tag rule from policy.ts.
+      const policy = new ToolkitPolicy([], [slug]);
+      let eligibleToolCount = 0;
+      let destructiveToolCount = 0;
+      await api.forEachTool(slug, batch => {
+        for (const tool of batch) {
+          if (tool.tags.includes("destructiveHint")) destructiveToolCount++;
+          else if (isAutoApplyEligible(policy, tool.toolkitSlug, {
+            tags: tool.tags,
+            readOnly: tool.readOnlyHint === true,
+          })) eligibleToolCount++;
+        }
+      });
+      return { slug, exists: true, eligibleToolCount, destructiveToolCount };
+    }));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Verifier. Composio admits observers only under the owner's explicit sharing consent, verified
+// against the account DO's consent flag; the verifier itself is never interrogated.
+
+@validateRpc()
+export class ComposioVerifier
+  extends WorkerEntrypoint<Cloudflare.Env>
+  implements GatekeeperUserVerifier
+{
+  verify(): void {}
+}
+
+export default GatekeeperVendor;
