@@ -185,15 +185,20 @@ behind a generic card.
   `getAutoApprovableActions()` toggles — nothing new is built; agents and "use" collaborators
   can never arm. The connector emits one toolkit-level kind
   `{tag: "composio:<slug>:write"}` (label: "all current and future write tools in this
-  toolkit") and marks a write `autoApprovable` iff **`adminListed && mode === "action" &&
-  tags.destructiveHint === false`** — a strict positive claim: Composio's silence never enables
-  anything (untagged tools queue normally), and third-party tags may only *restrict*, never
-  enable. Auto-apply never covers meta-tool slugs, outcome-unknown/blocked settlement paths, or
+  toolkit") and marks a write `autoApprovable` iff **`adminListed && mode === "action" && the
+  tool's tags affirmatively include `createHint` or `updateHint` and do not include
+  `destructiveHint`**. Two strict positive claims: Composio's silence never enables anything
+  (untagged tools queue normally), and the *absence* of a destructive tag alone never suffices —
+  the tool must affirmatively carry a create/update-family tag. This downgrade was triggered by
+  verification (below): Composio infers tags for MCP tools from the MCP server's own hints
+  (docs.composio.dev/docs/tool-tags), so third parties can influence tag values; requiring the
+  affirmative pair means an injected or mislabeled `destructiveHint: false` alone cannot arm a
+  write. Auto-apply never covers meta-tool slugs, outcome-unknown/blocked settlement paths, or
   continuations (below); a failed/blocked auto-apply parks the queue behind a human — the
   settlement map is never weakened. The admin editor states the forever-vouch semantics with
-  live tool and destructive-tag counts per toolkit; unlisting does not de-escalate actions
-  already pending (disclosed — identical to trust-tier withdrawal semantics today). Arming is
-  refused while observer sharing is on (see the ambient-singleton decision).
+  live per-toolkit counts of eligible tools under this stricter rule; unlisting does not
+  de-escalate actions already pending (disclosed — identical to trust-tier withdrawal semantics
+  today). Arming is refused while observer sharing is on (see the ambient-singleton decision).
 
 - **The execute envelope has four states and the settlement map is explicit.**
   `POST /tool_router/session/{id}/execute` returns `result_type ∈ completed | failed | blocked`
@@ -471,29 +476,44 @@ Kernel lines stay minimal and land apart from the connector, per the review bar:
 - No token custody: upstream OAuth tokens live at Composio, by design and disclosure.
 - No mcp-shared changes beyond PR 1's auth-scheme option and redirect hygiene.
 
-## Verification (before or during the build — remaining unknowns)
+## Verification — settled 2026-10-25 (research wave, omp-reviewed; reports archived)
 
-- **Rate limits**: per-key request rates on REST and session MCP, and the 429 shape — informs
-  the refusal copy and whether the account DO backs off REST assembly.
-- **Retention specifics**: the docs pages exist (`docs/security/data-retention`,
-  `zero-data-retention`, `token-custody`) — confirm the tool-arg/response retention windows
-  before enabling the connector in restricted-data workspaces; until then the app UI carries
-  the transit disclosure.
-- **`tags.require_approval` behavior** under our session shape as the defense-in-depth fence
-  (confirm it never queues read-classified tools, and that listed auto-apply toolkits can be
-  exempted via the per-toolkit override — otherwise auto-applied executes are server-held and
-  the drain parks behind a human).
-- **`GET /logs/tool_execution/{id}`** resolves `log_id` for session executes (the
-  outcome-unknown reconciliation handle) — verified shape, not just existence.
-- **`execute_meta`** (`POST .../execute_meta`) as the REST-side alternative if session-MCP
-  execution proves awkward; gated by the same Session-tool-execution permission.
+Findings below are docs-verified against live docs.composio.dev plus unauthenticated probes
+(401-gated endpoints verified by error envelope only). Load-bearing citations re-checked by the
+coordinator; reports at `/tmp/composio-research-{a,b}.md` (session artifacts).
 
-- **Composio tag authorship**: whether app authors can influence the
-  `readOnlyHint`/`destructiveHint` values Composio serves; if they can, downgrade auto-apply
-  eligibility to also require an affirmative create/update-family tag.
-- **`input_required` semantics**: that Composio emits it only before any side effect (the
-  continuation's not-run claim and retry safety rest on it), and the upstream `request_state`
-  TTL (local rows expire at 1 h regardless).
+- **Rate limits — settled.** No per-key limits: one organization-wide shared budget over a 60 s
+  window across all authenticated endpoints (REST and session MCP draw from it; Starter/Hobby
+  2,000/min, Growth 10,000/min). 429 body `{"message":"Rate limit exceeded. Limit: …"}` with
+  `Retry-After` and `X-RateLimit-*` headers. The account DO honors `Retry-After` and backs off
+  REST catalog assembly. Source: docs.composio.dev/reference/rate-limits.
+- **Retention — settled.** Tool-execution payloads (arguments + responses) retained **up to one
+  year by default**; project-scoped ZDR stops storing payloads for *new covered calls* (metadata
+  remains) but does not erase prior logs and excludes triggers, and managed apps are
+  Enterprise-only. The app UI transit disclosure now states the one-year default and the ZDR
+  carve-outs; restricted-data workspaces should require ZDR and know triggers stay outside it.
+  Sources: docs/security/data-retention, zero-data-retention, token-custody.
+- **Tag authorship — settled, downgrade applied.** Composio tags tools best-effort from
+  description and behavior, and **for MCP tools infers tags from the MCP server's hints** —
+  third-party influence on tag values is real (docs.composio.dev/docs/tool-tags). The auto-apply
+  eligibility rule above now requires an affirmative `createHint`/`updateHint` pair. Residual:
+  whether toolkit vendors can directly set tags on non-MCP Composio toolkits is undocumented —
+  the stricter rule covers that case too.
+- **`input_required` — mostly settled.** Composio's changelog states that on the input-required
+  path "Nothing was executed and the call is not retried" — supports the continuation's not-run
+  claim on the documented path. Residuals: no public `request_state` TTL (local 1 h row expiry
+  stands regardless); the guarantee is documented for the elicitation path, not sworn universal.
+- **`tags.require_approval` — settled.** Per-toolkit override exists
+  (`tools.<toolkit>.tags` replaces the session-wide approval list), so listed auto-apply
+  toolkits can be exempted from server-held approval; it still never queues read-classified
+  tools. Sources: docs.composio.dev/docs/approvals, tool-tags.
+- **`GET /logs/tool_execution/{id}` — settled (docs).** Detail response = list shape plus
+  `timings`, `context` (`session_id`/`trace_id`/`request_id`), `source`, and `data` (full
+  request payload and response body) — sufficient as the outcome-unknown reconciliation handle;
+  endpoint is auth-gated (401 envelope verified live).
+- **`execute_meta` — settled: not a general fallback.** It executes `COMPOSIO_*` meta tools
+  within a session only, gated by Session tool execution: Write. Session-MCP execution remains
+  the only ordinary route; this item closes.
 
 ## Relationship to prior art
 
