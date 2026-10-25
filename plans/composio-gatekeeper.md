@@ -360,8 +360,14 @@ behind a generic card.
   first, then top-of-catalog) with `catalogChange` on connect/disconnect. "Zero backend
   changes" was false and is withdrawn — the kernel touches are exactly: the mcp-shared
   auth-scheme option, the backend props pass-through for both toolkit lists, the two
-  `AdminConfig` fields, the SINGLETON manifest registration, and the dev-server var
-  registrations. **Observers: owner-consented sharing, default off.** The round-one text
+  `AdminConfig` fields, the SINGLETON manifest registration, the dev-server var
+  registrations, and (owner-approved 2026-10-25, PR-3 review finding F1/M1) an additive
+  **optional policy argument on `getSingletonGatekeeperClass`** so the live toolkit policy
+  reaches the ambient singleton's mint — without it the admin exclusion knob was advisory on
+  the surface every chat gets. The connector additionally persists the freshest policy it has
+  seen and re-reads it at use time (`executeTool`, classification, catalog listings), so
+  exclusions reach already-minted facets too.
+  **Observers: owner-consented sharing, default off.** The round-one text
   understated what refusal means: the ambient capsule sits in every build collaborator's
   verification scope (fail-closed), so refusing observers does not merely withhold an
   observation stream — it makes the owner's shared workspaces **unopenable by collaborators**,
