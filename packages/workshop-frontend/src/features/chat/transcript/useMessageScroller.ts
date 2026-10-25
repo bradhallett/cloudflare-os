@@ -89,15 +89,16 @@ export interface MessageScroller {
   missedCount: number;
   /** Scroll-event handler for the container. */
   handleScroll: () => void;
-  /** Spread on the container: every explicit reader input opts out of following. */
+  /** Spread on the container: explicit reader input — wheel, touch drag, scroll keys, scrollbar drag — opts out of following. */
   intentEvents: {
     onWheel: () => void;
-    onTouchStart: () => void;
+    onTouchMove: () => void;
     onKeyDown: (event: ReactKeyboardEvent<HTMLDivElement>) => void;
     onPointerDown: (event: ReactPointerEvent<HTMLDivElement>) => void;
   };
-  /** Scrolls to the live edge if (and only if) still following. Call whenever content may grow. */
+  /** Scrolls to the live edge if (and only if) still following — gliding, not snapping, while a jump is in flight. Call whenever content may grow. */
   followContent: () => void;
+
   /** Jump-pill action: scrolls to the live edge and re-enables following. */
   jumpToLatest: () => void;
   /** Chat switch: re-enable following, forget what was missed, scroll to the live edge. */
@@ -107,7 +108,7 @@ export interface MessageScroller {
 /**
  * Reader affordances for the transcript's scroll container, ported from HextaUI's Message
  * Scroller (https://hextaui.com/docs/message-scroller): follow-the-live-edge with back-off on
- * any explicit reader input (wheel, touch, keyboard, scrollbar drag), a missed-row count taken
+ * any explicit reader input (wheel, touch drag, keyboard, scrollbar drag), a missed-row count taken
  * while scrolled away, and turn anchoring that settles a prompt sent mid-turn near the top of
  * the viewport so its answer streams in below it.
  *
@@ -135,11 +136,12 @@ export function useMessageScroller({
   // The chat the per-sequence refs above describe. Message sequences restart per chat, so a
   // stale chat's numbers must never be compared against the current chat's rows.
   const chatIdRef = useRef(chatId);
-  // Armed on chat change, until the switched-to chat's first non-empty rows pass: those rows
-  // are history the reader is landing on, not a prompt to anchor (they may arrive a commit
-  // later, when a fresh page load fills the cache after the switch). Mount is not a switch:
-  // a first send into an empty chat still anchors.
-  const adoptingChatRef = useRef(false);
+  // Armed for a chat's opening rows — from mount when rows are already on screen or a turn is
+  // already running (a page-load or warm-cache remount mid-turn: those rows, and any that
+  // arrive over its still-running turn while the cache refills, are history the reader is
+  // landing on, not a prompt to anchor), and on chat change until the switched-to chat's first
+  // non-empty rows pass. A first send into an empty chat mounts with neither, so it anchors.
+  const adoptingChatRef = useRef(entries.length > 0 || isTurnActive);
   const lastScrollHeightRef = useRef(0);
 
   const setAtBottomState = useCallback((next: boolean) => {
@@ -168,8 +170,8 @@ export function useMessageScroller({
     // A prompt that lands while a turn runs anchors near the top of the viewport, with a peek of
     // the prior exchange above it, so the answer streams in below it (HextaUI's scrollAnchor).
     const anchor = latestUserMessageEntry(entries);
-    // The first rows this hook sees for a chat are history the reader is landing on, not a
-    // fresh prompt: adopt the newest one as already anchored instead of scrolling to it.
+    // The armed chat's opening rows are history the reader is landing on, not a fresh
+    // prompt: adopt the newest one as already anchored instead of scrolling to it.
     if (adoptingChatRef.current && entries.length > 0) {
       adoptingChatRef.current = false;
       if (anchor) lastUserSequenceRef.current = anchor.sequence;
@@ -180,7 +182,15 @@ export function useMessageScroller({
       // attribute selector (jsdom has no CSS.escape).
       const selector = `[data-entry-key="${anchor.key.replace(/"/g, '\\"')}"]`;
       const row = el?.querySelector<HTMLElement>(selector) ?? null;
-      if (isTurnActive && el && row) {
+      if (
+        isTurnActive &&
+        el &&
+        row &&
+        // A transcript that fits on screen has no live edge to leave: anchor only when there
+        // is somewhere to scroll away from, so a steer in a short thread keeps following
+        // instead of freezing fully-visible rows into missed ones.
+        el.scrollHeight - el.clientHeight > BOTTOM_TOLERANCE_PX
+      ) {
         el.scrollTo({
           top: turnAnchorScrollTop(
             rowTopInContainer(el, row),
@@ -258,7 +268,14 @@ export function useMessageScroller({
 
   const handleKeyDown = useCallback(
     (event: ReactKeyboardEvent<HTMLDivElement>) => {
-      if (Object.hasOwn(READER_SCROLL_KEYS, event.key)) interrupt();
+      // Only keys pressed with the container itself focused scroll it; the same key on a
+      // focused row control (a button's Space) is content interaction, not reader intent.
+      if (
+        event.target === event.currentTarget &&
+        Object.hasOwn(READER_SCROLL_KEYS, event.key)
+      ) {
+        interrupt();
+      }
     },
     [interrupt],
   );
@@ -274,7 +291,9 @@ export function useMessageScroller({
   const followContent = useCallback(() => {
     const el = containerRef.current;
     if (!el || !atBottomRef.current || readerIntentRef.current) return;
-    el.scrollTo({ top: el.scrollHeight, behavior: "auto" });
+    // While the pill's smooth jump glides, follow in kind: an instant scroll here would snap
+    // the reader to the new edge mid-flight. Retargeting keeps the glide smooth to it.
+    el.scrollTo({ top: el.scrollHeight, behavior: jumpingRef.current ? "smooth" : "auto" });
     lastSeenSequenceRef.current = latestSequenceRef.current;
   }, [containerRef]);
 
@@ -307,7 +326,7 @@ export function useMessageScroller({
     handleScroll,
     intentEvents: {
       onWheel: interrupt,
-      onTouchStart: interrupt,
+      onTouchMove: interrupt,
       onKeyDown: handleKeyDown,
       onPointerDown: handlePointerDown,
     },

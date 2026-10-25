@@ -380,4 +380,158 @@ describe("useMessageScroller", () => {
     rectSpy.mockRestore();
     harness.unmount();
   });
+
+  it("keeps following a steer in a transcript that fits on screen", async () => {
+    // A 400px thread in a 400px viewport: nothing to scroll, so nothing can be missed.
+    const harness = await renderHarness([agentMessage(1)], true, {
+      scrollHeight: 400,
+      clientHeight: 400,
+      scrollTop: 0,
+    });
+    scrollToCalls.length = 0;
+
+    await harness.rerender([agentMessage(1), userMessage(2)], true);
+    // No anchor scroll fires (there is no live edge to leave) and the reader stays on it.
+    expect(scrollToCalls.filter((call) => call.behavior === "smooth")).toHaveLength(0);
+    expect(scroller().atBottom).toBe(true);
+
+    // Streaming rows after the steer are fully visible: none counts as missed.
+    await harness.rerender([agentMessage(1), userMessage(2), agentMessage(3)], true);
+    expect(scroller().missedCount).toBe(0);
+    expect(scroller().atBottom).toBe(true);
+
+    harness.unmount();
+  });
+
+  it("backs off on touch drag, not on a tap on a row", async () => {
+    const harness = await renderHarness([agentMessage(1)], false, {
+      scrollHeight: 1000,
+      clientHeight: 400,
+      scrollTop: 600,
+    });
+    const row = harness.transcript.querySelector<HTMLElement>("[data-entry-key]")!;
+
+    // A tap on a row (touchstart bubbling from the child) is content interaction: following
+    // survives it, so later content still scrolls to the live edge.
+    scrollToCalls.length = 0;
+    await act(async () => {
+      row.dispatchEvent(new Event("touchstart", { bubbles: true }));
+      scroller().followContent();
+    });
+    expect(scrollToCalls.at(-1)?.top).toBe(1000);
+
+    // A finger moving over the container is a scroll gesture: following backs off.
+    await act(async () => {
+      harness.transcript.dispatchEvent(new Event("touchmove", { bubbles: true }));
+      scroller().followContent();
+    });
+    expect(scrollToCalls).toHaveLength(1);
+
+    harness.unmount();
+  });
+
+  it("ignores scroll keys pressed on a focused row control, not the container", async () => {
+    const harness = await renderHarness([agentMessage(1)], false, {
+      scrollHeight: 1000,
+      clientHeight: 400,
+      scrollTop: 600,
+    });
+    const row = harness.transcript.querySelector<HTMLElement>("[data-entry-key]")!;
+
+    // Space on a focused button inside a row activates the button; it is not reader intent.
+    scrollToCalls.length = 0;
+    await act(async () => {
+      row.dispatchEvent(new KeyboardEvent("keydown", { key: " ", bubbles: true }));
+      scroller().followContent();
+    });
+    expect(scrollToCalls.at(-1)?.top).toBe(1000);
+
+    // The same key with the container itself focused scrolls it: the reader takes control.
+    await act(async () => {
+      harness.transcript.dispatchEvent(
+        new KeyboardEvent("keydown", { key: " ", bubbles: true }),
+      );
+      scroller().followContent();
+    });
+    expect(scrollToCalls).toHaveLength(1);
+
+    harness.unmount();
+  });
+
+  it("adopts opening rows when mounting into a chat whose turn is already running", async () => {
+    const harness = await renderHarness([userMessage(5), agentMessage(6)], true, {
+      scrollHeight: 1000,
+      clientHeight: 400,
+      scrollTop: 600,
+    });
+
+    // The loaded history is not a fresh prompt: no mid-thread anchor at mount...
+    expect(scrollToCalls.filter((call) => call.behavior === "smooth")).toHaveLength(0);
+    expect(scroller().atBottom).toBe(true);
+
+    // ...and its prompt is not waiting to be counted as missed.
+    await harness.rerender([userMessage(5), agentMessage(6), agentMessage(7)], true);
+    expect(scroller().missedCount).toBe(0);
+
+    harness.unmount();
+  });
+
+  it("adopts history that arrives after mounting mid-turn, before any anchor fires", async () => {
+    // A page-load remount mid-turn: the turn's metadata is in place while the message cache
+    // is still refilling, so the first rows arrive over a running turn.
+    const harness = await renderHarness([], true, {
+      scrollHeight: 1000,
+      clientHeight: 400,
+      scrollTop: 600,
+    });
+    scrollToCalls.length = 0;
+    await harness.rerender([userMessage(5), agentMessage(6)], true);
+    expect(scrollToCalls.filter((call) => call.behavior === "smooth")).toHaveLength(0);
+    expect(scroller().missedCount).toBe(0);
+
+    harness.unmount();
+  });
+
+  it("still anchors a first send into an empty chat once its turn starts", async () => {
+    const harness = await renderHarness([], false, {
+      scrollHeight: 1000,
+      clientHeight: 400,
+      scrollTop: 600,
+    });
+    const rectSpy = vi
+      .spyOn(Element.prototype, "getBoundingClientRect")
+      .mockReturnValue({ top: 0 } as DOMRect);
+
+    scrollToCalls.length = 0;
+    await harness.rerender([userMessage(1)], true);
+    // Row top (600) minus the peek: the first send anchors near the top, not the bottom.
+    expect(scrollToCalls.at(-1)?.top).toBe(504);
+
+    rectSpy.mockRestore();
+    harness.unmount();
+  });
+
+  it("follows a streaming commit by retargeting an in-flight jump, not snapping it", async () => {
+    const harness = await renderHarness([agentMessage(1)], false, {
+      scrollHeight: 1000,
+      clientHeight: 400,
+      scrollTop: 200,
+    });
+    await fireScroll(harness.transcript);
+    expect(scroller().atBottom).toBe(false);
+
+    scrollToCalls.length = 0;
+    await act(async () => {
+      scroller().jumpToLatest();
+    });
+    expect(scrollToCalls.at(-1)).toEqual({ top: 1000, behavior: "smooth" });
+
+    // Content lands while the pill's glide is in flight: the follow must keep gliding.
+    await act(async () => {
+      scroller().followContent();
+    });
+    expect(scrollToCalls.at(-1)).toEqual({ top: 1000, behavior: "smooth" });
+
+    harness.unmount();
+  });
 });

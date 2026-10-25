@@ -64,6 +64,7 @@ import {
 import { usePendingTurnChanges } from "./features/chat/transcript/usePendingTurnChanges";
 import { useMessageScroller } from "./features/chat/transcript/useMessageScroller";
 import { JumpToLatestPill } from "./features/chat/transcript/JumpToLatestPill";
+import { MissedMessagesStatus } from "./features/chat/transcript/MissedMessagesStatus";
 import { type AutoApproveTarget } from "./features/chat/transcript/ActionCard";
 import { useChatSubscription } from "./features/chat/useChatSubscription";
 
@@ -1120,6 +1121,10 @@ function ChatInterface({
                     queuedSteers={queuedSteers}
                   />
                 </div>
+                <MissedMessagesStatus
+                  missedCount={scroller.missedCount}
+                  isTurnActive={isAgentActive}
+                />
                 {!scroller.atBottom && (
                   <div className="pointer-events-none absolute inset-x-0 bottom-3 z-10 flex justify-center">
                     <JumpToLatestPill
