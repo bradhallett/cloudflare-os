@@ -54,6 +54,10 @@ function useButtonFeedback(options: ButtonFeedbackOptions = {}) {
   const optionsRef = React.useRef(options);
   const runRef = React.useRef(0);
   const inFlightRef = React.useRef(false);
+  // Whether the current run's action has settled. A settled run only has its outcome display
+  // pending (the spinner hold or reset), which a new attempt supersedes: letting the stale
+  // outcome land over the new attempt would desync the control from what is actually running.
+  const settledRef = React.useRef(true);
   const timersRef = React.useRef<ReturnType<typeof setTimeout>[]>([]);
   const holdRef = React.useRef({ hovered: false, focused: false });
   const resetPendingRef = React.useRef(false);
@@ -109,17 +113,19 @@ function useButtonFeedback(options: ButtonFeedbackOptions = {}) {
 
   /**
    * Starts tracking an action given as a promise or a function returning one.
-   * Ignored while another action is in flight.
+   * Ignored while another action is still pending; once it has settled, the new action
+   * supersedes its outcome display, which never lands.
    */
   const track = React.useCallback(
     (action: PromiseLike<unknown> | (() => PromiseLike<unknown>)) => {
-      if (inFlightRef.current) {
+      if (inFlightRef.current && !settledRef.current) {
         return;
       }
       const run = ++runRef.current;
       let spinnerShownAt: number | null = null;
 
       inFlightRef.current = true;
+      settledRef.current = false;
       resetPendingRef.current = false;
       clearTimers();
 
@@ -132,6 +138,7 @@ function useButtonFeedback(options: ButtonFeedbackOptions = {}) {
         if (run !== runRef.current) {
           return;
         }
+        settledRef.current = true;
         clearTimers();
         const remaining =
           spinnerShownAt === null
@@ -176,6 +183,7 @@ function useButtonFeedback(options: ButtonFeedbackOptions = {}) {
     runRef.current += 1;
     clearTimers();
     inFlightRef.current = false;
+    settledRef.current = true;
     resetPendingRef.current = false;
     setError(undefined);
     update("idle");
