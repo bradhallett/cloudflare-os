@@ -61,7 +61,8 @@ describe("JumpToLatestPill", () => {
     ] as const) {
       const pill = renderPill({ missedCount, onJump: () => {} });
       await pill.advance(250);
-      expect(pill.button()!.textContent).toContain(label);
+      // The label span is asserted exactly, so reverting to the old "N new messages" wording fails.
+      expect(pill.button()!.querySelector("span")!.textContent).toBe(label);
       pill.unmount();
     }
   });

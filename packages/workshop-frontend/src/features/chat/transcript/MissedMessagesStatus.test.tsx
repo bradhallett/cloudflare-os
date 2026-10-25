@@ -44,15 +44,15 @@ describe("MissedMessagesStatus", () => {
   it("announces the first missed rows, not every streaming commit, and settles at turn end", async () => {
     const status = renderStatus();
     await status.set({ missedCount: 2, isTurnActive: true });
-    expect(status.status()!.textContent).toContain("2 new");
+    expect(status.status()!.textContent).toBe("2 new");
 
     // Rows keep landing while the turn runs: the growing count is not re-announced.
     await status.set({ missedCount: 5, isTurnActive: true });
-    expect(status.status()!.textContent).toContain("2 new");
+    expect(status.status()!.textContent).toBe("2 new");
 
     // The turn settles: one final announcement carries the settled count.
     await status.set({ missedCount: 5, isTurnActive: false });
-    expect(status.status()!.textContent).toContain("5 new");
+    expect(status.status()!.textContent).toBe("5 new");
 
     status.unmount();
   });
@@ -60,14 +60,28 @@ describe("MissedMessagesStatus", () => {
   it("clears and re-arms when the reader returns to the live edge", async () => {
     const status = renderStatus();
     await status.set({ missedCount: 3, isTurnActive: false });
-    expect(status.status()!.textContent).toContain("3 new");
+    expect(status.status()!.textContent).toBe("3 new");
 
     await status.set({ missedCount: 0, isTurnActive: false });
     expect(status.status()!.textContent).toBe("");
 
     // A later batch of missed rows announces afresh.
     await status.set({ missedCount: 1, isTurnActive: true });
-    expect(status.status()!.textContent).toContain("1 new");
+    expect(status.status()!.textContent).toBe("1 new");
+
+    status.unmount();
+  });
+
+  it("announces only the first count while no turn is running, not every increment", async () => {
+    const status = renderStatus();
+    await status.set({ missedCount: 2, isTurnActive: false });
+    expect(status.status()!.textContent).toBe("2 new");
+
+    // Increments landing with no turn active are not re-announced.
+    await status.set({ missedCount: 4, isTurnActive: false });
+    expect(status.status()!.textContent).toBe("2 new");
+    await status.set({ missedCount: 7, isTurnActive: false });
+    expect(status.status()!.textContent).toBe("2 new");
 
     status.unmount();
   });
