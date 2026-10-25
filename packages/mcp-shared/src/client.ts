@@ -368,8 +368,27 @@ export function clampToolSummary(tool: McpWireTool | McpTool): McpTool {
   };
 }
 
-/** Supplies a bearer token for an MCP method, or null for a public server. */
-export type AuthorizationProvider = (method: string) => Promise<string | null>;
+/**
+ * How a connection's credential is presented to the server. The default -- and the only behavior
+ * when no scheme is configured -- is `Authorization: Bearer <token>`. A server whose credential
+ * travels in its own header (e.g. Composio's `x-api-key`) names that header and may send the
+ * value verbatim (`scheme: null`) instead of under a scheme prefix.
+ */
+export type McpAuthScheme = {
+  /** Header field name the credential is sent in. */
+  header: string;
+  /** Scheme prefix inside the header value, or null to send the credential verbatim. */
+  scheme: string | null;
+};
+
+// RFC 9110 field-name. Checked before use so a configured header name can never smuggle a value
+// into another header's syntax (a colon, space, or newline in the name).
+const AUTH_HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+
+const DEFAULT_AUTH_SCHEME: McpAuthScheme = { header: "Authorization", scheme: "Bearer" };
+
+ /** Supplies a bearer token for an MCP method, or null for a public server. */
+ export type AuthorizationProvider = (method: string) => Promise<string | null>;
 
 /**
  * A stateless-per-instance MCP client. Construct one per operation; the only state worth keeping
@@ -378,6 +397,7 @@ export type AuthorizationProvider = (method: string) => Promise<string | null>;
 export class McpClient {
   #endpoint: string;
   #getAuthorization: AuthorizationProvider;
+  #authScheme: McpAuthScheme;
   #fetchOptions: FetchOptions;
   #requestPrefix = crypto.randomUUID();
   #requestId = 0;
@@ -390,13 +410,26 @@ export class McpClient {
     getAuthorization: AuthorizationProvider,
     sessionId?: string | null,
     fetchOptions: FetchOptions = {},
+    authScheme?: McpAuthScheme,
   ) {
     this.#endpoint = endpoint;
     this.#getAuthorization = getAuthorization;
+    this.#authScheme = authScheme ?? DEFAULT_AUTH_SCHEME;
+    // Validated at construction, not when a credential appears: a malformed name is bad
+    // configuration regardless of whether this particular request carries a credential, and the
+    // message carries neither the name nor any value.
+    if (!AUTH_HEADER_NAME.test(this.#authScheme.header)) {
+      throw new Error("The configured MCP auth header name is invalid.");
+    }
     this.sessionId = sessionId ?? null;
-    this.#fetchOptions = fetchOptions.timeoutMs !== undefined && fetchOptions.deadline === undefined
+    const base: FetchOptions = fetchOptions.timeoutMs !== undefined && fetchOptions.deadline === undefined
       ? { ...fetchOptions, deadline: Date.now() + fetchOptions.timeoutMs }
       : fetchOptions;
+    // The configured header is a credential, so redirect hygiene must treat it like
+    // `Authorization` and never forward it to another origin.
+    this.#fetchOptions = this.#authScheme.header.toLowerCase() === "authorization"
+      ? base
+      : { ...base, credentialHeaders: [...(base.credentialHeaders ?? []), this.#authScheme.header] };
   }
 
   // The credential most recently sent, kept only so it can be recognised if it comes back. See
@@ -411,7 +444,10 @@ export class McpClient {
     });
     const authorization = await this.#getAuthorization(method);
     this.#lastCredential = authorization;
-    if (authorization) headers.set("Authorization", `Bearer ${authorization}`);
+    if (authorization) {
+      const { header, scheme } = this.#authScheme;
+      headers.set(header, scheme ? `${scheme} ${authorization}` : authorization);
+    }
     if (this.sessionId) headers.set("Mcp-Session-Id", this.sessionId);
     return headers;
   }
