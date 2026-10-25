@@ -14,7 +14,8 @@ export interface MissedMessagesStatusProps {
  * Visually-hidden polite status for missed rows. The transcript's `role="log"` is held
  * `aria-busy` while a turn runs, so rows landing below the fold are otherwise silent for
  * assistive tech; this announces them when they are first missed, and once more with the
- * settled count when the turn ends — not on every streaming commit.
+ * settled count when the turn ends — not on every streaming commit, and not on every
+ * increment that lands while no turn is running.
  */
 export const MissedMessagesStatus = ({
   missedCount,
@@ -24,18 +25,30 @@ export const MissedMessagesStatus = ({
   // The count already announced; null while nothing is missed, so each batch of missed rows
   // still gets its first announcement.
   const announcedRef = useRef<number | null>(null);
+  // Rows arrived during a turn whose end has not yet been announced.
+  const pendingSettleRef = useRef(false);
 
   useEffect(() => {
     if (missedCount === 0) {
       // Back on the live edge: nothing is pending, and the next batch announces afresh.
       announcedRef.current = null;
+      pendingSettleRef.current = false;
       setAnnouncement("");
       return;
     }
-    if (
-      announcedRef.current === null ||
-      (!isTurnActive && missedCount !== announcedRef.current)
-    ) {
+    if (announcedRef.current === null) {
+      announcedRef.current = missedCount;
+      setAnnouncement(missedCountLabel(missedCount));
+      return;
+    }
+    if (isTurnActive) {
+      if (missedCount !== announcedRef.current) pendingSettleRef.current = true;
+      return;
+    }
+    // Outside a turn, only a count grown during one re-announces — at its settled boundary —
+    // so increments landing with no turn running stay silent after the first announcement.
+    if (pendingSettleRef.current) {
+      pendingSettleRef.current = false;
       announcedRef.current = missedCount;
       setAnnouncement(missedCountLabel(missedCount));
     }
