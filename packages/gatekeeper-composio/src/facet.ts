@@ -35,8 +35,8 @@ import type {
   ComposioExecuteOutcome,
   ComposioExecuteRequest,
 } from "./account.js";
-import type { InputRequest, ToolInfo } from "./composio-api.js";
-import { toolkitWriteActionKind } from "./policy.js";
+import { MAX_REQUEST_STATE_BYTES, type InputRequest, type ToolInfo } from "./composio-api.js";
+import { resolveToolkitPolicy, toolkitWriteActionKind } from "./policy.js";
 import {
   ComposioActionDeclinedError,
   ComposioNotDispatchedError,
@@ -72,6 +72,7 @@ type ContinuationRow = {
   action_id: number;
   origin_action_id: number;
   tool_slug: string;
+  toolkit_slug: string;
   args_json: string;
   account: string | null;
   request_state: string;
@@ -108,6 +109,7 @@ abstract class ComposioFacetCore<Props> extends DurableObject<Cloudflare.Env, Pr
       action_id INTEGER NOT NULL UNIQUE,
       origin_action_id INTEGER NOT NULL,
       tool_slug TEXT NOT NULL,
+      toolkit_slug TEXT NOT NULL DEFAULT '',
       args_json TEXT NOT NULL,
       account TEXT,
       request_state TEXT NOT NULL,
@@ -119,6 +121,14 @@ abstract class ComposioFacetCore<Props> extends DurableObject<Cloudflare.Env, Pr
       state TEXT NOT NULL CHECK (state IN ('open', 'staged')),
       created_at INTEGER NOT NULL
     ) STRICT`);
+    // Rows recorded before the toolkit column existed (dev storages) backfill to unknown, which
+    // dispatch resolves through the account's cached-catalog backstop.
+    try {
+      ctx.storage.sql.exec(
+        "ALTER TABLE composio_continuations ADD COLUMN toolkit_slug TEXT NOT NULL DEFAULT ''");
+    } catch {
+      // Column already present.
+    }
     // A fresh activation means any persisted 'staged' row belonged to an interrupted answering
     // round: roll it back to open so the agent can answer again rather than wedging it.
     ctx.storage.sql.exec(
@@ -173,6 +183,9 @@ abstract class ComposioFacetCore<Props> extends DurableObject<Cloudflare.Env, Pr
       tool: String(stored.args.tool),
       arguments: stored.args.arguments,
       ...(typeof stored.args.account === "string" ? { account: stored.args.account } : {}),
+      ...(typeof stored.args.toolkitSlug === "string"
+        ? { toolkitSlug: stored.args.toolkitSlug }
+        : {}),
       generation: typeof stored.args.generation === "number"
         ? stored.args.generation
         : this.mintGeneration,
@@ -185,6 +198,9 @@ abstract class ComposioFacetCore<Props> extends DurableObject<Cloudflare.Env, Pr
       tool: row.tool_slug,
       arguments: JSON.parse(row.args_json),
       ...(row.account === null ? {} : { account: row.account }),
+      // Empty for rows recorded before the column existed: dispatch falls back to the
+      // account's cached-catalog backstop.
+      ...(row.toolkit_slug === "" ? {} : { toolkitSlug: row.toolkit_slug }),
       requestState: row.request_state,
       ...(row.input_responses_json === null
         ? {}
@@ -265,17 +281,21 @@ abstract class ComposioFacetCore<Props> extends DurableObject<Cloudflare.Env, Pr
     }
     const argsJson = JSON.stringify(request.arguments);
     if (encoder.encode(argsJson).byteLength > MAX_CONTINUATION_ARGS_BYTES) return undefined;
+    // An oversized opaque continuation token would wedge the answering flow past its storage
+    // bounds; declined here the call stays not-dispatched (retryable) instead.
+    if (encoder.encode(err.requestState ?? "").byteLength > MAX_REQUEST_STATE_BYTES) return undefined;
     const continuationId = crypto.randomUUID();
     this.ctx.storage.sql.exec(
       `INSERT INTO composio_continuations
-         (continuation_id, action_id, origin_action_id, tool_slug, args_json, account,
-          request_state, input_requests_json, input_responses_json, generation, chain_depth,
-          expires_at, state, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 'open', ?)`,
+         (continuation_id, action_id, origin_action_id, tool_slug, toolkit_slug, args_json,
+          account, request_state, input_requests_json, input_responses_json, generation,
+          chain_depth, expires_at, state, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 'open', ?)`,
       continuationId,
       action,
       prior?.origin_action_id ?? action,
       request.tool,
+      request.toolkitSlug ?? "",
       argsJson,
       request.account ?? null,
       err.requestState ?? "",
@@ -396,60 +416,93 @@ abstract class ComposioFacetCore<Props> extends DurableObject<Cloudflare.Env, Pr
   }
 
   /**
-   * Stages the next answering round for one continuation: single-use (the row flips to staged),
-   * re-validated for every question answered, and fenced against a key switch since the round
-   * it continues.
+   * Stages the next answering round for one continuation. Single-use is claimed with a
+   * conditional UPDATE checked for affected rows *before any await* — the answering below makes
+   * RPCs to the account, which releases the input gate, so a concurrent answer could otherwise
+   * double-stage a round. A failed attempt re-opens its claim so the agent can retry.
    */
   async continueAction(
     continuationId: string,
     responses: Record<string, unknown>,
   ): Promise<ContinuationRound> {
-    const row = await this.#requireOpenRow(continuationId);
-    const generation = await this.keyGeneration();
-    if (generation !== row.generation) {
-      this.#deleteRows(row.action_id);
-      await this.syncPending();
-      throw new Error(
-        "The Composio key was switched, so this tool call was abandoned. Start it again.");
-    }
-    const inputRequests = JSON.parse(row.input_requests_json) as InputRequest[];
-    for (const question of inputRequests) {
-      if (!Object.hasOwn(responses, question.id)) {
-        throw new Error(`An answer for "${question.id}" is required (see getInputRequest).`);
-      }
-    }
-    const args = JSON.parse(row.args_json) as Record<string, unknown>;
-    const staged = this.stageAction(row.tool_slug, {
-      tool: row.tool_slug,
-      arguments: args,
-      responses,
-      ...(row.account === null ? {} : { account: row.account }),
-      generation: row.generation,
+    const claimed = this.ctx.storage.sql.exec(
+      `UPDATE composio_continuations SET state = 'staged'
+       WHERE continuation_id = ? AND state = 'open' AND expires_at > ?`,
       continuationId,
-    });
-    this.ctx.storage.sql.exec(
-      `UPDATE composio_continuations
-         SET action_id = ?, input_responses_json = ?, state = 'staged'
-       WHERE continuation_id = ?`,
-      staged.id,
-      JSON.stringify(responses),
-      continuationId,
+      Date.now(),
     );
-    await this.syncPending();
-    return {
-      action: staged,
-      payload: {
-        continuationId,
-        toolSlug: row.tool_slug,
+    if (claimed.rowsWritten === 0) {
+      // Unknown, expired, or already answered: #requireOpenRow throws the matching error (it
+      // cannot find the row open — the claim above just proved it is not).
+      await this.#requireOpenRow(continuationId);
+      throw new Error(
+        `The Composio input request with id "${continuationId}" was already answered.`);
+    }
+    const row = this.#continuationById(continuationId);
+    if (row === undefined) {
+      throw new Error(`No Composio input request with id "${continuationId}".`);
+    }
+    let staged: StoredAction | undefined;
+    try {
+      const generation = await this.keyGeneration();
+      if (generation !== row.generation) {
+        this.#deleteRows(row.action_id);
+        await this.syncPending();
+        throw new Error(
+          "The Composio key was switched, so this tool call was abandoned. Start it again.");
+      }
+      const inputRequests = JSON.parse(row.input_requests_json) as InputRequest[];
+      for (const question of inputRequests) {
+        if (!Object.hasOwn(responses, question.id)) {
+          throw new Error(`An answer for "${question.id}" is required (see getInputRequest).`);
+        }
+      }
+      const args = JSON.parse(row.args_json) as Record<string, unknown>;
+      staged = this.stageAction(row.tool_slug, {
+        tool: row.tool_slug,
         arguments: args,
-        ...(row.account === null ? {} : { account: row.account }),
-        requestState: row.request_state,
-        inputRequests,
         responses,
-        chainDepth: row.chain_depth,
+        ...(row.toolkit_slug === "" ? {} : { toolkitSlug: row.toolkit_slug }),
+        ...(row.account === null ? {} : { account: row.account }),
         generation: row.generation,
-      },
-    };
+        continuationId,
+      });
+      this.ctx.storage.sql.exec(
+        `UPDATE composio_continuations
+           SET action_id = ?, input_responses_json = ?
+         WHERE continuation_id = ?`,
+        staged.id,
+        JSON.stringify(responses),
+        continuationId,
+      );
+      await this.syncPending();
+      return {
+        action: staged,
+        payload: {
+          continuationId,
+          toolSlug: row.tool_slug,
+          arguments: args,
+          ...(row.toolkit_slug === "" ? {} : { toolkitSlug: row.toolkit_slug }),
+          ...(row.account === null ? {} : { account: row.account }),
+          requestState: row.request_state,
+          inputRequests,
+          responses,
+          chainDepth: row.chain_depth,
+          generation: row.generation,
+        },
+      };
+    } catch (err) {
+      // Release the claim unless the row was deliberately deleted (the generation fence above);
+      // the revert is state-guarded so it cannot resurrect a deleted row.
+      this.ctx.storage.sql.exec(
+        `UPDATE composio_continuations
+           SET state = 'open', action_id = origin_action_id, input_responses_json = NULL
+         WHERE continuation_id = ? AND state = 'staged'`,
+        continuationId,
+      );
+      if (staged !== undefined) this.discardStagedAction(staged.id);
+      throw err;
+    }
   }
 
   async readContinuation(continuationId: string): Promise<InputRequest[]> {
@@ -674,13 +727,17 @@ export class ComposioToolkitGatekeeper
 
   /**
    * The potential auto-apply set: armed only when the mint froze auto-apply for this toolkit,
-   * the account has not enabled observer sharing (the two are mutually exclusive), and nothing
-   * excluded it. The per-action verdict at submit time is the binding gate.
+   * the account has not enabled observer sharing (the two are mutually exclusive), and the
+   * toolkit is not excluded under the *live* admin policy — a facet minted before an exclusion
+   * must stop offering auto-apply the moment the exclusion lands, not when it is next minted.
+   * The per-action verdict at submit time is the binding gate.
    */
   async getAutoApprovableActions(): Promise<ActionKind[]> {
     await this.register();
     const props = this.ctx.props;
     if (!props.autoApply || props.excluded) return [];
+    const live = resolveToolkitPolicy(await this.account().policyState());
+    if (!live.allows(props.toolkitSlug)) return [];
     if ((await this.account().sharingState()).enabled) return [];
     const { toolkits } = await this.account().agentToolkits();
     const name = toolkits.find(entry => entry.slug === props.toolkitSlug)?.name

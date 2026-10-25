@@ -15,12 +15,17 @@ function fakeApi(toolkits: ToolkitSummary[], tools: ToolInfo[]): {
   const toolCalls: string[] = [];
   const api = {
     forEachToolkit: async (page: (batch: ToolkitSummary[]) => void) => {
+      toolCalls.push("/toolkits");
       page(toolkits.slice(0, 2));
       if (toolkits.length > 2) page(toolkits.slice(2));
     },
-    forEachTool: async (slug: string, page: (batch: ToolInfo[]) => void) => {
-      toolCalls.push(slug);
-      page(tools.filter((t) => t.toolkitSlug === slug));
+    forEachAllTools: async (page: (batch: ToolInfo[]) => void) => {
+      toolCalls.push("/tools");
+      page(tools.slice(0, 3));
+      page(tools.slice(3));
+    },
+    forEachTool: async () => {
+      throw new Error("catalog assembly never walks tools per toolkit");
     },
   } as unknown as ComposioApi;
   return { api, toolCalls };
@@ -65,10 +70,12 @@ describe("assembleCatalog", () => {
     expect(snapshot.toolsBySlug.size).toBe(4);
   });
 
-  it("queries tools once per toolkit, honoring pagination batches", async () => {
+  it("sweeps tools globally once, never per toolkit, honoring pagination batches", async () => {
     const { api, toolCalls } = fakeApi(SUMMARIES, TOOLS);
     await assembleCatalog(api);
-    expect(toolCalls).toEqual(["github", "slack", "composio_core"]);
+    // Two sweeps total however many toolkits exist — a per-toolkit fan-out would blow the
+    // Workers subrequest cap on a cold cache (review finding B1).
+    expect(toolCalls).toEqual(["/toolkits", "/tools"]);
   });
 
   it("handles a toolkit with no tools", async () => {

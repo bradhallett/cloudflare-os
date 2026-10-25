@@ -16,18 +16,18 @@ import type {
   HookDescription,
   HookController,
   ObservationDescription,
+  ComposioToolkitInfo,
 } from "@gadgets/workshop-shared/gatekeeper";
 
 import type { ComposioAccount } from "../../src/account.js";
 import {
   ComposioSingletonGatekeeper,
   ComposioToolkitGatekeeper,
-  type SingletonFacetProps,
   type ToolkitFacetProps,
 } from "../../src/facet.js";
 import type { ComposioSessionImpl, ComposioToolkitSessionImpl } from "../../src/session.js";
 import type { ComposioCallResult, ComposioInputRequest } from "../../src/types.js";
-import { setComposioFetchForTests } from "../../src/worker.js";
+import { GatekeeperVendor, setComposioFetchForTests } from "../../src/worker.js";
 
 // ---------------------------------------------------------------------------
 // The fake Composio REST surface. A spec is plain JSON so it can cross the RPC boundary from
@@ -42,7 +42,9 @@ export type FakeExecuteSpec =
   | {
       resultType: "input_required"; requestState: string; logId?: string | null;
       inputRequests: { id: string; question: string; options?: string[] }[];
-    };
+    }
+  /** A plain HTTP failure: the response returns with this status (e.g. a pre-execution 4xx). */
+  | { status: number; error?: string };
 
 /** The whole REST surface the suites need, as plain JSON. */
 export type FakeComposioSpec = {
@@ -66,7 +68,19 @@ export type FakeExecuteCall = {
   action: string | null;
 };
 
-function renderExecute(spec: FakeExecuteSpec): Record<string, unknown> {
+/** One captured `POST /tool_router/session`, parsed into the concrete fields tests assert on. */
+export type FakeSessionCall = {
+  composioUserId: string;
+  requireApproval: string[] | null;
+  toolsOverride: [slug: string, requireApproval: string[]][] | null;
+};
+
+/** How many times each catalog route was hit, for subrequest-count assertions. */
+export type FakeGetCounts = { toolkits: number; tools: number };
+
+function renderExecute(
+  spec: Exclude<FakeExecuteSpec, { status: number }>,
+): Record<string, unknown> {
   switch (spec.resultType) {
     case "completed":
       return { result_type: "completed", result: spec.result ?? null, log_id: spec.logId ?? null };
@@ -168,6 +182,8 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
   readonly #sessions = new Map<string, AnySession>();
   readonly #queues = new Map<string, TestApprovalQueue>();
   #executeCalls: FakeExecuteCall[] = [];
+  #sessionCalls: FakeSessionCall[] = [];
+  #getCounts: FakeGetCounts = { toolkits: 0, tools: 0 };
 
   // -- Faking the Composio REST surface --------------------------------------
 
@@ -175,11 +191,17 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
   installFake(spec: FakeComposioSpec | null): void {
     if (spec === null) {
       this.#executeCalls = [];
+      this.#sessionCalls = [];
+      this.#getCounts = { toolkits: 0, tools: 0 };
       setComposioFetchForTests(undefined);
       return;
     }
     const calls: FakeExecuteCall[] = [];
     this.#executeCalls = calls;
+    const sessionCalls: FakeSessionCall[] = [];
+    this.#sessionCalls = sessionCalls;
+    const getCounts: FakeGetCounts = { toolkits: 0, tools: 0 };
+    this.#getCounts = getCounts;
     const plans = spec.executes.length > 0
       ? spec.executes
       : [{ resultType: "completed" as const, result: null }];
@@ -189,16 +211,38 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
       const path = url.pathname.replace(/^\/api\/v3\.1/, "");
       const method = init?.method ?? "GET";
       if (method === "GET" && path === "/toolkits") {
+        getCounts.toolkits++;
         return Response.json({ items: spec.toolkits, nextCursor: null });
       }
       if (method === "GET" && path === "/tools") {
-        const toolkit = url.searchParams.get("toolkits") ?? "";
+        getCounts.tools++;
+        const toolkit = url.searchParams.get("toolkits");
+        if (toolkit === null) {
+          // The unfiltered global sweep: every tool, its toolkit embedded per item.
+          const items = Object.entries(spec.tools).flatMap(([slug, tools]) =>
+            tools.map(tool => ({ ...tool, toolkit: { slug } })));
+          return Response.json({ items, nextCursor: null });
+        }
         return Response.json({ items: spec.tools[toolkit] ?? [], nextCursor: null });
       }
       if (method === "GET" && path === "/connected_accounts") {
         return Response.json({ items: spec.connectedAccounts ?? [], nextCursor: null });
       }
       if (method === "POST" && path === "/tool_router/session") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        const tags = (body.tags as { require_approval?: string[] } | undefined)
+          ?.require_approval ?? null;
+        const tools = body.tools as
+          | Record<string, { tags?: { require_approval?: string[] } }>
+          | undefined;
+        sessionCalls.push({
+          composioUserId: String(body.composio_user_id ?? ""),
+          requireApproval: tags,
+          toolsOverride: tools === undefined
+            ? null
+            : Object.entries(tools)
+              .map(([slug, entry]) => [slug, entry.tags?.require_approval ?? []] as const),
+        });
         return Response.json({
           id: "sess-1",
           mcp: { url: "https://mcp.example/sess-1", headers: { "x-api-key": "fake" } },
@@ -208,6 +252,13 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
         return new Response(null, { status: 204 });
       }
       if (method === "POST" && path === "/tool_router/session/sess-1/execute") {
+        const plan = plans[Math.min(executeIndex++, plans.length - 1)];
+        if ("status" in plan) {
+          return Response.json(
+            { error: plan.error ?? "fake Composio error" },
+            { status: plan.status },
+          );
+        }
         const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
         calls.push({
           tool: String(body.tool),
@@ -217,7 +268,7 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
           inputResponses: (body.input_responses ?? null) as object | null,
           action: typeof body.action === "string" ? body.action : null,
         });
-        return Response.json(renderExecute(plans[Math.min(executeIndex++, plans.length - 1)]));
+        return Response.json(renderExecute(plan));
       }
       return new Response("no such route in the fake Composio", { status: 404 });
     };
@@ -228,6 +279,17 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
   executeCalls(): FakeExecuteCall[] {
     return this.#executeCalls;
   }
+
+  /** Every `POST /tool_router/session` body seen so far, in order. */
+  sessionCalls(): FakeSessionCall[] {
+    return this.#sessionCalls;
+  }
+
+  /** How many catalog GETs the fake served, for subrequest-count assertions. */
+  getCounts(): FakeGetCounts {
+    return this.#getCounts;
+  }
+
 
   // -- Accounts ---------------------------------------------------------------
   //
@@ -338,11 +400,54 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
     >);
   }
 
-  /** The ambient singleton facet for one account, and a session on it. */
-  async singletonSession(accountName: string, facetName: string): Promise<void> {
-    const props: SingletonFacetProps = { accountObjectId: this.#accountObjectId(accountName) };
-    await this.#startSession(
-      facetName, () => this.ctx.exports.ComposioSingletonGatekeeper({ props }));
+  /**
+   * The ambient singleton facet for one account, and a session on it. With a policy the mint
+   * goes through the account (persisting it, as the kernel's mint does); without one the facet
+   * is instantiated directly, the state an older deployment's facet is left in.
+   */
+  async singletonSession(
+    accountName: string,
+    facetName: string,
+    policy?: ComposioToolkitPolicy,
+  ): Promise<void> {
+    const klass = policy === undefined
+      ? this.ctx.exports.ComposioSingletonGatekeeper({
+        props: { accountObjectId: this.#accountObjectId(accountName) },
+      })
+      : (await this.#account(accountName).getSingletonGatekeeperClass(policy)) as DurableObjectClass<ComposioSingletonGatekeeper>;
+    await this.#startSession(facetName, () => klass);
+  }
+
+  /** The account's freshest persisted policy, for use-time re-check assertions. */
+  async policyState(accountName: string) {
+    return await this.#account(accountName).policyState();
+  }
+
+  /** The singleton session's listing, for exclusion-hiding assertions. */
+  listToolkits(
+    facetName: string,
+  ): Promise<Attempt<{ toolkits: { slug: string; toolCount: number }[]; truncated: boolean }>> {
+    return this.#attempt(() =>
+      (this.#session(facetName) as ComposioSessionImpl).listToolkits());
+  }
+
+  /** The account's quota counters, for release assertions. */
+  async usage(accountName: string) {
+    return await this.#account(accountName).usage();
+  }
+
+  /** Runs the vendor's admin slug validation against the installed fake. The vendor always
+   * runs on the deployment key; the fake surface makes any non-empty key work. */
+  getToolkitInfo(
+    slugs: string[],
+  ): Promise<Attempt<ComposioToolkitInfo[]>> {
+    return this.#attempt(async () => {
+      const vendor = new GatekeeperVendor({} as never, {
+        ...this.env,
+        COMPOSIO_API_KEY: this.env.COMPOSIO_API_KEY ?? "test-deployment-key",
+      });
+      return await vendor.getToolkitInfo(slugs);
+    });
   }
 
   #facet(facetName: string): HeldFacet["stub"] {

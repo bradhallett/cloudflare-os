@@ -14,7 +14,9 @@ export type FakeExecute =
   | {
       resultType: "input_required"; requestState: string;
       inputRequests: { id: string; question: string; options?: string[] }[];
-    };
+    }
+  /** A plain HTTP failure status (e.g. a definite pre-execution 4xx). */
+  | { status: number; error?: string };
 
 /** The one toolkit every suite's fake catalog serves. */
 export function githubSpec(executes: FakeExecute[]): {

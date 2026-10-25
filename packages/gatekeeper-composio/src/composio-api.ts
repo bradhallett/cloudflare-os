@@ -139,6 +139,24 @@ function parseConnectedAccount(value: unknown): ConnectedAccountInfo {
   };
 }
 
+/** The plan's elicitation bounds: 2 KiB per question (and per option), at most 5 questions. */
+export const MAX_QUESTION_BYTES = 2 * 1024;
+export const MAX_REQUEST_STATE_BYTES = 16 * 1024;
+const utf8 = new TextEncoder();
+const MAX_QUESTIONS = 5;
+
+/** Truncates `text` to at most `maxBytes` UTF-8 bytes without splitting a code point. */
+export function capUtf8(text: string, maxBytes: number): string {
+  if (utf8.encode(text).byteLength <= maxBytes) return text;
+  const capped = Array.from(text);
+  let kept = "";
+  for (const char of capped) {
+    if (utf8.encode(kept + char).byteLength > maxBytes) break;
+    kept += char;
+  }
+  return kept;
+}
+
 function parseInputRequest(value: unknown): InputRequest {
   if (!isRecord(value)) throw new ComposioApiError(502, "Invalid input request.");
   const options = Array.isArray(value.options)
@@ -146,8 +164,12 @@ function parseInputRequest(value: unknown): InputRequest {
     : undefined;
   return {
     id: requireString(value.id, "input_request.id"),
-    question: requireString(value.question, "input_request.question"),
-    options,
+    // Provider-authored text: bounded at parse so no oversized question can reach storage or
+    // an approval description (plans/composio-gatekeeper.md "Execution, approval, settlement").
+    question: capUtf8(requireString(value.question, "input_request.question"), MAX_QUESTION_BYTES),
+    ...(options === undefined ? {} : {
+      options: options.map(option => capUtf8(option, MAX_QUESTION_BYTES)),
+    }),
   };
 }
 
@@ -167,7 +189,9 @@ function parseExecuteEnvelope(value: unknown): ExecuteEnvelope {
       return {
         resultType: "input_required",
         logId,
-        inputRequests: requests,
+        // At most five questions survive parsing; extras would only overflow the answering
+        // flow's bounds without ever being answerable through it.
+        inputRequests: requests.slice(0, MAX_QUESTIONS),
         requestState: requireString(value.request_state, "execute.request_state"),
       };
     }
@@ -245,6 +269,25 @@ export class ComposioApi {
     } while (cursor !== null);
   }
 
+  /**
+   * Cursor-paginate an unfiltered `GET /tools` (limit 500): one global sweep assembling the
+   * whole catalog in a bounded number of subrequests, never one walk per toolkit. Items whose
+   * toolkit cannot be resolved are skipped: the sweep has no per-toolkit fallback to attribute
+   * them to.
+   */
+  async forEachAllTools(page: (batch: ToolInfo[]) => void): Promise<void> {
+    let cursor: string | null = null;
+    do {
+      const query = `/tools?limit=${PAGE_LIMIT}` +
+        (cursor === null ? "" : `&cursor=${encodeURIComponent(cursor)}`);
+      const parsed = parsePage(await this.#request(query));
+      page(parsed.items
+        .map((item) => parseTool(item, ""))
+        .filter((tool) => tool.toolkitSlug !== ""));
+      cursor = parsed.nextCursor;
+    } while (cursor !== null);
+  }
+
   /** Cursor-paginate `GET /tools` for one toolkit; calls `page` per batch. */
   async forEachTool(toolkitSlug: string, page: (batch: ToolInfo[]) => void): Promise<void> {
     let cursor: string | null = null;
@@ -259,10 +302,13 @@ export class ComposioApi {
 
   /**
    * Create a session MCP session for `composioUserId` with every meta-tool knob disabled and
-   * multi-account mode on; returns the session id plus the streamable-HTTP endpoint and the
-   * `x-api-key`-bearing headers Composio returns verbatim.
+   * multi-account mode on. `autoApplyToolkits` (admin-listed, not excluded) configures
+   * Composio's server-side approval fence — `tags.require_approval` over the non-read tags
+   * everywhere, overridden per listed toolkit down to the destructive tag only, so connector
+   * auto-apply can actually apply its create/update verdicts. The fence is defense in depth;
+   * the connector's own queue stays the authority (tags are third-party metadata).
    */
-  async createSession(composioUserId: string): Promise<{
+  async createSession(composioUserId: string, autoApplyToolkits: string[]): Promise<{
     sessionId: string; mcpUrl: string; headers: Record<string, string>;
   }> {
     const body = await this.#request("/tool_router/session", {
@@ -276,6 +322,12 @@ export class ComposioApi {
         manage_connections: { enable: false },
         search: { enable: false },
         execute: { enable_multi_execute: false },
+        tags: { require_approval: ["createHint", "updateHint", "destructiveHint"] },
+        ...(autoApplyToolkits.length === 0 ? {} : {
+          tools: Object.fromEntries(autoApplyToolkits.map(slug => [
+            slug, { tags: { require_approval: ["destructiveHint"] } },
+          ])),
+        }),
       }),
     });
     if (!isRecord(body) || !isRecord(body.mcp) || !isRecord(body.mcp.headers)) {

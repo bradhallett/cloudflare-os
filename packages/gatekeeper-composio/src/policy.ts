@@ -26,6 +26,11 @@ export class ToolkitPolicy {
     return this.#autoApply.has(slug) && this.allows(slug);
   }
 
+  /** The admin-listed auto-apply slugs that are not also excluded (excluded wins). */
+  autoApplyListedSlugs(): string[] {
+    return [...this.#autoApply].filter(slug => this.allows(slug));
+  }
+
   /** Copy of the excluded slugs. */
   get excludedToolkits(): string[] {
     return [...this.#excluded];

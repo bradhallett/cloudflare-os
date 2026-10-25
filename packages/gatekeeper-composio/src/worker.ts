@@ -173,9 +173,14 @@ export class GatekeeperVendor
   /**
    * Live validation of admin-entered toolkit slugs against Composio's catalog, with per-toolkit
    * counts under the auto-apply eligibility rule. Runs on the deployment key and fails closed
-   * when it is unset — the admin editor would otherwise validate against nothing.
+   * when it is unset — the admin editor would otherwise validate against nothing. Capped at 25
+   * slugs per call (each known slug costs a paginated walk): an unbounded array from the admin
+   * editor would fan out past the Workers subrequest limit.
    */
   async getToolkitInfo(slugs: string[]): Promise<ComposioToolkitInfo[]> {
+    if (slugs.length > 25) {
+      throw new Error("getToolkitInfo validates at most 25 toolkit slugs per call.");
+    }
     const api = new ComposioApi(deploymentApiKey(this.env), composioFetch());
     const known = new Set<string>();
     await api.forEachToolkit(batch => {

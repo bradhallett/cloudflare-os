@@ -70,15 +70,18 @@ export class QuotaTable {
 
   /** Record that `n` reserved calls (default 1) took effect; they still count toward the limit. */
   settle(key: QuotaKey, n = 1): void {
+    // MAX(...) floors `reserved` at 0: a settle racing a release (or replaying a drifted
+    // counter) must not push it negative, where it would silently *raise* headroom.
     this.#sql.exec(
-      "UPDATE composio_quota SET reserved = reserved - ?, settled = settled + ? WHERE key = ?",
+      "UPDATE composio_quota SET reserved = MAX(reserved - ?, 0), settled = settled + ? " +
+        "WHERE key = ?",
       n, n, key);
   }
 
   /** Give `n` reservations (default 1) back — the call provably never dispatched. */
   release(key: QuotaKey, n = 1): void {
     this.#sql.exec(
-      "UPDATE composio_quota SET reserved = reserved - ? WHERE key = ?", n, key);
+      "UPDATE composio_quota SET reserved = MAX(reserved - ?, 0) WHERE key = ?", n, key);
   }
 
   /** The current counters for `key` (zeros when unseen). */

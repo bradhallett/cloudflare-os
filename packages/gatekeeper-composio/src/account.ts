@@ -35,6 +35,7 @@ import {
   type ExecuteEnvelope,
   type ToolInfo,
 } from "./composio-api.js";
+import { ToolkitPolicy, resolveToolkitPolicy } from "./policy.js";
 import {
   CONNECT_LINK_CALLBACK_PATH,
   dailyCallLimit,
@@ -68,6 +69,12 @@ export type ComposioExecuteRequest = {
   account?: string;
   requestState?: string;
   inputResponses?: Record<string, unknown>;
+  /**
+   * The tool's toolkit, as the stager resolved it from the catalog. The account re-checks the
+   * deployment's exclusion policy against it at dispatch, so an admin exclusion reaches actions
+   * staged before it. Absent only on pre-upgrade rows: the catalog lookup then backstops.
+   */
+  toolkitSlug?: string;
   /** The key-mode generation the call was staged under; a mismatch strands it pre-dispatch. */
   generation: number;
   /** Declines an upstream input_required continuation instead of executing (nothing runs). */
@@ -106,6 +113,8 @@ const TOOLKIT_LISTING_LIMIT = 30;
 const SEARCH_RESULT_LIMIT = 50;
 /** Facet ids are `toolkit:<slug>` / `singleton` names; a slug this long is garbage input. */
 const MAX_SLUG_LENGTH = 120;
+/** HTTP statuses Composio can only have answered before executing anything. */
+const PRE_EXECUTION_4XX: ReadonlySet<number> = new Set([400, 401, 403, 404, 422]);
 
 @validateRpc()
 export class ComposioAccount extends DurableObject<Cloudflare.Env> {
@@ -193,7 +202,8 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
       throw new Error(`"${slug}" is not a toolkit in Composio's catalog.`);
     }
 
-    const excluded = composioPolicy?.excludedToolkits.includes(slug) ?? false;
+    const policy = await this.#refreshPolicy(composioPolicy);
+    const excluded = !policy.allows(slug);
     if (excluded) {
       throw new Error(
         `The "${entry.name}" toolkit is excluded by this deployment's Composio policy.`);
@@ -203,7 +213,7 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
       accountObjectId: this.ctx.id.toString(),
       toolkitSlug: slug,
       excluded,
-      autoApply: composioPolicy?.autoApplyToolkits.includes(slug) ?? false,
+      autoApply: policy.autoApplyListed(slug),
       generation: keyState.generation,
     };
     return {
@@ -222,7 +232,8 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
     if (resourceUrlPatterns.length > 1) {
       throw new Error("Composio grants one toolkit resource at a time.");
     }
-    // Route through the mint checks so exclusion and fail-closed behavior cannot drift.
+    // Route through the mint checks so exclusion and fail-closed behavior cannot drift; the
+    // mint re-reads the freshest persisted policy, so an admin exclusion bites here too.
     const url = resourceUrlPatterns[0];
     if (url !== undefined) await this.getGatekeeperClassFor(url);
     return {};
@@ -248,8 +259,8 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
       await this.#deleteSessions();
       logger.info("account revoked", { event: "account.revoke.completed" });
     });
-    // kv + SQLite go with the namespace; the upstream connected accounts above are the state
-    // that outlives this object.
+    // SQLite goes with the namespace; the upstream connected accounts above are the state that
+    // outlives this object.
     await this.ctx.storage.deleteAll();
   }
 
@@ -272,7 +283,11 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
   }
 
   /** The ambient singleton's facet; it serves every toolkit at once (see facet.ts). */
-  async getSingletonGatekeeperClass(): Promise<DurableObjectClass<Gatekeeper<unknown>>> {
+  async getSingletonGatekeeperClass(composioPolicy?: ComposioToolkitPolicy)
+      : Promise<DurableObjectClass<Gatekeeper<unknown>>> {
+    // The singleton facet carries no frozen policy: it re-reads the persisted one at use time.
+    // The kernel passes it fresh at every mint, so this is the policy's main refresh channel.
+    await this.#refreshPolicy(composioPolicy);
     const props: SingletonFacetProps = { accountObjectId: this.ctx.id.toString() };
     return this.ctx.exports.ComposioSingletonGatekeeper({ props });
   }
@@ -280,6 +295,27 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
   /** The full-page Composio app (catalog browser, keys, sharing, usage). */
   async startAppUi(context: AppUiContext): Promise<GatekeeperUiFrame> {
     return startAppUi(context, this);
+  }
+
+  /**
+   * Persists `composioPolicy` when the call carried one, then resolves the freshest policy seen
+   * (facet mint, singleton mint). An undefined policy never overwrites: absence means "this call
+   * carried none", never "the deployment emptied its lists".
+   */
+  async #refreshPolicy(composioPolicy?: ComposioToolkitPolicy): Promise<ToolkitPolicy> {
+    if (composioPolicy !== undefined) {
+      await this.ctx.storage.put("toolkitPolicy", {
+        excludedToolkits: composioPolicy.excludedToolkits,
+        autoApplyToolkits: composioPolicy.autoApplyToolkits,
+      });
+    }
+    return resolveToolkitPolicy(
+      await this.ctx.storage.get<ComposioToolkitPolicy>("toolkitPolicy"));
+  }
+
+  /** The freshest toolkit policy seen, for the facets' and sessions' use-time re-checks. */
+  async policyState(): Promise<ComposioToolkitPolicy | undefined> {
+    return await this.ctx.storage.get<ComposioToolkitPolicy>("toolkitPolicy");
   }
 
   // -- Key mode and quota ----------------------------------------------------
@@ -362,7 +398,7 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
         return { status: "refused", message: err instanceof Error ? err.message : String(err) };
       }
       const api = new ComposioApi(declineKey, composioFetch());
-      const sessionId = await this.#ensureSession(api, keyState.keyMode);
+      const sessionId = await this.#ensureSession(api, keyState.keyMode, keyState.generation);
       const envelope = await api.execute(sessionId, {
         tool: request.tool,
         arguments: request.arguments,
@@ -376,6 +412,20 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
       return {
         status: "refused",
         message: `The "${request.tool}" meta-tool is disabled by this deployment.`,
+      };
+    }
+    const policy = await this.#refreshPolicy();
+    const toolkitSlug = request.toolkitSlug ?? await this.#cachedToolToolkit(request.tool);
+    if (toolkitSlug !== undefined && !policy.allows(toolkitSlug)) {
+      // Use-time exclusion: the admin excluded this toolkit after the action staged, so the
+      // dispatch is refused (never reaches Composio) exactly like a fresh submit would be.
+      logger.info("call refused: toolkit excluded by deployment policy", {
+        event: "account.execute.excluded-toolkit", toolkitSlug,
+      });
+      return {
+        status: "refused",
+        message:
+          `The "${toolkitSlug}" toolkit is excluded by this deployment's Composio policy.`,
       };
     }
 
@@ -408,7 +458,18 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
 
     const api = new ComposioApi(apiKey, composioFetch());
     try {
-      const sessionId = await this.#ensureSession(api, keyState.keyMode);
+      const sessionId = await this.#ensureSession(api, keyState.keyMode, keyState.generation);
+      if (await this.ctx.storage.get<number>("generation") !== keyState.generation) {
+        // A key switch interleaved after the entry check (a read holds no pending-action
+        // fence): nothing was dispatched, so give the reservation back and strand the call.
+        this.#quota.release(quotaKey);
+        return {
+          status: "stranded",
+          message:
+            "The Composio key was switched while this call was starting, so it was not run. " +
+            "Stage it again under the new key.",
+        };
+      }
       const envelope = await api.execute(sessionId, {
         tool: request.tool,
         arguments: request.arguments,
@@ -427,6 +488,20 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
       }
       return { status: "envelope", envelope };
     } catch (err) {
+      if (err instanceof ComposioApiError && PRE_EXECUTION_4XX.has(err.status)) {
+        // Composio answered a definite pre-execution failure (bad request, auth, unknown
+        // tool/session, unprocessable): the call provably never ran, so the reservation goes
+        // back and the caller settles not-dispatched rather than outcome-unknown.
+        this.#quota.release(quotaKey);
+        logger.info("composio refused the call before execution", {
+          event: "account.execute.pre-execution-refused",
+          keyMode: keyState.keyMode, status: err.status,
+        });
+        return {
+          status: "refused",
+          message: `Composio refused the call before it ran (HTTP ${err.status}).`,
+        };
+      }
       // A transport failure may still have landed at Composio: settle, never release.
       this.#quota.settle(quotaKey);
       if (err instanceof ComposioApiError) {
@@ -584,19 +659,36 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
     return snapshot;
   }
 
-  /** One tool by exact slug across the whole catalog, for the singleton session's lookups. */
+  /**
+   * One tool by exact slug across the whole catalog, for the singleton session's lookups.
+   * Excluded toolkits are hidden here too: to the agent their tools do not exist.
+   */
   async toolBySlug(toolSlug: string): Promise<ToolInfo | undefined> {
-    return (await this.#catalog()).toolsBySlug.get(toolSlug);
+    const policy = await this.#refreshPolicy();
+    const tool = (await this.#catalog()).toolsBySlug.get(toolSlug);
+    return tool !== undefined && policy.allows(tool.toolkitSlug) ? tool : undefined;
   }
 
-  /** One toolkit's tools, as the toolkit facet and the session list them. */
+  /** One toolkit's tools, as the toolkit facet and the session list them; excluded → none. */
   async toolkitTools(toolkitSlug: string): Promise<ToolInfo[]> {
+    if (!(await this.#refreshPolicy()).allows(toolkitSlug)) return [];
     return toolsForToolkit(await this.#catalog(), toolkitSlug);
   }
 
   /** The whole catalog for the session's listTools()-free surfaces; facets scope by slug. */
   async #catalogEntries(): Promise<CatalogEntry[]> {
-    return (await this.#catalog()).entries;
+    const policy = await this.#refreshPolicy();
+    return (await this.#catalog()).entries.filter(entry => policy.allows(entry.slug));
+  }
+
+  /**
+   * The toolkit of `tool` per the cached catalog, when a snapshot is cached at all — a
+   * warm-cache-only backstop for requests that predate the `toolkitSlug` field.
+   */
+  async #cachedToolToolkit(tool: string): Promise<string | undefined> {
+    const cached = await this.ctx.storage.get<StoredCatalog>(CATALOG_CACHE_KEY);
+    if (cached === undefined) return undefined;
+    return cached.toolsBySlug.find(([slug]) => slug === tool)?.[1]?.toolkitSlug;
   }
 
   /**
@@ -701,7 +793,7 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
   }> {
     const keyState = await this.#keyState();
     const api = new ComposioApi(await this.#activeApiKey(keyState), composioFetch());
-    const sessionId = await this.#ensureSession(api, keyState.keyMode);
+    const sessionId = await this.#ensureSession(api, keyState.keyMode, keyState.generation);
     const callbackUrl = this.env.BASE_URL === undefined
       ? CONNECT_LINK_CALLBACK_PATH
       : new URL(CONNECT_LINK_CALLBACK_PATH, this.env.BASE_URL).href;
@@ -761,14 +853,31 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
     return new ComposioApi(await this.#activeApiKey(keyState), composioFetch());
   }
 
-  /** The account's Composio session for the active mode, created on first use. */
-  async #ensureSession(api: ComposioApi, mode: ComposioKeyMode): Promise<string> {
+  /**
+   * The account's Composio session for the active mode, created on first use. Creation configures
+   * Composio's server-side `tags.require_approval` fence (non-read tags) with the admin-listed
+   * auto-apply toolkits exempted down to the destructive tag — defense in depth, never the
+   * authority. A key switch racing the create leaves the stray session unstored: it belongs to
+   * the old key the switch already discarded.
+   */
+  async #ensureSession(
+    api: ComposioApi,
+    mode: ComposioKeyMode,
+    generation: number,
+  ): Promise<string> {
     const key = mode === "own" ? "ownSessionId" : "deploymentSessionId";
     const existing = await this.ctx.storage.get<string>(key);
     if (existing !== undefined) return existing;
-    const { sessionId } = await api.createSession(this.composioUserId);
+    const autoApplyToolkits = (await this.#refreshPolicy()).autoApplyListedSlugs();
+    const { sessionId } = await api.createSession(this.composioUserId, autoApplyToolkits);
+    if (await this.ctx.storage.get<number>("generation") !== generation) {
+      await api.deleteSession(sessionId).catch(() => {});
+      return sessionId;
+    }
     await this.ctx.storage.put(key, sessionId);
-    logger.info("composio session created", { event: "account.session.created", keyMode: mode });
+    logger.info("composio session created", {
+      event: "account.session.created", keyMode: mode, count: autoApplyToolkits.length,
+    });
     return sessionId;
   }
 
@@ -853,5 +962,11 @@ export function parseToolkitUrl(url: string): string | null {
   // WHATWG URLs treat the authority of a non-special scheme as a host, so composio://toolkit/x
   // parses with pathname "/x" — match the literal shape instead of re-reading a parsed URL.
   const match = /^composio:\/\/toolkit\/([^/?#]+)$/.exec(url);
-  return match === null ? null : decodeURIComponent(match[1]);
+  if (match === null) return null;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    // Malformed percent-encoding is just an unparseable URL, not a crash.
+    return null;
+  }
 }

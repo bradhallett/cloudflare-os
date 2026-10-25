@@ -2088,7 +2088,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (!record?.description.singleton) return null;
     let allowed = await this.#allowedGatekeepers();
     if (allowed !== null && !allowed.has(record.vendorId.toLowerCase())) return null;
-    return (record.account as unknown as SingletonAccountStub).getSingletonGatekeeperClass();
+    return (record.account as unknown as SingletonAccountStub).getSingletonGatekeeperClass(
+      await this.#composioToolkitPolicy(record.vendorId));
   }
 
   /**

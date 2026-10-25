@@ -971,8 +971,13 @@ export interface GatekeeperUser extends WorkerEntrypoint {
    *
    * The returned class is imbued (via `ctx.props`) with whatever the account needs to serve the
    * singleton (e.g. the account id and sharing domain).
+   *
+   * `composioPolicy` mirrors the getGatekeeperClassFor channel: the deployment's Composio toolkit
+   * policy (see ComposioToolkitPolicy), passed only when the account's vendor is `composio` so the
+   * account can refresh the policy it re-reads at use time. Every other vendor ignores it.
    */
-  getSingletonGatekeeperClass?(): Promise<DurableObjectClass<Gatekeeper<any>>>;
+  getSingletonGatekeeperClass?(composioPolicy?: ComposioToolkitPolicy)
+    : Promise<DurableObjectClass<Gatekeeper<any>>>;
 
   /**
    * The account's full-page management UI (iframe HTML + ui capability). `context` is passed fresh

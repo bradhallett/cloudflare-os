@@ -29,11 +29,12 @@ import type {
   ComposioExecuteOutcome,
   ComposioExecuteRequest,
 } from "./account.js";
-import type { InputRequest, ToolInfo } from "./composio-api.js";
+import { MAX_QUESTION_BYTES, capUtf8, type InputRequest, type ToolInfo } from "./composio-api.js";
 import { isMetaTool } from "./config.js";
 import {
   CONTINUATION_ACTION_KIND,
   isAutoApplyEligible,
+  resolveToolkitPolicy,
   ToolkitPolicy,
   toolkitWriteActionKind,
 } from "./policy.js";
@@ -48,7 +49,7 @@ import type {
 } from "./types.js";
 
 /** The execution request shape a read dispatches as (no continuation or decline fields). */
-type ReadRequest = Pick<ComposioExecuteRequest, "tool" | "arguments" | "account" | "generation">;
+type ReadRequest = Pick<ComposioExecuteRequest, "tool" | "arguments" | "toolkitSlug" | "account" | "generation">;
 
 /** What a session needs from the gatekeeper facet that owns it: the facet's host surface. */
 export interface FacetHost {
@@ -165,9 +166,13 @@ abstract class ComposioSessionBase extends RpcTarget {
   /** Classifies one catalog tool and computes the per-action auto-apply verdict. */
   protected async classify(tool: ToolInfo): Promise<ScopedToolInfo> {
     const arming = this.host.arming;
+    // Live admin policy, not the facet's mint-time snapshot: a session minted before an
+    // exclusion must stop offering auto-apply the moment the exclusion lands.
+    const policy = resolveToolkitPolicy(await this.host.account.policyState());
     const autoApprovable = arming !== undefined
       && arming.autoApply
       && !arming.excluded
+      && policy.allows(tool.toolkitSlug)
       && !(await this.host.account.sharingState()).enabled
       && isAutoApplyEligible(new ToolkitPolicy([], [tool.toolkitSlug]), tool.toolkitSlug, {
         tags: tool.tags,
@@ -269,6 +274,7 @@ abstract class ComposioSessionBase extends RpcTarget {
       const outcome = await this.host.facet.executeRead({
         tool,
         arguments: toolArgs,
+        toolkitSlug: entry.toolkitSlug,
         ...(account === undefined ? {} : { account }),
         generation: await this.host.facet.keyGeneration(),
       });
@@ -278,6 +284,7 @@ abstract class ComposioSessionBase extends RpcTarget {
     const staged = this.host.facet.stageAction(tool, {
       tool,
       arguments: toolArgs,
+      toolkitSlug: entry.toolkitSlug,
       ...(account === undefined ? {} : { account }),
       generation: await this.host.facet.keyGeneration(),
     });
@@ -375,7 +382,9 @@ abstract class ComposioSessionBase extends RpcTarget {
     const questions = await this.host.facet.readContinuation(id);
     const flattened = questions.map(question => ({
       id: question.id,
-      question: question.question.replace(/[\r\n]+/g, " "),
+      // Provider-authored text is bounded again at render: rows recorded before the parse-time
+      // cap (and their verbatim approval fields) must never exceed the 2 KiB question bound.
+      question: capUtf8(question.question.replace(/[\r\n]+/g, " "), MAX_QUESTION_BYTES),
       ...(question.options === undefined ? {} : { options: question.options }),
     }));
     const builder = buildDescription(
@@ -411,7 +420,7 @@ abstract class ComposioSessionBase extends RpcTarget {
         `(round ${payload.chainDepth} of 3); the tool call runs only after approval.`,
     ).json("Arguments", payload.arguments);
     for (const question of payload.inputRequests) {
-      builder.verbatim(`Question ${question.id}`, question.question);
+      builder.verbatim(`Question ${question.id}`, capUtf8(question.question, MAX_QUESTION_BYTES));
     }
     const rendered = builder.json("Answers", payload.responses).finish();
     const description: ActionDescription = {
