@@ -11,8 +11,14 @@ export interface JumpToLatestPillProps {
 }
 
 /**
- * The transcript's floating jump pill (HextaUI's Message Scroller button): "N new messages ↓"
- * while rows landed below the fold, "Jump to latest" the rest of the time the reader is scrolled
+ * Label for missed rows, shared by the pill and the polite status: the count is of rendered
+ * rows — collapsed runs and merged rows mean it is not a message count — so it claims no noun.
+ */
+export const missedCountLabel = (count: number) => `${count} new`;
+
+/**
+ * The transcript's floating jump pill (HextaUI's Message Scroller button): "N new ↓" while
+ * rows landed below the fold, "Jump to latest" the rest of the time the reader is scrolled
  * away. Mounting it is the caller's signal that it should show; the delayed entrance keeps a
  * brief scroll adjustment from flashing it.
  */
@@ -27,9 +33,7 @@ export const JumpToLatestPill = ({ missedCount, onJump }: JumpToLatestPillProps)
       className="themed-floating-shadow pointer-events-auto gap-1.5 rounded-full"
     >
       <span>
-        {missedCount > 0
-          ? `${missedCount} new message${missedCount === 1 ? "" : "s"}`
-          : "Jump to latest"}
+        {missedCount > 0 ? missedCountLabel(missedCount) : "Jump to latest"}
       </span>
       <ArrowDownIcon size={13} aria-hidden="true" />
     </Button>

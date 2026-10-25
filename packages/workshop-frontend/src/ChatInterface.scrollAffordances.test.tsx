@@ -155,7 +155,7 @@ function pinTranscript() {
 
 const jumpPill = () =>
   [...document.querySelectorAll('button')].find((button) =>
-    button.textContent?.includes('Jump to latest') || button.textContent?.includes('new message'))
+    button.textContent?.includes('Jump to latest') || button.textContent?.includes(' new'))
 
 const settlePillEntrance = () =>
   act(async () => {
@@ -184,7 +184,7 @@ describe('ChatInterface scroll affordances', () => {
     // Rows that land below the fold are counted, not silently followed.
     chat.emitMessage(agentMessage(1, 'first'))
     chat.emitMessage(agentMessage(2, 'second'))
-    expect(jumpPill()?.textContent).toContain('2 new messages')
+    expect(jumpPill()?.textContent).toContain('2 new')
 
     // The pill jumps back to the live edge and dismisses itself.
     scrollToCalls.length = 0

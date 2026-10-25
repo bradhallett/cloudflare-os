@@ -55,8 +55,8 @@ describe("JumpToLatestPill", () => {
   it("labels singular and plural missed messages, or no count at all", async () => {
     vi.useFakeTimers();
     for (const [missedCount, label] of [
-      [1, "1 new message"],
-      [3, "3 new messages"],
+      [1, "1 new"],
+      [3, "3 new"],
       [0, "Jump to latest"],
     ] as const) {
       const pill = renderPill({ missedCount, onJump: () => {} });
