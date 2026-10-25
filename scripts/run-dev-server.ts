@@ -504,6 +504,9 @@ const PASSTHROUGH_GATEKEEPER_VARS: Record<string, string[]> = {
   // The instance a self-hosted GitLab gatekeeper talks to, and the Access service token for one
   // behind Cloudflare Access; unset, it talks to gitlab.com.
   "gatekeeper-gitlab": ["GITLAB_URL", "GITLAB_API_URL", "CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET"],
+  // The Composio project key the gatekeeper runs against, and each user's daily call limit; the
+  // key is unset only for BYO-key-only local experiments.
+  "gatekeeper-composio": ["COMPOSIO_API_KEY", "COMPOSIO_DAILY_CALL_LIMIT"],
   // Each connection's daily read limit; unset, the in-code default.
   "gatekeeper-x": ["X_DAILY_READ_LIMIT"],
 };

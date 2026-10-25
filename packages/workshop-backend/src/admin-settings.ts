@@ -1,5 +1,5 @@
 import { AdminApi, AdminFormat, AdminFormatPatch, AdminModel, AdminResourceVendor, AdminSettingsView, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, BotDefinition, DeploymentUpdateStatus, GatewayModel, GatewayModelLevelTest, GatewayModelMode, GatewayModelSettings, GatewayModelTest, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, MAX_UPDATE_CHECK_INTERVAL_MINUTES, MAX_UPDATE_HOURS, ReasoningLevel, SUGGESTED_MODELS, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
-import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
+import { GatekeeperVendor, ComposioToolkitInfo, ComposioVendorAdmin } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
 import { RpcTarget } from 'capnweb';
 import { validateRpc } from 'capnweb-validate';
@@ -534,6 +534,8 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
       resourceVendors: await this.#listResourceConfig(config, adminUserId),
       formats: await this.#listFormatConfig(config),
       gatewayModels: this.#listGatewayModels(config),
+      composioExcludedToolkits: config.composioExcludedToolkits,
+      composioAutoApplyToolkits: config.composioAutoApplyToolkits,
     };
   }
 
@@ -1004,6 +1006,32 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     }
   }
 
+  // --- Composio toolkit policy (see plans/composio-gatekeeper.md §Admin config) ---
+
+  /**
+   * Set the Composio toolkits this deployment hides. Both lists are normalized (trimmed,
+   * deduplicated, exact slugs) by updateAdminConfig's normalizeAdminConfig pass, so the setters
+   * just persist the admin's entries.
+   */
+  setComposioExcludedToolkits(slugs: string[]): Promise<void> {
+    return this.updateAdminConfig({ composioExcludedToolkits: slugs });
+  }
+
+  setComposioAutoApplyToolkits(slugs: string[]): Promise<void> {
+    return this.updateAdminConfig({ composioAutoApplyToolkits: slugs });
+  }
+
+  /**
+   * Validate Composio toolkit slugs against the vendor's live catalog. Null when the Composio
+   * gatekeeper isn't bound, so the editor says it cannot validate rather than guessing; the
+   * vendor-side method is the ComposioVendorAdmin extension only that vendor implements.
+   */
+  async getComposioToolkitInfo(slugs: string[]): Promise<ComposioToolkitInfo[] | null> {
+    let vendor = this.vendors.get("composio");
+    if (!vendor) return null;
+    return await (vendor as unknown as ComposioVendorAdmin).getToolkitInfo(slugs);
+  }
+
   // --- Deployment bots ---
 
   /**
@@ -1193,6 +1221,18 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
       throw new Error(`Invalid gatekeeper mode: ${mode}`);
     }
     return this.admin.setGatekeeperMode(vendorId, mode);
+  }
+
+  setComposioExcludedToolkits(slugs: string[]): Promise<void> {
+    return this.admin.setComposioExcludedToolkits(slugs);
+  }
+
+  setComposioAutoApplyToolkits(slugs: string[]): Promise<void> {
+    return this.admin.setComposioAutoApplyToolkits(slugs);
+  }
+
+  getComposioToolkitInfo(slugs: string[]): Promise<ComposioToolkitInfo[] | null> {
+    return this.admin.getComposioToolkitInfo(slugs);
   }
 
   async setAnnouncement(text: string): Promise<void> {

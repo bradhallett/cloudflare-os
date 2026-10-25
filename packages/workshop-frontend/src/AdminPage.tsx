@@ -13,6 +13,7 @@ import SiteLogo from './components/SiteLogo'
 import { useDocumentTitle } from './useDocumentTitle'
 import AdminFormatsPanel from './components/format/AdminFormatsPanel'
 import { AdminModelsPanel } from './features/ai-models/AdminModelsPanel'
+import { AdminComposioPanel } from './features/composio/AdminComposioPanel'
 import { AdminUpdatesPanel } from './features/deployment-updates/AdminUpdatesPanel'
 import { DeploymentBotsPanel } from './features/bots/DeploymentBotsPanel'
 import { latestReads } from './features/deployment-updates/latestReads'
@@ -91,6 +92,10 @@ export default function AdminPage() {
   // Gatekeeper resource config, and the set of resource keys ("vendorId\u0000urlPattern") busy toggling.
   const [resourceVendors, setResourceVendors] = useState<AdminResourceVendor[]>([])
   const [resourceBusy, setResourceBusy] = useState<Set<string>>(new Set())
+  // The Composio toolkit policy lists (see AdminComposioPanel); rendered only when the Composio
+  // gatekeeper is bound, but kept for every deployment so a settings read always populates them.
+  const [composioExcluded, setComposioExcluded] = useState<string[]>([])
+  const [composioAutoApply, setComposioAutoApply] = useState<string[]>([])
 
   // The update status of a deployment the deploy flow installed, null for any other deployment.
   // Loaded beside the settings but never holding them up, so it may still be pending.
@@ -138,6 +143,8 @@ export default function AdminPage() {
     setBannerColorDraft(view.banner.color)
     setSavedAccent(view.accentColor)
     setAccentDraft(view.accentColor)
+    setComposioExcluded(view.composioExcludedToolkits)
+    setComposioAutoApply(view.composioAutoApplyToolkits)
     setFormats(view.formats)
     setGatewayModels(view.gatewayModels)
   }
@@ -1066,6 +1073,24 @@ export default function AdminPage() {
               </div>
             )})}
           </div>
+        </div>
+      )}
+
+      {/* Composio's per-toolkit policy, offered only where the connector is installed. */}
+      {activeTab === 'gatekeepers' && admin && resourceVendors.some((v) => v.vendorId === 'composio') && (
+        <div className="bg-kumo-elevated border border-kumo-line rounded-xl p-6">
+          <h2 className="text-lg font-semibold text-kumo-strong mb-1">Composio toolkits</h2>
+          <p className="text-sm text-kumo-subtle mb-5">
+            Choose which of Composio&rsquo;s toolkits this deployment offers. Slugs must match
+            Composio&rsquo;s exactly; entries are checked against its live catalog below.
+          </p>
+          <AdminComposioPanel
+            admin={admin.api}
+            excludedToolkits={composioExcluded}
+            autoApplyToolkits={composioAutoApply}
+            onSaved={(which, slugs) =>
+              which === 'excluded' ? setComposioExcluded(slugs) : setComposioAutoApply(slugs)}
+          />
         </div>
       )}
     </div>

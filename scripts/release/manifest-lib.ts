@@ -346,6 +346,7 @@ const SINGLETON = new Set([
   "gatekeeper-homeassistant", // (2) no inputs; users connect their own URL + token in-app
   "gatekeeper-mcp",           // (2) no inputs; users paste their own endpoints in-app
   "gatekeeper-mcp-portal",    // (2) no inputs; the one portal comes from the deployment's vars
+  "gatekeeper-composio",      // (2) the wizard's COMPOSIO_API_KEY installs the one deployment project; a second install would give every user a duplicate ambient capsule
 ]);
 
 /** Default wizard inputs for an installable gatekeeper that fronts a third-party OAuth app. */
