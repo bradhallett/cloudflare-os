@@ -474,7 +474,12 @@ Kernel lines stay minimal and land apart from the connector, per the review bar:
   see the ambient-singleton decision); no per-workspace consent (the contract carries no
   workspace context to key it on).
 - No token custody: upstream OAuth tokens live at Composio, by design and disclosure.
-- No mcp-shared changes beyond PR 1's auth-scheme option and redirect hygiene.
+- No mcp-shared changes beyond PR 1's auth-scheme option and redirect hygiene — with one
+  owner-approved exception (2026-10-25): PR 3 adds a single additive line to the
+  `@gadgets/mcp-shared` exports map (`./action-store`) so the connector's REST-catalog facets can
+  reuse the queued-action store directly; `McpFacetBase` is hard-wired to MCP discovery this
+  design bypasses, and duplicating the store would create a parallel mechanism. No other
+  mcp-shared change of any kind.
 
 ## Verification — settled 2026-10-25 (research wave, omp-reviewed; reports archived)
 
