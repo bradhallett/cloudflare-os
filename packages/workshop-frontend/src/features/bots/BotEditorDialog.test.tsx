@@ -4,7 +4,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ReactNode } from "react";
+import type { ComponentProps, ReactNode } from "react";
 import { MAX_BOT_SKILLS, type BotDefinition, type BotSkillChoice } from "@gadgets/workshop-shared/api";
 import { BotEditorDialog } from "./BotEditorDialog";
 
@@ -133,34 +133,41 @@ function setNativeValue(
 }
 
 
+// Renders one dialog into a fresh container, sharing the describe's root/container teardown.
+const renderDialog = (props: Partial<ComponentProps<typeof BotEditorDialog>> = {}) => {
+  container = document.createElement("div");
+  document.body.append(container);
+  root = createRoot(container);
+  act(() => root!.render(
+    <BotEditorDialog
+      models={models}
+      skills={skills}
+      title="New bot"
+      onSave={() => {}}
+      onClose={() => {}}
+      {...props}
+    />,
+  ));
+  return container!;
+};
+
 describe("BotEditorDialog", () => {
   it("shows a linked, announced name error on a Save attempt with an empty name, and clears it on input", async () => {
     const onSave = vi.fn<(def: BotDefinition) => Promise<void>>()
-    container = document.createElement("div");
-    document.body.append(container);
-    root = createRoot(container);
-    act(() => root!.render(
-      <BotEditorDialog
-        models={models}
-        skills={skills}
-        title="New bot"
-        onSave={onSave}
-        onClose={() => {}}
-      />,
-    ))
-    const nameInput = container.querySelector<HTMLInputElement>('input[placeholder="Research assistant"]')!
+    const view = renderDialog({ onSave });
+    const nameInput = view.querySelector<HTMLInputElement>('input[placeholder="Research assistant"]')!
     // Save stays clickable with an empty name: the attempt is what reveals the error.
-    const save = [...container.querySelectorAll("button")].find((b) => b.textContent === "Save")!
+    const save = [...view.querySelectorAll("button")].find((b) => b.textContent === "Save")!
     expect(save.disabled).toBe(false);
     await act(async () => save.click());
     expect(onSave).not.toHaveBeenCalled();
-    const error = container.querySelector("#bot-editor-name-error")!;
+    const error = view.querySelector("#bot-editor-name-error")!
     expect(error.getAttribute("role")).toBe("alert");
     expect(error.textContent).toBe("Give the bot a name.");
     expect(nameInput.getAttribute("aria-invalid")).toBe("true");
     expect(nameInput.getAttribute("aria-describedby")).toBe("bot-editor-name-error");
     act(() => setNativeValue(nameInput, "Helper"));
-    expect(container.querySelector("#bot-editor-name-error")).toBeNull();
+    expect(view.querySelector("#bot-editor-name-error")).toBeNull();
     expect(nameInput.getAttribute("aria-invalid")).toBe("false");
     await act(async () => save.click());
     expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ name: "Helper" }));
@@ -168,27 +175,16 @@ describe("BotEditorDialog", () => {
 
   it("announces and focuses the model error when a Save attempt finds no model picked", async () => {
     const onSave = vi.fn<(def: BotDefinition) => Promise<void>>()
-    container = document.createElement("div");
-    document.body.append(container);
-    root = createRoot(container);
-    act(() => root!.render(
-      <BotEditorDialog
-        models={[]}
-        skills={skills}
-        title="New bot"
-        onSave={onSave}
-        onClose={() => {}}
-      />,
-    ))
-    const nameInput = container.querySelector<HTMLInputElement>('input[placeholder="Research assistant"]')!
+    const view = renderDialog({ models: [], onSave });
+    const nameInput = view.querySelector<HTMLInputElement>('input[placeholder="Research assistant"]')!
     act(() => setNativeValue(nameInput, "Helper"));
-    const save = [...container.querySelectorAll("button")].find((b) => b.textContent === "Save")!
+    const save = [...view.querySelectorAll("button")].find((b) => b.textContent === "Save")!
     await act(async () => save.click());
     expect(onSave).not.toHaveBeenCalled();
-    const error = container.querySelector("#bot-editor-model-error")!;
+    const error = view.querySelector("#bot-editor-model-error")!
     expect(error.getAttribute("role")).toBe("alert");
     expect(error.textContent).toBe("Pick a model for the bot to run.");
-    const modelTrigger = [...container.querySelectorAll("button")].find((b) =>
+    const modelTrigger = [...view.querySelectorAll("button")].find((b) =>
       b.getAttribute("aria-describedby") === "bot-editor-model-error")!;
     expect(modelTrigger.getAttribute("aria-invalid")).toBe("true");
     // The invalid model select is where the user lands, since the name is already valid.
@@ -197,32 +193,21 @@ describe("BotEditorDialog", () => {
 
   it("hands back a trimmed name, no description for a blank one, and picked skills", async () => {
     const onSave = vi.fn<(def: BotDefinition) => Promise<void>>()
-    container = document.createElement("div");
-    document.body.append(container);
-    root = createRoot(container);
-    act(() => root!.render(
-      <BotEditorDialog
-        models={models}
-        skills={skills}
-        title="New bot"
-        onSave={onSave}
-        onClose={() => {}}
-      />,
-    ))
-    const nameInput = container.querySelector<HTMLInputElement>('input[placeholder="Research assistant"]')!
+    const view = renderDialog({ onSave });
+    const nameInput = view.querySelector<HTMLInputElement>('input[placeholder="Research assistant"]')!
     const descriptionInput =
-      container.querySelector<HTMLInputElement>('input[placeholder="What this bot is for, in one line"]')!
-    const modelSelect = container.querySelector<HTMLSelectElement>("select")!
+      view.querySelector<HTMLInputElement>('input[placeholder="What this bot is for, in one line"]')!
+    const modelSelect = view.querySelector<HTMLSelectElement>("select")!
     act(() => {
       setNativeValue(nameInput, "  Helper  ")
       setNativeValue(descriptionInput, "   ")
     })
     act(() => setNativeValue(modelSelect, "gpt-6"))
     const searchNotes =
-      [...container.querySelectorAll("label")].find((l) => l.textContent?.includes("Search notes"))!
+      [...view.querySelectorAll("label")].find((l) => l.textContent?.includes("Search notes"))!
         .querySelector("input")!
     act(() => setNativeValue(searchNotes, true))
-    const save = [...container.querySelectorAll("button")].find((b) => b.textContent === "Save")!
+    const save = [...view.querySelectorAll("button")].find((b) => b.textContent === "Save")!
     await act(async () => save.click());
     expect(onSave).toHaveBeenCalledWith({
       name: "Helper",
@@ -241,20 +226,8 @@ describe("BotEditorDialog", () => {
       modelId: "claude-opus-5-5",
       skills: [{ vendorId: "github", commandId: "open-pr", name: "Open PR" }],
     }
-    container = document.createElement("div");
-    document.body.append(container);
-    root = createRoot(container);
-    act(() => root!.render(
-      <BotEditorDialog
-        models={models}
-        skills={skills}
-        initial={gone}
-        title="Edit bot"
-        onSave={onSave}
-        onClose={() => {}}
-      />,
-    ))
-    const save = [...container.querySelectorAll("button")].find((b) => b.textContent === "Save")!
+    const view = renderDialog({ initial: gone, title: "Edit bot", onSave });
+    const save = [...view.querySelectorAll("button")].find((b) => b.textContent === "Save")!
     await act(async () => save.click());
     expect(onSave).toHaveBeenCalledWith(expect.objectContaining({
       skills: [{ vendorId: "github", commandId: "open-pr", name: "Open PR" }],
@@ -270,22 +243,10 @@ describe("BotEditorDialog", () => {
         vendorId: "context", commandId: `skill-${i}`, name: `Skill ${i}`,
       })),
     }
-    container = document.createElement("div");
-    document.body.append(container);
-    root = createRoot(container);
-    act(() => root!.render(
-      <BotEditorDialog
-        models={models}
-        skills={skills}
-        initial={full}
-        title="Edit bot"
-        onSave={() => {}}
-        onClose={() => {}}
-      />,
-    ))
+    const view = renderDialog({ initial: full, title: "Edit bot" });
     // Every offered skill the bot doesn't already have is disabled: the cap is reached.
     const searchNotes =
-      [...container.querySelectorAll("label")].find((l) => l.textContent?.includes("Search notes"))!
+      [...view.querySelectorAll("label")].find((l) => l.textContent?.includes("Search notes"))!
         .querySelector("input")!
     expect(searchNotes.disabled).toBe(true)
   })
@@ -299,20 +260,9 @@ describe("BotEditorDialog", () => {
     });
     vi.stubGlobal("matchMedia", matchMedia);
     try {
-      container = document.createElement("div");
-      document.body.append(container);
-      root = createRoot(container);
-      act(() => root!.render(
-        <BotEditorDialog
-          models={models}
-          skills={skills}
-          title="New bot"
-          onSave={() => {}}
-          onClose={() => {}}
-        />,
-      ))
-      const nameInput = container.querySelector<HTMLInputElement>('input[placeholder="Research assistant"]')!;
-      const save = [...container.querySelectorAll("button")].find((b) => b.textContent === "Save")!;
+      const view = renderDialog();
+      const nameInput = view.querySelector<HTMLInputElement>('input[placeholder="Research assistant"]')!
+      const save = [...view.querySelectorAll("button")].find((b) => b.textContent === "Save")!
       // No shake before any attempt, even once the field is invalid.
       act(() => nameInput.setAttribute("aria-invalid", "true"));
       act(() => vi.advanceTimersByTime(1000));
