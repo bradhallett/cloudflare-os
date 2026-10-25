@@ -90,6 +90,41 @@ it("classifies an expired pre-fetch deadline as not dispatched", async () => {
   expect(callMayHaveTakenEffect(error)).toBe(false);
 });
 
+it("sends the credential under a configured non-Bearer header on every request", async () => {
+  const seen: Headers[] = [];
+  vi.stubGlobal("fetch", async (_input: unknown, init?: RequestInit) => {
+    seen.push(new Headers(init?.headers));
+    const request = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} }), {
+      status: 200, headers: { "Content-Type": "application/json" },
+    });
+  });
+  const account: ConnectionAccount = {
+    async getConnection() {
+      return {
+        authorization: "composio-key",
+        authScheme: { header: "x-api-key", scheme: null },
+        sessionId: null,
+        generation: 1,
+      };
+    },
+    async assertConnectionCurrent() {},
+    async setMcpSessionId() { return true; },
+    async noteCredentialsExpired() {},
+  };
+
+  await withClient({}, account, "https://mcp.example.com", async client => {
+    await client.callTool("send", {});
+  });
+
+  // One initialize, one initialized notification, one tool call: the key rides all of them.
+  expect(seen.length).toBeGreaterThanOrEqual(3);
+  for (const headers of seen) {
+    expect(headers.get("x-api-key")).toBe("composio-key");
+    expect(headers.get("Authorization")).toBeNull();
+  }
+});
+
 it("rechecks account generation immediately before the tool request", async () => {
   let current = true;
   let requests = 0;

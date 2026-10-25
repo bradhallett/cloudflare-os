@@ -5,6 +5,7 @@ import { guardedFetch, isAllowedUrl, sdkFetch } from "../src/fetch.js";
 type Hop = {
   url: string;
   authorization: string | null;
+  apiKey: string | null;
   sessionId: string | null;
   method: string;
   body: unknown;
@@ -17,6 +18,7 @@ function stubChain(chain: Record<string, string>, status = 307): Hop[] {
     hops.push({
       url: String(input),
       authorization: new Headers(init.headers).get("Authorization"),
+      apiKey: new Headers(init.headers).get("x-api-key"),
       sessionId: new Headers(init.headers).get("Mcp-Session-Id"),
       method: init.method ?? "GET",
       body: init.body,
@@ -166,6 +168,31 @@ describe("guardedFetch", () => {
     const response = await guardedFetch("https://a.example.com/", {});
     expect(response.status).toBe(307);
     expect(hops.length).toBeLessThanOrEqual(4);
+  });
+
+  it("drops a configured credential header on a cross-origin hop, like Authorization", async () => {
+    // A connector whose API key rides in its own header (e.g. Composio's `x-api-key`) must not
+    // have it forwarded to whatever host a redirect names.
+    const hops = stubChain(
+      { "https://mcp.example.com/mcp": "https://cdn.example.net/mcp" }, 302);
+    await guardedFetch("https://mcp.example.com/mcp", {
+      method: "POST",
+      headers: { Authorization: "Bearer tok", "x-api-key": "composio-key" },
+      body: "{}",
+    }, { credentialHeaders: ["x-api-key"] });
+    expect(hops[1].apiKey).toBeNull();
+    expect(hops[1].authorization).toBeNull();
+  });
+
+  it("keeps a configured credential header on a same-origin hop", async () => {
+    const hops = stubChain(
+      { "https://mcp.example.com/mcp": "https://mcp.example.com/v2" }, 307);
+    await guardedFetch("https://mcp.example.com/mcp", {
+      method: "POST",
+      headers: { "x-api-key": "composio-key" },
+      body: "{}",
+    }, { credentialHeaders: ["x-api-key"] });
+    expect(hops[1].apiKey).toBe("composio-key");
   });
 });
 
