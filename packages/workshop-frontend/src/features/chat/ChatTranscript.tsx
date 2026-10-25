@@ -1034,7 +1034,7 @@ export function ChatTranscript({
                                     <span className="min-w-0 flex-1">
                                       <span className="flex min-w-0 items-center gap-2 text-[14px] leading-5 tracking-[-0.25px]">
                                         <span className="min-w-0 truncate">{label}</span>
-                                        {running && <ToolRunningIndicator />}
+                                        <ToolRunningIndicator running={running} />
                                         <CaretRight
                                           size={13}
                                           weight="bold"
