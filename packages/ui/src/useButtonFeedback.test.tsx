@@ -78,6 +78,29 @@ describe("useButtonFeedback", () => {
     hook.unmount();
   });
 
+  it("replaces a settled attempt's pending outcome when a new action starts", async () => {
+    const statuses: string[] = [];
+    const hook = mountHook(use, {
+      onStatusChange: (s) => statuses.push(s),
+    });
+    const failure = wait(160).then(() => {
+      throw new Error("boom");
+    });
+
+    hook.value.track(failure);
+    await advance(160);
+    // The failure settled inside the spinner hold, so its error display is still pending.
+    expect(hook.value.status).toBe("loading");
+    expect(hook.value.isPending()).toBe(true);
+
+    // A retry within that window takes over instead of being ignored.
+    hook.value.track(wait(300));
+    await advance(3000);
+    // The retry's spinner re-reports loading; the failure's error never lands.
+    expect(statuses).toEqual(["loading", "loading", "success", "idle"]);
+    hook.unmount();
+  });
+
   it("reports the error and holds the error state while hovered, then resets after the pointer leaves", async () => {
     const seen: unknown[] = [];
     const hook = mountHook(use, { onError: (e) => seen.push(e) });

@@ -87,6 +87,30 @@ describe('ResolveButton async feedback', () => {
     expect(button.textContent).toBe('Approve failed')
   })
 
+  it('tracks a retry issued inside the failure window instead of the stale failure', async () => {
+    let attempt = deferred<boolean>()
+    await testRoot.render(
+      <ResolveButton tone="approve" disabled={false} onClick={() => attempt.promise} />,
+    )
+    const button = approveButton()
+
+    await act(async () => button.click())
+    await advance(150)
+    expect(button.dataset.feedback).toBe('loading')
+
+    // The attempt fails while the spinner is still held, so its error display is still pending.
+    await attempt.resolve(false)
+    // A retry starts inside that window and succeeds.
+    const retry = deferred<boolean>()
+    attempt = retry
+    await act(async () => button.click())
+    await retry.resolve(true)
+
+    await advance(600)
+    expect(button.dataset.feedback).toBe('success')
+    expect(button.textContent).toBe('Approved')
+  })
+
   it('holds the error state while hovered, then resets after the pointer leaves', async () => {
     const decision = deferred<void>()
     await testRoot.render(

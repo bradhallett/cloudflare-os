@@ -9,6 +9,7 @@ import type {
   AuthenticatedApi, NotificationSubscriber, UserNotification,
 } from "@gadgets/workshop-shared/api";
 import { NotificationBridge } from "./NotificationBridge";
+import { reportActivityDropdown } from "./activityDropdown";
 import { reportVisibleChat } from "./visibleChat";
 
 const addToast = vi.fn<(options: { actions: { onClick: () => void }[] }) => void>();
@@ -133,6 +134,26 @@ describe("NotificationBridge", () => {
     expect(addToast).not.toHaveBeenCalled();
 
     await act(() => subscribers[0].notify({ ...notification, chatId: 2 }));
+    expect(addToast).toHaveBeenCalledOnce();
+    withdraw();
+  });
+
+  it("does not toast a permission request already on screen in the activity dropdown", async () => {
+    await render();
+    const withdraw = reportActivityDropdown(() => "workspace-1");
+    await act(() => subscribers[0].notify({ ...notification, kind: "permissionRequested" }));
+    expect(addToast).not.toHaveBeenCalled();
+
+    // Completions are not dropdown content, so they still toast.
+    await act(() => subscribers[0].notify(notification));
+    expect(addToast).toHaveBeenCalledOnce();
+    withdraw();
+  });
+
+  it("still toasts a permission request from another workspace while a dropdown is open", async () => {
+    await render();
+    const withdraw = reportActivityDropdown(() => "workspace-2");
+    await act(() => subscribers[0].notify({ ...notification, kind: "permissionRequested" }));
     expect(addToast).toHaveBeenCalledOnce();
     withdraw();
   });
