@@ -1641,6 +1641,7 @@ export default function GadgetEditor() {
 
           <ActivityNotifications
             overseer={overseer.stub}
+            workspaceId={id!}
             onViewActivity={openActivity}
             restricted={metadata?.containsRestrictedData === true}
           />

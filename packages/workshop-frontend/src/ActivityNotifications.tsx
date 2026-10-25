@@ -1,4 +1,4 @@
-import { useId, useState } from 'react'
+import { useEffect, useId, useState } from 'react'
 import { Popover } from '@cloudflare/kumo'
 import { ArrowRight, Pulse } from '@phosphor-icons/react'
 import type { RpcStub } from 'capnweb'
@@ -16,9 +16,13 @@ import {
 } from './Activity'
 import { useActions } from './useActions'
 import { useResolveAction } from './useResolveAction'
+import { reportActivityDropdown } from './features/notifications/activityDropdown'
 
 interface ActivityNotificationsProps {
   overseer: RpcStub<Overseer>
+  // The workspace the dropdown reports itself open for, so notification toasts for the same
+  // workspace are suppressed while its requests are already on screen here.
+  workspaceId: string
   onViewActivity: (view: ActivityView) => void
   // True once the workspace has read restricted data (GadgetMetadata.containsRestrictedData):
   // the approver is the leak check, so each request is shown in full with a notice saying so.
@@ -29,6 +33,7 @@ const PREVIEW_LIMIT = 3
 
 export default function ActivityNotifications({
   overseer,
+  workspaceId,
   onViewActivity,
   restricted,
 }: ActivityNotificationsProps) {
@@ -39,6 +44,8 @@ export default function ActivityNotifications({
   // While restricted each request's approve/deny buttons name the shared notice and their own
   // request text as their description: both follow the controls in DOM order.
   const noticeId = useId()
+
+  useEffect(() => reportActivityDropdown(() => (open ? workspaceId : null)), [open, workspaceId])
 
   const openFullView = (view: ActivityView) => {
     setOpen(false)

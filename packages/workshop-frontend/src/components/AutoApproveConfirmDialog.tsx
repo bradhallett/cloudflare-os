@@ -1,6 +1,6 @@
 import { Dialog } from '@cloudflare/kumo'
 import { useButtonFeedback } from '@gadgets/ui'
-import { Check, X } from '@phosphor-icons/react'
+import { X } from '@phosphor-icons/react'
 import { WorkshopButton, WorkshopIconButton } from './WorkshopControls'
 import { FeedbackSpinner } from './ResolveButton'
 
@@ -82,24 +82,21 @@ export default function AutoApproveConfirmDialog({
                 Promise.resolve(onConfirm()).then((enabled) => {
                   if (!enabled) throw undefined
                 }),
-              )}
+              )
+            }
             disabled={isProcessing}
             data-feedback={status}
+            aria-busy={status === 'loading' || undefined}
             className="!h-9 min-w-[64px]"
           >
+            {/* Success never renders here: both callers close the dialog the moment enabling
+                resolves, so only the in-flight and failure states are reachable. */}
             {status === 'loading' ? (
               <>
                 <FeedbackSpinner className="border-kumo-inverse border-t-transparent" />
                 Enabling…
               </>
-            ) : status === 'error' ? 'Failed' : status === 'success' ? (
-              <>
-                <Check size={13} aria-hidden="true" />
-                Enabled
-              </>
-            ) : (
-              'Always approve'
-            )}
+            ) : status === 'error' ? 'Failed' : 'Always approve'}
           </WorkshopButton>
         </div>
       </Dialog>

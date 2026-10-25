@@ -10,6 +10,7 @@ import type {
 import { logRpcFailure } from "../../rpcErrors";
 import { nativeApp } from "../native-app/nativeApp";
 import { isChatVisible } from "./visibleChat";
+import { isActivityDropdownOpen } from "./activityDropdown";
 
 const DEVICE_REGISTRATION_EVENT = "cloudflare-os:notification-device-registration";
 
@@ -123,6 +124,9 @@ export const NotificationBridge = ({
       let subscriber = new NotificationSubscriberImpl(notification => {
         let { id, kind, workspaceId, chatId, chatTitle } = notification;
         if (isChatVisible(workspaceId, chatId)) return;
+        // The workspace's activity dropdown already lists its pending requests, so a permission
+        // toast over it would only duplicate them; completions are not dropdown content.
+        if (kind === "permissionRequested" && isActivityDropdownOpen(workspaceId)) return;
         let completed = kind === "taskCompleted";
         addToast.current({
           id,

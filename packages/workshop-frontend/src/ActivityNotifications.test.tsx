@@ -1,19 +1,38 @@
 // @vitest-environment jsdom
 /* eslint-disable react/react-in-jsx-scope */
 
+import { act } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('@cloudflare/kumo', async (importOriginal) => {
   const actual = await importOriginal() as typeof import('@cloudflare/kumo')
-  // Render the popover inline (open or not) so its content is in the DOM to assert on.
-  const Pass = ({ children }: { children?: React.ReactNode }) => children ?? null
-  const parts = new Proxy(Pass, { get: () => Pass })
+  const { cloneElement, createContext, useContext, isValidElement } = await import('react')
+  // Render the popover inline (open or not) so its content is in the DOM to assert on, with a
+  // trigger that really toggles open through onOpenChange.
+  const PopoverState = createContext<{ open?: boolean; onOpenChange?: (open: boolean) => void }>({})
+  const Popover = ({ children, open, onOpenChange }: {
+    children?: React.ReactNode
+    open?: boolean
+    onOpenChange?: (open: boolean) => void
+  }) => <PopoverState.Provider value={{ open, onOpenChange }}>{children}</PopoverState.Provider>
+  const popover = Object.assign(Popover, {
+    Trigger: ({ render }: { render?: React.ReactElement<{ onClick?: unknown }> }) => {
+      const { open, onOpenChange } = useContext(PopoverState)
+      return isValidElement(render)
+        ? cloneElement(render, { onClick: () => onOpenChange?.(!open) })
+        : null
+    },
+    Content: ({ children }: { children?: React.ReactNode }) => <>{children}</>,
+    Title: ({ children }: { children?: React.ReactNode }) => <>{children}</>,
+  })
   const toasts = { add: vi.fn<(options: unknown) => void>() }
-  return { ...actual, Popover: parts, useKumoToastManager: () => toasts }
+  return { ...actual, Popover: popover, useKumoToastManager: () => toasts }
 })
+
 
 import { entry, flushFrames, makeOverseer, makeTestRoot } from './action-test-harness'
 import ActivityNotifications from './ActivityNotifications'
+import { isActivityDropdownOpen } from './features/notifications/activityDropdown'
 import { INCOMPLETE_DESCRIPTION_COPY } from './components/IncompleteDescriptionNotice'
 import { RESTRICTED_APPROVAL_COPY } from './components/RestrictedApprovalNotice'
 
@@ -36,7 +55,8 @@ async function renderPending(
 ): Promise<HTMLElement> {
   const server = makeOverseer()
   await view.render(
-    <ActivityNotifications overseer={server.overseer} onViewActivity={() => {}} restricted={restricted} />,
+    <ActivityNotifications overseer={server.overseer} workspaceId="workspace-1"
+      onViewActivity={() => {}} restricted={restricted} />,
   )
   await server.resolveSubscription()
   await server.resolvePendingQuery({
@@ -77,6 +97,24 @@ describe('ActivityNotifications', () => {
     expect(described).toContain(RESTRICTED_APPROVAL_COPY)
     expect(described).toContain('Regards, the workspace.')
     expect(described).toContain(INCOMPLETE_DESCRIPTION_COPY)
+  })
+
+  it('reports its open workspace so permission toasts are suppressed over it', async () => {
+    const server = makeOverseer()
+    await view.render(
+      <ActivityNotifications overseer={server.overseer} workspaceId="workspace-1"
+        onViewActivity={() => {}} />,
+    )
+    await server.resolveSubscription()
+    expect(isActivityDropdownOpen('workspace-1')).toBe(false)
+
+    const trigger = document.querySelector('button[aria-label="Activity"]')
+    if (!(trigger instanceof HTMLButtonElement)) throw new Error('No dropdown trigger rendered')
+    await act(async () => trigger.click())
+    expect(isActivityDropdownOpen('workspace-1')).toBe(true)
+
+    await act(async () => trigger.click())
+    expect(isActivityDropdownOpen('workspace-1')).toBe(false)
   })
 
   it('names only the restricted notice and request for a complete description', async () => {
