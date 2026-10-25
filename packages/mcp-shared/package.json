@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./action-store": "./src/action-store.ts",
     "./account": "./src/account.ts",
     "./base-types": "./src/base-types.ts",
     "./client": "./src/client.ts",

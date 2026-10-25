@@ -86,6 +86,62 @@
         "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/cloudflare"
       }
     },
+    "gatekeeper-composio": {
+      "bindings": [
+        {
+          "name": "COMPOSIO_API_KEY",
+          "text": "$SECRET(COMPOSIO_API_KEY)",
+          "type": "secret_text"
+        }
+      ],
+      "compatibilityDate": "2026-09-04",
+      "compatibilityFlags": [
+        "allow_irrevocable_stub_storage",
+        "global_fetch_strictly_public",
+        "nodejs_als"
+      ],
+      "inputs": [
+        {
+          "kind": "secret",
+          "label": "Composio project API key",
+          "name": "COMPOSIO_API_KEY"
+        }
+      ],
+      "installable": true,
+      "kind": "gatekeeper",
+      "mainModule": "composio.js",
+      "migrations": [
+        {
+          "new_sqlite_classes": [
+            "ComposioAccount",
+            "ComposioSingletonGatekeeper",
+            "ComposioToolkitGatekeeper"
+          ],
+          "tag": "v1"
+        }
+      ],
+      "modules": [
+        {
+          "name": "composio.js",
+          "r2Key": "blobs/modules/3f6d01af88c58a5ee08c59a1035888a8e08c64e1baff4c0a0deebf5ead4e8174",
+          "sha256": "3f6d01af88c58a5ee08c59a1035888a8e08c64e1baff4c0a0deebf5ead4e8174",
+          "size": 61,
+          "type": "esm"
+        }
+      ],
+      "observability": {
+        "enabled": true,
+        "head_sampling_rate": 1,
+        "logs": {
+          "invocation_logs": false
+        }
+      },
+      "shortName": "composio",
+      "singleton": true,
+      "vars": {
+        "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/composio"
+      }
+    },
     "gatekeeper-confluence": {
       "bindings": [
         {
