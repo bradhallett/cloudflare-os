@@ -103,12 +103,12 @@ describe("ComposerAttachmentTray", () => {
 
     // Fast uploads never flash a skeleton: within the delay the preview is simply there.
     expect(view.querySelector("img")!.getAttribute("src")).toBe("blob:photo");
-    expect(view.querySelector(".sr-only")).toBeNull();
+    expect(view.textContent).not.toContain("Uploading");
 
     // A slow upload replaces the content with a skeleton that still announces the upload.
     act(() => vi.advanceTimersByTime(150));
     expect(view.querySelector("img")).toBeNull();
-    expect(view.querySelector(".sr-only")?.textContent).toBe("Uploading photo.png");
+    expect(view.textContent).toContain("Uploading photo.png");
   });
 
   it("reports a failed upload next to the file name, replacing any image preview", () => {
@@ -148,18 +148,17 @@ describe("ComposerAttachmentTray", () => {
     expect(onRetry).not.toHaveBeenCalled();
   });
 
-  it("renders a long name as a truncatable base plus an untruncated extension", () => {
+  it("shows a long name's base and extension, keeping the whole name available", () => {
     const view = render([attachment({ id: "long", name: "a-very-long-file-name.pdf" })]);
 
-    const base = view.querySelector("span.truncate")!;
-    const extension = view.querySelector("span.shrink-0")!;
-    expect(base.textContent).toBe("a-very-long-file-name");
-    expect(extension.textContent).toBe(".pdf");
+    expect(view.textContent).toContain("a-very-long-file-name");
+    expect(view.textContent).toContain(".pdf");
+    // The whole name stays available to hover and assistive tech through the remove button's label.
+    expect(view.querySelector('button[aria-label="Remove a-very-long-file-name.pdf"]')).not.toBeNull();
 
-    // A name with no extension worth keeping renders as one clamped span instead.
+    // A name with no extension worth keeping reads as a single whole name.
     const plain = render([attachment({ id: "none", name: "Makefile" })]);
-    expect(plain.querySelector("span.truncate")).toBeNull();
-    expect(plain.querySelector("span.shrink-0")).toBeNull();
     expect(plain.textContent).toContain("Makefile");
+    expect(plain.querySelector('button[aria-label="Remove Makefile"]')).not.toBeNull();
   });
 });
