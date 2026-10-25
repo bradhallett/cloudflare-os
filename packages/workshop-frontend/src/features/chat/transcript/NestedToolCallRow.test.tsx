@@ -54,12 +54,16 @@ describe("NestedToolCallRow running indicator", () => {
     expect(spinner()).not.toBeNull();
   });
 
-  it("drops the spinner the moment output arrives", () => {
+  it("keeps the spinner long enough not to flash once output arrives", () => {
     renderRow(codeCall());
     act(() => vi.advanceTimersByTime(150));
     expect(spinner()).not.toBeNull();
 
     renderRow(codeCall({ output: "done" }));
+    act(() => vi.advanceTimersByTime(399));
+    expect(spinner()).not.toBeNull();
+
+    act(() => vi.advanceTimersByTime(1));
     expect(spinner()).toBeNull();
   });
 

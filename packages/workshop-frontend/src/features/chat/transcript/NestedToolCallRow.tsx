@@ -37,7 +37,7 @@ export const NestedToolCallRow = memo(function NestedToolCallRow({
         </span>
         <span className="flex min-w-0 flex-1 items-center gap-2 text-[14px] leading-5 tracking-[-0.25px]">
           <span className="min-w-0 truncate">{label}</span>
-          {running && <ToolRunningIndicator />}
+          <ToolRunningIndicator running={running} />
           {tc.error && (
             <span className="flex-shrink-0 rounded-full bg-kumo-danger-tint px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.04em] text-kumo-danger">
               Error

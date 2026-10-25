@@ -362,8 +362,8 @@ function describeProvisionalToolCount(toolName: AiToolCall["toolName"], count: n
 /**
  * Whether a tool call is still waiting for its result. Only a tool that records an `output` can
  * be told apart from a finished call (a writeFile's record looks the same done or not), so calls
- * of the other tools count as finished; an errored call is finished too -- the Error pill speaks
- * for it, so running and error never co-occur.
+ * of the other tools count as finished; an errored call is finished too -- its row shows the
+ * Error pill, never a spinner.
  */
 export function isToolCallRunning(tc: AiToolCall): boolean {
   if (tc.error) return false;
@@ -383,9 +383,19 @@ export function isToolCallRunning(tc: AiToolCall): boolean {
     case "messageBot":
     case "createExternalResource":
       return tc.output === undefined;
-    default:
+    case "readFile":
+    case "writeFile":
+    case "editFile":
+    case "setBindingHook":
+    case "saveCapsuleAsBinding":
+    case "giveUp":
+    case "observeUserChanges":
       return false;
   }
+  // Compile-time exhaustiveness check: a new AiToolCall variant must join one of the groups
+  // above, or one that declares `output` would silently read as finished while it still runs.
+  const _exhaustive: never = tc;
+  return _exhaustive;
 }
 
 /**
@@ -394,7 +404,9 @@ export function isToolCallRunning(tc: AiToolCall): boolean {
 export function buildProvisionalToolSummary(
   calls: ProvisionalToolCallState[],
 ): { label: string; detailLines: string[]; running: boolean } {
-
+  if (calls.length === 0) {
+    return { label: "Using tool", detailLines: [], running: false };
+  }
   if (calls.length === 1 && calls[0].outputFormat) {
     return { label: `Creating ${calls[0].outputFormat.noun}`, detailLines: [], running: !calls[0].finished };
   }
@@ -452,7 +464,10 @@ export type ToolCallGroup = {
   calls: AiToolCall[];
   observations: ObservationChatMessage[];
   hasError: boolean;
-  /** Whether the group's latest call is still waiting for its result (a spinner, not an Error pill). */
+  /**
+   * Whether the group's latest call is still waiting for its result. False whenever the group has
+   * an error: the Error pill speaks for the group, so the two never show together.
+   */
   running: boolean;
 };
 
@@ -500,6 +515,7 @@ export function buildToolCallGroups(
 
   const firstToolCall = toolCalls[0];
   const firstObservation = observations[0];
+  const hasError = toolCalls.some((tc) => Boolean(tc.error));
 
   return [{
     // Use the first work item id so expansion survives streaming → committed.
@@ -515,8 +531,9 @@ export function buildToolCallGroups(
     detailLines,
     calls: toolCalls,
     observations,
-    hasError: toolCalls.some((tc) => Boolean(tc.error)),
-    running: toolCalls.length > 0 && isToolCallRunning(toolCalls[toolCalls.length - 1]),
+    hasError,
+    // Error wins over running, so a failed group shows the Error pill alone.
+    running: !hasError && toolCalls.length > 0 && isToolCallRunning(toolCalls[toolCalls.length - 1]),
   }];
 }
 

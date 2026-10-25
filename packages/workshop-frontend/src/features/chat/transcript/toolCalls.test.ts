@@ -62,6 +62,13 @@ describe("buildToolCallGroups running", () => {
     expect(group.hasError).toBe(true);
     expect(group.running).toBe(false);
   });
+
+  it("never shows running once any call of the run failed, even a later one still running", () => {
+    const failed = codeCall({ toolCallId: "call-0", error: "boom" });
+    const group = buildToolCallGroups([failed, codeCall({ toolCallId: "call-1" })])[0];
+    expect(group.hasError).toBe(true);
+    expect(group.running).toBe(false);
+  });
 });
 
 describe("buildProvisionalToolSummary running", () => {
@@ -76,5 +83,13 @@ describe("buildProvisionalToolSummary running", () => {
       provisionalCall({ toolCallId: "call-0" }),
       provisionalCall({ toolCallId: "call-1", finished: true }),
     ]).running).toBe(false);
+  });
+
+  it("tolerates an empty call list", () => {
+    expect(buildProvisionalToolSummary([])).toEqual({
+      label: "Using tool",
+      detailLines: [],
+      running: false,
+    });
   });
 });
