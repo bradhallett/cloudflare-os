@@ -28,6 +28,10 @@ import {
 import {
   ActionDescriptionBuilder, buildDescription, codeSpan, sanitizeTitle, type RenderedDescription,
 } from "@gadgets/gatekeeper-kit/action-description";
+import {
+  APPLY_OUTCOME_UNKNOWN_MESSAGE, ActionJournal, ActionOutcomeUnknownError, type JournalRecord,
+} from "@gadgets/gatekeeper-kit/actions";
+import { SerialTaskQueue } from "@gadgets/gatekeeper-kit/serial-queue";
 import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import {
   clearCredentialExpiryLatch, notifyCredentialsExpiredOnce,
@@ -225,16 +229,6 @@ type StoredProvisionalResource = {
 
 type StoredActionState = "staged" | "pending" | "approved" | "rejected";
 
-type GitHubRevertInfo =
-  | {
-      type: "issueComment";
-      commentId: number;
-    }
-  | {
-      type: "reviewComment";
-      commentId: number;
-    };
-
 type BaseAction = {
   approvalId: number;
   submittedAt: number;
@@ -295,6 +289,8 @@ type PostCommentAction = BaseEntityAction & {
   type: "postComment";
   bodyMarkdown: string;
   provisionalCommentId: string;
+  /** The comment GitHub created, once the apply dispatched: what its revert deletes. */
+  createdCommentId?: number;
 };
 
 type StoredDraftDiffComment = GitHubDraftDiffComment & {
@@ -316,6 +312,8 @@ type ReplyToDiffCommentAction = BaseAction & {
   commentId: string;
   bodyMarkdown: string;
   provisionalCommentId: string;
+  /** The reply GitHub created, once the apply dispatched: what its revert deletes. */
+  createdCommentId?: number;
 };
 
 /**
@@ -549,13 +547,42 @@ function autoApprovalOf(action: GitHubAction): Pick<ActionDescription, "actionKi
   };
 }
 
+/**
+ * Whether a dispatch failure leaves GitHub's outcome unknown. Transport failures and server
+ * errors might have committed; client errors, git compare-and-swap refusals, and validation
+ * failures definitively did not.
+ * @param error The failure thrown by a dispatch.
+ * @returns Whether the provider effect is unknown.
+ */
+function isGitHubOutcomeUnknown(error: unknown): boolean {
+  if (error instanceof GitHubApiError) return error.status >= 500;
+  // A failed `fetch` throws TypeError; `AbortSignal.timeout` aborts with a TimeoutError
+  // DOMException. Both mean the request's fate is unknown.
+  return error instanceof TypeError ||
+    (error instanceof DOMException && error.name === "TimeoutError");
+}
+
 type StoredActionRecord = {
   action: GitHubAction;
   state: StoredActionState;
   appliedAt?: number;
   rejectedAt?: number;
-  revertInfo?: GitHubRevertInfo;
+  /** Legacy field, read only by the one-time adoption onto the action journal. */
+  revertInfo?: { type: "issueComment" | "reviewComment"; commentId: number };
 };
+
+/**
+ * Whether an action's provider call is compare-and-swap bound -- a push whose ref update carries
+ * its queue-time old sha, a merge bound to the head it was approved at -- so re-delivering it can
+ * never repeat the effect: GitHub refuses the repeat and the refusal path settles the apply. An
+ * interrupted dispatch of such an action stays appliable; an unbound one may have committed, so
+ * its outcome is terminal-unknown instead.
+ * @param action The action being applied.
+ * @returns Whether a re-dispatch is provider-refused.
+ */
+function isCasBound(action: GitHubAction): boolean {
+  return action.type === "push" || action.type === "mergePullRequest";
+}
 
 /**
  * A `base...head` pull request comparison computed as if the head branch's queued pushes had
@@ -1819,8 +1846,6 @@ export class GitHubVerifier extends WorkerEntrypoint<Env, GitHubVerifierProps>
 export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImplProps>
   implements Gatekeeper<GitHubRepoSession | GitHubIssue | GitHubPullRequest> {
 
-  #pendingActionsCache?: GitHubAction[];
-
   /**
    * Commit ids this instance has served from the workspace git cache as part of simulating
    * queued pushes (branch heads *and* the intermediate commits of pending chains). Session
@@ -1890,10 +1915,6 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const value = (this.ctx.storage.kv.get<number>(key) ?? 0) + 1;
     this.ctx.storage.kv.put(key, value);
     return value;
-  }
-
-  #nextActionId(): number {
-    return this.#nextCounter("action");
   }
 
   #nextProvisionalResourceId(): string {
@@ -2358,69 +2379,82 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     return this.#readAllPullReviewComments(realId);
   }
 
-  #actionRecordKey(approvalId: number): string {
-    return `action:${approvalId}`;
+  /**
+   * The action store: the kit journal over the exact keys this gatekeeper kept before it, so a
+   * ported record moves nowhere. `upgradeRecord` is the old row shape minus its wrapper; the
+   * one-time adoption below rewrites every old row before anything else reads the store.
+   */
+  #actions: ActionJournal<GitHubAction> = this.#actionJournal();
+
+  /** Serializes applies and discards: a discard's cascade reads records an apply may settle. */
+  #resolutions = new SerialTaskQueue();
+
+  #actionJournal(): ActionJournal<GitHubAction> {
+    const journal = new ActionJournal<GitHubAction>(this.ctx.storage.kv, {
+      legacyKeys: { nextIdKey: "nextActionId", recordPrefix: "action:" },
+      upgradeRecord: raw => (raw as StoredActionRecord).action,
+    });
+    this.#adoptActionRecords(journal);
+    return journal;
   }
 
-  #retiredActionRecordKey(approvalId: number): string {
-    return `retiredAction:${approvalId}`;
+  /**
+   * One-time port of the records this gatekeeper kept by hand onto the journal. Idempotent by
+   * construction: every step consumes the storage it reads, so a crash mid-port leaves the rest
+   * for the next attempt, and the marker rules out a rerun once complete.
+   * @param journal The freshly constructed journal adopting the records.
+   */
+  #adoptActionRecords(journal: ActionJournal<GitHubAction>): void {
+    if (this.ctx.storage.kv.get("actionRecordsV2") !== undefined) return;
+    // The old counter held the last issued id; the journal's holds the next unused one.
+    const lastIssued = this.ctx.storage.kv.get<number>("counter:action");
+    if (lastIssued !== undefined) {
+      this.ctx.storage.kv.put("nextActionId", lastIssued + 1);
+      this.ctx.storage.kv.delete("counter:action");
+    }
+    for (const [key, record] of this.ctx.storage.kv.list<StoredActionRecord>({ prefix: "action:" })) {
+      const id = Number(key.slice("action:".length));
+      this.ctx.storage.kv.delete(key);
+      journal.adopt(id, { state: record.state === "staged" ? "staged" : "pending", action: record.action });
+    }
+    for (const [key, record] of this.ctx.storage.kv.list<StoredActionRecord>({ prefix: "retiredAction:" })) {
+      const id = Number(key.slice("retiredAction:".length));
+      this.ctx.storage.kv.delete(key);
+      if (record.state === "approved") {
+        // A revert's target rides on the action itself now; the wrapper record is gone.
+        journal.adopt(id, {
+          state: "applied",
+          action: {
+            ...record.action,
+            ...(record.revertInfo ? { createdCommentId: record.revertInfo.commentId } : {}),
+          },
+        });
+      } else {
+        journal.adopt(id, {
+          state: "failed",
+          action: record.action,
+          error: `GitHub action ${id} was discarded, or something it depended on was, so it cannot be applied.`,
+          undispatched: true,
+        });
+      }
+    }
+    this.ctx.storage.kv.put("actionRecordsV2", true);
   }
 
-  #getLiveActionRecord(approvalId: number): StoredActionRecord | undefined {
-    return this.ctx.storage.kv.get<StoredActionRecord>(this.#actionRecordKey(approvalId));
-  }
-
-  #getActionRecord(approvalId: number): StoredActionRecord | undefined {
-    return this.#getLiveActionRecord(approvalId)
-      ?? this.ctx.storage.kv.get<StoredActionRecord>(this.#retiredActionRecordKey(approvalId));
-  }
-
-  #requireActionRecord(approvalId: number): StoredActionRecord {
-    const record = this.#getActionRecord(approvalId);
+  #requireActionRecord(approvalId: number): JournalRecord<GitHubAction> {
+    const record = this.#actions.get(approvalId);
     if (!record) {
       throw new Error(`No queued GitHub action exists with id ${approvalId}.`);
     }
     return record;
   }
 
-  #putActionRecord(approvalId: number, record: StoredActionRecord): void {
-    this.ctx.storage.kv.put(this.#actionRecordKey(approvalId), record);
-  }
-
-  #putRetiredActionRecord(approvalId: number, record: StoredActionRecord): void {
-    this.ctx.storage.kv.put(this.#retiredActionRecordKey(approvalId), record);
-  }
-
-  #retireActionRecord(approvalId: number, record: StoredActionRecord): void {
-    this.ctx.storage.kv.delete(this.#actionRecordKey(approvalId));
-    this.#putRetiredActionRecord(approvalId, record);
-  }
-
-  #stageAction(action: GitHubAction): void {
-    this.#putActionRecord(action.approvalId, {
-      action,
-      state: "staged",
-    });
-    this.#pendingActionsCache = undefined;
-  }
-
   #listPendingActions(): GitHubAction[] {
-    if (!this.#pendingActionsCache) {
-      this.#pendingActionsCache = [...this.ctx.storage.kv.list<StoredActionRecord>({ prefix: "action:" })]
-        .map(([, value]) => value)
-        .filter(record => record.state === "pending")
-        .map(record => record.action)
-        .toSorted((a, b) => a.submittedAt - b.submittedAt);
-    }
-
-    return this.#pendingActionsCache;
+    return this.#actions.listPending().map(({ action }) => action);
   }
 
   #markActionPending(action: GitHubAction): void {
-    const record = this.#requireActionRecord(action.approvalId);
-    record.state = "pending";
-    this.#putActionRecord(action.approvalId, record);
-    this.#pendingActionsCache = undefined;
+    this.#actions.markSubmitted(action.approvalId);
     if (action.type === "createIssue" || action.type === "createPullRequest") {
       this.ctx.storage.kv.put<StoredProvisionalResource>(`provisional:${action.provisionalId}`, {
         kind: action.type === "createIssue" ? "issue" : "pull",
@@ -2428,23 +2462,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
   }
 
-  #markActionApproved(action: GitHubAction, revertInfo?: GitHubRevertInfo): void {
-    const record = this.#requireActionRecord(action.approvalId);
-    record.state = "approved";
-    record.appliedAt = Date.now();
-    if (revertInfo) {
-      record.revertInfo = revertInfo;
-    }
-    this.#retireActionRecord(action.approvalId, record);
-    this.#pendingActionsCache = undefined;
-  }
-
   #markActionRejected(action: GitHubAction): void {
-    const record = this.#requireActionRecord(action.approvalId);
-    record.state = "rejected";
-    record.rejectedAt = Date.now();
-    this.#retireActionRecord(action.approvalId, record);
-    this.#pendingActionsCache = undefined;
+    this.#actions.markFailed(action.approvalId,
+      `GitHub action ${action.approvalId} was discarded, or something it depended on was, so it cannot be applied.`,
+      { undispatched: true });
   }
 
   #actionDependsOnResource(action: GitHubAction, kind: EntityKind, provisionalId: string): boolean {
@@ -2497,10 +2518,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       : undefined;
     // The read yields, so a concurrent apply or discard may have settled the push meanwhile.
     const { state } = this.#requireActionRecord(push.approvalId);
-    if (state === "approved") {
+    if (state === "applied") {
       throw new Error(`GitHub action ${push.approvalId} was applied while it was being discarded.`);
     }
-    if (state === "rejected") return false;
+    if (state === "failed") return false;
     // Marked before simulating, which takes the push out of the queued pushes it overlays.
     this.#markActionRejected(push);
     if (realHead === undefined || this.#simulateBranchHead(push.branch, realHead) !== null) return false;
@@ -3743,7 +3764,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     action: GitHubAction,
     presentation: { title: string; implementsRevert: boolean; pushedCommits?: string[] },
   ): Promise<void> {
-    this.#stageAction(action);
+    // Sessions reserve the id while building the payload; a hand-built action (tests, older
+    // callers) numbers itself, so the journal acknowledges the issuance here.
+    this.#actions.reserveThrough(action.approvalId);
+    this.#actions.stage(action.approvalId, action);
     try {
       // The text and the auto-approval verdict come from the staged payload, not the caller, so
       // they always describe what applies.
@@ -3753,8 +3777,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         ...autoApprovalOf(action),
       });
     } catch (error) {
-      this.ctx.storage.kv.delete(this.#actionRecordKey(action.approvalId));
-      this.#pendingActionsCache = undefined;
+      this.#actions.rollbackSubmission(action.approvalId);
       throw error;
     }
 
@@ -4020,22 +4043,69 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   }
 
   async applyAction(actionId: number, cache: RpcStub<GitCache>): Promise<void> {
+    return this.#resolutions.run(() => this.#applyAction(actionId, cache));
+  }
+
+  /**
+   * Applies a decided action inside the resolution lane, claiming it first so an activation that
+   * dies mid-dispatch can never have the same effect delivered twice.
+   * @param actionId The action to apply.
+   * @param cache Action-scoped git cache capability.
+   */
+  async #applyAction(actionId: number, cache: RpcStub<GitCache>): Promise<void> {
     const record = this.#requireActionRecord(actionId);
-    if (record.state === "approved") {
+    if (record.state === "applied") {
       // Already applied: the overseer persists its own completion record only after this method
       // returns, so a crash or lost reply in that window re-delivers the apply. Only this durable
       // record can answer it -- the world may have legitimately moved on since -- and throwing
       // would strand the action as forever un-appliable.
       return;
     }
-    if (record.state === "rejected") {
+    if (record.state === "failed") {
       // A cascade retires actions the Workshop still shows as pending until the user discards
       // them too, so this is how an apply learns why it cannot run.
-      throw new Error(
-        `GitHub action ${actionId} was discarded, or something it depended on was, so it cannot be applied.`);
+      throw new Error(record.error);
+    }
+    if (record.state === "claimed") {
+      // A previous activation died mid-dispatch. For an unbound action the effect may or may not
+      // exist at GitHub, so it must never be re-dispatched blindly; a compare-and-swap-bound one
+      // is safe to re-deliver, because the provider refuses the repeat and the refusal settles.
+      if (isCasBound(record.action)) {
+        this.#actions.restorePending(actionId);
+        throw new Error(
+          `A previous attempt to apply GitHub action ${actionId} was interrupted. Apply it again: ` +
+          "its provider call is bound to the state it was approved against, so a repeat cannot land twice.");
+      }
+      this.#actions.markFailed(actionId, APPLY_OUTCOME_UNKNOWN_MESSAGE, { outcome: "unknown" });
+      throw new ActionOutcomeUnknownError(APPLY_OUTCOME_UNKNOWN_MESSAGE);
     }
 
-    const action = record.action;
+    this.#actions.markClaimed(actionId);
+    try {
+      const applied = await this.#dispatchAction(record.action, cache);
+      this.#actions.retain(actionId, applied);
+      this.#clearCaches();
+    } catch (error) {
+      if (isGitHubOutcomeUnknown(error) && !isCasBound(record.action)) {
+        const detail = error instanceof Error ? error.message : String(error);
+        const message = `${APPLY_OUTCOME_UNKNOWN_MESSAGE} (${detail})`;
+        this.#actions.markFailed(actionId, message, { outcome: "unknown" });
+        throw new ActionOutcomeUnknownError(message);
+      }
+      // A definitive refusal -- or an interrupted compare-and-swap-bound dispatch, whose repeat
+      // the provider itself refuses and the refusal path settles: the action stays appliable.
+      this.#actions.restorePending(actionId);
+      throw error;
+    }
+  }
+
+  /**
+   * Performs the provider calls for one action.
+   * @param action The action to dispatch.
+   * @param cache Action-scoped git cache capability.
+   * @returns The action as applied, carrying artifacts the apply created (a created comment's id).
+   */
+  async #dispatchAction(action: GitHubAction, cache: RpcStub<GitCache>): Promise<GitHubAction> {
     switch (action.type) {
       case "createIssue": {
         const response = await this.#withApi(api => api.createIssue(action.owner, action.repo, {
@@ -4045,9 +4115,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           assignees: action.options.assignees,
         }));
         this.#setProvisionalResource(action.provisionalId, { kind: "issue", realId: String(response.number) });
-        this.#markActionApproved(action);
-        this.#clearCaches();
-        return;
+        return action;
       }
       case "createPullRequest": {
         let response;
@@ -4074,17 +4142,13 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           throw error;
         }
         this.#setProvisionalResource(action.provisionalId, { kind: "pull", realId: String(response.number) });
-        this.#markActionApproved(action);
-        this.#clearCaches();
-        return;
+        return action;
       }
       case "setTitle": {
         const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
         if (!realId) throw new Error(`Target ${action.targetId} has not been created on GitHub yet.`);
         await this.#withApi(api => api.updateIssue(action.owner, action.repo, Number(realId), { title: action.title }));
-        this.#markActionApproved(action);
-        this.#clearCaches();
-        return;
+        return action;
       }
       case "setBody": {
         const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
@@ -4092,26 +4156,20 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         await this.#withApi(api => api.updateIssue(action.owner, action.repo, Number(realId), {
           body: this.#rewriteKnownReferences(action.bodyMarkdown, true),
         }));
-        this.#markActionApproved(action);
-        this.#clearCaches();
-        return;
+        return action;
       }
       case "addLabels": {
         const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
         if (!realId) throw new Error(`Target ${action.targetId} has not been created on GitHub yet.`);
         await this.#withApi(api => api.addLabels(action.owner, action.repo, Number(realId), action.labels));
-        this.#markActionApproved(action);
-        this.#clearCaches();
-        return;
+        return action;
       }
       case "removeLabels": {
         const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
         if (!realId) throw new Error(`Target ${action.targetId} has not been created on GitHub yet.`);
         await this.#withApi(api =>
           api.setLabels(action.owner, action.repo, Number(realId), remainingLabels(action)));
-        this.#markActionApproved(action);
-        this.#clearCaches();
-        return;
+        return action;
       }
       case "changeState": {
         const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
@@ -4120,9 +4178,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           state: action.state,
           state_reason: denormalizeStateReason(action.reason),
         }));
-        this.#markActionApproved(action);
-        this.#clearCaches();
-        return;
+        return action;
       }
       case "postComment": {
         const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
@@ -4133,13 +4189,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           Number(realId),
           this.#rewriteKnownReferences(action.bodyMarkdown, true),
         ));
-        const revertInfo: GitHubRevertInfo = {
-          type: "issueComment",
-          commentId: response.id,
-        };
-        this.#markActionApproved(action, revertInfo);
-        this.#clearCaches();
-        return;
+        return { ...action, createdCommentId: response.id };
       }
       case "postReview": {
         const realId = action.pullId.startsWith("~") ? this.#resolveProvisionalId(action.pullId) : action.pullId;
@@ -4164,9 +4214,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
             subject_type: comment.target.subjectType,
           })),
         }));
-        this.#markActionApproved(action);
-        this.#clearCaches();
-        return;
+        return action;
       }
       case "replyToDiffComment": {
         const pullId = action.pullId.startsWith("~") ? this.#resolveProvisionalId(action.pullId) : action.pullId;
@@ -4180,21 +4228,13 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           this.#rewriteKnownReferences(action.bodyMarkdown, true),
         ));
         this.ctx.storage.kv.put(`diffAlias:${action.provisionalCommentId}`, String(response.id));
-        const revertInfo: GitHubRevertInfo = {
-          type: "reviewComment",
-          commentId: response.id,
-        };
-        this.#markActionApproved(action, revertInfo);
-        this.#clearCaches();
-        return;
+        return { ...action, createdCommentId: response.id };
       }
       case "mergePullRequest": {
         const pullId = action.pullId.startsWith("~") ? this.#resolveProvisionalId(action.pullId) : action.pullId;
         if (!pullId) throw new Error(`Pull request ${action.pullId} has not been created on GitHub yet.`);
         await this.#mergePullRequest(Number(pullId), action);
-        this.#markActionApproved(action);
-        this.#clearCaches();
-        return;
+        return action;
       }
       case "push": {
         // No gatekeeper-side object walk: the overseer composes the pack from the action's
@@ -4218,9 +4258,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           );
           if (head !== undefined) throw this.#pushRefusal(action, head, error);
         }
-        this.#markActionApproved(action);
-        this.#clearCaches();
-        return;
+        return action;
       }
     }
   }
@@ -4289,8 +4327,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     } else if (this.#listPendingActions().some(leavesExpected)) {
       reason = `The push cannot be applied yet: it builds on ${expected}, the head the queued ` +
         `push to "${branch}" will leave. Approve that push first, then this one.`;
-    } else if ([...this.ctx.storage.kv.list<StoredActionRecord>({ prefix: "retiredAction:" })]
-      .some(([, record]) => record.state === "rejected" && leavesExpected(record.action))) {
+    } else if (this.#actions.listFailed().some(({ action }) => leavesExpected(action))) {
       reason = `The push cannot be applied: it builds on ${expected}, the head of a discarded ` +
         `push to "${branch}". Re-push your commits from the branch's current head.`;
     } else {
@@ -4340,11 +4377,20 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   }
 
   async rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
+    return this.#resolutions.run(() => this.#rejectAction(actionId));
+  }
+
+  /**
+   * Discards an action inside the resolution lane: its cascades read records an apply may settle.
+   * @param actionId The action to discard.
+   */
+  async #rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
     const record = this.#requireActionRecord(actionId);
     const action = record.action;
     // Discarded already: a cascade retires actions the Workshop still shows as pending, and the
-    // user's discard of one must then succeed rather than strand it.
-    if (record.state === "rejected") return;
+    // user's discard of one must then succeed rather than strand it. The failure record stays --
+    // pending-push refusals still cite a discarded push's target head -- until capacity prunes it.
+    if (record.state === "failed") return;
     if (record.state !== "pending" && record.state !== "staged") {
       throw new Error(`GitHub action ${actionId} is no longer pending.`);
     }
@@ -4382,7 +4428,6 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async revertAction(actionId: number): Promise<void | { message?: string; canRetry?: boolean; restart?: boolean }> {
     const record = this.#requireActionRecord(actionId);
     const action = record.action;
-    const revertInfo = record.revertInfo;
     switch (action.type) {
       case "setTitle": {
         const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
@@ -4398,11 +4443,25 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         this.#clearCaches();
         return;
       }
-      case "addLabels":
+      case "addLabels": {
+        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
+        if (!realId) return { message: "The target resource no longer exists on GitHub.", canRetry: false };
+        // Only the labels the action introduced: one that was already there stays.
+        const introduced = action.labels.filter(label => !action.previousLabels.includes(label));
+        for (const label of introduced) {
+          await this.#withApi(api => api.removeLabel(action.owner, action.repo, Number(realId), label));
+        }
+        this.#clearCaches();
+        return;
+      }
       case "removeLabels": {
         const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
         if (!realId) return { message: "The target resource no longer exists on GitHub.", canRetry: false };
-        await this.#withApi(api => api.setLabels(action.owner, action.repo, Number(realId), action.previousLabels));
+        // Only the labels the action removed: one that was never there is not added.
+        const removed = action.labels.filter(label => action.previousLabels.includes(label));
+        if (removed.length > 0) {
+          await this.#withApi(api => api.addLabels(action.owner, action.repo, Number(realId), removed));
+        }
         this.#clearCaches();
         return;
       }
@@ -4417,18 +4476,21 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         return;
       }
       case "postComment": {
-        if (revertInfo?.type !== "issueComment") {
+        const createdCommentId = action.createdCommentId;
+        if (createdCommentId === undefined) {
           return { message: "Missing issue comment revert information.", canRetry: false };
         }
-        await this.#withApi(api => api.deleteIssueComment(action.owner, action.repo, revertInfo.commentId));
+        await this.#withApi(api => api.deleteIssueComment(action.owner, action.repo, createdCommentId));
         this.#clearCaches();
         return;
       }
       case "replyToDiffComment": {
-        if (revertInfo?.type !== "reviewComment") {
+        const createdCommentId = action.createdCommentId;
+        if (createdCommentId === undefined) {
           return { message: "Missing review comment revert information.", canRetry: false };
         }
-        await this.#withApi(api => api.deletePullRequestReviewComment(action.owner, action.repo, revertInfo.commentId));
+        await this.#withApi(api =>
+          api.deletePullRequestReviewComment(action.owner, action.repo, createdCommentId));
         this.#clearCaches();
         return;
       }
@@ -4471,6 +4533,8 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           message: "This GitHub action cannot be automatically reverted.",
           canRetry: false,
         };
+      default:
+        action satisfies never;
     }
   }
 
@@ -5366,7 +5430,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async prepareCreateIssue(options: GitHubCreateIssueOptions): Promise<CreateIssueAction> {
     return {
       type: "createIssue",
-      approvalId: this.#nextActionId(),
+      approvalId: this.#actions.reserveId(),
       submittedAt: Date.now(),
       owner: this.ctx.props.owner,
       repo: this.ctx.props.repo,
@@ -5393,7 +5457,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
     return {
       type: "createPullRequest",
-      approvalId: this.#nextActionId(),
+      approvalId: this.#actions.reserveId(),
       submittedAt: Date.now(),
       owner: this.ctx.props.owner,
       repo: this.ctx.props.repo,
@@ -5406,7 +5470,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const details = targetKind === "issue" ? await this.#getIssueDetails(targetId) : await this.#getPullRequestDetails(targetId);
     return {
       type: "setTitle",
-      approvalId: this.#nextActionId(),
+      approvalId: this.#actions.reserveId(),
       submittedAt: Date.now(),
       owner: this.ctx.props.owner,
       repo: this.ctx.props.repo,
@@ -5421,7 +5485,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const details = targetKind === "issue" ? await this.#getIssueDetails(targetId) : await this.#getPullRequestDetails(targetId);
     return {
       type: "setBody",
-      approvalId: this.#nextActionId(),
+      approvalId: this.#actions.reserveId(),
       submittedAt: Date.now(),
       owner: this.ctx.props.owner,
       repo: this.ctx.props.repo,
@@ -5436,7 +5500,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const details = targetKind === "issue" ? await this.#getIssueDetails(targetId) : await this.#getPullRequestDetails(targetId);
     return {
       type: "addLabels",
-      approvalId: this.#nextActionId(),
+      approvalId: this.#actions.reserveId(),
       submittedAt: Date.now(),
       owner: this.ctx.props.owner,
       repo: this.ctx.props.repo,
@@ -5451,7 +5515,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const details = targetKind === "issue" ? await this.#getIssueDetails(targetId) : await this.#getPullRequestDetails(targetId);
     return {
       type: "removeLabels",
-      approvalId: this.#nextActionId(),
+      approvalId: this.#actions.reserveId(),
       submittedAt: Date.now(),
       owner: this.ctx.props.owner,
       repo: this.ctx.props.repo,
@@ -5471,7 +5535,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const current = await this.#getCurrentStateInfo(targetKind, targetId);
     return {
       type: "changeState",
-      approvalId: this.#nextActionId(),
+      approvalId: this.#actions.reserveId(),
       submittedAt: Date.now(),
       owner: this.ctx.props.owner,
       repo: this.ctx.props.repo,
@@ -5487,7 +5551,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async preparePostComment(targetKind: EntityKind, targetId: string, bodyMarkdown: string): Promise<PostCommentAction> {
     return {
       type: "postComment",
-      approvalId: this.#nextActionId(),
+      approvalId: this.#actions.reserveId(),
       submittedAt: Date.now(),
       owner: this.ctx.props.owner,
       repo: this.ctx.props.repo,
@@ -5501,7 +5565,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async preparePostReview(pullId: string, review: GitHubPullRequestReviewDraft): Promise<PostReviewAction> {
     return {
       type: "postReview",
-      approvalId: this.#nextActionId(),
+      approvalId: this.#actions.reserveId(),
       submittedAt: Date.now(),
       owner: this.ctx.props.owner,
       repo: this.ctx.props.repo,
@@ -5520,7 +5584,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async prepareReplyToDiffComment(pullId: string, commentId: string, bodyMarkdown: string): Promise<ReplyToDiffCommentAction> {
     return {
       type: "replyToDiffComment",
-      approvalId: this.#nextActionId(),
+      approvalId: this.#actions.reserveId(),
       submittedAt: Date.now(),
       owner: this.ctx.props.owner,
       repo: this.ctx.props.repo,
@@ -5566,7 +5630,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
     return {
       type: "mergePullRequest",
-      approvalId: this.#nextActionId(),
+      approvalId: this.#actions.reserveId(),
       submittedAt: Date.now(),
       owner: this.ctx.props.owner,
       repo: this.ctx.props.repo,
@@ -5609,7 +5673,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
     return {
       type: "push",
-      approvalId: this.#nextActionId(),
+      approvalId: this.#actions.reserveId(),
       submittedAt: Date.now(),
       owner: this.ctx.props.owner,
       repo: this.ctx.props.repo,
