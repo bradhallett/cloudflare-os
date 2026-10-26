@@ -5,6 +5,7 @@ import { Warning } from '@phosphor-icons/react'
 import { useOptionalAuthenticatedApi } from '../../AuthContext'
 import { useCloudflareLimitsEnabled } from '../../ServerConfigContext'
 import { NATIVE_CONNECT_COMPLETE_EVENT } from '../../connectHandoff'
+import { useReportRpcFailure } from '../../useReportRpcFailure'
 
 /**
  * Global, mandatory modal that forces the user to pick which Cloudflare account to bill whenever
@@ -15,6 +16,7 @@ export default function AccountSelectionModal() {
   const limitsEnabled = useCloudflareLimitsEnabled()
   const auth = useOptionalAuthenticatedApi()
   const toasts = useKumoToastManager()
+  const reportRpcFailure = useReportRpcFailure()
   const [needsSelection, setNeedsSelection] = useState(false)
   const [accounts, setAccounts] = useState<CloudflareAccountOption[] | null>(null)
   const [chosen, setChosen] = useState<string | undefined>(undefined)
@@ -67,8 +69,7 @@ export default function AccountSelectionModal() {
       setNeedsSelection(false)
       setAccounts(null)
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to select account'
-      toasts.add({ title: msg, variant: 'error' })
+      reportRpcFailure('Failed to select account', err)
     } finally {
       setSaving(false)
     }

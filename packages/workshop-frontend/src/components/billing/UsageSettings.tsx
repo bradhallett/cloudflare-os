@@ -4,11 +4,12 @@ import { Button, useKumoToastManager } from '@cloudflare/kumo'
 import { Lightning, CloudCheck, Warning } from '@phosphor-icons/react'
 import CloudflareLogo from '../auth/CloudflareLogo'
 import { useAuthenticatedApi } from '../../AuthContext'
+import { useConnectAccountActions } from '../../useConnectAccountActions'
+import { useReportRpcFailure } from '../../useReportRpcFailure'
 import { useCloudflareLimitsEnabled } from '../../ServerConfigContext'
 import { buildAddCreditsUrl } from './creditsUrl'
 import ResetCountdown from './ResetCountdown'
-import { NATIVE_CONNECT_COMPLETE_EVENT, openConnectWindow } from '../../connectHandoff'
-import { AuthPopupCancelledError } from '../../features/native-app/authPopup'
+import { NATIVE_CONNECT_COMPLETE_EVENT } from '../../connectHandoff'
 
 /**
  * Shows the user's free-tier usage and Cloudflare connection / credit status on the profile page.
@@ -20,7 +21,6 @@ export default function UsageSettings() {
   const toasts = useKumoToastManager()
   const [usage, setUsage] = useState<CloudflareUsageInfo | null>(null)
   const [loading, setLoading] = useState(true)
-  const [busy, setBusy] = useState(false)
   const refreshVersion = useRef(0)
 
   // Account-selection state (only used when the user has multiple Cloudflare accounts).
@@ -63,22 +63,18 @@ export default function UsageSettings() {
     return () => { cancelled = true }
   }, [usage, accounts, authenticatedApi])
 
+  const connectActions = useConnectAccountActions(authenticatedApi)
+  const reportRpcFailure = useReportRpcFailure()
+
   // Hidden entirely when the feature is off, or while the unlimited (self-hosted) default applies.
   if (!limitsEnabled || (usage && usage.unlimited)) return null
 
-  const connect = async () => {
-    setBusy(true)
-    try {
-      // Connecting (or signing in with) Cloudflare is handled by the Cloudflare gatekeeper. Open its
-      // OAuth flow; native redemption triggers the refresh above after focus has already returned.
-      await openConnectWindow(await authenticatedApi.connectAccount('cloudflare', []), authenticatedApi)
-    } catch (error) {
-      if (error instanceof AuthPopupCancelledError) return
-      toasts.add({ title: 'Could not connect Cloudflare',
-        description: error instanceof Error ? error.message : undefined, variant: 'error' })
-    } finally {
-      setBusy(false)
-    }
+  const busy = connectActions.connectingVendor !== null
+
+  const connect = () => {
+    // Connecting (or signing in with) Cloudflare is handled by the Cloudflare gatekeeper. Open its
+    // OAuth flow; native redemption triggers the refresh above after focus has already returned.
+    void connectActions.connect('cloudflare', [], { errorTitle: 'Could not connect Cloudflare' })
   }
 
   const selectAccount = async (accountId: string) => {
@@ -89,8 +85,7 @@ export default function UsageSettings() {
       setAccounts(null)
       refresh()
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to select account'
-      toasts.add({ title: msg, variant: 'error' })
+      reportRpcFailure('Failed to select account', err)
     } finally {
       setSelecting(null)
     }

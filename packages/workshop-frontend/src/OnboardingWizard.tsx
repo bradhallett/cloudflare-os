@@ -35,8 +35,7 @@ import { useSiteName } from './ServerConfigContext'
 import SiteLogo from './components/SiteLogo'
 import { useDocumentTitle } from './useDocumentTitle'
 import { AccountsSubscriberAdapter } from './accountsSubscriber'
-import { openConnectWindow } from './connectHandoff'
-import { AuthPopupCancelledError } from './features/native-app/authPopup'
+import { useConnectAccountActions } from './useConnectAccountActions'
 
 // ─── constants ──────────────────────────────────────────────────────────────────
 
@@ -100,7 +99,8 @@ export default function OnboardingWizard({
   const [vendors, setVendors] = useState<VendorEntry[]>([])
   const [connectedVendorIds, setConnectedVendorIds] = useState<Set<string>>(new Set())
   const [vendorsLoading, setVendorsLoading] = useState(true)
-  const [connectingVendorId, setConnectingVendorId] = useState<string | null>(null)
+  const connectActions = useConnectAccountActions(authenticatedApi)
+  const connectingVendorId = connectActions.connectingVendor
 
   // Ambient gatekeepers the user can opt into. Each is on unless the user switches it off.
   const [ambientVendors, setAmbientVendors] = useState<GatekeeperVendorInfo[]>([])
@@ -277,18 +277,10 @@ export default function OnboardingWizard({
 
   // ── connection handlers ───────────────────────────────────────────────────────
 
-  const handleConnect = async (vendorId: string) => {
-    setConnectingVendorId(vendorId)
-    try {
-      await openConnectWindow(await authenticatedApi.connectAccount(vendorId), authenticatedApi)
-    } catch (err) {
-      if (err instanceof AuthPopupCancelledError) return
-      console.error('Failed to start connection:', err)
-      toasts.add({ title: err instanceof Error ? err.message : 'Could not complete connection', variant: 'error' })
-    } finally {
-      // Reset after a short delay — the subscription will update the UI when the connection completes
-      setTimeout(() => setConnectingVendorId(null), 2000)
-    }
+  const handleConnect = (vendorId: string) => {
+    // Busy holds briefly after the flow settles — the subscription updates the UI when the
+    // connection completes, and the button should stay disabled until then.
+    void connectActions.connect(vendorId, undefined, { busyHoldMs: 2000 })
   }
 
   const handleAmbientToggle = (vendorId: string, on: boolean) => {

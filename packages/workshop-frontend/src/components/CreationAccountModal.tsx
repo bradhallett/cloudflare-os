@@ -2,23 +2,20 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Dialog, Loader, useKumoToastManager } from '@cloudflare/kumo'
 import type { RpcStub } from 'capnweb'
 import type {
-  ConnectFlowStart, CreationApproval, GatekeeperVendorInfo, Overseer, WorkpieceId,
+  CreationApproval, GatekeeperVendorInfo, Overseer, WorkpieceId,
 } from '@gadgets/workshop-shared/api'
 import type { GatekeeperUiFrame } from '@gadgets/workshop-shared/gatekeeper'
 import { useAuthenticatedApi } from '../AuthContext'
 import { AccountsSubscriberAdapter, type AccountEvent } from '../accountsSubscriber'
-import { openConnectWindow } from '../connectHandoff'
+import { rpcFailureDescription } from '../rpcErrors'
 import { requestAccountResources } from '../requestAccountResources'
-import { AuthPopupCancelledError } from '../features/native-app/authPopup'
+import { useConnectAccountActions } from '../useConnectAccountActions'
 import { AccountChooser } from '../gatekeeper-modal/AccountChooser'
 import ResourceConfiguratorHost from '../ResourceConfiguratorHost'
 import { disposeConfiguratorFrame } from '../disposeConfiguratorFrame'
 import { WorkshopButton } from './WorkshopControls'
 
 type CreationTarget = { vendor: GatekeeperVendorInfo; typeUrlPattern: string }
-
-// The popup flow whose start request is in flight.
-type StartingFlow = { kind: 'connect' } | { kind: 'reconnect' | 'grant'; accountId: number }
 
 // The creation configurator started for an account, or why it could not start.
 type Configurator = { accountId: number } & ({ frame: GatekeeperUiFrame } | { error: string })
@@ -41,7 +38,6 @@ export const CreationAccountModal = ({ overseer, gatekeeperId, onChoose, onCance
   const [accounts, setAccounts] = useState<AccountEvent[]>([])
   const [ready, setReady] = useState(false)
   const [chosen, setChosen] = useState<number>()
-  const [starting, setStarting] = useState<StartingFlow | null>(null)
   const [configurator, setConfigurator] = useState<Configurator | null>(null)
   const [configuratorReady, setConfiguratorReady] = useState<boolean | null>(null)
   const [collector, setCollector] = useState<{ collect: () => Promise<string> } | null>(null)
@@ -105,19 +101,7 @@ export const CreationAccountModal = ({ overseer, gatekeeperId, onChoose, onCance
   }, [authenticatedApi])
 
   // Desktop redeems in the popup; native awaits in-app redemption. Both notify the subscription.
-  const startFlow = async (flow: StartingFlow, start: () => Promise<ConnectFlowStart | null>) => {
-    setStarting(flow)
-    try {
-      const started = await start()
-      if (started) await openConnectWindow(started, authenticatedApi)
-    } catch (err) {
-      if (err instanceof AuthPopupCancelledError) return
-      console.error('Failed to start connection flow:', err)
-      toasts.add({ title: err instanceof Error ? err.message : 'Could not complete connection flow', variant: 'error' })
-    } finally {
-      setStarting(null)
-    }
-  }
+  const connectActions = useConnectAccountActions(authenticatedApi)
 
   const matching = target ? accounts.filter(a => a.vendorId === target.vendor.id) : []
   const resource = target?.vendor.supportedResources
@@ -144,7 +128,7 @@ export const CreationAccountModal = ({ overseer, gatekeeperId, onChoose, onCance
       .catch((err: unknown) => {
         console.error('Failed to start the creation configurator:', err)
         if (cancelled) return
-        const error = err instanceof Error ? err.message : 'Could not start configurator.'
+        const error = rpcFailureDescription(err) ?? 'Could not start configurator.'
         setConfigurator({ accountId: configuratorAccountId, error })
       })
     return () => {
@@ -202,18 +186,15 @@ export const CreationAccountModal = ({ overseer, gatekeeperId, onChoose, onCance
                 accounts={matching.map(a => ({ ...a, vendorDescription: a.vendor }))}
                 selectedAccountId={selected?.id ?? null}
                 vendorName={target.vendor.description.displayName}
-                connecting={starting?.kind === 'connect'}
-                reconnectingAccountId={starting?.kind === 'reconnect' ? starting.accountId : null}
+                connecting={connectActions.connectingVendor !== null}
+                reconnectingAccountId={connectActions.reconnectingAccountId}
                 requiredResourceUrlPatterns={required}
-                grantingAccountId={starting?.kind === 'grant' ? starting.accountId : null}
+                grantingAccountId={connectActions.grantingAccountId}
                 onSelect={setChosen}
-                onConnect={() => void startFlow({ kind: 'connect' }, () =>
-                  authenticatedApi.connectAccount(
-                    target.vendor.id, required.length > 0 ? required : undefined))}
-                onReconnect={accountId => void startFlow({ kind: 'reconnect', accountId }, () =>
-                  authenticatedApi.reconnectAccount(accountId))}
-                onGrantAccess={accountId => void startFlow({ kind: 'grant', accountId }, () =>
-                  authenticatedApi.ensureAccountResources(accountId, required))}
+                onConnect={() => void connectActions.connect(
+                  target.vendor.id, required.length > 0 ? required : undefined)}
+                onReconnect={accountId => void connectActions.reconnect(accountId)}
+                onGrantAccess={accountId => void connectActions.grant(accountId, required)}
               />
               {configuratorAccountId !== null && (
                 <ResourceConfiguratorHost
