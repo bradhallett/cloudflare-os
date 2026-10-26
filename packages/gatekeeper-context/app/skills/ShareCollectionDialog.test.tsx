@@ -44,6 +44,7 @@ const button = (label: string) => [...document.querySelectorAll<HTMLButtonElemen
   .find((candidate) => candidate.textContent?.trim() === label);
 
 const addRole = () => document.querySelector<HTMLElement>("[aria-label='Role for users you add']");
+const addOrg = () => document.querySelector<HTMLElement>("[aria-label='Add organization']");
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -68,6 +69,7 @@ const choose = async (trigger: HTMLElement | null | undefined, label: string) =>
 };
 
 const ownerPermissions = { canEdit: true, canShare: true, canManageOwners: true, canDelete: true };
+const viewerWithoutOrgs = async () => ({ isAdmin: false, supportsGitCollections: false, orgs: [] });
 const twoOwners: ContextCollectionSharing = {
   members: [
     { memberId: "me", role: "owner", displayName: "Ada", isViewer: true },
@@ -127,6 +129,7 @@ describe("ShareCollectionDialog", () => {
       if (ticket === "refused") throw new Error("They have no Context account yet.");
     });
     mocks.api = {
+      getViewerInfo: viewerWithoutOrgs,
       getContextCollectionSharing: async () => sharing,
       getContextCollectionPermissions: async () => ({
         canEdit: true,
@@ -193,6 +196,7 @@ describe("ShareCollectionDialog", () => {
     let permissions = ownerPermissions;
     const shareContextCollection = vi.fn<ContextApi["shareContextCollection"]>(async () => {});
     mocks.api = {
+      getViewerInfo: viewerWithoutOrgs,
       getContextCollectionSharing: async () => twoOwners,
       getContextCollectionPermissions: async () => permissions,
       setContextCollectionMemberRole: async () => {
@@ -224,6 +228,7 @@ describe("ShareCollectionDialog", () => {
       return twoOwners;
     });
     mocks.api = {
+      getViewerInfo: viewerWithoutOrgs,
       getContextCollectionSharing,
       getContextCollectionPermissions: async () => ownerPermissions,
       setContextCollectionMemberRole: async () => {
@@ -256,6 +261,7 @@ describe("ShareCollectionDialog", () => {
       throw new Error("Access was changed, but Git tokens could not be revoked yet.");
     });
     mocks.api = {
+      getViewerInfo: viewerWithoutOrgs,
       getContextCollectionSharing: async () => ({
         members: [{ memberId: "me", role: "editor", isViewer: true }],
         everyoneCanView: true,
@@ -288,6 +294,7 @@ describe("ShareCollectionDialog", () => {
     const refreshedPermissions = deferred<typeof ownerPermissions>();
     let changed = false;
     mocks.api = {
+      getViewerInfo: viewerWithoutOrgs,
       getContextCollectionSharing: () => changed ? refreshedSharing.promise : Promise.resolve(twoOwners),
       getContextCollectionPermissions: () => changed ? refreshedPermissions.promise : Promise.resolve(ownerPermissions),
       setContextCollectionMemberRole: async () => { changed = true; },
@@ -313,6 +320,7 @@ describe("ShareCollectionDialog", () => {
     let delivered = false;
     let receiver: UserSelectionReceiver | undefined;
     mocks.api = {
+      getViewerInfo: viewerWithoutOrgs,
       getContextCollectionSharing: async () => delivered ? {
         ...sharing,
         members: [...sharing.members, { memberId: "late", role: "viewer", displayName: "Late arrival", isViewer: false }],
@@ -344,6 +352,7 @@ describe("ShareCollectionDialog", () => {
     let memberCount = 1;
     let receiver: UserSelectionReceiver | undefined;
     mocks.api = {
+      getViewerInfo: viewerWithoutOrgs,
       getContextCollectionSharing: async () => sharing,
       getContextCollectionPermissions: async () => ownerPermissions,
       shareContextCollection: async () => { await delivery.promise; memberCount = 2; },
@@ -374,5 +383,64 @@ describe("ShareCollectionDialog", () => {
     await act(async () => { delivery.resolve(); await receive; });
     expect(document.body.textContent).toContain("Members in library: 2");
     expect(button("Select users")).toBeUndefined();
+  });
+
+  it("offers the viewer's ungranted orgs and shares with the chosen role, surfacing refusals", async () => {
+    const shareContextCollectionWithOrg = vi.fn<ContextApi["shareContextCollectionWithOrg"]>(async () => {});
+    mocks.api = {
+      getViewerInfo: async () => ({
+        isAdmin: false,
+        supportsGitCollections: false,
+        orgs: [
+          { orgId: "org-1", role: "member" },
+          { orgId: "org-granted", role: "admin" },
+        ],
+      }),
+      getContextCollectionSharing: async () => ({
+        members: [
+          { memberId: "me", role: "owner", displayName: "Ada", isViewer: true },
+          { memberId: "org-granted", subject: "org" as const, role: "editor", isViewer: false },
+        ],
+        everyoneCanView: false,
+        hasOwner: true,
+      }),
+      getContextCollectionPermissions: async () => ownerPermissions,
+      shareContextCollectionWithOrg,
+    } as unknown as ContextApi;
+    root = await renderDialog();
+
+    // An org that already holds a grant is a member row, never an add target again.
+    expect(document.body.textContent).toContain("Organization org-granted");
+
+    await choose(addRole(), "Owner");
+    await choose(addOrg(), "Organization org-1");
+    expect(shareContextCollectionWithOrg).toHaveBeenCalledWith("collection", "org-1", "owner");
+
+    shareContextCollectionWithOrg.mockRejectedValueOnce(
+      new Error("You must belong to an organization to give it access to this collection."));
+    await choose(addOrg(), "Organization org-1");
+    expect(document.body.textContent)
+      .toContain("You must belong to an organization to give it access to this collection.");
+  });
+
+  it("changes an org grant's role through its member row", async () => {
+    const setContextCollectionMemberRole = vi.fn<ContextApi["setContextCollectionMemberRole"]>(async () => {});
+    mocks.api = {
+      getViewerInfo: viewerWithoutOrgs,
+      getContextCollectionSharing: async () => ({
+        members: [
+          { memberId: "me", role: "owner", displayName: "Ada", isViewer: true },
+          { memberId: "org-9", subject: "org" as const, role: "editor", isViewer: false },
+        ],
+        everyoneCanView: false,
+        hasOwner: true,
+      }),
+      getContextCollectionPermissions: async () => ownerPermissions,
+      setContextCollectionMemberRole,
+    } as unknown as ContextApi;
+    root = await renderDialog();
+
+    await choose(document.querySelector<HTMLElement>("[aria-label='Role for Organization org-9']"), "Can view");
+    expect(setContextCollectionMemberRole).toHaveBeenCalledWith("collection", "org-9", "viewer");
   });
 });

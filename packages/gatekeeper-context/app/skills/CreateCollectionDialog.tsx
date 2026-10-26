@@ -9,13 +9,14 @@ import {
   Text,
   useKumoToastManager,
 } from "@cloudflare/kumo";
-import { Buildings, GitBranch, Lock, PencilSimple, X } from "@phosphor-icons/react";
+import { Buildings, GitBranch, Lock, PencilSimple, User, X } from "@phosphor-icons/react";
 import { useState } from "react";
 import type {
   ContextCollectionContent,
   ContextCollectionMetadata,
   ContextCollectionVisibility,
   ContextGitTokenCreateResult,
+  ContextViewerOrg,
 } from "../../src/context-types";
 import { CollectionIconPicker, DEFAULT_COLLECTION_ICON } from "../components/CollectionIconPicker";
 import { useContextApi } from "../bridge";
@@ -23,7 +24,7 @@ import { GitTokenCredentials } from "./GitTokenCredentials";
 import { useMutationDialog } from "./useMutationDialog";
 
 type CreateCollectionDialogProps = {
-  viewerInfo: { isAdmin: boolean; supportsGitCollections: boolean };
+  viewerInfo: { isAdmin: boolean; supportsGitCollections: boolean; orgs: ContextViewerOrg[] };
   onCreated: () => void;
   onClose: () => void;
 };
@@ -41,6 +42,12 @@ export const CreateCollectionDialog = ({
   const [icon, setIcon] = useState(DEFAULT_COLLECTION_ICON);
   const [source, setSource] = useState<ContextCollectionContent["source"]>("web");
   const [visibility, setVisibility] = useState<ContextCollectionVisibility>("private");
+  // "" creates for the viewer themself; an org id creates an org-owned collection.
+  const [ownerOrgId, setOwnerOrgId] = useState("");
+  // Only an org's owners and admins may spend its name on a new collection.
+  const governedOrgs = viewerInfo.orgs.filter(
+    (org) => org.role === "owner" || org.role === "admin",
+  );
   const [creating, setCreating] = useState(false);
   const [creatingToken, setCreatingToken] = useState(false);
   const [gitSetup, setGitSetup] = useState<{
@@ -69,6 +76,10 @@ export const CreateCollectionDialog = ({
     const trimmedTitle = title.trim();
     if (!trimmedTitle || creating) return;
 
+    // Only private collections can be org-owned; the API re-checks the recorded membership, so
+    // an offer here can never spend an org the viewer no longer governs.
+    const ownerOrg = visibility === "private" && ownerOrgId ? ownerOrgId : undefined;
+
     setCreating(true);
     try {
       const collection = await context.createContextCollection(
@@ -77,6 +88,7 @@ export const CreateCollectionDialog = ({
         visibility,
         icon,
         source,
+        ownerOrg,
       );
       onCreated();
       if (collection.content.source === "git") {
@@ -209,6 +221,33 @@ export const CreateCollectionDialog = ({
                     label={<span className="flex items-center gap-2"><Buildings size={15} />Everyone</span>}
                     description="Shared across your organization and enabled for all users."
                   />
+                </Radio.Group>
+              )}
+              {visibility === "private" && governedOrgs.length > 0 && (
+                <Radio.Group<string>
+                  legend="Owner"
+                  appearance="card"
+                  value={ownerOrgId}
+                  onValueChange={setOwnerOrgId}
+                  className="grid gap-2"
+                >
+                  <Radio.Item
+                    value=""
+                    label={<span className="flex items-center gap-2"><User size={15} />Just me</span>}
+                    description="Owned by your account until you share it."
+                  />
+                  {governedOrgs.map((org) => (
+                    <Radio.Item
+                      key={org.orgId}
+                      value={org.orgId}
+                      label={(
+                        <span className="flex items-center gap-2">
+                          <Buildings size={15} />Organization {org.orgId}
+                        </span>
+                      )}
+                      description="Governed by this org's owners and admins; its members can edit and share."
+                    />
+                  ))}
                 </Radio.Group>
               )}
             </>

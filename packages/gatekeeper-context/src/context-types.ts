@@ -359,15 +359,33 @@ export function isMarkdownContentType(contentType: string): boolean {
   return contentType === "text/markdown";
 }
 
+/**
+ * One of the viewer's recorded org memberships, as the Workshop last synced it to this account's
+ * library. Mirrors `GatekeeperOrgMembership` from `@gadgets/workshop-shared/gatekeeper` without
+ * importing that module, whose Workers types the app's DOM build cannot resolve. These are the
+ * only orgs the viewer may share to or create collections for; every org grant re-checks them
+ * live. The Workshop knows org names — the gatekeeper only ever sees opaque org ids.
+ */
+export type ContextViewerOrg = {
+  orgId: string;
+  role: "owner" | "admin" | "member";
+};
+
 // ---------------------------------------------------------------------------
 // Per-user management capability (ContextApi)
 // ---------------------------------------------------------------------------
 
 /** Per-account management API exposed to the gatekeeper app iframe. */
 export interface ContextApi extends RpcTarget {
-  /** Gates creating/editing public collections and offering Git-backed collections. */
-  getViewerInfo(): Promise<{ isAdmin: boolean; supportsGitCollections: boolean }>;
-
+  /**
+   * Gates creating/editing public collections and offering Git-backed collections. `orgs` are the
+   * viewer's recorded org memberships — the orgs it may share collections with or create them for.
+   */
+  getViewerInfo(): Promise<{
+    isAdmin: boolean;
+    supportsGitCollections: boolean;
+    orgs: ContextViewerOrg[];
+  }>;
   /**
    * Create a collection owned by an org the actor belongs to with the owner or admin role. The
    * org holds the owner grant; the creator is attributed but holds no account grant.

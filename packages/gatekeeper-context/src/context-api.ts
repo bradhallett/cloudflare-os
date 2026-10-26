@@ -5,12 +5,12 @@ import { RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import { asVerifier } from "@gadgets/gatekeeper-kit/observers";
 import type { GatekeeperOrgMembership, GatekeeperUserSelectionExchange } from "@gadgets/workshop-shared/gatekeeper";
-import {
-  ContextApi, ContextCollectionContent, ContextCollectionMetadata, ContextCollectionPermissions,
-  ContextCollectionRole, ContextCollectionSharing, ContextCollectionVisibility,
-  ContextDocument, ContextDocumentSummary, ContextGitTokenCreateResult, ContextGitTokenList,
-  DEFAULT_GIT_BRANCH, EnabledCollectionInfo,
-} from "./context-types.js";
+ import {
+   ContextApi, ContextCollectionContent, ContextCollectionMetadata, ContextCollectionPermissions,
+   ContextCollectionRole, ContextCollectionSharing, ContextCollectionVisibility,
+   ContextDocument, ContextDocumentSummary, ContextGitTokenCreateResult, ContextGitTokenList,
+  ContextViewerOrg, DEFAULT_GIT_BRANCH, EnabledCollectionInfo,
+ } from "./context-types.js";
 import type { ContextCollectionDurableObject } from "./context-collection.js";
 import type { UserLibraryDurableObject } from "./user-library.js";
 import type { LibraryRegistryDurableObject } from "./registry-do.js";
@@ -76,9 +76,17 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
     if (!this.isAdmin) throw new Error("Admin access required.");
   }
 
-  async getViewerInfo(): Promise<{ isAdmin: boolean; supportsGitCollections: boolean }> {
-    return { isAdmin: this.isAdmin, supportsGitCollections: !!this.env.ARTIFACTS };
-  }
+  async getViewerInfo(): Promise<{
+    isAdmin: boolean; supportsGitCollections: boolean; orgs: ContextViewerOrg[];
+  }> {
+    return {
+      isAdmin: this.isAdmin,
+      supportsGitCollections: !!this.env.ARTIFACTS,
+      // The recorded memberships org grants resolve against, so the UI offers exactly the orgs
+      // the backend would accept; sharing and creation re-check them live when spent.
+      orgs: await this.#userLib().listOrgMemberships(this.domain, this.accountId),
+    };
+   }
 
   // --- Collection management ---
 

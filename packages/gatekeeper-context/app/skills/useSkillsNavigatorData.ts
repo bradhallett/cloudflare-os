@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
-import type {
-  ContextApi,
-  ContextCollectionMetadata,
-  ContextCollectionPermissions,
-  ContextDocumentSummary,
-  EnabledCollectionInfo,
-} from "../../src/context-types";
+ import type {
+   ContextApi,
+   ContextCollectionMetadata,
+   ContextCollectionPermissions,
+   ContextDocumentSummary,
+  ContextViewerOrg,
+   EnabledCollectionInfo,
+ } from "../../src/context-types";
 
 type SkillsNavigatorData = {
   collections: EnabledCollectionInfo[];
@@ -16,7 +17,7 @@ type SkillsNavigatorData = {
   failedDocumentCollectionIds: ReadonlySet<string>;
   /** Web-backed, editable collections whose documents loaded: targets for skill mutations. */
   writableCollectionIds: ReadonlySet<string>;
-  viewerInfo: { isAdmin: boolean; supportsGitCollections: boolean };
+  viewerInfo: { isAdmin: boolean; supportsGitCollections: boolean; orgs: ContextViewerOrg[] };
   status: "loading" | "ready" | "error";
 };
 
@@ -32,7 +33,7 @@ export const useSkillsNavigatorData = (
     documents: new Map(),
     failedDocumentCollectionIds: new Set(),
     writableCollectionIds: new Set(),
-    viewerInfo: { isAdmin: false, supportsGitCollections: false },
+    viewerInfo: { isAdmin: false, supportsGitCollections: false, orgs: [] },
     status: "loading",
   });
 
@@ -45,6 +46,7 @@ export const useSkillsNavigatorData = (
           context.getViewerInfo().catch(() => ({
             isAdmin: false,
             supportsGitCollections: false,
+            orgs: [],
           })),
         ]);
         const [documentResults, accessResults] = await Promise.all([
