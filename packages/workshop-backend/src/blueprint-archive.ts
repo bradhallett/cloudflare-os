@@ -139,11 +139,6 @@ export async function deleteBlueprintContent(
   } while (cursor !== undefined);
 }
 
-export function randomBlueprintId(): string {
-  let idBytes = new Uint8Array(16);
-  crypto.getRandomValues(idBytes);
-  return idBytes.toHex();
-}
 
 function encodeBlueprintArchivePrefix(metadata: BlueprintMetadata, contentLength: number): Uint8Array {
   let metadataBytes = textEncoder.encode(JSON.stringify(metadata));

@@ -20,7 +20,8 @@ import { GatekeeperUiFrame, GatekeeperUserSelection } from "@gadgets/workshop-sh
 import { DecisionModelGatekeeper, LanguageModelGatekeeper } from "./ai-models";
 import { getGatewayModels } from "./ai-gateway.js";
 import { AdminSettings, AdminApiImpl } from "./admin-settings.js";
-import { blueprintContentKey, buildBlueprintArchiveStream, sanitizeBlueprintOutput, parseBlueprintArchive, randomBlueprintId } from "./blueprint-archive.js";
+import { blueprintContentKey, buildBlueprintArchiveStream, sanitizeBlueprintOutput, parseBlueprintArchive } from "./blueprint-archive.js";
+import { random128BitId } from "./ids.js";
 import { BlueprintKvRecord, blueprintKvKey, listFeaturedBlueprintsFromKv, readBlueprintKvRecord } from "./storage-schema/blueprints-kv.js";
 import { GatekeeperConnectCallbackImpl, GatekeeperUserSelectionExchangeImpl, normalizeUsername, UserDurableObject, CLOUDFLARE_VENDOR_ID } from "./user";
 import { resolveBlueprintForUser } from "./blueprint-access.js";
@@ -630,7 +631,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   async importBlueprint(archive: ReadableStream<Uint8Array>): Promise<string> {
     let { metadata, contentLength, content } = await parseBlueprintArchive(archive);
     delete metadata.screenshot;
-    let blueprintId = randomBlueprintId();
+    let blueprintId = random128BitId();
     // An imported blueprint belongs to the importing user, as a workspace-published one belongs
     // to the workspace's owner.
     let owner = {type: "user", id: this.#userId.toString()} as const;
