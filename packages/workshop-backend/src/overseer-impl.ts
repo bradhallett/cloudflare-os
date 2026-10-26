@@ -10,7 +10,7 @@ import type { UserChatContext } from "./user";
 import { AutoApprovalDrainer } from "./auto-approval";
 import { OverseerBots } from "./overseer-bots";
 import { AGENT_KEEPALIVE_ALARM_MS, ALARM_MAX_RETRIES, stringifyError } from "./overseer-support";
-import { GIT_BINDING_NAME } from "./agent";
+import { GIT_BINDING_NAME } from "./agent-session";
 import { assertBindingNameFree, type ExternalMessageResponseTargetRegistration } from "./overseer-support";
 import { observerBindingNeed } from "./overseer-binding-info";
 

@@ -3,7 +3,7 @@ import type { AgentCatalog } from "@gadgets/workshop-shared/gatekeeper";
 import type { BoundHookRecord, ChatBindingEntry } from "./storage-schema/overseer-storage";
 import { chatKeyPrefix } from "./storage-schema/overseer-storage";
 import { ChatBindingScope, applyMessageBindings } from "./project-chat-log";
-import { alwaysAvailableResources, GIT_BINDING_NAME } from "./agent";
+import { alwaysAvailableResources, GIT_BINDING_NAME } from "./agent-session";
 import type { SeedBindingInfo } from "./agent-hooks";
 import { reportIssue } from "@gadgets/observability/error-reporting";
 import { normalizeAgentCatalog } from "./agent-catalog";

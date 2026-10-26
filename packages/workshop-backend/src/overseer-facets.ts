@@ -10,7 +10,7 @@ import { formatBotSection } from "./bot-config";
 import type { ResolvedBotSkill, UnavailableBotSkill } from "./bot-config";
 import type { UserChatContext } from "./user";
 import type { ActionRecord, ChatBindingEntry, GatekeeperClass, GatekeeperRecord } from "./storage-schema/overseer-storage";
-import { GIT_BINDING_NAME } from "./agent";
+import { GIT_BINDING_NAME } from "./agent-session";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
 import EXPORTS_BINDING_TYPES from "./exports-binding.txt";
 import { readAdminConfig } from "./admin-config";

@@ -6,7 +6,7 @@ import { chatKey, chatKeyPrefix } from "./storage-schema/overseer-storage";
 import type { ChatBindingEntry, ChatChangeRecord, GatekeeperCaller, StoredChatMessage, StoredChatMetadata } from "./storage-schema/overseer-storage";
 import type { WorkspaceOutputEntry } from "./storage-schema/user-storage";
 import { getAiGatewayConfig } from "./ai-gateway";
-import { GIT_BINDING_NAME } from "./agent";
+import { GIT_BINDING_NAME } from "./agent-session";
 import { chatChangeStatuses } from "./agent-compaction";
 import { WebFetchEnv } from "./web-fetch";
 import { actionRecordToLog } from "./overseer-action-log";

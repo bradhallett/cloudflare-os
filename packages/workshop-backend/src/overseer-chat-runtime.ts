@@ -9,7 +9,7 @@ import type { AiChatAgentContext, BindingRecord, ChatChangeRecord, CompactionChe
 import type { BindingHolder } from "./overseer-support";
 import { getModel } from "./ai-models";
 import { completeText } from "./ai-invoke";
-import { GIT_BINDING_NAME } from "./agent";
+import { GIT_BINDING_NAME } from "./agent-session";
 import type { AgentGadgetInfo } from "./agent-hooks";
 import type { ChatHistory } from "./agent-hooks";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
