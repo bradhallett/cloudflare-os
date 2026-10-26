@@ -23,6 +23,7 @@ import type { CodeModeEntrypoint } from "./overseer-harness";
 import { CODE_MODE_HARNESS, RestoreForgerImpl } from "./overseer-harness";
 import { OverseerCore } from "./overseer-core";
 import { emitUsageEvent, usageTokens } from "./usage-events";
+import { COMPATIBILITY_DATE } from "@gadgets/scripts/worker-config";
 
 /**
  * OverseerPublishing: binding metadata, blueprint releases and propagation, agent chat messages and costs, code mode, and vendor listings.
@@ -744,7 +745,7 @@ export abstract class OverseerPublishing extends OverseerFacets {
       };
 
       let workerDef: WorkerLoaderWorkerCode = {
-        compatibilityDate: "2026-02-01",
+        compatibilityDate: COMPATIBILITY_DATE,
         compatibilityFlags: [
           // disallow_importable_env also disallows importable ctx.exports, to prevent the code
           // from calling itself in a loop.

@@ -1,5 +1,6 @@
 import type { Logger } from "@gadgets/observability/logger";
 import { createObservabilityContext } from "@gadgets/observability/observability-context";
+import type { OrgRole } from "@gadgets/workshop-shared/orgs";
 
 /** Observability fields emitted by the Workshop backend. */
 export type WorkshopObservabilityFields = {
@@ -44,7 +45,7 @@ export type WorkshopObservabilityFields = {
   /** Organization membership events: which org, and (where one was granted or changed) a role.
    *  User ids of members never enter org logs. */
   orgId: string;
-  orgRole: "owner" | "admin" | "member";
+  orgRole: OrgRole;
   gatekeeperId: number | string;
   handoffKind: "connect" | "restore";
   hookId: number;

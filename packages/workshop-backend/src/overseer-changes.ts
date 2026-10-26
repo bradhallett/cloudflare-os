@@ -500,25 +500,28 @@ export abstract class OverseerChanges extends OverseerPublishing {
       if (fresh.activeAgent || this.isPreparingChatMessage(chatId)) {
         throw new Error(AGENT_RUNNING_ERROR_MESSAGE);
       }
+      // The three staleness checks below (generation moved, content cache stale, apply
+      // rejected) all bail to a retry; the exhausted-check lives here once, at the bottom.
+      let retry = false;
+      let result: {generation: number, revision: number} | "retry" | undefined;
       let freshBase = this.chatCodeBase(fresh);
       if (freshBase.generation !== codeBase.generation) {
         // A merge/revert landed during the prefetches. Re-resolve: the bridge (or a rejection)
         // will sort the submission out against the new stream.
-        if (attempt < 3) continue;
-        throw new Error("The chat is changing too quickly; please retry.");
+        retry = true;
+      } else {
+        let cached = this.chatContentCache.get(chatId);
+        if (cached === undefined || cached.generation !== freshBase.generation ||
+            cached.revision !== freshBase.revision) {
+          retry = true;
+        } else {
+          content = cached.content;
+          result = this.#applyValidatedSubmission(
+              chatId, fresh, freshBase, submission, author, content, pinData, bridge,
+              worktreeBases, worktreeSeeds);
+        }
       }
-      let cached = this.chatContentCache.get(chatId);
-      if (cached === undefined || cached.generation !== freshBase.generation ||
-          cached.revision !== freshBase.revision) {
-        if (attempt < 3) continue;
-        throw new Error("The chat is changing too quickly; please retry.");
-      }
-      content = cached.content;
-
-      let result = this.#applyValidatedSubmission(
-          chatId, fresh, freshBase, submission, author, content, pinData, bridge,
-          worktreeBases, worktreeSeeds);
-      if (result === "retry") {
+      if (retry || result === undefined || result === "retry") {
         if (attempt < 3) continue;
         throw new Error("The chat is changing too quickly; please retry.");
       }

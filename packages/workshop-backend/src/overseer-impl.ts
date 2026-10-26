@@ -163,24 +163,6 @@ export class OverseerImpl extends OverseerBots implements AgentHooks {
       }
     }
 
-    // Backwards compatibility: Prior to the introduction of the `activeAgents` table, we could
-    // only detect abandoned agents by the presence of `activeAgent` in the `AiChatMetadata` for
-    // the chat thread. On the first app update after `activeAgents` is introduced, we could still
-    // have such threads with no record in `activeAgents`. We can't resume these threads, but at
-    // the very least, we should properly cancel them.
-    //
-    // After this change has been deployed, we could plausibly remove this block, though it might
-    // be nice to keep for consistency purposes.
-    for (let thread of Array.from(this.storage.chatMeta.list())) {
-      if (thread.activeAgent && !this.runningAgents.has(thread.id)) {
-        this.postAgentErrorMessage(thread.id, thread.activeAgent,
-            "Agent interrupted due to server restart.");
-        delete thread.activeAgent;
-        this.storage.chatMeta.put(thread);
-        this.deliverWaitingExternalMessageResponse(thread.id);
-      }
-    }
-
     // Deliver any calls to callable agents that were recorded but not yet appended to their chat
     // when the previous instance went away. (A chat whose turn was just resumed drains at the end
     // of that turn instead.)

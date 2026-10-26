@@ -20,6 +20,7 @@ import { LiveChatState } from "./live-chat-state";
 import { AGENT_KEEPALIVE_ALARM_MS, AGENT_RESPONSE_DELIVERED_RETENTION_MS, CHAT_CHANGE_RETIRED_TTL_MS } from "./overseer-support";
 import { ChatCacheWarmer } from "./chat-cache-warming";
 import { CHAT_ATTACHMENT_EXTENSION_BY_MIME } from "./overseer-chat-attachments";
+import { seedEditBases, applyPrefetchedEditBases } from "./code-content";
 import type { OverseerImpl } from "./overseer-impl";
 
 const logger = createWorkshopLogger("workshop.overseer");
@@ -920,36 +921,16 @@ export abstract class OverseerCore {
   }
 
   /**
-   * The lazy half of worktree chat content: for each `edit` in `change` that targets a worktree
-   * path the content map does not yet hold, reads the file at the worktree's pinned base commit
-   * and seeds it into (a copy of) the content, so the edit applies and validates exactly as if
-   * the whole base tree had been materialized. Only edits need bases (a `set` is valid against
-   * any state and a `remove` of an absent path is a no-op), so untouched files are never read. A
-   * path absent from the base stays absent -- "edit of absent file" is then the change's own
-   * validation error -- while unreadable content (oversized/binary/symlink) throws its
-   * descriptive error, which ingestion surfaces to the submitter. (One deliberate quirk falls
-   * out for hand-rolled clients only: a row that edits a path an earlier row removed re-seeds
-   * the base text rather than failing -- every fold applies the same rule in the same order, so
-   * all replicas agree; the shipped producers never emit that sequence.)
+   * Seeds a change's worktree edit bases into (a copy of) the content before it applies: every
+   * edit of a path the content map does not yet hold is read at the worktree's pinned base
+   * commit. See seedEditBases in code-content.ts for the rule and its quirks; this is the
+   * ingestion-side fold.
    */
   async seedWorktreeEditBases(content: CodeContent, change: CodeChange,
                               worktreeBases: Map<WorkpieceId, string>): Promise<CodeContent> {
-    let result = content;
-    for (let [key, entries] of Object.entries(change)) {
-      let worktreeId = Number(key);
-      let base = worktreeBases.get(worktreeId);
-      if (base === undefined) continue;
-      for (let [path, fileChange] of entries) {
-        if (!("edit" in fileChange) || result.get(worktreeId)?.has(path)) continue;
-        let text = await this.gitCache.walker.readFileAtCommitIfExists(base, path);
-        if (text === undefined) continue;
-        if (result === content) result = new Map(content);
-        let files = new Map(result.get(worktreeId));
-        files.set(path, text);
-        result.set(worktreeId, files);
-      }
-    }
-    return result;
+    return await seedEditBases(content, change,
+        id => worktreeBases.get(id) !== undefined,
+        (id, path) => this.gitCache.walker.readFileAtCommitIfExists(worktreeBases.get(id)!, path));
   }
 
   /**
@@ -978,61 +959,36 @@ export abstract class OverseerCore {
                                       count: number}>();
 
   /**
-   * The async half of getCurrentChatContent's live-row worktree seeding: like
-   * seedWorktreeEditBases, but additionally records every looked-up base into `seeds`
-   * (`${worktreeId}:${path}` -> text, or null for a path absent from the base), so the
-   * synchronous tail can re-seed without awaiting.
+   * The async half of getCurrentChatContent's live-row worktree seeding: seedEditBases with a
+   * memoizing reader that records every looked-up base into `seeds` (`${worktreeId}:${path}` ->
+   * text, or null for a path absent from the base), so the synchronous tail can re-seed without
+   * awaiting.
    */
   protected async prefetchWorktreeSeeds(content: CodeContent, change: CodeChange,
                                worktreeBases: Map<WorkpieceId, string>,
                                seeds: Map<string, FileContent | null>): Promise<CodeContent> {
-    let result = content;
-    for (let [key, entries] of Object.entries(change)) {
-      let worktreeId = Number(key);
-      let base = worktreeBases.get(worktreeId);
-      if (base === undefined) continue;
-      for (let [path, fileChange] of entries) {
-        if (!("edit" in fileChange) || result.get(worktreeId)?.has(path)) continue;
-        let key = `${worktreeId}:${path}`;
-        let text = seeds.get(key);
-        if (text === undefined) {
-          text = await this.gitCache.walker.readFileAtCommitIfExists(base, path) ?? null;
-          seeds.set(key, text);
-        }
-        if (text === null) continue;
-        if (result === content) result = new Map(content);
-        let files = new Map(result.get(worktreeId));
-        files.set(path, text);
-        result.set(worktreeId, files);
-      }
-    }
-    return result;
+    return await seedEditBases(content, change,
+        id => worktreeBases.get(id) !== undefined,
+        async (id, path) => {
+          let key = `${id}:${path}`;
+          let text = seeds.get(key);
+          if (text === undefined) {
+            text = await this.gitCache.walker.readFileAtCommitIfExists(worktreeBases.get(id)!, path) ?? null;
+            seeds.set(key, text);
+          }
+          return text;
+        });
   }
 
   /**
-   * The synchronous half: seeds a change's worktree edit bases from the prefetched map, or
-   * returns null when a needed base wasn't prefetched (the row landed mid-prefetch; the caller
-   * retries the whole read).
+   * The synchronous half: applyPrefetchedEditBases seeds from the prefetched map, or returns
+   * null when a needed base wasn't prefetched (the row landed mid-prefetch; the caller retries
+   * the whole read).
    */
   protected applyPrefetchedWorktreeSeeds(content: CodeContent, change: CodeChange,
                                 worktreeBases: Map<WorkpieceId, string>,
                                 seeds: Map<string, FileContent | null>): CodeContent | null {
-    let result = content;
-    for (let [key, entries] of Object.entries(change)) {
-      let worktreeId = Number(key);
-      if (!worktreeBases.has(worktreeId)) continue;
-      for (let [path, fileChange] of entries) {
-        if (!("edit" in fileChange) || result.get(worktreeId)?.has(path)) continue;
-        let text = seeds.get(`${worktreeId}:${path}`);
-        if (text === undefined) return null;
-        if (text === null) continue;  // absent from the base: the edit's own validation reports
-        if (result === content) result = new Map(content);
-        let files = new Map(result.get(worktreeId));
-        files.set(path, text);
-        result.set(worktreeId, files);
-      }
-    }
-    return result;
+    return applyPrefetchedEditBases(content, change, worktreeBases, seeds);
   }
 
   /** Broadcast one accepted row to chat subscribers (see AiChatSubscriber.changeApplied). */

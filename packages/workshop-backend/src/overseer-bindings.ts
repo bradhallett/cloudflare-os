@@ -1,6 +1,7 @@
 import { WorkpieceId, AiChatMessage, AiChatAuthorInfo, AiModelConfig, validateBindingName } from "@gadgets/workshop-shared/api";
 import type { AgentCatalog } from "@gadgets/workshop-shared/gatekeeper";
-import type { BoundHookRecord } from "./storage-schema/overseer-storage";
+import type { BoundHookRecord, ChatBindingEntry } from "./storage-schema/overseer-storage";
+import { ChatBindingScope, applyMessageBindings } from "./project-chat-log";
 import { SeedBindingInfo, alwaysAvailableResources, GIT_BINDING_NAME } from "./agent";
 import { reportIssue } from "@gadgets/observability/error-reporting";
 import { normalizeAgentCatalog } from "./agent-catalog";
@@ -267,91 +268,36 @@ export abstract class OverseerBindings extends OverseerAgents {
     let seedMap = context.bindings;
 
     // --- The naming chokepoint: stamp binding names onto persisted messages that lack them. ---
-    // First collect every name already in the chat's scope (and a target -> name map for reuse)
-    // from the seed plus the log, then name and stamp the unnamed, in log order. We scan and
-    // stamp the caller's in-memory message objects (not a fresh storage listing, which would
-    // deserialize separate copies): the caller replays these same objects right after we return,
-    // and must see the names we stamp. (This scan can't reuse chatScopeNames: that method rereads
-    // the chat context from storage, where a seed map created just above isn't persisted yet.)
-    // TODO: The logic here is replaying the chat message log to regenerate the binding map.
-    //   Could this logic be incorporated into the chat log replay that happens inside runAgent(),
-    //   in agent.ts? It feels similar, and it would be nice to consolidate all "tool call replay"
-    //   logic into one place. Ideally, there shouldn't be logic outside of agent.ts that is
-    //   interpreting tool semantics at all (though making that true will require more refactoring
-    //   than just this).
-    let taken = new Set([...Object.keys(seedMap), GIT_BINDING_NAME]);  // (see chatScopeNames)
-    let nameByTarget = new Map<WorkpieceId, string>();
-    for (let [name, target] of Object.entries(seedMap)) {
-      if (!nameByTarget.has(target)) nameByTarget.set(target, name);
-    }
-    // Names allocated before the compaction boundary aren't in `chatMessages`, so take them from the
-    // checkpoint. Skipping them would hand a new resource a name the prefix already bound, and replay
-    // -- which seeds its map from the same checkpoint -- would keep resolving that name to the older
-    // target while rendering the new resource's link with it.
-    for (let [name, entry] of this.getActiveChatCompaction(chatId)?.chatBindings ?? []) {
-      taken.add(name);
-      if (entry.type === "workpiece" && !nameByTarget.has(entry.id)) {
-        nameByTarget.set(entry.id, name);
-      }
-    }
+    // One walk over the seed and the log (see project-chat-log.ts -- the same walk the agent's
+    // replay and compaction apply) collects every name in the chat's scope and the target ->
+    // name map the stamping below reuses. We scan the caller's in-memory message objects (not a
+    // fresh storage listing, which would deserialize separate copies): the caller replays these
+    // same objects right after we return, and must see the names we stamp. (This can't reuse
+    // chatScopeNames: that method rereads the chat context from storage, where a seed map
+    // created just above isn't persisted yet.)
+    //
+    // Names allocated before the compaction boundary aren't in `chatMessages`, so the
+    // checkpoint's entries join the seed in the initial scope; skipping them would hand a new
+    // resource a name the prefix already bound, and replay -- which seeds its map from the same
+    // checkpoint -- would keep resolving that name to the older target while rendering the new
+    // resource's link with it.
+    let scope = new ChatBindingScope([
+      ...Object.entries(seedMap).map(([name, target]) =>
+          [name, {type: "workpiece", id: target}] as [string, ChatBindingEntry]),
+      ...this.getActiveChatCompaction(chatId)?.chatBindings ?? [],
+    ]);
+    scope.taken.add(GIT_BINDING_NAME);
+    for (let msg of chatMessages) applyMessageBindings(scope, msg);
+    let taken = scope.taken;
+    let nameByTarget = scope.nameByTarget;
     let namingLog = chatMessages;
-    let anythingToName = false;
-    for (let msg of namingLog) {
-      if (msg.type === "message") {
-        for (let capsule of msg.capsules ?? []) {
-          if (capsule.bindingName !== undefined) {
-            taken.add(capsule.bindingName);
-            if (!nameByTarget.has(capsule.gatekeeperId)) {
-              nameByTarget.set(capsule.gatekeeperId, capsule.bindingName);
-            }
-          } else {
-            anythingToName = true;
-          }
-        }
-        for (let call of msg.toolCalls ?? []) {
-          if (call.toolName === "createGadget") {
-            taken.add(call.input.bindingName);
-            if (call.output && !nameByTarget.has(call.output.gadgetId)) {
-              nameByTarget.set(call.output.gadgetId, call.input.bindingName);
-            }
-          } else if (call.toolName === "createWorktree") {
-            taken.add(call.input.bindingName);
-            if (call.output && !nameByTarget.has(call.output.worktreeId)) {
-              nameByTarget.set(call.output.worktreeId, call.input.bindingName);
-            }
-          } else if (call.toolName === "createExternalResource") {
-            taken.add(call.input.bindingName);
-            if (call.output && !nameByTarget.has(call.output.gatekeeperId)) {
-              nameByTarget.set(call.output.gatekeeperId, call.input.bindingName);
-            }
-          }
-        }
-      } else if (msg.type === "connectionRequest") {
-        if (msg.bindingName !== undefined) {
-          if (msg.state !== "denied") taken.add(msg.bindingName);
-          if (msg.gatekeeperId !== undefined && !nameByTarget.has(msg.gatekeeperId)) {
-            nameByTarget.set(msg.gatekeeperId, msg.bindingName);
-          }
-        } else if (msg.state !== "denied") {
-          anythingToName = true;
-        }
-      } else if (msg.type === "changes") {
-        for (let created of msg.createdGadgets ?? []) {
-          taken.add(created.bindingName);
-          if (!nameByTarget.has(created.gadgetId)) {
-            nameByTarget.set(created.gadgetId, created.bindingName);
-          }
-        }
-        for (let created of msg.createdWorktrees ?? []) {
-          taken.add(created.bindingName);
-          if (!nameByTarget.has(created.worktreeId)) {
-            nameByTarget.set(created.worktreeId, created.bindingName);
-          }
-        }
-      } else if (msg.type === "agentCallback") {
-        if (msg.bindingName !== undefined) taken.add(msg.bindingName);
-      }
-    }
+    // Anything the walk saw that lacks a name (an unstamped capsule, or a not-yet-denied
+    // connection request) needs one allocated below.
+    let anythingToName = namingLog.some(msg =>
+        (msg.type === "message" &&
+          msg.capsules?.some(capsule => capsule.bindingName === undefined) === true) ||
+        (msg.type === "connectionRequest" &&
+          msg.state !== "denied" && msg.bindingName === undefined));
 
     // A regular chat also takes in each ambient resource the workspace gained after the chat
     // started (e.g. the owner turned on Web Search), deduped against every name in its scope. The

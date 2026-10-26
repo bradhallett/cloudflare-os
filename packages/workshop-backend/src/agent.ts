@@ -30,6 +30,8 @@ import type { SpawnCallableOptions } from "./agent-spawner-binding";
 import { traceRejectedToolCall, traceTool } from "./agent-tracing";
 import { dedupCatalogsForBot } from "./bot-config";
 import { AgentTurnError, completeText, httpStatusFromError, zeroUsage } from "./ai-invoke";
+import { seedEditBases } from "./code-content";
+import { ChatBindingScope, applyMessageBindings } from "./project-chat-log";
 import type { CachedRequest, ModelHandle } from "./ai-models";
 import { blobOid } from "./git-store";
 import type {
@@ -1756,46 +1758,36 @@ async function runAgentPass(
   };
 
   // Seeds the base texts a change's worktree edits need before it applies to the session
-  // content -- the agent-side mirror of the overseer's seedWorktreeEditBases, and deliberately
-  // the same rule (including its edit-after-remove re-seed quirk, hence faultWorktreeBase with
-  // no tombstone check), so replay reconstructs byte-identical content.
+  // content: the agent-side fold of the one shared seeding rule (seedEditBases in
+  // code-content.ts, which the overseer's ingestion also applies), read at the same base a
+  // fault would use -- including its edit-after-remove re-seed quirk (no tombstone check,
+  // unlike readWorktreeBase) -- so replay reconstructs byte-identical content.
   let seedWorktreeBasesForChange = async (change: CodeChange) => {
-    for (let [key, entries] of Object.entries(change)) {
-      let worktreeId = Number(key);
-      if (!worktreePinBases.has(worktreeId)) continue;
-      for (let [path, fileChange] of entries) {
-        if (!("edit" in fileChange) || sessionContent.get(worktreeId)?.has(path)) continue;
-        await faultWorktreeBase(worktreeId, path);
-      }
-    }
+    sessionContent = await seedEditBases(sessionContent, change,
+        id => worktreePinBases.has(id),
+        async (id, path) => {
+          let base = worktreeBase(id);
+          return base === undefined ? undefined : await hooks.readFileAtCommit(base, path);
+        });
   };
 
   // The chat's binding map: what each name in the agent's executeCode `env` resolves to. Starts
-  // from the seed layer (see AgentHooks.prepareChatBindings) and accumulates chat-local entries
-  // during history replay (pasted resources, accepted connections, created gadgets, agent
-  // callbacks) and live tool calls (createGadget). Names are never rebound, so resolution is
-  // replay-deterministic. Iteration order is insertion order; the first name inserted for a
-  // target wins reverse lookups (see chatNameFor).
-  let chatBindings = new Map<string, ChatBindingEntry>(checkpoint?.chatBindings ?? []);
-
-  // Names claimed in the chat's scope by connection requests that are still pending: the name is
-  // reserved from request time (so nothing else takes it before acceptance) but doesn't resolve
-  // to anything yet. A denied request releases its name (log-derived, so replay agrees).
-  let claimedNames = new Set<string>();
+  // from the compaction checkpoint, takes the seed layer (see AgentHooks.prepareChatBindings),
+  // and accumulates chat-local entries during history replay (pasted resources, accepted
+  // connections, created gadgets, agent callbacks) and live tool calls -- all through the ONE
+  // walk shared with the naming chokepoint and compaction (see project-chat-log.ts), so
+  // resolution is replay-deterministic. Iteration order is insertion order; the first name
+  // inserted for a target wins reverse lookups (see chatNameFor).
+  let chatScope = new ChatBindingScope(checkpoint?.chatBindings ?? []);
+  let chatBindings = chatScope.bindings;
 
   // Whether a name is unavailable for a new chat binding. GIT_BINDING_NAME counts as in scope
   // because the automatic env.GIT occupies it; only new bindings are refused -- a chat binding
   // that already took the name (from before env.GIT existed) keeps resolving as it did.
-  let isNameInScope = (name: string) =>
-      name === GIT_BINDING_NAME || chatBindings.has(name) || claimedNames.has(name);
+  let isNameInScope = (name: string) => name === GIT_BINDING_NAME || chatScope.inScope(name);
 
   // Reverse lookup: the chat env name for a workpiece, if the agent holds one.
-  let chatNameFor = (id: WorkpieceId): string | undefined => {
-    for (let [name, entry] of chatBindings) {
-      if (entry.type === "workpiece" && entry.id === id) return name;
-    }
-    return undefined;
-  };
+  let chatNameFor = (id: WorkpieceId) => chatScope.nameFor(id);
   // Applies a replayed change to the session content, optionally rendering the change as unified
   // diffs for the model (used to surface user edits as observeUserChanges results). Changes make
   // the changed paths and contents directly visible, so the diff is computed from the change's own
@@ -2137,9 +2129,7 @@ async function runAgentPass(
   // cacheable prefix; chat-local bindings accumulate on top during replay.
   let seedBindings = await hooks.prepareChatBindings(chatId, chatMessages);
   for (let seed of seedBindings) {
-    if (!chatBindings.has(seed.name)) {
-      chatBindings.set(seed.name, {type: "workpiece", id: seed.target});
-    }
+    chatScope.bindIfAbsent(seed.name, {type: "workpiece", id: seed.target});
   }
   // Read after prepareChatBindings, which seeds (and persists) the context on first use.
   let agentContext = hooks.getChatAgentContext(chatId);
@@ -2208,6 +2198,11 @@ async function runAgentPass(
   for (let [msgIndex, msg] of chatMessages.entries()) {
     let modelMessageStart = modelMessages.length;
     let msgTimestamp = msg.timestamp.getTime();
+    // Fold this message's binding effects in first, through the shared walk (see
+    // project-chat-log.ts), so every rendering below -- diff headings, links, descriptions --
+    // sees the scope as of this point in the log. The message's own binding mutations used to
+    // be inlined per case below; they are one walk now.
+    applyMessageBindings(chatScope, msg);
     switch (msg.type) {
       case "message": {
         let content = msg.message;
@@ -2221,15 +2216,11 @@ async function runAgentPass(
 
           // Rewrite the content to replace each pasted resource with `[<title>](env.<name>)`,
           // where <name> is the binding name stamped onto the message at the turn-start naming
-          // chokepoint (see prepareChatBindings). If the same workpiece already had a name in
-          // scope, the stamp reused it, so the map entry is a no-op.
+          // chokepoint (see prepareChatBindings).
           let parts: string[] = [];
           let pos = 0;
           for (let capsule of srcCaps) {
             let name = capsule.bindingName;
-            if (name !== undefined && !chatBindings.has(name)) {
-              chatBindings.set(name, {type: "workpiece", id: capsule.gatekeeperId});
-            }
             parts.push(content.slice(pos, capsule.position));
             // A missing name should be impossible (the chokepoint stamps before replay), but
             // never let it break the whole turn: degrade to a plain title.
@@ -2530,8 +2521,6 @@ async function runAgentPass(
                   if (toolCall.output === undefined) {
                     throw new Error("createGadget tool call in log is missing its result");
                   }
-                  chatBindings.set(toolCall.input.bindingName,
-                      {type: "workpiece", id: toolCall.output.gadgetId});
                   toolOutput = {text: jsonToolResultText(toolCall.output)};
                   break;
                 }
@@ -2544,8 +2533,6 @@ async function runAgentPass(
                   if (toolCall.output === undefined) {
                     throw new Error("createWorktree tool call in log is missing its result");
                   }
-                  chatBindings.set(toolCall.input.bindingName,
-                      {type: "workpiece", id: toolCall.output.worktreeId});
                   toolOutput = {text: jsonToolResultText(toolCall.output)};
                   break;
                 }
@@ -2602,8 +2589,6 @@ async function runAgentPass(
                     throw new Error(
                         "createExternalResource tool call in log is missing its result");
                   }
-                  chatBindings.set(toolCall.input.bindingName,
-                      {type: "workpiece", id: toolCall.output.gatekeeperId});
                   toolOutput = {text: jsonToolResultText(toolCall.output)};
                   break;
                 default:
@@ -2646,21 +2631,10 @@ async function runAgentPass(
       }
 
       case "changes": {
-        // User-created gadgets enter the chat's binding map (agent creations were already added
-        // by their createGadget tool-call replay; the has() check makes this a no-op for those).
-        for (let {gadgetId, bindingName} of msg.createdGadgets ?? []) {
-          if (!chatBindings.has(bindingName)) {
-            chatBindings.set(bindingName, {type: "workpiece", id: gadgetId});
-          }
-        }
-        // Likewise worktree creations (always agent-made, so normally a no-op after the
-        // createWorktree tool-call replay -- but a compaction boundary can swallow the call
-        // while this message survives).
-        for (let {worktreeId, bindingName} of msg.createdWorktrees ?? []) {
-          if (!chatBindings.has(bindingName)) {
-            chatBindings.set(bindingName, {type: "workpiece", id: worktreeId});
-          }
-        }
+        // The message's binding effects (user-created gadgets and worktrees entering the chat's
+        // binding map) were folded in by applyMessageBindings above, before this case ran --
+        // the diff rendering below name-addresses workpieces through that scope.
+
 
         // A migrated chat's conversion boundary acts as an epoch boundary that re-seeds at
         // (pin bases + this change): everything before it is text-only history whose code payloads
@@ -2819,7 +2793,6 @@ async function runAgentPass(
               `A callback was received: \`self.${msg.methodName}()\`. ` +
               `Its arguments are no longer available.`;
         } else {
-          chatBindings.set(name, { type: "value", messageSequence: msg.sequence });
           let call = agentContext.spawnerTypes
               ? `The Gadget called \`${msg.methodName}()\` on your interface.`
               : `A callback was received: \`self.${msg.methodName}()\`.`;
@@ -2846,18 +2819,14 @@ async function runAgentPass(
         // isn't resumed (and the name is released), but the note is still surfaced here so the
         // agent sees the outcome the next time the user messages it.
         if (msg.state === "pending") {
-          if (msg.bindingName !== undefined) {
-            claimedNames.add(msg.bindingName);
-          }
+          // The pending claim was folded in by applyMessageBindings above; nothing actionable
+          // to report (the agent already saw the tool's "awaiting" output and ended its turn).
         } else if (msg.state === "accepted") {
           if (msg.gatekeeperId !== undefined && msg.bindingName !== undefined) {
             // The accepted resource enters the chat's env under the name recorded on the request
-            // (chosen by the agent, or stamped lazily for requests made before agents named their
-            // own).
+            // (chosen by the agent, or stamped lazily for requests made before agents named
+            // their own); the binding itself was folded in by applyMessageBindings above.
             let name = msg.bindingName;
-            if (!chatBindings.has(name)) {
-              chatBindings.set(name, { type: "workpiece", id: msg.gatekeeperId });
-            }
             modelMessages.push({
               role: "user",
               content:
@@ -3740,7 +3709,7 @@ async function runAgentPass(
 
           let created = hooks.createGadget(title, bindingName, chatId, blueprint);
           pendingCreatedGadgets.push({gadgetId: created.id, title: created.title, bindingName});
-          chatBindings.set(bindingName, {type: "workpiece", id: created.id});
+          chatScope.rebind(bindingName, {type: "workpiece", id: created.id});
 
           // The creation is part of the upcoming "changes" batch; report that batch's change ID
           // (exactly as writeFile/editFile do) so reverts can be referred to precisely.
@@ -3830,7 +3799,7 @@ async function runAgentPass(
           let created = await hooks.createWorktree(title, chatId, commitId);
           pendingCreatedWorktrees.push(
               {worktreeId: created.id, title: created.title, bindingName});
-          chatBindings.set(bindingName, {type: "workpiece", id: created.id});
+          chatScope.rebind(bindingName, {type: "workpiece", id: created.id});
 
           // Report the batch's change ID like the other creation/edit tools, and the resolved
           // full commit id (the input may have been a prefix). Recorded as the tool's output for
@@ -3989,7 +3958,7 @@ async function runAgentPass(
             connectionRequested = true;
             // The name is claimed in the chat's scope from request time (released only by
             // denial), so nothing else in this step can take it.
-            claimedNames.add(input.bindingName);
+            chatScope.claim(input.bindingName);
           }
           return toolResult(result.message, { output: result.message });
         } catch (error) {
@@ -4027,7 +3996,7 @@ async function runAgentPass(
                 `env. Choose a different name.`);
           }
           let output = await hooks.createExternalResource(chatId, input);
-          chatBindings.set(input.bindingName, {type: "workpiece", id: output.gatekeeperId});
+          chatScope.rebind(input.bindingName, {type: "workpiece", id: output.gatekeeperId});
           // Recorded so replay can re-bind without creating again (see the replay path above).
           return toolResult(jsonToolResultText(output), {output} as Partial<AiToolCall>);
         } catch (error) {

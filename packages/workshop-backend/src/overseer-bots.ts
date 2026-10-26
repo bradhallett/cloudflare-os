@@ -11,6 +11,9 @@ import { SlashCommandAuthorizerImpl } from "./overseer-gatekeeper-client";
 import type { UserChatContext } from "./user";
 import { OverseerGatekeepers } from "./overseer-gatekeepers";
 
+/** Fallback reply for a bot subagent whose turn ended without producing a reply. */
+const NO_BOT_REPLY = "The bot ended its turn without a reply — it may be waiting for an approval; see its thread.";
+
 /**
  * OverseerBots: declared bots -- the bot snapshot stored on a chat, workspace-scoped skill
  * resolution, the activateSkill hook, and bot subagents/DMs (delegateToBot, messageBot).
@@ -201,9 +204,7 @@ export abstract class OverseerBots extends OverseerGatekeepers {
         !this.runningAgents.has(childChatId) &&
         !this.isPreparingChatMessage(childChatId)) {
       this.settleSubagentWaiters(childChatId);
-      return this.#lastBotReply(childChatId) ??
-          "The bot ended its turn without a reply — it may be waiting for an approval; " +
-          "see its thread.";
+      return this.#lastBotReply(childChatId) ?? NO_BOT_REPLY;
     }
     let waiter = this.liveChats.armSubagentWaiter(childChatId);
     let timedOut = false;
@@ -231,8 +232,7 @@ export abstract class OverseerBots extends OverseerGatekeepers {
         (timedOut
             ? `The bot did not finish within ${OverseerBots.SUBAGENT_TIMEOUT_MS / 60000} ` +
               `minutes and was stopped; see its thread.`
-            : "The bot ended its turn without a reply — it may be waiting for an approval; " +
-              "see its thread.");
+            : NO_BOT_REPLY);
   }
 
   /** AgentHooks.runBotSubagent: run (or continue) a bot thread and await its reply. */
@@ -249,9 +249,7 @@ export abstract class OverseerBots extends OverseerGatekeepers {
     let existing = this.storage.pendingDelegations.get(toolCallId);
     if (existing) {
       let response = existing.done
-          ? this.#lastBotReply(existing.childChatId) ??
-              "The bot ended its turn without a reply — it may be waiting for an approval; " +
-              "see its thread."
+          ? this.#lastBotReply(existing.childChatId) ?? NO_BOT_REPLY
           : await this.#awaitBotSubagent(existing.childChatId, signal);
       return {threadId: existing.childChatId, response};
     }

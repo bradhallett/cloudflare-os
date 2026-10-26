@@ -906,140 +906,130 @@ function directAuth(config: AiModelConfig, keyHeader: string): Pick<HandleArgs, 
       : { apiKey: config.apiToken, headers: config.extraHeaders };
 }
 
+// Direct-connection spec per provider: the fixed parts of the Model envelope plus how to reach
+// the provider's own API. `keyHeader` names a provider whose SDK can go keyless (see
+// directAuth); without it the config's raw API token is sent (pi's Google API, for instance,
+// requires a key, and @google/genai adds `x-goog-api-key` with no way to suppress it, though an
+// extra header of that name replaces it). `local` marks a provider of user-run models pi has no
+// catalog for, so name, cost, input and reasoning come from the spec alone rather than pi's
+// entry.
+type DirectProviderSpec = {
+  api: Model<Api>["api"];
+  provider: string;
+  baseUrl: (config: AiModelConfig) => string;
+  keyHeader?: string;
+  reasoningDefault: boolean;
+  inputDefault: Model<Api>["input"];
+  local?: boolean;
+  thinkingLevelMap?: boolean;
+  compat?: (catalog: CatalogEntry | undefined) => Model<Api>["compat"];
+};
+
+const DIRECT_PROVIDERS: Record<AiModelProvider, DirectProviderSpec> = {
+  anthropic: {
+    api: "anthropic-messages",
+    provider: "anthropic",
+    baseUrl: config => config.apiUrl ?? "https://api.anthropic.com",
+    keyHeader: "x-api-key",
+    reasoningDefault: true,
+    inputDefault: ["text", "image"],
+    thinkingLevelMap: true,
+    // Catalog compat verbatim -- see the gateway-path comment on forceAdaptiveThinking.
+    compat: catalog => catalog?.compat,
+  },
+  cloudflare: {
+    // Workers AI is fetch-only (no Workers-binding transport), so outside AI Gateway mode it's
+    // BYOK like every other provider: the user's own account ID and API token come from the
+    // model config. (The REST endpoint is account-scoped, hence the extra accountId field.)
+    api: "openai-completions",
+    provider: "cloudflare-workers-ai",
+    baseUrl: config => `${workersAiAccountUrl(config)}/v1`,
+    reasoningDefault: false,
+    inputDefault: ["text"],
+    compat: catalog => workersAiCompat(catalog),
+  },
+  google: {
+    api: "google-generative-ai",
+    provider: "google",
+    baseUrl: config => config.apiUrl ?? "https://generativelanguage.googleapis.com/v1beta",
+    reasoningDefault: true,
+    inputDefault: ["text", "image"],
+    thinkingLevelMap: true,
+  },
+  ollama: {
+    api: "openai-completions",
+    provider: "ollama",
+    // `apiUrl` is the Ollama server base; its OpenAI-compat endpoint lives under /v1. Accept
+    // (and strip) a trailing `/api` or `/v1` path: configs saved before the pi migration store
+    // the native-API base `http://host:11434/api` (the old ollama provider's convention), and
+    // users may paste the /v1 endpoint directly.
+    baseUrl: config => `${stripTrailingSlashes(config.apiUrl ?? "http://localhost:11434")
+        .replace(/\/(api|v1)$/, "")}/v1`,
+    keyHeader: "Authorization",
+    reasoningDefault: true,
+    inputDefault: ["text", "image"],
+    local: true,
+    // Pi's OpenAI compat uses the "developer" role for the system prompt by default,
+    // disabling it only for certain hostnames which are known not to support it.
+    //
+    // In ollama, some models support it and some do not. Frustratingly, the ones that do not
+    // don't necessarily throw an error. They may just proceed without a system prompt. For
+    // example, when I tested Muse Glimmer the day after it was released, I found it
+    // understood what tool calls were available to it but didn't know any of the info in the
+    // system prompt. Annoyingly, Muse Glimmer seems to be trained to treat the system
+    // prompt as secret, so refused to answer my questions about it directly. But I figured
+    // out it clearly wasn't getting the system prompt. And when I disabled  the "developer"
+    // role, the problem was fixed. In contrast, though, Gemma 4 running under otherwise
+    // exactly the same setup does understand the "developer" role and works fine. Weird!
+    //
+    // Some users also filed issues about this because they were trying to use the ollama
+    // provider as a way to target an arbitrary third-party OpenAI-compatible provider. This
+    // is not the intended use case for the ollama provider -- we should add an explicit
+    // provider for this. The ollama provider could in the future switch to using the ollama
+    // native API rather than the OpenAI-compatible endpoint, which would break users using
+    // it in this way. That said, if this flag works as a temporary work-around for them
+    // util we add a real OpenAI provider option... great.
+    compat: catalog => catalog?.compat ?? {supportsDeveloperRole: false},
+  },
+  openai: {
+    api: "openai-responses",
+    provider: "openai",
+    baseUrl: config => config.apiUrl ?? "https://api.openai.com/v1",
+    keyHeader: "Authorization",
+    reasoningDefault: true,
+    inputDefault: ["text", "image"],
+    thinkingLevelMap: true,
+    compat: catalog => catalog?.compat,
+  },
+};
+
 // Direct provider access using the credentials in the model config itself (no AI Gateway).
 function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelHandle {
+  const spec: DirectProviderSpec | undefined = DIRECT_PROVIDERS[config.provider];
+  if (spec === undefined) throw new Error(`Unknown provider "${config.provider}".`);
   const catalog = catalogModel(config.provider, config.model);
   const window = modelTokenWindow(config, catalog);
-  switch (config.provider) {
-    case "anthropic":
-      return makeHandle({
-        model: {
-          id: config.model,
-          name: catalog?.name ?? config.model,
-          api: "anthropic-messages",
-          provider: "anthropic",
-          baseUrl: config.apiUrl ?? "https://api.anthropic.com",
-          reasoning: true,
-          input: catalog?.input ?? ["text", "image"],
-          cost: catalog?.cost ?? ZERO_COST,
-          ...window,
-          thinkingLevelMap: catalog?.thinkingLevelMap,
-          // Catalog compat verbatim -- see the gateway-path comment on forceAdaptiveThinking.
-          compat: catalog?.compat,
-        },
-        ...directAuth(config, "x-api-key"),
-        sessionAffinity,
-      });
-    case "cloudflare": {
-      // Workers AI is fetch-only (no Workers-binding transport), so outside AI Gateway mode it's
-      // BYOK like every other provider: the user's own account ID and API token come from the
-      // model config. (The REST endpoint is account-scoped, hence the extra accountId field.)
-      return makeHandle({
-        model: {
-          id: config.model,
-          name: catalog?.name ?? config.model,
-          api: "openai-completions",
-          provider: "cloudflare-workers-ai",
-          baseUrl: `${workersAiAccountUrl(config)}/v1`,
-          reasoning: catalog?.reasoning ?? false,
-          input: catalog?.input ?? ["text"],
-          cost: catalog?.cost ?? ZERO_COST,
-          ...window,
-          compat: workersAiCompat(catalog),
-        },
-        apiKey: config.apiToken,
-        headers: config.extraHeaders,
-        sessionAffinity,
-      });
-    }
-    case "google":
-      return makeHandle({
-        model: {
-          id: config.model,
-          name: catalog?.name ?? config.model,
-          api: "google-generative-ai",
-          provider: "google",
-          baseUrl: config.apiUrl ?? "https://generativelanguage.googleapis.com/v1beta",
-          reasoning: catalog?.reasoning ?? true,
-          input: catalog?.input ?? ["text", "image"],
-          cost: catalog?.cost ?? ZERO_COST,
-          ...window,
-          thinkingLevelMap: catalog?.thinkingLevelMap,
-        },
-        // Not directAuth: pi's Google API requires a key, and @google/genai adds `x-goog-api-key`
-        // with no way to suppress it (an extra header of that name replaces it, though).
-        apiKey: config.apiToken,
-        headers: config.extraHeaders,
-        sessionAffinity,
-      });
-    case "ollama":
-      // `apiUrl` is the Ollama server base; its OpenAI-compat endpoint lives under /v1. Accept
-      // (and strip) a trailing `/api` or `/v1` path: configs saved before the pi migration store
-      // the native-API base `http://host:11434/api` (the old ollama provider's convention), and
-      // users may paste the /v1 endpoint directly. When no API key was configured we assume
-      // local auth and send no Authorization header at all (as before the pi migration; a strict
-      // local proxy may reject an unexpected bearer token).
-      return makeHandle({
-        model: {
-          id: config.model,
-          name: config.model,
-          api: "openai-completions",
-          provider: "ollama",
-          baseUrl: `${stripTrailingSlashes(config.apiUrl ?? "http://localhost:11434")
-              .replace(/\/(api|v1)$/, "")}/v1`,
-          reasoning: true,
-          input: ["text", "image"],
-          cost: ZERO_COST,
-
-          // Pi's OpenAI compat uses the "developer" role for the system prompt by default,
-          // disabling it only for certain hostnames which are known not to support it.
-          //
-          // In ollama, some models support it and some do not. Frustratingly, the ones that do not
-          // don't necessarily throw an error. They may just proceed without a system prompt. For
-          // example, when I tested Muse Glimmer the day after it was released, I found it
-          // understood what tool calls were available to it but didn't know any of the info in
-          // the system prompt. Annoyingly, Muse Glimmer seems to be trained to treat the system
-          // prompt as secret, so refused to answer my questions about it directly. But I figured
-          // out it clearly wasn't getting the system prompt. And when I disabled  the "developer"
-          // role, the problem was fixed. In contrast, though, Gemma 4 running under otherwise
-          // exactly the same setup does understand the "developer" role and works fine. Weird!
-          //
-          // Some users also filed issues about this because they were trying to use the ollama
-          // provider as a way to target an arbitrary third-party OpenAI-compatible provider. This
-          // is not the intended use case for the ollama provider -- we should add an explicit
-          // provider for this. The ollama provider could in the future switch to using the ollama
-          // native API rather than the OpenAI-compatible endpoint, which would break users using
-          // it in this way. That said, if this flag works as a temporary work-around for them
-          // util we add a real OpenAI provider option... great.
-          compat: catalog?.compat ?? {supportsDeveloperRole: false},
-
-          ...window,
-        },
-        ...directAuth(config, "Authorization"),
-        sessionAffinity,
-      });
-    case "openai":
-      return makeHandle({
-        model: {
-          id: config.model,
-          name: catalog?.name ?? config.model,
-          api: "openai-responses",
-          provider: "openai",
-          baseUrl: config.apiUrl ?? "https://api.openai.com/v1",
-          reasoning: catalog?.reasoning ?? true,
-          input: catalog?.input ?? ["text", "image"],
-          cost: catalog?.cost ?? ZERO_COST,
-          ...window,
-          thinkingLevelMap: catalog?.thinkingLevelMap,
-          compat: catalog?.compat,
-        },
-        ...directAuth(config, "Authorization"),
-        sessionAffinity,
-      });
-    default:
-      config.provider satisfies never;
-      throw new Error(`Unknown provider "${config.provider}".`);
-  }
+  // A local provider's models are unknown to pi, so nothing about them is borrowed.
+  const local = spec.local === true;
+  return makeHandle({
+    model: {
+      id: config.model,
+      name: local ? config.model : catalog?.name ?? config.model,
+      api: spec.api,
+      provider: spec.provider,
+      baseUrl: spec.baseUrl(config),
+      reasoning: local ? spec.reasoningDefault : catalog?.reasoning ?? spec.reasoningDefault,
+      input: local ? spec.inputDefault : catalog?.input ?? spec.inputDefault,
+      cost: local ? ZERO_COST : catalog?.cost ?? ZERO_COST,
+      ...window,
+      ...(spec.thinkingLevelMap ? {thinkingLevelMap: catalog?.thinkingLevelMap} : {}),
+      ...(spec.compat ? {compat: spec.compat(catalog)} : {}),
+    },
+    ...(spec.keyHeader !== undefined
+        ? directAuth(config, spec.keyHeader)
+        : {apiKey: config.apiToken, headers: config.extraHeaders}),
+    sessionAffinity,
+  });
 }
 
 // Workers AI's account-scoped REST root for a direct connection, which needs the config's own
@@ -1152,15 +1142,55 @@ async function refuseRevokedModel(env: Cloudflare.Env, props: AiModelGatekeeperP
   }
 }
 
+/**
+ * Base for gatekeepers of resources that implement no actions and track no observers: the
+ * action trio throws, the observer pair is a no-op, and nothing is ever auto-approvable. Such
+ * a resource is not restricted-access -- nothing read through it identifies the observer or
+ * leaks private data, so any observer is permitted. Subclasses define describe(),
+ * getTypeScriptTypes() and startSession().
+ *
+ * TODO: Decide if we need real URLs or if `url` should stop being part of the description.
+ */
+export abstract class StaticResourceGatekeeper<Props extends object, B>
+    extends DurableObject<Cloudflare.Env, Props>
+    implements Gatekeeper<B> {
+  abstract describe(): Promise<ResourceDescription>;
+
+  abstract getTypeScriptTypes(): Promise<string>;
+
+  abstract startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<B>;
+
+  async getAutoApprovableActions() {
+    return [];
+  }
+
+  applyAction(action: number): Promise<void> {
+    throw new Error("This gatekeeper implements no actions.");
+  }
+  rejectAction(action: number): Promise<void | {restart?: boolean}> {
+    throw new Error("This gatekeeper implements no actions.");
+  }
+  revertAction(action: number):
+      Promise<void | {message?: string, canRetry?: boolean, restart?: boolean}> {
+    throw new Error("This gatekeeper implements no actions.");
+  }
+
+  async addObserver(_id: string, _user: Fetcher): Promise<void> {
+    // No observer state is tracked (see the class comment). Idempotent no-op (never throws).
+  }
+
+  async removeObserver(_id: string): Promise<void> {
+    // No observer state is tracked (see addObserver). Idempotent no-op.
+  }
+}
+
 export class LanguageModelGatekeeper
-    extends DurableObject<Cloudflare.Env, AiModelGatekeeperProps>
-    implements Gatekeeper<LanguageModelBinding> {
+    extends StaticResourceGatekeeper<AiModelGatekeeperProps, LanguageModelBinding> {
   async describe(): Promise<ResourceDescription> {
     let modelConfig = this.ctx.props.config;
     let displayName = this.ctx.props.displayName;
 
     return {
-      // TODO: Decide if we need real URLs or if `url` should stop being part of the description.
       url: `http://models.local/${modelConfig.provider}/${modelConfig.model}`,
 
       title: displayName,
@@ -1176,10 +1206,6 @@ export class LanguageModelGatekeeper
     return AI_MODEL_BINDING_TYPES;
   }
 
-  async getAutoApprovableActions() {
-    return [];
-  }
-
   async startSession(approvalQueue: RpcStub<ApprovalQueue>)
       : Promise<LanguageModelBinding> {
     // A binding makes one-shot calls, which ask for no reasoning level. Without the level it was
@@ -1192,26 +1218,6 @@ export class LanguageModelGatekeeper
     let { usageGate, onUsage } = bindingMetering(
         this.env, this.ctx, this.ctx.props.ownerUserId, model.model.id);
     return new LanguageModelBindingImpl(model, usageGate, onUsage);
-  }
-
-  applyAction(action: number): Promise<void> {
-    throw new Error("This gatekeeper implements no actions.");
-  }
-  rejectAction(action: number): Promise<void | {restart?: boolean}> {
-    throw new Error("This gatekeeper implements no actions.");
-  }
-  revertAction(action: number):
-      Promise<void | {message?: string, canRetry?: boolean, restart?: boolean}> {
-    throw new Error("This gatekeeper implements no actions.");
-  }
-
-  async addObserver(_id: string, _user: Fetcher): Promise<void> {
-    // An AI model is not a restricted-access resource: nothing read through it identifies the
-    // observer or leaks private data, so any observer is permitted. No-op (never throws).
-  }
-
-  async removeObserver(_id: string): Promise<void> {
-    // No observer state is tracked (see addObserver). Idempotent no-op.
   }
 }
 
@@ -1237,8 +1243,7 @@ class LanguageModelBindingImpl extends RpcTarget implements LanguageModelBinding
 }
 
 export class DecisionModelGatekeeper
-    extends DurableObject<Cloudflare.Env, AiModelGatekeeperProps>
-    implements Gatekeeper<DecisionModelBinding> {
+    extends StaticResourceGatekeeper<AiModelGatekeeperProps, DecisionModelBinding> {
   async describe(): Promise<ResourceDescription> {
     let modelConfig = this.ctx.props.config;
     return {
@@ -1254,10 +1259,6 @@ export class DecisionModelGatekeeper
     return DECISION_MODEL_BINDING_TYPES;
   }
 
-  async getAutoApprovableActions() {
-    return [];
-  }
-
   async startSession(approvalQueue: RpcStub<ApprovalQueue>)
       : Promise<DecisionModelBinding> {
     let { config, initiator, metadata } = this.ctx.props;
@@ -1266,26 +1267,6 @@ export class DecisionModelGatekeeper
         this.env, this.ctx, this.ctx.props.ownerUserId, config.model);
     return new DecisionModelBindingImpl(
         getDecisionModel(this.env, config, initiator, metadata), usageGate, onUsage);
-  }
-
-  applyAction(action: number): Promise<void> {
-    throw new Error("This gatekeeper implements no actions.");
-  }
-  rejectAction(action: number): Promise<void | {restart?: boolean}> {
-    throw new Error("This gatekeeper implements no actions.");
-  }
-  revertAction(action: number):
-      Promise<void | {message?: string, canRetry?: boolean, restart?: boolean}> {
-    throw new Error("This gatekeeper implements no actions.");
-  }
-
-  async addObserver(_id: string, _user: Fetcher): Promise<void> {
-    // Like an LLM, a decision model is not a restricted-access resource (see
-    // LanguageModelGatekeeper).
-  }
-
-  async removeObserver(_id: string): Promise<void> {
-    // No observer state is tracked (see addObserver). Idempotent no-op.
   }
 }
 
