@@ -28,7 +28,8 @@ type SaveFilePicker = (options: {
   }>
 }) => Promise<SaveFileHandle>
 
-function triggerBlobDownload(blob: Blob, filename: string): void {
+/** Saves `blob` client-side by clicking a transient download link named `filename`. */
+export function triggerBlobDownload(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob)
 
   try {

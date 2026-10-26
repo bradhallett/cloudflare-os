@@ -13,7 +13,7 @@ import {
   type ChangeChatMessage,
   type ObservationChatMessage,
 } from "./messageTypes";
-import { buildToolCallGroups, type ToolCallGroup, type ToolOutputResolver } from "./toolCalls";
+import { buildToolCallGroup, type ToolCallGroup, type ToolOutputResolver } from "./toolCalls";
 import type { FailedChatSend } from "./failedSends";
 
 /** A compaction checkpoint reported with a history page. */
@@ -62,16 +62,14 @@ export type ChatDisplayEntry =
       key: string;
       message: AiChatMessage;
       slashCommand?: Extract<AiChatMessage, {type: "slashCommand"}>;
-      toolCalls?: AiToolCall[];
-      toolCallGroups?: ToolCallGroup[];
+
+      workGroup?: ToolCallGroup | null;
       lastMessageSequence?: number;
     }
   | {
       type: "workRun";
       key: string;
-      toolCalls: AiToolCall[];
-      observations: ObservationChatMessage[];
-      toolCallGroups: ToolCallGroup[];
+      workGroup: ToolCallGroup | null;
       lastMessageSequence: number;
       lastMessageTimestamp: Date;
     }
@@ -255,6 +253,25 @@ export function buildChatDisplayEntries(
   // Whether a "changes" message gets a row of its own, which ends the run of work before it.
   const startsOwnRow = (msg: AiChatMessage) =>
     appliedBlueprintMerges(msg).length > 0 || isVisibleSavedChangesMessage(msg);
+  // Walks the messages after a work-bearing one, folding the run's further work-only messages
+  // into `parts` and skipping mid-run "changes" records that never got a row of their own (see
+  // startsOwnRow). Returns the index the outer loop resumes from.
+  const collectTrailingWork = (start: number, parts: WorkMessageParts): number => {
+    let j = start;
+    while (j < messages.length) {
+      const nextMsg = messages[j];
+      if (nextMsg.type === "changes") {
+        if (startsOwnRow(nextMsg)) break;
+        j++;
+        continue;
+      }
+      const nextWorkParts = getWorkOnlyMessageParts(nextMsg);
+      if (!nextWorkParts) break;
+      appendWorkParts(parts, nextWorkParts);
+      j++;
+    }
+    return j;
+  };
 
   for (let i = 0; i < messages.length; ) {
     const msg = messages[i];
@@ -339,26 +356,12 @@ export function buildChatDisplayEntries(
         lastWorkSequence: initialWorkParts.lastWorkSequence,
         lastWorkTimestamp: initialWorkParts.lastWorkTimestamp,
       };
-      let j = i + 1;
-      while (j < messages.length) {
-        const nextMsg = messages[j];
-        if (nextMsg.type === "changes") {
-          if (startsOwnRow(nextMsg)) break;
-          j++;
-          continue;
-        }
-        const nextWorkParts = getWorkOnlyMessageParts(nextMsg);
-        if (!nextWorkParts) break;
-        appendWorkParts(workParts, nextWorkParts);
-        j++;
-      }
+      const j = collectTrailingWork(i + 1, workParts);
 
       result.push({
         type: "workRun",
         key: `work-${msg.chatId}-${msg.sequence}`,
-        toolCalls: workParts.toolCalls,
-        observations: workParts.observations,
-        toolCallGroups: buildToolCallGroups(
+        workGroup: buildToolCallGroup(
           transcriptToolCalls(workParts.toolCalls),
           workParts.observations,
           outputOf,
@@ -379,27 +382,14 @@ export function buildChatDisplayEntries(
         lastWorkSequence: msg.sequence,
         lastWorkTimestamp: msg.timestamp,
       };
-      let j = i + 1;
-      while (j < messages.length) {
-        const nextMsg = messages[j];
-        if (nextMsg.type === "changes") {
-          if (startsOwnRow(nextMsg)) break;
-          j++;
-          continue;
-        }
-        const nextWorkParts = getWorkOnlyMessageParts(nextMsg);
-        if (!nextWorkParts) break;
-        appendWorkParts(workParts, nextWorkParts);
-        j++;
-      }
+      const j = collectTrailingWork(i + 1, workParts);
 
       if (workParts.toolCalls.length > 0 || workParts.observations.length > 0) {
         result.push({
           type: "message",
           key: `msg-${msg.chatId}-${msg.sequence}`,
           message: msg,
-          toolCalls: workParts.toolCalls,
-          toolCallGroups: buildToolCallGroups(
+          workGroup: buildToolCallGroup(
             transcriptToolCalls(workParts.toolCalls),
             workParts.observations,
             outputOf,
@@ -519,7 +509,7 @@ function isPureWorkRowEntry(entry: ChatDisplayEntry): boolean {
 export function entryEndsInWorkRow(entry: ChatDisplayEntry): boolean {
   if (isPureWorkRowEntry(entry)) return true;
   if (entry.type !== "message") return false;
-  return entry.toolCallGroups !== undefined && entry.toolCallGroups.length > 0;
+  return entry.workGroup != null;
 }
 
 function entryStartsWithWorkRow(entry: ChatDisplayEntry): boolean {
@@ -530,8 +520,7 @@ function entryStartsWithWorkRow(entry: ChatDisplayEntry): boolean {
     m.type === "message" &&
     m.author.type !== "user" &&
     !m.message &&
-    entry.toolCallGroups !== undefined &&
-    entry.toolCallGroups.length > 0
+    entry.workGroup != null
   );
 }
 

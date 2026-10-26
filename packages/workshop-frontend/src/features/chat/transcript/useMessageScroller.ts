@@ -19,6 +19,12 @@ import {
  * fractional scroll positions and layout rounding.
  */
 const BOTTOM_TOLERANCE_PX = 8;
+/**
+ * How the scroller relates to the live edge: "following" rides it, "readerOwns" is the reader's
+ * explicit opt-out until they return to the edge, and "jumping" is a programmatic smooth jump in
+ * flight, whose intermediate positions must not read as the reader leaving the edge.
+ */
+type FollowMode = "following" | "readerOwns" | "jumping";
 
 /**
  * How much of the previous exchange stays visible above a turn anchor, so a new question reads
@@ -123,13 +129,14 @@ export function useMessageScroller({
 }: UseMessageScrollerOptions): MessageScroller {
   const [atBottom, setAtBottom] = useState(true);
   const [missedCount, setMissedCount] = useState(0);
+  const atBottomRef = useRef(true);
   // Following = at the live edge and no reader back-off. The refs are the truth effects read;
   // the state is what rendering shows.
-  const atBottomRef = useRef(true);
-  const readerIntentRef = useRef(false);
-  // True while a programmatic smooth jump to the bottom is in flight: intermediate positions it
-  // scrolls through must not read as the reader leaving the edge.
-  const jumpingRef = useRef(false);
+  const setAtBottomState = useCallback((next: boolean) => {
+    atBottomRef.current = next;
+    setAtBottom(next);
+  }, []);
+  const modeRef = useRef<FollowMode>("following");
   const lastSeenSequenceRef = useRef<number>(-Infinity);
   const latestSequenceRef = useRef<number>(-Infinity);
   const lastUserSequenceRef = useRef<number>(-Infinity);
@@ -144,9 +151,12 @@ export function useMessageScroller({
   const adoptingChatRef = useRef(entries.length > 0 || isTurnActive);
   const lastScrollHeightRef = useRef(0);
 
-  const setAtBottomState = useCallback((next: boolean) => {
-    atBottomRef.current = next;
-    setAtBottom(next);
+  // Resume following the live edge: whatever put the reader back on it means nothing below
+  // counts as missed, and any in-flight jump is over.
+  const markFollowing = useCallback(() => {
+    modeRef.current = "following";
+    lastSeenSequenceRef.current = latestSequenceRef.current;
+    setMissedCount(0);
   }, []);
 
   useLayoutEffect(() => {
@@ -217,10 +227,10 @@ export function useMessageScroller({
     if (!el) return;
     const grew = el.scrollHeight > lastScrollHeightRef.current + 0.5;
     lastScrollHeightRef.current = el.scrollHeight;
-    if (atBottomRef.current && !readerIntentRef.current) {
-      // Still following: the caller's follow effect scrolls to the new edge, so nothing is missed.
-      lastSeenSequenceRef.current = latestSequenceRef.current;
-      setMissedCount(0);
+    if (atBottomRef.current && modeRef.current !== "readerOwns") {
+      // Still riding the live edge — following it, or mid-glide back to it (a jump): content
+      // growth must retarget the follow, not strand it. The caller's follow effect scrolls.
+      markFollowing();
       return;
     }
     // Not following. Content growth moves the live edge past an opted-out reader even though
@@ -228,40 +238,32 @@ export function useMessageScroller({
     const next = !grew && isAtBottom(el);
     if (next !== atBottomRef.current) setAtBottomState(next);
     if (next) {
-      readerIntentRef.current = false;
-      lastSeenSequenceRef.current = latestSequenceRef.current;
-      setMissedCount(0);
+      markFollowing();
     } else {
       setMissedCount(
         entries.filter((entry) => entrySequenceId(entry) > lastSeenSequenceRef.current)
           .length,
       );
     }
-  }, [chatId, entries, isTurnActive, containerRef, setAtBottomState]);
+  }, [chatId, entries, isTurnActive, containerRef, setAtBottomState, markFollowing]);
 
   const handleScroll = useCallback(() => {
     const el = containerRef.current;
     if (!el) return;
     const edge = isAtBottom(el);
-    if (jumpingRef.current) {
+    if (modeRef.current === "jumping" && !edge) {
       // In flight: only arriving at the edge ends the jump; a reader input cancels it instead.
-      if (edge) jumpingRef.current = false;
-      else return;
+      return;
     }
     if (edge !== atBottomRef.current) setAtBottomState(edge);
-    if (edge) {
-      // Reaching the live edge by any means re-enables following and clears what was missed.
-      readerIntentRef.current = false;
-      lastSeenSequenceRef.current = latestSequenceRef.current;
-      setMissedCount(0);
-    }
-  }, [containerRef, setAtBottomState]);
+    // Reaching the live edge by any means re-enables following and clears what was missed.
+    if (edge) markFollowing();
+  }, [containerRef, setAtBottomState, markFollowing]);
 
   const interrupt = useCallback(() => {
     // Any explicit reader input opts out of following until they are back on the live edge
     // (HextaUI counts wheel, touch, keyboard and scrollbar drags alike).
-    jumpingRef.current = false;
-    readerIntentRef.current = true;
+    modeRef.current = "readerOwns";
     const el = containerRef.current;
     if (el && !isAtBottom(el)) setAtBottomState(false);
   }, [containerRef, setAtBottomState]);
@@ -290,35 +292,34 @@ export function useMessageScroller({
 
   const followContent = useCallback(() => {
     const el = containerRef.current;
-    if (!el || !atBottomRef.current || readerIntentRef.current) return;
+    if (!el || !atBottomRef.current || modeRef.current === "readerOwns") return;
     // While the pill's smooth jump glides, follow in kind: an instant scroll here would snap
     // the reader to the new edge mid-flight. Retargeting keeps the glide smooth to it.
-    el.scrollTo({ top: el.scrollHeight, behavior: jumpingRef.current ? "smooth" : "auto" });
+    el.scrollTo({ top: el.scrollHeight, behavior: modeRef.current === "jumping" ? "smooth" : "auto" });
     lastSeenSequenceRef.current = latestSequenceRef.current;
   }, [containerRef]);
 
   const jumpToLatest = useCallback(() => {
     const el = containerRef.current;
     if (!el) return;
-    readerIntentRef.current = false;
-    lastSeenSequenceRef.current = latestSequenceRef.current;
-    setMissedCount(0);
+    markFollowing();
     setAtBottomState(true);
     const reduced = prefersReducedMotion();
-    jumpingRef.current = !reduced;
+    // The smooth glide reads as "jumping" until it settles on the edge (see handleScroll);
+    // reduced motion degrades to an instant jump, which is already following.
+    modeRef.current = reduced ? "following" : "jumping";
     el.scrollTo({ top: el.scrollHeight, behavior: reduced ? "auto" : "smooth" });
-  }, [containerRef, setAtBottomState]);
+  }, [containerRef, setAtBottomState, markFollowing]);
 
   const resetToBottom = useCallback(() => {
+    markFollowing();
     const el = containerRef.current;
-    readerIntentRef.current = false;
-    jumpingRef.current = false;
-    lastSeenSequenceRef.current = latestSequenceRef.current;
+    // Snap straight to the edge and skip this pass's growth re-check, which would still see
+    // the pre-scroll position.
     lastScrollHeightRef.current = el?.scrollHeight ?? 0;
-    setMissedCount(0);
     setAtBottomState(true);
     el?.scrollTo({ top: el?.scrollHeight ?? 0, behavior: "auto" });
-  }, [containerRef, setAtBottomState]);
+  }, [containerRef, setAtBottomState, markFollowing]);
 
   return {
     atBottom,

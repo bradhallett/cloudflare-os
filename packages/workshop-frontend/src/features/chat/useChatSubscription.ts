@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type Dispatch, type RefObject, type SetStateAction } from "react";
 import { RpcStub, RpcTarget } from "capnweb";
 import { reportIssue } from "../../errorReporting";
 import { logRpcFailure } from "../../rpcErrors";
@@ -67,6 +67,436 @@ export interface UseChatSubscriptionArgs {
   onLiveRowsChange?: (rows: ChatLiveChangeRows | undefined) => void;
   onLiveEditPreviewsChange?: (previews: ChatLiveEditPreviews | undefined) => void;
   onStreamingActiveFileChange?: (chatId: number, file: ActiveFileTarget | null | undefined) => void;
+}
+
+/**
+ * What {@link ChatSubscriberImpl} reads from its owning hook: the hook's stable refs (which carry
+ * the live data) plus its per-render helpers and state setters. The hook refreshes the bag every
+ * render, so the one subscriber instance the server holds never reads a stale closure.
+ */
+interface SubscriberDeps {
+  cacheRef: RefObject<ChatCache>;
+  provisionalRef: RefObject<Map<number, ProvisionalChatState>>;
+  chatChangeRowsRef: RefObject<Map<number, ChatChangeRowBuffer>>;
+  chatChangeRowListenersRef: RefObject<Map<number, Set<(row: ChatChangeRow) => void>>>;
+  editPreviewsRef: RefObject<Map<number, StreamingEditPreview>>;
+  editPreviewListenersRef: RefObject<Map<number, Set<(event: EditPreviewEvent) => void>>>;
+  lastStreamGenerationRef: RefObject<number | undefined>;
+  toastsRef: RefObject<Toasts>;
+  staleBoundaryChatsRef: RefObject<Set<number>>;
+  refreshBoundaryRef: RefObject<(chatId: number, beforeSequence?: number) => Promise<boolean>>;
+  selectedChatIdRef: RefObject<number | null>;
+  onNavigateToChatRef: RefObject<(chatId: number | null, options?: { replace?: boolean }) => void>;
+  onStreamingActiveFileChangeRef:
+    RefObject<((chatId: number, file: ActiveFileTarget | null | undefined) => void) | undefined>;
+  removeChatFromActionMessageIndex: (chatId: number) => void;
+  indexActionMessage: (msg: AiChatMessage) => void;
+  refreshStaleBoundary: (chatId: number) => Promise<void>;
+  resetEditPreviews: (chatId: number) => void;
+  emitEditPreviewEvent: (chatId: number, event: EditPreviewEvent) => void;
+  forceUpdate: () => void;
+  bumpChatListVersion: () => void;
+  scheduleUpdate: () => void;
+  setLiveRowsVersion: Dispatch<SetStateAction<number>>;
+  setProposedChangesVersion: Dispatch<SetStateAction<number>>;
+}
+
+// Proper class implementation of AiChatSubscriber: a class is necessary so the server receives a
+// single stub for the object, not separate stubs for each method. It lives at module scope so the
+// hook allocates one constructor and one instance for the session, not one per render.
+class ChatSubscriberImpl extends RpcTarget implements AiChatSubscriber {
+  // The hook refreshes this bag every render (see SubscriberDeps), so the instance reads current
+  // values however late the server delivers an event.
+  readonly #depsRef: RefObject<SubscriberDeps | null>;
+
+  constructor(depsRef: RefObject<SubscriberDeps | null>) {
+    super();
+    this.#depsRef = depsRef;
+  }
+
+  get #deps(): SubscriberDeps {
+    return this.#depsRef.current!;
+  }
+
+  streamGeneration(generation: number) {
+    const {lastStreamGenerationRef, provisionalRef, editPreviewListenersRef, resetEditPreviews, forceUpdate} = this.#deps;
+    if (
+      lastStreamGenerationRef.current !== undefined &&
+      lastStreamGenerationRef.current !== generation
+    ) {
+      // The DO fully restarted since our last subscription; any in-flight provisional streams
+      // were lost and will be re-streamed from scratch. Discard stale provisional state so the
+      // re-streamed content isn't appended to it. Clearing all chats is safe: provisional state
+      // is purely ephemeral display state, and idle chats already have none.
+      provisionalRef.current.clear();
+      // Reset every subscribed chat's previews, not just those with a streaming entry:
+      // consumers also hold finished previews awaiting rows that were lost with the DO.
+      for (const chatId of editPreviewListenersRef.current.keys()) resetEditPreviews(chatId);
+      forceUpdate();
+    }
+    lastStreamGenerationRef.current = generation;
+  }
+
+  metadata(chat: AiChatMetadata) {
+    const {
+      cacheRef,
+      provisionalRef,
+      resetEditPreviews,
+      refreshBoundaryRef,
+      chatChangeRowsRef,
+      setLiveRowsVersion,
+      bumpChatListVersion,
+      forceUpdate,
+    } = this.#deps;
+    // When the agent stops running (activeAgent becomes unset), do a final full clear of this
+    // chat's provisional streaming state. This generally shouldn't be necessary because chat
+    // stream state is cleared when the final message arrives and code stream state is cleared
+    // when the finalized changes arrive, but doing this final clear will "mop up" if there
+    // were any inconsistencies in the streaming.
+    const prevChat = cacheRef.current.chats.get(chat.id);
+    if (prevChat?.activeAgent && !chat.activeAgent) {
+      provisionalRef.current.delete(chat.id);
+      resetEditPreviews(chat.id);
+    }
+
+    // A compaction that lands while the chat is open publishes a boundary the client only gets
+    // with a page, so refetch instead of waiting for a reload. Asking whether that boundary is
+    // already loaded makes this idempotent: paging back adds boundaries rather than replacing
+    // them, so an extra fetch can neither miss a compaction nor undo an expansion.
+    if (cacheRef.current.messages.has(chat.id) && chat.compactedTo !== undefined &&
+        !cacheRef.current.compacted.get(chat.id)?.some(({to}) => to === chat.compactedTo)) {
+      void refreshBoundaryRef.current(chat.id);
+    }
+
+    // A generation bump obsoletes buffered rows: a *destructive* bump (revert / draft
+    // discard -- no `prior`) erased every row, so drop them all; a content-preserving bump
+    // (a merge's epoch reset) retires the closed generation's rows but the code view may
+    // still be draining its tail, so keep exactly the prior generation and the new one.
+    // (The buffers are advisory replay caches -- the OT client dedupes and prunes on its own
+    // stream position -- so pruning here is memory hygiene, not correctness.)
+    const codeBase = chat.codeBase;
+    if (prevChat !== undefined && codeBase !== undefined &&
+        (prevChat.codeBase?.generation ?? 0) !== codeBase.generation) {
+      const keepFrom = codeBase.prior?.generation ?? codeBase.generation;
+      if (pruneChatChangeRows(chatChangeRowsRef.current, chat.id,
+                              row => row.generation >= keepFrom)) {
+        setLiveRowsVersion((prev) => prev + 1);
+      }
+    }
+
+    cacheRef.current.chats.set(chat.id, chat);
+    bumpChatListVersion();
+    forceUpdate();
+  }
+
+  deleted(chatId: number) {
+    const {
+      cacheRef,
+      removeChatFromActionMessageIndex,
+      provisionalRef,
+      editPreviewsRef,
+      chatChangeRowsRef,
+      bumpChatListVersion,
+      selectedChatIdRef,
+      onNavigateToChatRef,
+      forceUpdate,
+    } = this.#deps;
+    // Remove from cache
+    cacheRef.current.chats.delete(chatId);
+    cacheRef.current.messages.delete(chatId);
+    cacheRef.current.compacted.delete(chatId);
+    removeChatFromActionMessageIndex(chatId);
+    provisionalRef.current.delete(chatId);
+    editPreviewsRef.current.delete(chatId);
+    chatChangeRowsRef.current.delete(chatId);
+    bumpChatListVersion();
+
+    // If currently viewing this chat, go back to list
+    // Use replace to prevent browser-back returning to the deleted chat
+    if (selectedChatIdRef.current === chatId) {
+      onNavigateToChatRef.current(null, { replace: true });
+    }
+
+    forceUpdate();
+  }
+
+  changeApplied(
+    chatId: number,
+    generation: number,
+    revision: number,
+    author: AiChatAuthorInfo,
+    change: CodeChange,
+    submission?: { clientId: string; seq: number },
+  ) {
+    const {chatChangeRowsRef, chatChangeRowListenersRef, setLiveRowsVersion, scheduleUpdate} = this.#deps;
+    let buffer = chatChangeRowsRef.current.get(chatId);
+    if (!buffer) {
+      buffer = { rows: [], seen: new Set(), lastUserEditAt: null };
+      chatChangeRowsRef.current.set(chatId, buffer);
+    }
+    // Dedupe: subscribe-replay redelivers every retained row (see Overseer.subscribeToChat).
+    const key = `${generation}:${revision}`;
+    if (buffer.seen.has(key)) return;
+    buffer.seen.add(key);
+    const row: ChatChangeRow = {
+      generation, revision, author, change,
+      ...(submission !== undefined ? { submission } : {}),
+    };
+    buffer.rows.push(row);
+    if (submission !== undefined) {
+      // Only human submissions drive the draft banner (see ChatChangeRowBuffer).
+      buffer.lastUserEditAt = new Date();
+    }
+    // Deliver to subscribers synchronously: the message that materializes this row may prune
+    // it from the buffer before any effect runs (see ChatLiveChangeRows).
+    chatChangeRowListenersRef.current.get(chatId)?.forEach((listener) => listener(row));
+    setLiveRowsVersion((prev) => prev + 1);
+    scheduleUpdate();
+  }
+
+  message(msg: AiChatMessage) {
+    const {
+      cacheRef,
+      indexActionMessage,
+      setProposedChangesVersion,
+      staleBoundaryChatsRef,
+      refreshStaleBoundary,
+      chatChangeRowsRef,
+      setLiveRowsVersion,
+      resetEditPreviews,
+      provisionalRef,
+      forceUpdate,
+    } = this.#deps;
+    // Use sequence number as index to make this idempotent
+    // This handles both duplicate subscriptions (React strict mode) and race conditions
+
+    // Get or initialize messages array for this chat
+    let messages = cacheRef.current.messages.get(msg.chatId);
+    if (!messages) {
+      messages = [];
+      cacheRef.current.messages.set(msg.chatId, messages);
+    }
+
+    // Set message at sequence index (idempotent)
+    messages[msg.sequence] = msg;
+    indexActionMessage(msg);
+
+    // Update last message timestamp
+    if (
+      !cacheRef.current.lastMessageTimestamp ||
+      msg.timestamp > cacheRef.current.lastMessageTimestamp
+    ) {
+      cacheRef.current.lastMessageTimestamp = msg.timestamp;
+    }
+
+    // Only trigger proposed-changes recomputation for message types that affect the code.
+    // "merge" is excluded: the epoch reset it performs reaches the doc through the metadata's
+    // codeBase.epoch (redelivered with the merge), which the chat-doc effect above depends on
+    // -- recomputing here as well would race the metadata and transiently pair the old epoch's
+    // updates with the new epoch's (empty) pin set.
+    if (msg.type === "changes" || msg.type === "revert") {
+      setProposedChangesVersion((prev) => prev + 1);
+    }
+
+    // A revert reaching past the oldest loaded boundary changed it on the server; see
+    // staleBoundaryChatsRef.
+    if (msg.type === "revert") {
+      let oldest = cacheRef.current.compacted.get(msg.chatId)?.[0];
+      if (oldest !== undefined && msg.revertFrom < oldest.to) {
+        staleBoundaryChatsRef.current.add(msg.chatId);
+        void refreshStaleBoundary(msg.chatId);
+      }
+    }
+
+    // A "changes" message's watermark absorbs the rows it materialized; drop our copies (see
+    // AiChatMessageBody.watermark). Rows of other generations are untouched -- revisions
+    // restart per generation, so an unqualified prune could clear the wrong stream's rows.
+    if (msg.type === "changes" && msg.watermark !== undefined) {
+      const { changesGeneration, throughRevision } = msg.watermark;
+      if (pruneChatChangeRows(chatChangeRowsRef.current, msg.chatId,
+                              row => row.generation !== changesGeneration ||
+                                     row.revision > throughRevision)) {
+        setLiveRowsVersion((prev) => prev + 1);
+      }
+    }
+
+    // The turn-flush "changes" message covers every row a successful edit appended, and an
+    // error message ends the step -- either way this step's previews are over (ordinarily
+    // each previewed edit's own row already resolved it; see WorkpieceCodeInterface).
+    if (msg.type === "changes" || msg.type === "error") {
+      resetEditPreviews(msg.chatId);
+    }
+
+    const provisional = provisionalRef.current.get(msg.chatId);
+    if (provisional) {
+      if (msg.type === "message") {
+        clearProvisionalTextState(provisional);
+      } else if (msg.type === "changes") {
+        clearProvisionalCodeState(provisional);
+      } else if (msg.type === "error") {
+        clearProvisionalTextState(provisional);
+        clearProvisionalCodeState(provisional);
+      }
+
+      if (isProvisionalChatStateEmpty(provisional)) {
+        provisionalRef.current.delete(msg.chatId);
+      }
+    }
+
+    forceUpdate();
+  }
+
+  stream(chatId: number, event: AiChatStreamEvent) {
+    const {
+      provisionalRef,
+      resetEditPreviews,
+      toastsRef,
+      selectedChatIdRef,
+      onStreamingActiveFileChangeRef,
+      editPreviewsRef,
+      emitEditPreviewEvent,
+      scheduleUpdate,
+    } = this.#deps;
+    let provisional = provisionalRef.current.get(chatId);
+
+    if (!provisional) {
+      provisional = createProvisionalChatState();
+      provisionalRef.current.set(chatId, provisional);
+    }
+
+    switch (event.type) {
+      case "streamReset":
+        // A failed model request is being retried: drop everything it streamed, as an error
+        // message would, so the retry's output doesn't append to the failed attempt's.
+        clearProvisionalTextState(provisional);
+        clearProvisionalCodeState(provisional);
+        resetEditPreviews(chatId);
+        break;
+      case "compacting":
+        provisional.compacting = true;
+        break;
+      case "compacted":
+        provisional.compacting = false;
+        if (event.nothingToCompact) {
+          toastsRef.current.add({
+            title: "Nothing to compact — there are no earlier messages to summarize.",
+          });
+        }
+        break;
+      case "textDelta":
+        provisional.text += event.delta;
+        break;
+      case "reasoningDelta":
+        provisional.reasoning += event.delta;
+        break;
+      case "toolCallStarted": {
+        getOrCreateProvisionalToolCall(
+          provisional,
+          event.toolCallId,
+          event.toolName,
+        );
+        break;
+      }
+      case "toolCodeDelta": {
+        const toolCall = getOrCreateProvisionalToolCall(
+          provisional,
+          event.toolCallId,
+          null,
+        );
+        toolCall.code += event.delta;
+        break;
+      }
+      case "toolOutputDelta": {
+        const toolCall = getOrCreateProvisionalToolCall(
+          provisional,
+          event.toolCallId,
+          null,
+        );
+        toolCall.output += event.delta;
+        break;
+      }
+      case "toolCallFinished": {
+        const toolCall = getOrCreateProvisionalToolCall(
+          provisional,
+          event.toolCallId,
+          null,
+        );
+        toolCall.finished = true;
+        break;
+      }
+      case "setActiveFile":
+        provisional.activeEditingFile = event.file ?? null;
+        // Also tell the editor straight away. The effect above only runs on re-render, which is
+        // too late for the tab to follow the very first file of a turn.
+        if (chatId === selectedChatIdRef.current) {
+          onStreamingActiveFileChangeRef.current?.(chatId, event.file ?? null);
+        }
+        break;
+      case "toolCallOutputFormat": {
+        const toolCall = getOrCreateProvisionalToolCall(
+          provisional,
+          event.toolCallId,
+          null,
+        );
+        toolCall.outputFormat = event.output;
+        break;
+      }
+      case "toolCallTarget": {
+        // Surfaces the file name during streaming for writes and edits so the frontend can update.
+        const toolCall = getOrCreateProvisionalToolCall(
+          provisional,
+          event.toolCallId,
+          null,
+        );
+        toolCall.target = event.file.filename;
+        break;
+      }
+      case "editPreviewStart":
+        editPreviewsRef.current.set(chatId, {
+          toolCallId: event.toolCallId,
+          workpieceId: event.file.workpieceId,
+          filename: event.file.filename,
+          ...(event.textToReplace !== undefined
+            ? { textToReplace: event.textToReplace } : {}),
+          text: "",
+        });
+        emitEditPreviewEvent(chatId, {
+          kind: "start",
+          toolCallId: event.toolCallId,
+          workpieceId: event.file.workpieceId,
+          filename: event.file.filename,
+          ...(event.textToReplace !== undefined
+            ? { textToReplace: event.textToReplace } : {}),
+        });
+        break;
+      case "editPreviewDelta": {
+        const preview = editPreviewsRef.current.get(chatId);
+        if (preview !== undefined && preview.toolCallId === event.toolCallId) {
+          preview.text += event.delta;
+        }
+        emitEditPreviewEvent(chatId,
+          { kind: "delta", toolCallId: event.toolCallId, delta: event.delta });
+        break;
+      }
+      case "editPreviewClear": {
+        const preview = editPreviewsRef.current.get(chatId);
+        if (preview !== undefined && preview.toolCallId === event.toolCallId) {
+          editPreviewsRef.current.delete(chatId);
+        }
+        // Forwarded regardless of which call it names: a failed call's clear arrives at
+        // execution time, when a later call's preview may already be the streaming one, and
+        // the consumer still holds the named call's finished preview.
+        emitEditPreviewEvent(chatId, { kind: "clear", toolCallId: event.toolCallId });
+        break;
+      }
+    }
+
+    if (isProvisionalChatStateEmpty(provisional)) {
+      provisionalRef.current.delete(chatId);
+    }
+
+    scheduleUpdate();
+  }
 }
 
 /**
@@ -438,7 +868,7 @@ export function useChatSubscription({
   const onStreamingActiveFileChangeRef = useRef(onStreamingActiveFileChange);
   onStreamingActiveFileChangeRef.current = onStreamingActiveFileChange;
   const currentProvisionalState =
-    selectedChatId !== null
+      selectedChatId !== null
       ? (provisionalRef.current.get(selectedChatId) ?? null)
       : null;
   const currentStreamingActiveFile = currentProvisionalState?.activeEditingFile;
@@ -461,348 +891,36 @@ export function useChatSubscription({
     emitEditPreviewEvent(chatId, { kind: "reset" });
   };
 
-  // Proper class implementation of AiChatSubscriber
-  // This is necessary so the server receives a single stub for the object,
-  // not separate stubs for each method
-  class ChatSubscriberImpl extends RpcTarget implements AiChatSubscriber {
-    streamGeneration(generation: number) {
-      if (
-        lastStreamGenerationRef.current !== undefined &&
-        lastStreamGenerationRef.current !== generation
-      ) {
-        // The DO fully restarted since our last subscription; any in-flight provisional streams
-        // were lost and will be re-streamed from scratch. Discard stale provisional state so the
-        // re-streamed content isn't appended to it. Clearing all chats is safe: provisional state
-        // is purely ephemeral display state, and idle chats already have none.
-        provisionalRef.current.clear();
-        // Reset every subscribed chat's previews, not just those with a streaming entry:
-        // consumers also hold finished previews awaiting rows that were lost with the DO.
-        for (const chatId of editPreviewListenersRef.current.keys()) resetEditPreviews(chatId);
-        forceUpdate();
-      }
-      lastStreamGenerationRef.current = generation;
-    }
-
-    metadata(chat: AiChatMetadata) {
-      // When the agent stops running (activeAgent becomes unset), do a final full clear of this
-      // chat's provisional streaming state. This generally shouldn't be necessary because chat
-      // stream state is cleared when the final message arrives and code stream state is cleared
-      // when the finalized changes arrive, but doing this final clear will "mop up" if there
-      // were any inconsistencies in the streaming.
-      const prevChat = cacheRef.current.chats.get(chat.id);
-      if (prevChat?.activeAgent && !chat.activeAgent) {
-        provisionalRef.current.delete(chat.id);
-        resetEditPreviews(chat.id);
-      }
-
-      // A compaction that lands while the chat is open publishes a boundary the client only gets
-      // with a page, so refetch instead of waiting for a reload. Asking whether that boundary is
-      // already loaded makes this idempotent: paging back adds boundaries rather than replacing
-      // them, so an extra fetch can neither miss a compaction nor undo an expansion.
-      if (cacheRef.current.messages.has(chat.id) && chat.compactedTo !== undefined &&
-          !cacheRef.current.compacted.get(chat.id)?.some(({to}) => to === chat.compactedTo)) {
-        void refreshBoundaryRef.current(chat.id);
-      }
-
-      // A generation bump obsoletes buffered rows: a *destructive* bump (revert / draft
-      // discard -- no `prior`) erased every row, so drop them all; a content-preserving bump
-      // (a merge's epoch reset) retires the closed generation's rows but the code view may
-      // still be draining its tail, so keep exactly the prior generation and the new one.
-      // (The buffers are advisory replay caches -- the OT client dedupes and prunes on its own
-      // stream position -- so pruning here is memory hygiene, not correctness.)
-      const codeBase = chat.codeBase;
-      if (prevChat !== undefined && codeBase !== undefined &&
-          (prevChat.codeBase?.generation ?? 0) !== codeBase.generation) {
-        const keepFrom = codeBase.prior?.generation ?? codeBase.generation;
-        if (pruneChatChangeRows(chatChangeRowsRef.current, chat.id,
-                                row => row.generation >= keepFrom)) {
-          setLiveRowsVersion((prev) => prev + 1);
-        }
-      }
-
-      cacheRef.current.chats.set(chat.id, chat);
-      bumpChatListVersion();
-      forceUpdate();
-    }
-
-    deleted(chatId: number) {
-      // Remove from cache
-      cacheRef.current.chats.delete(chatId);
-      cacheRef.current.messages.delete(chatId);
-      cacheRef.current.compacted.delete(chatId);
-      removeChatFromActionMessageIndex(chatId);
-      provisionalRef.current.delete(chatId);
-      editPreviewsRef.current.delete(chatId);
-      chatChangeRowsRef.current.delete(chatId);
-      bumpChatListVersion();
-
-      // If currently viewing this chat, go back to list
-      // Use replace to prevent browser-back returning to the deleted chat
-      if (selectedChatIdRef.current === chatId) {
-        onNavigateToChatRef.current(null, { replace: true });
-      }
-
-      forceUpdate();
-    }
-
-    changeApplied(
-      chatId: number,
-      generation: number,
-      revision: number,
-      author: AiChatAuthorInfo,
-      change: CodeChange,
-      submission?: { clientId: string; seq: number },
-    ) {
-      let buffer = chatChangeRowsRef.current.get(chatId);
-      if (!buffer) {
-        buffer = { rows: [], seen: new Set(), lastUserEditAt: null };
-        chatChangeRowsRef.current.set(chatId, buffer);
-      }
-      // Dedupe: subscribe-replay redelivers every retained row (see Overseer.subscribeToChat).
-      const key = `${generation}:${revision}`;
-      if (buffer.seen.has(key)) return;
-      buffer.seen.add(key);
-      const row: ChatChangeRow = {
-        generation, revision, author, change,
-        ...(submission !== undefined ? { submission } : {}),
-      };
-      buffer.rows.push(row);
-      if (submission !== undefined) {
-        // Only human submissions drive the draft banner (see ChatChangeRowBuffer).
-        buffer.lastUserEditAt = new Date();
-      }
-      // Deliver to subscribers synchronously: the message that materializes this row may prune
-      // it from the buffer before any effect runs (see ChatLiveChangeRows).
-      chatChangeRowListenersRef.current.get(chatId)?.forEach((listener) => listener(row));
-      setLiveRowsVersion((prev) => prev + 1);
-      scheduleUpdate();
-    }
-
-    message(msg: AiChatMessage) {
-      // Use sequence number as index to make this idempotent
-      // This handles both duplicate subscriptions (React strict mode) and race conditions
-
-      // Get or initialize messages array for this chat
-      let messages = cacheRef.current.messages.get(msg.chatId);
-      if (!messages) {
-        messages = [];
-        cacheRef.current.messages.set(msg.chatId, messages);
-      }
-
-      // Set message at sequence index (idempotent)
-      messages[msg.sequence] = msg;
-      indexActionMessage(msg);
-
-      // Update last message timestamp
-      if (
-        !cacheRef.current.lastMessageTimestamp ||
-        msg.timestamp > cacheRef.current.lastMessageTimestamp
-      ) {
-        cacheRef.current.lastMessageTimestamp = msg.timestamp;
-      }
-
-      // Only trigger proposed-changes recomputation for message types that affect the code.
-      // "merge" is excluded: the epoch reset it performs reaches the doc through the metadata's
-      // codeBase.epoch (redelivered with the merge), which the chat-doc effect above depends on
-      // -- recomputing here as well would race the metadata and transiently pair the old epoch's
-      // updates with the new epoch's (empty) pin set.
-      if (msg.type === "changes" || msg.type === "revert") {
-        setProposedChangesVersion((prev) => prev + 1);
-      }
-
-      // A revert reaching past the oldest loaded boundary changed it on the server; see
-      // staleBoundaryChatsRef.
-      if (msg.type === "revert") {
-        let oldest = cacheRef.current.compacted.get(msg.chatId)?.[0];
-        if (oldest !== undefined && msg.revertFrom < oldest.to) {
-          staleBoundaryChatsRef.current.add(msg.chatId);
-          void refreshStaleBoundary(msg.chatId);
-        }
-      }
-
-      // A "changes" message's watermark absorbs the rows it materialized; drop our copies (see
-      // AiChatMessageBody.watermark). Rows of other generations are untouched -- revisions
-      // restart per generation, so an unqualified prune could clear the wrong stream's rows.
-      if (msg.type === "changes" && msg.watermark !== undefined) {
-        const { changesGeneration, throughRevision } = msg.watermark;
-        if (pruneChatChangeRows(chatChangeRowsRef.current, msg.chatId,
-                                row => row.generation !== changesGeneration ||
-                                       row.revision > throughRevision)) {
-          setLiveRowsVersion((prev) => prev + 1);
-        }
-      }
-
-      // The turn-flush "changes" message covers every row a successful edit appended, and an
-      // error message ends the step -- either way this step's previews are over (ordinarily
-      // each previewed edit's own row already resolved it; see WorkpieceCodeInterface).
-      if (msg.type === "changes" || msg.type === "error") {
-        resetEditPreviews(msg.chatId);
-      }
-
-      const provisional = provisionalRef.current.get(msg.chatId);
-      if (provisional) {
-        if (msg.type === "message") {
-          clearProvisionalTextState(provisional);
-        } else if (msg.type === "changes") {
-          clearProvisionalCodeState(provisional);
-        } else if (msg.type === "error") {
-          clearProvisionalTextState(provisional);
-          clearProvisionalCodeState(provisional);
-        }
-
-        if (isProvisionalChatStateEmpty(provisional)) {
-          provisionalRef.current.delete(msg.chatId);
-        }
-      }
-
-      forceUpdate();
-    }
-
-    stream(chatId: number, event: AiChatStreamEvent) {
-      let provisional = provisionalRef.current.get(chatId);
-
-      if (!provisional) {
-        provisional = createProvisionalChatState();
-        provisionalRef.current.set(chatId, provisional);
-      }
-
-      switch (event.type) {
-        case "streamReset":
-          // A failed model request is being retried: drop everything it streamed, as an error
-          // message would, so the retry's output doesn't append to the failed attempt's.
-          clearProvisionalTextState(provisional);
-          clearProvisionalCodeState(provisional);
-          resetEditPreviews(chatId);
-          break;
-        case "compacting":
-          provisional.compacting = true;
-          break;
-        case "compacted":
-          provisional.compacting = false;
-          if (event.nothingToCompact) {
-            toastsRef.current.add({
-              title: "Nothing to compact — there are no earlier messages to summarize.",
-            });
-          }
-          break;
-        case "textDelta":
-          provisional.text += event.delta;
-          break;
-        case "reasoningDelta":
-          provisional.reasoning += event.delta;
-          break;
-        case "toolCallStarted": {
-          getOrCreateProvisionalToolCall(
-            provisional,
-            event.toolCallId,
-            event.toolName,
-          );
-          break;
-        }
-        case "toolCodeDelta": {
-          const toolCall = getOrCreateProvisionalToolCall(
-            provisional,
-            event.toolCallId,
-            null,
-          );
-          toolCall.code += event.delta;
-          break;
-        }
-        case "toolOutputDelta": {
-          const toolCall = getOrCreateProvisionalToolCall(
-            provisional,
-            event.toolCallId,
-            null,
-          );
-          toolCall.output += event.delta;
-          break;
-        }
-        case "toolCallFinished": {
-          const toolCall = getOrCreateProvisionalToolCall(
-            provisional,
-            event.toolCallId,
-            null,
-          );
-          toolCall.finished = true;
-          break;
-        }
-        case "setActiveFile":
-          provisional.activeEditingFile = event.file ?? null;
-          // Also tell the editor straight away. The effect above only runs on re-render, which is
-          // too late for the tab to follow the very first file of a turn.
-          if (chatId === selectedChatIdRef.current) {
-            onStreamingActiveFileChangeRef.current?.(chatId, event.file ?? null);
-          }
-          break;
-        case "toolCallOutputFormat": {
-          const toolCall = getOrCreateProvisionalToolCall(
-            provisional,
-            event.toolCallId,
-            null,
-          );
-          toolCall.outputFormat = event.output;
-          break;
-        }
-        case "toolCallTarget": {
-          // Surfaces the file name during streaming for writes and edits so the frontend can update.
-          const toolCall = getOrCreateProvisionalToolCall(
-            provisional,
-            event.toolCallId,
-            null,
-          );
-          toolCall.target = event.file.filename;
-          break;
-        }
-        case "editPreviewStart":
-          editPreviewsRef.current.set(chatId, {
-            toolCallId: event.toolCallId,
-            workpieceId: event.file.workpieceId,
-            filename: event.file.filename,
-            ...(event.textToReplace !== undefined
-              ? { textToReplace: event.textToReplace } : {}),
-            text: "",
-          });
-          emitEditPreviewEvent(chatId, {
-            kind: "start",
-            toolCallId: event.toolCallId,
-            workpieceId: event.file.workpieceId,
-            filename: event.file.filename,
-            ...(event.textToReplace !== undefined
-              ? { textToReplace: event.textToReplace } : {}),
-          });
-          break;
-        case "editPreviewDelta": {
-          const preview = editPreviewsRef.current.get(chatId);
-          if (preview !== undefined && preview.toolCallId === event.toolCallId) {
-            preview.text += event.delta;
-          }
-          emitEditPreviewEvent(chatId,
-            { kind: "delta", toolCallId: event.toolCallId, delta: event.delta });
-          break;
-        }
-        case "editPreviewClear": {
-          const preview = editPreviewsRef.current.get(chatId);
-          if (preview !== undefined && preview.toolCallId === event.toolCallId) {
-            editPreviewsRef.current.delete(chatId);
-          }
-          // Forwarded regardless of which call it names: a failed call's clear arrives at
-          // execution time, when a later call's preview may already be the streaming one, and
-          // the consumer still holds the named call's finished preview.
-          emitEditPreviewEvent(chatId, { kind: "clear", toolCallId: event.toolCallId });
-          break;
-        }
-      }
-
-      if (isProvisionalChatStateEmpty(provisional)) {
-        provisionalRef.current.delete(chatId);
-      }
-
-      scheduleUpdate();
-    }
-  }
-
-  // Keep stable subscriber instance across re-renders
-  const subscriberRef = useRef(new ChatSubscriberImpl());
+  // The server holds one subscriber stub for the session, so the instance is constructed once
+  // and reads the hook through the deps bag refreshed every render above (see ChatSubscriberImpl).
+  const subscriberDepsRef = useRef<SubscriberDeps | null>(null);
+  subscriberDepsRef.current = {
+    cacheRef,
+    provisionalRef,
+    chatChangeRowsRef,
+    chatChangeRowListenersRef,
+    editPreviewsRef,
+    editPreviewListenersRef,
+    lastStreamGenerationRef,
+    toastsRef,
+    staleBoundaryChatsRef,
+    refreshBoundaryRef,
+    selectedChatIdRef,
+    onNavigateToChatRef,
+    onStreamingActiveFileChangeRef,
+    removeChatFromActionMessageIndex,
+    indexActionMessage,
+    refreshStaleBoundary,
+    resetEditPreviews,
+    emitEditPreviewEvent,
+    forceUpdate,
+    bumpChatListVersion,
+    scheduleUpdate,
+    setLiveRowsVersion,
+    setProposedChangesVersion,
+  };
+  const subscriberRef = useRef<ChatSubscriberImpl | null>(null);
+  if (!subscriberRef.current) subscriberRef.current = new ChatSubscriberImpl(subscriberDepsRef);
 
   // Subscribe to chat updates
   useEffect(() => {
@@ -817,7 +935,7 @@ export function useChatSubscription({
         // Store the promise itself as the subscription
         // Pass the subscriber instance (which is now a proper class instance)
         const subscription = overseer.subscribeToChat(
-          subscriberRef.current,
+          subscriberRef.current!,
           startAfter,
         );
 

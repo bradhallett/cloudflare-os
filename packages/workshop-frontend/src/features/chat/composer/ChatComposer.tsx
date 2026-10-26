@@ -91,6 +91,7 @@ export const ChatComposer = ({
   selectedBot,
   onBotChange,
   showModels,
+  defaultModelId,
   staleBotName,
   pendingConsoleLogCount = 0,
   consoleLogPreview = "",
@@ -149,6 +150,8 @@ export const ChatComposer = ({
    * the default model as "Default agent" instead.
    */
   showModels?: boolean;
+  /** The intake row's model id (see ComposerModelSelector.defaultModelId); intake only. */
+  defaultModelId?: string | null;
   /** The chat's own bot name when that bot no longer resolves; shown as a disabled picker row. */
   staleBotName?: string;
   pendingConsoleLogCount?: number;
@@ -1065,6 +1068,7 @@ export const ChatComposer = ({
                 selectedBot={selectedBot ?? null}
                 onBotChange={onBotChange}
                 showModels={showModels}
+                defaultModelId={defaultModelId}
                 staleBotName={staleBotName}
               />
               {isAgentActive && onStop && (

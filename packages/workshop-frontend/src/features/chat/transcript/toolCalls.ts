@@ -27,8 +27,9 @@ function formatGadgetBindingTarget(
   gadget: string | undefined,
   name: string | undefined,
 ): string | undefined {
-  if (!name) return gadget;
-  return gadget ? `${gadget}.${name}` : name;
+  if (gadget === undefined) return name;
+  if (name === undefined) return gadget;
+  return `${gadget}.${name}`;
 }
 /**
  * What a `createGadget` call produced. Read from the gadget's own stamped output rather than
@@ -60,96 +61,246 @@ export function toolOutputResolver(
   return (tc) => resolveToolCallOutput(tc, outputOfWorkpiece);
 }
 
+/** One tool's display data: every label, count phrase and icon its rows read. */
+interface ToolMeta {
+  /** Finished single-call verb; the call's target usually names the noun ("Read <file>"). */
+  summary: string;
+  /** Past-tense verb for count labels ("Read 2 files"). */
+  past: string;
+  /** What one call acts on, pluralized in count labels; omit when counts are a fixed phrase. */
+  noun?: string;
+  /** Irregular finished-count label (editFile's "Made N edits", grep's "…N times"). */
+  countLabel?: (count: number) => string;
+  /** Present-tense verb for in-progress labels ("Reading"). */
+  present: string;
+  /** Full present-tense phrase when one call's verb is one ("Creating gadget"). */
+  presentPhrase?: string;
+  /** Standalone in-progress label when the streaming call has no target yet. Tools that never
+   * got one keep the generic "Using tool" (their single-call placeholder predates them). */
+  presentLabel?: string;
+  /** Irregular in-progress count label (grep's "Searching files N times"). */
+  presentCountLabel?: (count: number) => string;
+  /** The icon a tool-call row draws for the tool. */
+  icon: PhosphorIcon;
+  /** Whether a running call is recognized by its missing `output` (see isToolCallRunning). */
+  runningNeedsOutput: boolean;
+}
+
+// The one table every tool-call label, count and icon derives from: adding a tool is one row
+// here (the Record type forces it), not seven parallel switches.
+const TOOL_META: Record<AiToolCall["toolName"], ToolMeta> = {
+  readFile: {
+    summary: "Read",
+    past: "Read",
+    noun: "file",
+    present: "Reading",
+    presentLabel: "Reading file",
+    icon: FileIcon,
+    runningNeedsOutput: false,
+  },
+  writeFile: {
+    summary: "Wrote",
+    past: "Wrote",
+    noun: "file",
+    present: "Writing",
+    presentLabel: "Writing file",
+    icon: FileIcon,
+    runningNeedsOutput: false,
+  },
+  editFile: {
+    summary: "Edited",
+    past: "Edited",
+    countLabel: (count) => `Made ${pluralize(count, "edit")}`,
+    present: "Editing",
+    presentLabel: "Editing file",
+    presentCountLabel: (count) => `Making ${pluralize(count, "edit")}`,
+    icon: PencilSimple,
+    runningNeedsOutput: false,
+  },
+  grep: {
+    summary: "Searched",
+    past: "Searched",
+    countLabel: (count) =>
+      count === 1 ? "Searched files" : `Searched files ${formatTimes(count)}`,
+    present: "Searching",
+    presentLabel: "Searching files",
+    presentCountLabel: (count) => `Searching files ${formatTimes(count)}`,
+    icon: MagnifyingGlass,
+    runningNeedsOutput: true,
+  },
+  describeBinding: {
+    summary: "Inspected",
+    past: "Inspected",
+    noun: "binding",
+    present: "Inspecting",
+    presentLabel: "Inspecting binding",
+    icon: MagnifyingGlass,
+    runningNeedsOutput: true,
+  },
+  setBindingHook: {
+    summary: "Connected",
+    past: "Connected",
+    noun: "binding",
+    present: "Connecting",
+    presentLabel: "Connecting binding",
+    icon: LinkSimple,
+    runningNeedsOutput: false,
+  },
+  setGadgetBinding: {
+    summary: "Wired up",
+    past: "Wired up",
+    noun: "binding",
+    present: "Wiring up",
+    presentLabel: "Wiring up binding",
+    icon: LinkSimple,
+    runningNeedsOutput: true,
+  },
+  // Obsolete predecessor of `setGadgetBinding`; appears only in old chat logs.
+  saveCapsuleAsBinding: {
+    summary: "Saved resource",
+    past: "Saved",
+    noun: "resource",
+    present: "Saving",
+    presentLabel: "Saving resource",
+    icon: LinkSimple,
+    runningNeedsOutput: false,
+  },
+  createGadget: {
+    summary: "Created gadget",
+    past: "Created",
+    noun: "gadget",
+    present: "Creating",
+    presentPhrase: "Creating gadget",
+    presentLabel: "Creating gadget",
+    icon: Plus,
+    runningNeedsOutput: true,
+  },
+  createWorktree: {
+    summary: "Created worktree",
+    past: "Created",
+    noun: "worktree",
+    present: "Creating",
+    presentPhrase: "Creating worktree",
+    presentLabel: "Creating worktree",
+    icon: GitBranch,
+    runningNeedsOutput: true,
+  },
+  executeCode: {
+    summary: "Ran code",
+    past: "Ran code",
+    countLabel: (count) =>
+      count === 1 ? "Ran code" : `Ran code ${formatTimes(count)}`,
+    present: "Running",
+    presentPhrase: "Running code",
+    presentLabel: "Running code",
+    presentCountLabel: (count) => `Running code ${formatTimes(count)}`,
+    icon: Terminal,
+    runningNeedsOutput: true,
+  },
+  giveUp: {
+    summary: "Stopped",
+    past: "Stopped",
+    countLabel: (count) => (count === 1 ? "Stopped" : `Stopped ${count} times`),
+    present: "Stopping",
+    presentLabel: "Stopping",
+    icon: Question,
+    runningNeedsOutput: false,
+  },
+  webFetch: {
+    summary: "Fetched",
+    past: "Fetched",
+    noun: "page",
+    present: "Fetching",
+    presentLabel: "Fetching web page",
+    icon: Globe,
+    runningNeedsOutput: true,
+  },
+  observeUserChanges: {
+    summary: "Observed user changes",
+    past: "Observed",
+    noun: "change set",
+    present: "Observing",
+    presentPhrase: "Observing user changes",
+    presentLabel: "Observing user changes",
+    icon: MagnifyingGlass,
+    runningNeedsOutput: false,
+  },
+  listBlueprints: {
+    summary: "Listed blueprints",
+    past: "Listed blueprints",
+    present: "Listing",
+    presentPhrase: "Listing blueprints",
+    icon: Blueprint,
+    runningNeedsOutput: true,
+  },
+  listConnectableResources: {
+    summary: "Listed connectable resources",
+    past: "Listed connectable resources",
+    present: "Listing",
+    presentPhrase: "Listing connectable resources",
+    icon: Question,
+    runningNeedsOutput: true,
+  },
+  requestConnection: {
+    summary: "Requested connection",
+    past: "Requested",
+    countLabel: (count) =>
+      count === 1 ? "Requested a connection" : `Requested ${count} connections`,
+    present: "Requesting",
+    presentPhrase: "Requesting a connection",
+    icon: Question,
+    runningNeedsOutput: true,
+  },
+  createExternalResource: {
+    summary: "Created",
+    past: "Created",
+    noun: "external resource",
+    present: "Creating",
+    presentPhrase: "Creating external resource",
+    icon: Question,
+    runningNeedsOutput: true,
+  },
+  activateSkill: {
+    summary: "Activated skill",
+    past: "Activated",
+    noun: "skill",
+    present: "Activating",
+    presentPhrase: "Activating a skill",
+    icon: Lightning,
+    runningNeedsOutput: true,
+  },
+  delegateToBot: {
+    summary: "Delegated to bot",
+    past: "Delegated",
+    noun: "subtask",
+    countLabel: (count) =>
+      count === 1 ? "Delegated to a bot" : `Delegated ${count} subtasks`,
+    present: "Delegating",
+    presentPhrase: "Delegating to a bot",
+    icon: Robot,
+    runningNeedsOutput: true,
+  },
+  messageBot: {
+    summary: "Sent direct message",
+    past: "Sent",
+    noun: "direct message",
+    present: "Sending",
+    presentPhrase: "Sending a direct message",
+    icon: Robot,
+    runningNeedsOutput: true,
+  },
+};
+
 /** The `{verb, target}` summary a tool-call row shows for one call. */
 export function getToolCallSummary(
   tc: AiToolCall,
   outputOf?: ToolOutputResolver,
 ): { verb: string; target?: string } {
-  switch (tc.toolName) {
-    case "readFile":
-      return { verb: "Read", target: tc.input.filename };
-    case "writeFile":
-      return { verb: "Wrote", target: tc.input.filename };
-    case "editFile":
-      return { verb: "Edited", target: tc.input.filename };
-    case "grep":
-      return { verb: "Searched", target: tc.input.path ?? tc.input.workpiece };
-    case "describeBinding":
-      return {
-        verb: "Inspected",
-        target: tc.input.gadget === undefined
-          ? `${String(tc.input.name)} binding`
-          : `${String(tc.input.name)} binding of ${tc.input.gadget}`,
-      };
-    case "setBindingHook":
-      return {
-        verb: "Connected",
-        target: tc.input.entrypoint
-          ? `${tc.input.bindingName} → ${tc.input.entrypoint}`
-          : tc.input.bindingName,
-      };
-    case "setGadgetBinding":
-      return {
-        verb: "Wired up",
-        target: formatGadgetBindingTarget(tc.input.gadget, tc.input.name ?? tc.input.source),
-      };
-    // Obsolete predecessor of `setGadgetBinding`; appears only in old chat logs.
-    case "saveCapsuleAsBinding":
-      return { verb: "Saved resource", target: tc.input.bindingName };
-    case "createGadget": {
-
-      const output = outputOf?.(tc);
-      return { verb: `Created ${output?.noun ?? "gadget"}`, target: tc.input.title };
-    }
-    case "createWorktree":
-      return { verb: "Created worktree", target: tc.input.title };
-    case "executeCode": {
-      // Prefer the first non-empty line as a preview. `code` may be absent while the tool call's
-      // input is still streaming in, so guard against undefined.
-      const firstLine = tc.input.code
-        ?.split("\n")
-        .map((line) => line.trim())
-        .find((line) => line.length > 0);
-      return {
-        verb: "Ran code",
-        target: firstLine
-          ? firstLine.length > 60
-            ? `${firstLine.slice(0, 57)}…`
-            : firstLine
-          : undefined,
-      };
-    }
-    case "giveUp":
-      return { verb: "Stopped" };
-    case "webFetch": {
-      let target = tc.input.url;
-      try {
-        target = new URL(tc.input.url).host;
-      } catch {
-        // Leave as the raw URL.
-      }
-      return { verb: "Fetched", target };
-    }
-    case "observeUserChanges":
-      return { verb: "Observed user changes" };
-    case "listBlueprints":
-      return { verb: "Listed blueprints" };
-    case "listConnectableResources":
-      return { verb: "Listed connectable resources", target: tc.input.vendorId };
-    case "requestConnection":
-      return { verb: "Requested connection", target: tc.input.vendorId };
-    case "createExternalResource":
-      return { verb: "Created", target: tc.input.title };
-    case "activateSkill":
-      return { verb: "Activated skill", target: tc.input.skill };
-    case "delegateToBot":
-      return { verb: "Delegated to bot", target: tc.input.bot };
-    case "messageBot":
-      return { verb: "Sent direct message", target: tc.input.to };
-  }
-  // Compile-time exhaustiveness check.
-  const _exhaustive: never = tc;
-  return { verb: (_exhaustive as { toolName: string }).toolName };
+  // createGadget names what it produced from the gadget's own stamped output ("Created Doc").
+  const verb = tc.toolName === "createGadget"
+    ? `Created ${outputOf?.(tc)?.noun ?? "gadget"}`
+    : TOOL_META[tc.toolName].summary;
+  return { verb, target: toolCallTarget(tc) };
 }
 
 function lowerFirst(text: string): string {
@@ -169,52 +320,9 @@ function describeObservationCount(count: number): string {
 }
 
 function describeToolCallCount(toolName: AiToolCall["toolName"], count: number): string {
-  switch (toolName) {
-    case "readFile":
-      return `Read ${pluralize(count, "file")}`;
-    case "writeFile":
-      return `Wrote ${pluralize(count, "file")}`;
-    case "editFile":
-      return count === 1 ? "Made 1 edit" : `Made ${count} edits`;
-    case "grep":
-      return count === 1 ? "Searched files" : `Searched files ${formatTimes(count)}`;
-    case "webFetch":
-      return `Fetched ${pluralize(count, "page")}`;
-    case "executeCode":
-      return count === 1 ? "Ran code" : `Ran code ${formatTimes(count)}`;
-    case "describeBinding":
-      return `Inspected ${pluralize(count, "binding")}`;
-    case "setBindingHook":
-      return `Connected ${pluralize(count, "binding")}`;
-    case "setGadgetBinding":
-      return `Wired up ${pluralize(count, "binding")}`;
-    case "saveCapsuleAsBinding":
-      return `Saved ${pluralize(count, "resource")}`;
-    case "createGadget":
-      return `Created ${pluralize(count, "gadget")}`;
-    case "createWorktree":
-      return `Created ${pluralize(count, "worktree")}`;
-    case "observeUserChanges":
-      return `Observed ${pluralize(count, "change set")}`;
-    case "giveUp":
-      return count === 1 ? "Stopped" : `Stopped ${count} times`;
-    case "listBlueprints":
-      return `Listed blueprints`;
-    case "listConnectableResources":
-      return `Listed connectable resources`;
-    case "requestConnection":
-      return count === 1 ? "Requested a connection" : `Requested ${count} connections`;
-    case "createExternalResource":
-      return `Created ${pluralize(count, "external resource")}`;
-    case "activateSkill":
-      return `Activated ${pluralize(count, "skill")}`;
-    case "delegateToBot":
-      return count === 1 ? "Delegated to a bot" : `Delegated ${count} subtasks`;
-    case "messageBot":
-      return `Sent ${pluralize(count, "direct message")}`;
-  }
-  const _exhaustive: never = toolName;
-  return _exhaustive;
+  const meta = TOOL_META[toolName];
+  return meta.countLabel?.(count)
+    ?? (meta.noun ? `${meta.past} ${pluralize(count, meta.noun)}` : meta.past);
 }
 
 // `output` names a format when the call is known to be producing one, so the row can use its icon.
@@ -224,178 +332,115 @@ export function getToolIcon(
   output?: BlueprintOutput,
 ): PhosphorIcon {
   if (output) return FORMAT_ICONS[output.icon];
-  switch (toolName) {
-    case "readFile":
-    case "writeFile":
-      return FileIcon;
-    case "editFile":
-      return PencilSimple;
-    case "executeCode":
-      return Terminal;
-    case "webFetch":
-      return Globe;
-    case "grep":
-    case "describeBinding":
-      return MagnifyingGlass;
-    case "setBindingHook":
-    case "setGadgetBinding":
-    case "saveCapsuleAsBinding":
-      return LinkSimple;
-    case "createGadget":
-      return Plus;
-    case "createWorktree":
-      return GitBranch;
-    case "listBlueprints":
-      return Blueprint;
-    case "observeUserChanges":
-      return MagnifyingGlass;
-    case "giveUp":
-      return Question;
-    case "activateSkill":
-      return Lightning;
-    case "delegateToBot":
-    case "messageBot":
-      return Robot;
-    default:
-      return Question;
-  }
+  return (toolName && TOOL_META[toolName].icon) || Question;
+}
+
+// Present-tense verb for an in-progress tool call.
+function getProvisionalToolVerb(toolName: AiToolCall["toolName"]): string {
+  return TOOL_META[toolName].presentPhrase ?? TOOL_META[toolName].present;
 }
 
 function getProvisionalToolLabel(toolName: AiToolCall["toolName"] | null | undefined) {
-  switch (toolName) {
-    case "readFile":
-      return "Reading file";
-    case "writeFile":
-      return "Writing file";
-    case "editFile":
-      return "Editing file";
-    case "grep":
-      return "Searching files";
-    case "describeBinding":
-      return "Inspecting binding";
-    case "setBindingHook":
-      return "Connecting binding";
-    case "setGadgetBinding":
-      return "Wiring up binding";
-    case "saveCapsuleAsBinding":
-      return "Saving resource";
-    case "createGadget":
-      return "Creating gadget";
-    case "createWorktree":
-      return "Creating worktree";
-    case "executeCode":
-      return "Running code";
-    case "webFetch":
-      return "Fetching web page";
-    case "observeUserChanges":
-      return "Observing user changes";
-    case "giveUp":
-      return "Stopping";
-    default:
-      return "Using tool";
-  }
+  return (toolName && TOOL_META[toolName].presentLabel) || "Using tool";
+}
+
+// Present-tense, count-aware label mirroring describeToolCallCount (e.g. "Writing 5 files").
+function describeProvisionalToolCount(toolName: AiToolCall["toolName"], count: number): string {
+  if (count <= 1) return getProvisionalToolLabel(toolName);
+  const meta = TOOL_META[toolName];
+  return meta.presentCountLabel?.(count)
+    ?? (meta.noun
+      ? `${meta.present} ${pluralize(count, meta.noun)}`
+      : (meta.presentPhrase ?? meta.present));
 }
 
 function getToolTarget(tc: AiToolCall): string | undefined {
   return getToolCallSummary(tc).target;
 }
 
-// Present-tense verb for an in-progress tool call.
-function getProvisionalToolVerb(toolName: AiToolCall["toolName"]): string {
-  switch (toolName) {
-    case "readFile": return "Reading";
-    case "writeFile": return "Writing";
-    case "editFile": return "Editing";
-    case "grep": return "Searching";
-    case "describeBinding": return "Inspecting";
-    case "setBindingHook": return "Connecting";
-    case "setGadgetBinding": return "Wiring up";
-    case "saveCapsuleAsBinding": return "Saving";
-    case "createGadget": return "Creating gadget";
-    case "createWorktree": return "Creating worktree";
-    case "executeCode": return "Running code";
-    case "webFetch": return "Fetching";
-    case "observeUserChanges": return "Observing user changes";
-    case "giveUp": return "Stopping";
-    case "listBlueprints": return "Listing blueprints";
-    case "listConnectableResources": return "Listing connectable resources";
-    case "requestConnection": return "Requesting a connection";
-    case "createExternalResource": return "Creating external resource";
-    case "activateSkill": return "Activating a skill";
-    case "delegateToBot": return "Delegating to a bot";
-    case "messageBot": return "Sending a direct message";
-  }
-  const _exhaustive: never = toolName;
-  return _exhaustive;
-}
-
-// Present-tense, count-aware label mirroring describeToolCallCount (e.g. "Writing 5 files").
-function describeProvisionalToolCount(toolName: AiToolCall["toolName"], count: number): string {
-  if (count <= 1) return getProvisionalToolLabel(toolName);
-  switch (toolName) {
-    case "readFile": return `Reading ${pluralize(count, "file")}`;
-    case "writeFile": return `Writing ${pluralize(count, "file")}`;
-    case "editFile": return `Making ${count} edits`;
-    case "grep": return `Searching files ${formatTimes(count)}`;
-    case "webFetch": return `Fetching ${pluralize(count, "page")}`;
-    case "executeCode": return count === 1 ? "Running code" : `Running code ${formatTimes(count)}`;
-    case "describeBinding": return `Inspecting ${pluralize(count, "binding")}`;
-    case "setBindingHook": return `Connecting ${pluralize(count, "binding")}`;
-    case "setGadgetBinding": return `Wiring up ${pluralize(count, "binding")}`;
-    case "saveCapsuleAsBinding": return `Saving ${pluralize(count, "resource")}`;
-    case "createGadget": return `Creating ${pluralize(count, "gadget")}`;
-    case "createWorktree": return `Creating ${pluralize(count, "worktree")}`;
-    case "observeUserChanges": return `Observing ${pluralize(count, "change set")}`;
-    case "giveUp": return "Stopping";
-    case "listBlueprints": return "Listing blueprints";
-    case "listConnectableResources": return "Listing connectable resources";
-    case "requestConnection": return `Requesting ${pluralize(count, "connection")}`;
-    case "createExternalResource": return `Creating ${pluralize(count, "external resource")}`;
-    case "activateSkill": return `Activating ${pluralize(count, "skill")}`;
-    case "delegateToBot": return `Delegating ${pluralize(count, "subtask")}`;
-    case "messageBot": return `Sending ${pluralize(count, "direct message")}`;
-  }
-  const _exhaustive: never = toolName;
-  return _exhaustive;
-}
-
 /**
  * Whether a tool call is still waiting for its result. Only a tool that records an `output` can
- * be told apart from a finished call (a writeFile's record looks the same done or not), so calls
- * of the other tools count as finished; an errored call is finished too -- its row shows the
- * Error pill, never a spinner.
+ * be seen running: those read as running until their output lands, while the rest are recorded
+ * only once finished (or failed, which ends them too).
  */
 export function isToolCallRunning(tc: AiToolCall): boolean {
   if (tc.error) return false;
+  // `output` exists only on the variants whose tool records one, so reach it via `in` rather
+  // than narrowing the whole union by hand (the table already says which tools those are).
+  return TOOL_META[tc.toolName].runningNeedsOutput
+    && !("output" in tc && tc.output !== undefined);
+}
+
+// Where a call's summary points: each tool names its target from a different input field, so
+// one call into this switch replaces the seven that each re-derived their own labels.
+function toolCallTarget(tc: AiToolCall): string | undefined {
   switch (tc.toolName) {
-    case "grep":
-    case "describeBinding":
-    case "setGadgetBinding":
-    case "createGadget":
-    case "createWorktree":
-    case "executeCode":
-    case "webFetch":
-    case "listBlueprints":
-    case "listConnectableResources":
-    case "requestConnection":
-    case "activateSkill":
-    case "delegateToBot":
-    case "messageBot":
-    case "createExternalResource":
-      return tc.output === undefined;
     case "readFile":
     case "writeFile":
     case "editFile":
+      return tc.input.filename;
+    case "grep":
+      return tc.input.path ?? tc.input.workpiece;
+    case "describeBinding":
+      return tc.input.gadget === undefined
+        ? `${String(tc.input.name)} binding`
+        : `${String(tc.input.name)} binding of ${tc.input.gadget}`;
     case "setBindingHook":
+      return tc.input.entrypoint
+        ? `${tc.input.bindingName} → ${tc.input.entrypoint}`
+        : tc.input.bindingName;
+    case "setGadgetBinding":
+      return formatGadgetBindingTarget(tc.input.gadget, tc.input.name ?? tc.input.source);
     case "saveCapsuleAsBinding":
+      return tc.input.bindingName;
+    case "createGadget":
+      return tc.input.title;
+    case "createWorktree":
+      return tc.input.title;
+    case "executeCode": {
+      // Prefer the first non-empty line as a preview. `code` may be absent while the tool call's
+      // input is still streaming in, so guard against undefined.
+      const firstLine = tc.input.code
+        ?.split("\n")
+        .map((line) => line.trim())
+        .find((line) => line.length > 0);
+      return firstLine
+        ? firstLine.length > 60
+          ? `${firstLine.slice(0, 57)}…`
+          : firstLine
+        : undefined;
+    }
     case "giveUp":
+      return undefined;
+    case "webFetch": {
+      let target = tc.input.url;
+      try {
+        target = new URL(tc.input.url).host;
+      } catch {
+        // Leave as the raw URL.
+      }
+      return target;
+    }
     case "observeUserChanges":
-      return false;
+      return undefined;
+    case "listBlueprints":
+      return undefined;
+    case "listConnectableResources":
+      return tc.input.vendorId;
+    case "requestConnection":
+      return tc.input.vendorId;
+    case "createExternalResource":
+      return tc.input.title;
+    case "activateSkill":
+      return tc.input.skill;
+    case "delegateToBot":
+      return tc.input.bot;
+    case "messageBot":
+      return tc.input.to;
   }
-  // Compile-time exhaustiveness check: a new AiToolCall variant must join one of the groups
-  // above, or one that declares `output` would silently read as finished while it still runs.
+  // Compile-time exhaustiveness check.
   const _exhaustive: never = tc;
-  return _exhaustive;
+  return (_exhaustive as { toolName: string }).toolName;
 }
 
 /**
@@ -473,14 +518,14 @@ export type ToolCallGroup = {
 
 /**
  * Collapse a run's tool calls and observations into the single group row the transcript shows
- * (one row per run; see buildChatDisplayEntries).
+ * (one row per run; see buildChatDisplayEntries), or null when the run produced nothing.
  */
-export function buildToolCallGroups(
+export function buildToolCallGroup(
   toolCalls: AiToolCall[],
   observations: ObservationChatMessage[] = [],
   outputOf?: ToolOutputResolver,
-): ToolCallGroup[] {
-  if (toolCalls.length === 0 && observations.length === 0) return [];
+): ToolCallGroup | null {
+  if (toolCalls.length === 0 && observations.length === 0) return null;
 
   const distinctToolNames = Array.from(new Set(toolCalls.map((tc) => tc.toolName)));
   const targets = toolCalls
@@ -517,7 +562,7 @@ export function buildToolCallGroups(
   const firstObservation = observations[0];
   const hasError = toolCalls.some((tc) => Boolean(tc.error));
 
-  return [{
+  return {
     // Use the first work item id so expansion survives streaming → committed.
     key: firstToolCall
       ? `group-${firstToolCall.toolCallId}`
@@ -534,6 +579,5 @@ export function buildToolCallGroups(
     hasError,
     // Error wins over running, so a failed group shows the Error pill alone.
     running: !hasError && toolCalls.length > 0 && isToolCallRunning(toolCalls[toolCalls.length - 1]),
-  }];
+  };
 }
-

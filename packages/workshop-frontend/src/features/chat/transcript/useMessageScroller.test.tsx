@@ -534,4 +534,29 @@ describe("useMessageScroller", () => {
 
     harness.unmount();
   });
+
+  it("retargets the follow when entries grow mid-glide, instead of stranding the jump", async () => {
+    const harness = await renderHarness([agentMessage(1)], false, {
+      scrollHeight: 1000,
+      clientHeight: 400,
+      scrollTop: 200,
+    });
+    await fireScroll(harness.transcript);
+    expect(scroller().atBottom).toBe(false);
+
+    await act(async () => {
+      scroller().jumpToLatest();
+    });
+    // A mid-glide scroll position: in flight, so scroll events must not read as leaving.
+    harness.setScrollTop(500);
+    await fireScroll(harness.transcript);
+
+    // Streamed entries arrive before the glide settles: still on the live edge semantically,
+    // so nothing flips atBottom or counts as missed, and the glide is free to retarget.
+    await harness.rerender([agentMessage(1), agentMessage(2)], false);
+    expect(scroller().atBottom).toBe(true);
+    expect(scroller().missedCount).toBe(0);
+
+    harness.unmount();
+  });
 });

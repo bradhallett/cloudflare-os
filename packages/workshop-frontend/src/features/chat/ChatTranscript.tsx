@@ -53,6 +53,7 @@ import type {
   ProvisionalToolCallState,
 } from "./provisionalChatState";
 import type { ComponentProps } from "react";
+import { CONSTRAINED_CHAT_COLUMN_CLASS } from "./chatColumn";
 
 type ActionCardResolve = ComponentProps<typeof ActionCard>["onResolve"];
 type ConnectionAccept = ComponentProps<typeof ConnectionRequestCard>["onAccept"];
@@ -338,7 +339,7 @@ export function ChatTranscript({
         <div
           role="log"
           aria-busy={isAgentActive}
-          className={`flex flex-col px-3 pt-5 sm:px-6 sm:pt-8 ${pendingConsoleLogCount > 0 ? "pb-16" : "pb-8"} ${useConstrainedChatWidth ? "mx-auto w-full max-w-[920px]" : ""}`}
+          className={`flex flex-col px-3 pt-5 sm:px-6 sm:pt-8 ${pendingConsoleLogCount > 0 ? "pb-16" : "pb-8"} ${useConstrainedChatWidth ? CONSTRAINED_CHAT_COLUMN_CLASS : ""}`}
         >
           {displayEntries.length === 0 && !isAgentActive && (
             <ChatTranscriptEmptyState />
@@ -461,7 +462,7 @@ function MessageEntryRow({
           <div data-entry-key={entry.key} className={entryTopClass}>
             <AgentMessageRow
               msg={msg}
-              toolCallGroups={entry.toolCallGroups}
+              workGroup={entry.workGroup}
               lastMessageSequence={entry.lastMessageSequence}
               showThinkingTraces={rest.showThinkingTraces}
               isAgentActive={rest.isAgentActive}
