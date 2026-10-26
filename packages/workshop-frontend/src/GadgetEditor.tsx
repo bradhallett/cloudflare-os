@@ -463,9 +463,17 @@ function NoGadgetPlaceholder({ height }: { height: string }) {
 
 // ─── component ────────────────────────────────────────────────────────────────
 
+/**
+ * Route component for /workspace/$id. Keying the workspace body by the route id makes React
+ * remount it on workspace navigation, so every atom (title draft included) resets for free —
+ * no hand-written reset effect to drift out of sync with the state list.
+ */
 export default function GadgetEditor() {
   const params = useParams({ strict: false }) as { id?: string }
-  const id = params.id
+  return <GadgetEditorWorkspace key={params.id} id={params.id} />
+}
+
+function GadgetEditorWorkspace({ id }: { id: string | undefined }) {
   const navigate = useNavigate()
   const { authenticatedApi } = useAuthenticatedApi()
   const publicApi = useRpcStub()
@@ -544,7 +552,6 @@ export default function GadgetEditor() {
   const [shareModalOpen, setShareModalOpen] = useState(false)
   const [blueprintModalOpen, setBlueprintModalOpen] = useState(false)
   const [blueprintUpdateDialogOpen, setBlueprintUpdateDialogOpen] = useState(false)
-  const [previewMode, _setPreviewMode] = useState(false)
   const [workpieceRailExpanded, setWorkpieceRailExpanded] = useState(getInitialAppRailExpanded)
   const workpieceRailWidth = workpieceRailExpanded
     ? WORKPIECE_RAIL_EXPANDED_WIDTH
@@ -664,7 +671,6 @@ export default function GadgetEditor() {
   const [hasCode, setHasCode] = useState<boolean | null>(null)
   const [chatCount, setChatCount] = useState<number | null>(null)
   const [hasChatZero, setHasChatZero] = useState(false)
-  const [_hasBindings, setHasBindings] = useState(false)
   const [isAgentActive, setIsAgentActive] = useState(false)
   // The workpieces any chat proposes changes to (see AiChatMetadata.proposedChangeWorkpieces).
   const [anyChatProposedWorkpieces, setAnyChatProposedWorkpieces] =
@@ -1134,31 +1140,11 @@ export default function GadgetEditor() {
     setActiveTab(tab)
   }, [])
 
-  useEffect(() => {
-    setChatChanges(undefined)
-    setLiveRows(undefined)
-    setStreamingActiveFileState(null)
-    setHasCode(null)
-    setChatCount(null)
-    setHasChatZero(false)
-    setAnyChatProposedWorkpieces([])
-    setSelectedChatProposedWorkpieces([])
-    setWorkspaceView(getStoredWorkspaceView(id))
-    openedWorkpieceParamRef.current = null
-    activityReturnViewRef.current = null
-    setActivityClosing(false)
-    setWorkspaceTransitionEnabled(false)
-    setWorkpieces(new Map())
-    setWorkpiecesReady(false)
-    knownWorkpieceIdsRef.current = null
-    turnOutputRef.current = null
-    setUserNavigatedToList(false)
-  }, [id])
 
   // ?showChat (a notification's "Open task") asks to see the chat, not merely select it: full-screen
-  // preview covers it, and on a phone so does the pane. Declared after the reset above, so arriving
-  // from another workspace beats its stored view; dropped once honoured, so the next request for
-  // the same chat works too.
+  // preview covers it, and on a phone so does the pane. It beats the stored workspace view (the
+  // remount's lazy initializers already ran); dropped once honoured, so the next request for the
+  // same chat works too.
   useEffect(() => {
     if (!showChatParam) return
     exitGadgetFullscreen()
@@ -2022,11 +2008,11 @@ export default function GadgetEditor() {
               {!paneShowsActivity && selectedWorkpieceSummary?.type !== 'worktree' && (
                 <WorkshopIconButton
                   aria-label="Enter full screen"
-                  title={activeTab === 'app' && !previewMode
+                  title={activeTab === 'app'
                     ? 'Full screen'
                     : `Full screen is available in ${formatOf(selectedGadgetSummary?.output).noun} view`}
                   onClick={enterGadgetFullscreen}
-                  disabled={activeTab !== 'app' || previewMode}
+                  disabled={activeTab !== 'app'}
                 >
                   <ArrowsOutSimple size={17} />
                 </WorkshopIconButton>
@@ -2080,26 +2066,26 @@ export default function GadgetEditor() {
               aria-modal={isGadgetFullscreen ? true : undefined}
               aria-label={isGadgetFullscreen ? 'Gadget full screen' : undefined}
               className={
-                activeTab !== 'app' || previewMode
+                activeTab !== 'app'
                   ? 'hidden'
                   : isGadgetFullscreen
                     ? 'visual-viewport-fixed z-20 bg-kumo-base outline-none'
                     : 'h-full'
               }
             >
-              {selectedGadgetStub && !previewMode ? (
+              {selectedGadgetStub ? (
                 <GadgetUI
                   key={selectedGadgetId}
                   gadget={selectedGadgetStub}
                   height="100%"
                   reloadTrigger={uiReloadTrigger}
-                  isVisible={activeTab === 'app' && !previewMode}
+                  isVisible={activeTab === 'app'}
                   chatId={previewChatId}
                   onConsoleLog={handleClientConsoleLog}
                   onIframeEscape={isGadgetFullscreen ? exitGadgetFullscreen : undefined}
                   onNoUiChange={handleNoUiChange}
                 />
-              ) : !previewMode && (
+              ) : (
                 <NoGadgetPlaceholder height="100%" />
               )}
               {isGadgetFullscreen && showFullscreenHint && (
@@ -2150,7 +2136,6 @@ export default function GadgetEditor() {
                   authenticatedApi={authenticatedApi}
                   onConnectionsChange={() => setUiReloadTrigger(t => t + 1)}
                   isVisible={activeTab === 'connections'}
-                  onHasGatekeepersChange={setHasBindings}
                 />
               ) : (
                 <NoGadgetPlaceholder height="100%" />
@@ -2181,22 +2166,6 @@ export default function GadgetEditor() {
         )}
       </div>
 
-      {/* ═══ PREVIEW OVERLAY ══════════════════════════════════════════════════ */}
-      {previewMode && (
-        <div className="absolute inset-x-0 bottom-0 bg-kumo-base z-10" style={{ top: TOPBAR_H }}>
-          {selectedGadgetStub && (
-            <GadgetUI
-              key={selectedGadgetId}
-              gadget={selectedGadgetStub}
-              height="100%"
-              reloadTrigger={uiReloadTrigger}
-              isVisible={true}
-              chatId={previewChatId}
-              onConsoleLog={handleClientConsoleLog}
-            />
-          )}
-        </div>
-      )}
 
       {/* Share modal */}
       {overseer && metadata && (

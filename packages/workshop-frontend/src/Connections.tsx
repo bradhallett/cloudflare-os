@@ -33,14 +33,13 @@ interface ConnectionsProps {
   authenticatedApi: RpcStub<AuthenticatedApi>
   onConnectionsChange?: () => void
   isVisible?: boolean
-  onHasGatekeepersChange?: (hasGatekeepers: boolean) => void
 }
 
 /**
  * Auto-approval rules live in Activity because they apply across the workspace, while this view is
  * scoped to one gadget.
  */
-export default function Connections({ overseer, gadget, chatId, authenticatedApi, onConnectionsChange, isVisible, onHasGatekeepersChange }: ConnectionsProps) {
+export default function Connections({ overseer, gadget, chatId, authenticatedApi, onConnectionsChange, isVisible }: ConnectionsProps) {
   const [bindings, setBindings] = useState<GadgetBindingInfo[]>([])
   // Identity of the gadget this tab is showing, needed to offer it to agent spawners.
   const [gadgetInfo, setGadgetInfo] = useState<{ id: WorkpieceId; title: string } | null>(null)
@@ -71,7 +70,6 @@ export default function Connections({ overseer, gadget, chatId, authenticatedApi
       // This tab shows one gadget, so drop hooks that wake a different one -- otherwise its
       // toggle/delete controls would operate on another gadget's hooks.
       setHooks(hookList.filter((hook) => hook.gadgetId === id))
-      onHasGatekeepersChange?.(bindingList.length > 0)
     } catch (err) {
       // Loud on purpose: this panel has no retry path, so a quieted transient failure would
       // silently render "no connected resources".
