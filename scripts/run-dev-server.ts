@@ -115,9 +115,6 @@ const plainWorkers = packages.filter((pkg) => pkg.overlay === true && !isGatekee
 
 const CONTEXT_GATEKEEPER_NAME = "gatekeeper-context";
 
-// What Wrangler picks for itself when no --port is derived, so also what we poll.
-const DEFAULT_WRANGLER_PORT = 8787;
-
 // Watchers rebuild each gatekeeper's generated UI (src/generated/*) on source change; wrangler dev's
 // `watch_dir: src` then re-bundles the worker. Deferred ones start once Wrangler is listening.
 const devWatchers: ChildProcess[] = [];
@@ -125,7 +122,8 @@ const deferredWatchers: (() => void)[] = [];
 let stoppingDevWatchers = false;
 let wranglerChild: ChildProcess | null = null;
 
-// Resolve once something accepts a TCP connection on `port`, or once `timeoutMs` has elapsed.
+// Resolve once something accepts a TCP connection on `port`, or once `timeoutMs` has elapsed — the
+// deadline only defers the deferred watchers, it never hides the state: hitting it says so.
 function waitForPort(port: number, timeoutMs: number): Promise<void> {
   return new Promise<void>(resolve => {
     const deadline = Date.now() + timeoutMs;
@@ -137,7 +135,11 @@ function waitForPort(port: number, timeoutMs: number): Promise<void> {
       });
       socket.once("error", () => {
         socket.destroy();
-        if (Date.now() >= deadline) resolve();
+        if (Date.now() >= deadline) {
+          console.warn(`no connection on port ${port} after ${timeoutMs}ms; ` +
+              "starting the deferred watchers anyway — wrangler's own output says why.");
+          resolve();
+        }
         else setTimeout(attempt, 100).unref();
       });
     };
@@ -694,6 +696,8 @@ wranglerChild.on("exit", async (code, signal) => {
 
 // Poll the socket rather than parsing stdout for "Ready on", which would mean giving up
 // `stdio: "inherit"`. The deadline is a backstop so a server that never comes up does not leave the
-// watchers silently unstarted.
-await waitForPort(Number(wranglerPort ?? DEFAULT_WRANGLER_PORT), 60_000);
+// watchers silently unstarted. With no derived port (warned above) there is nothing to poll:
+// wrangler picked its own — usually 8787, but not reliably when that one is busy — so guessing it
+// would wait 60s on a port the server may never take, then report silence as a connection.
+if (wranglerPort !== null) await waitForPort(Number(wranglerPort), 60_000);
 if (wranglerChild.exitCode === null) startDeferredWatchers();

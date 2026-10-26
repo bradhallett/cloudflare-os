@@ -39,6 +39,7 @@ import { spawn } from "node:child_process";
 import {
   isGatekeeperPackage, releaseShortName, type DeployablePackage,
 } from "../release/manifest-lib.ts";
+import { mapConcurrent } from "../map-concurrent.ts";
 import {
   ROOT,
   STAGING_CONFIG_NAME,
@@ -161,8 +162,15 @@ const RELEASED_WRANGLER = join(ROOT, "node_modules", ".bin", "wrangler");
 function parseArgs(argv: string[]): { command: Command; dryRun: boolean } {
   const command = argv[0] as Command;
   if (!["config", "deploy", "delete", "sweep"].includes(command)) throw new Error(USAGE);
-  const unknown = argv.slice(1).filter((arg) => arg !== "--dry-run");
-  if (unknown.length > 0) throw new Error(`unknown argument: ${unknown[0]}\n${USAGE}`);
+  // Unknown arguments still throw below; --scan-root's values are collected by scanRootArgs, which
+  // generatePreviewConfigs reads from process.argv and which owns the flag's validation, so the
+  // two spellings cannot drift.
+  for (let i = 1; i < argv.length; i++) {
+    if (argv[i] === "--dry-run") continue;
+    // --scan-root's value is validated by scanRootArgs at the read; here we only skip the pair.
+    else if (argv[i] === "--scan-root") i++;
+    else throw new Error(`unknown argument: ${argv[i]}\n${USAGE}`);
+  }
   return { command, dryRun: argv.includes("--dry-run") };
 }
 
@@ -182,43 +190,13 @@ function runAsync(
   });
 }
 
-// Every item is attempted even after one fails
-async function mapWithConcurrency<T, R>(
-  items: readonly T[],
-  concurrency: number,
-  mapper: (item: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const results: R[] = Array.from({ length: items.length });
-  let nextIndex = 0;
-  let firstError: unknown;
-
-  async function worker() {
-    while (nextIndex < items.length) {
-      const index = nextIndex++;
-      try {
-        results[index] = await mapper(items[index], index);
-      } catch (error) {
-        if (firstError === undefined) firstError = error;
-        else console.error(`Additional concurrent failure: ${describe(error)}`);
-      }
-    }
-  }
-
-  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
-  if (firstError !== undefined) throw firstError;
-  return results;
-}
-
-async function waitForAll(promises: readonly Promise<unknown>[]): Promise<void> {
-  const results = await Promise.allSettled(promises);
-  const failures = results.filter((r) => r.status === "rejected").map((r) => r.reason);
-  for (const failure of failures.slice(1)) {
-    console.error(`Additional concurrent failure: ${describe(failure)}`);
-  }
-  if (failures.length > 0) throw failures[0];
-}
+// Every failure is reported, not just whichever lost the race: mapConcurrent rejects with an
+// AggregateError over all of them once every task has settled, and describe() below unfolds it.
 
 function describe(error: unknown): string {
+  if (error instanceof AggregateError) {
+    return `${error.message}: ${error.errors.map(describe).join("; ")}`;
+  }
   return error instanceof Error ? error.message : String(error);
 }
 
@@ -479,25 +457,13 @@ async function deletePreviewFrom(
   previewName: string,
   wranglerCommand: string,
 ): Promise<void> {
-  const failures: unknown[] = [];
-  const attempt = async (pkg: DeployablePackage) => {
-    try {
-      await deletePreview(pkg, previewName, wranglerCommand);
-    } catch (error) {
-      failures.push(error);
-    }
-  };
+  const attempt = (pkg: DeployablePackage) => deletePreview(pkg, previewName, wranglerCommand);
 
   const named = (name: string) => workers.filter((pkg) => pkg.name === name);
   for (const pkg of [...named("router"), ...named("workshop-backend")]) await attempt(pkg);
-  await mapWithConcurrency(
+  await mapConcurrent(
       workers.filter((pkg) => !["router", "workshop-backend"].includes(pkg.name)),
       GATEKEEPER_CONCURRENCY, attempt);
-
-  for (const failure of failures.slice(1)) {
-    console.error(`Additional failure deleting ${previewName}: ${describe(failure)}`);
-  }
-  if (failures.length > 0) throw failures[0];
 }
 
 /**
@@ -626,10 +592,11 @@ async function deploy({ dryRun }: { dryRun: boolean }): Promise<void> {
 
   const wrangler = preparePreviewWrangler();
   try {
-    await waitForAll([wrangler.ready, buildWorkspace()]);
+    // One mapConcurrent over the two promises waits for both and reports every failure.
+    await mapConcurrent([wrangler.ready, buildWorkspace()], 2, (ready) => ready);
 
     // Keyed by worker name, because that is what a service binding names.
-    const gatekeeperPreviews = await mapWithConcurrency(gatekeepers, GATEKEEPER_CONCURRENCY,
+    const gatekeeperPreviews = await mapConcurrent(gatekeepers, GATEKEEPER_CONCURRENCY,
         async (pkg) => {
           // Before this gatekeeper's preview, not after, and for the same reason the backend's go
           // before its own: a preview inherits the Preview base config as it stands when it is
@@ -753,7 +720,7 @@ async function pullRequestStates(
   const numbers = [...new Set(previewNames
       .map((name) => previewPullRequestNumber(name))
       .filter((value): value is number => value !== undefined))];
-  const states = await mapWithConcurrency(numbers, API_CONCURRENCY,
+  const states = await mapConcurrent(numbers, API_CONCURRENCY,
       (number) => fetchPullRequestState(repo, number));
   const byNumber = new Map(numbers.map((number, index) => [number, states[index]]));
 
@@ -780,7 +747,7 @@ async function listPreviewsByName(
   accountId: string | undefined,
   packages: readonly DeployablePackage[],
 ): Promise<Map<string, IndexedPreview>> {
-  const lists = await mapWithConcurrency(packages, API_CONCURRENCY, async (pkg) => {
+  const lists = await mapConcurrent(packages, API_CONCURRENCY, async (pkg) => {
     let previews: unknown;
     try {
       previews = await cloudflareApi(
