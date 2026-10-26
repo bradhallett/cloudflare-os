@@ -1042,8 +1042,8 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
 
   /**
    * Delivers one queued event: startHook → authorizeObservation → onTrigger, each failure
-   * thrown for the queue's backoff. The initiator stub is disposed once per attempt; the
-   * stored capability record survives for the next one.
+   * thrown for the queue's backoff. The stubs each lease returns (initiator, approval queue,
+   * callback) are disposed per attempt; the stored capability record survives for the next one.
    */
   async #deliverTrigger(triggerId: string, message: ComposioTriggerMessage): Promise<void> {
     const row = this.#triggerRow(triggerId);
@@ -1090,6 +1090,10 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
         data,
       });
     } finally {
+      if (hookResult !== undefined && hookResult !== null) {
+        disposeStub(hookResult.approvalQueue);
+        disposeStub(hookResult.callback);
+      }
       disposeStub(caps.initiator);
     }
   }

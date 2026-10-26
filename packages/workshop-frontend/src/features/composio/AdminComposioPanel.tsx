@@ -35,6 +35,7 @@ const ComposioToolkitList = ({
   saved,
   infoBySlug,
   infoPending,
+  hiddenSlugs,
   onSave,
   saving,
 }: {
@@ -44,6 +45,8 @@ const ComposioToolkitList = ({
   infoBySlug: Validation
   infoPending: boolean
   onSave: (slugs: string[]) => void
+  /** Slugs also on the hidden list, whose precedence makes this listing inert. */
+  hiddenSlugs?: ReadonlySet<string>
   saving: boolean
 }) => {
   const [draft, setDraft] = useState(saved.join('\n'))
@@ -85,6 +88,12 @@ const ComposioToolkitList = ({
                   <span>
                     {info.eligibleToolCount} tool{info.eligibleToolCount === 1 ? '' : 's'} eligible
                     for auto-apply, {info.destructiveToolCount} destructive
+                  </span>
+                )}
+                {hiddenSlugs?.has(slug) && (
+                  <span className="inline-flex items-center gap-1 text-kumo-warning">
+                    <Warning size={12} weight="fill" aria-hidden />
+                    also hidden — hiding wins, so this listing has no effect
                   </span>
                 )}
               </li>
@@ -131,6 +140,8 @@ export const AdminComposioPanel = ({
   }, [autoApplyToolkits])
 
   const slugs = [...new Set([...parseSlugs(excludedDraft), ...parseSlugs(autoApplyDraft)])]
+  // Hiding wins over auto-apply, so a slug on both drafts renders its auto-apply listing inert.
+  const crossListed = new Set(parseSlugs(excludedDraft).filter((s) => parseSlugs(autoApplyDraft).includes(s)))
 
   useEffect(() => {
     if (slugs.length === 0) {
@@ -173,7 +184,7 @@ export const AdminComposioPanel = ({
     <div className="space-y-6">
       <ComposioToolkitList
         title="Hidden toolkits"
-        description="Composio toolkits this deployment hides from every surface: connecting, the agent catalog, and toolkit facets. Slugs must match Composio's exactly."
+        description="Composio toolkits this deployment hides from every surface: connecting, the agent catalog, and toolkit facets. Slugs must match Composio's exactly. Hiding wins: a toolkit on both lists is treated as hidden everywhere."
         saved={excludedToolkits}
         infoBySlug={info ?? new Map()}
         infoPending={info === null}
@@ -182,7 +193,8 @@ export const AdminComposioPanel = ({
       />
       <ComposioToolkitList
         title="Auto-apply-eligible toolkits"
-        description="Toolkits whose create/update-tagged write tools users may arm for auto-apply on the connections page. Listing a toolkit vouches for all current and future eligible write tools in it, and unlisting does not de-escalate actions already pending."
+        description="Toolkits whose create/update-tagged write tools users may arm for auto-apply on the connections page. Listing a toolkit vouches for all current and future eligible write tools in it. Hiding a toolkit is enforced everywhere immediately; unlisting affects only new bindings — a facet already armed keeps auto-applying new writes until its binding is re-minted."
+        hiddenSlugs={crossListed}
         saved={autoApplyToolkits}
         infoBySlug={info ?? new Map()}
         infoPending={info === null}

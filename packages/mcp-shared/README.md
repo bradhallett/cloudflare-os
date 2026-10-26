@@ -27,11 +27,11 @@ does so through a named hook (`staticToken`, `mintAccount`), not a private copy.
 | `portal` | Gateway detection, tool-name to upstream-server mapping, server listing |
 | `scope` | The resource-URL scope grammar, and the check every call passes through |
 | `endpoint` | Validation and host blocklist for a user-supplied endpoint |
-| `fetch` | Every outbound request; redirects are followed by hand and each hop re-checked, including SDK OAuth fetches. Cross-origin hops drop `Authorization`, `Mcp-Session-Id`, and any header named via `FetchOptions.credentialHeaders` |
+| `fetch` | Every outbound request; redirects are followed by hand and each hop re-checked, including SDK OAuth fetches |
 | `account` | Durable Object base and persisted SDK OAuth state: connect, refresh, revocation |
 | `facet` | Common session, catalog, action, and sharing behavior for connector-owned Durable Object facets |
 | `catalog` | One binding's tool list: fetched, cached, scoped to the grant, classified; plus the cache for tools hydrated past that list |
-| `connection` | `withClient` — transport sessions, retries, credential-expiry reporting. A connection may set `authScheme` to send its credential in a non-Bearer header (e.g. `x-api-key`) |
+| `connection` | `withClient` — transport sessions, retries, credential-expiry reporting |
 | `action-store` | Staged to applied/rejected/failed, with a bound on what is retained and a claim so one approval is never sent twice |
 | `session` | The Gadget-facing capability, and the one path every tool call takes |
 | `sharing-policy` | The owner-only sharing rule |
