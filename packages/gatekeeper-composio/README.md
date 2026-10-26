@@ -46,7 +46,8 @@ across facet spaces, so each facet pushes its pending count to the account at ev
 The catalog is assembled from Composio's REST surface (`backend.composio.dev/api/v3.1`,
 `GET /toolkits` + `GET /tools`, cursor-paginated at 500, `Retry-After` honored) and cached in the
 account DO — mcp-shared's MCP listing is capped far below Composio's catalog and is not used.
-Session MCP is for execution only (POST-only, `x-api-key` via PR 1's auth-scheme option).
+Execution is REST too: `POST /tool_router/session/{id}/execute` with the key on `x-api-key`
+(no MCP transport is used; the session MCP endpoint is unused).
 
 Tool annotations and tags are third-party metadata: tools classify at trust tier `byo`
 (`readOnlyHint` tools observe, **every write queues**). The meta-tool slugs
