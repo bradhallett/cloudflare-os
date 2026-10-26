@@ -653,6 +653,8 @@ export function useChatSubscription({
 
   // Subscription stub (wrapped in object for useState)
   const subscriptionRef = useRef<RpcStub<{}> | null>(null);
+  // The overseer stub whose onRpcBroken handler is already registered (see the subscribe effect).
+  const rpcBrokenOverseerRef = useRef<RpcStub<Overseer> | null>(null);
 
   // Force a re-render when a durable cache (messages, chats, compacted) is mutated.
   const forceUpdate = () => setMessagesVersion((prev) => prev + 1);
@@ -981,12 +983,18 @@ export function useChatSubscription({
 
     subscribe();
 
-    // Set up reconnection handling
-    overseer.onRpcBroken?.((error) => {
-      console.warn("RPC connection broken:", error);
-      setIsSubscribed(false);
-      // Cache persists, component will get new overseer prop and resubscribe
-    });
+    // capnweb's onRpcBroken has no unregister: each call attaches another rejection handler
+    // to the stub's session promise, so registering on every effect run (reconnects, StrictMode
+    // double-invoke) would stack handlers for the life of the session. Guard so each overseer
+    // stub gets at most one; the handler only flips local state, so a later stub needs its own.
+    if (rpcBrokenOverseerRef.current !== overseer) {
+      rpcBrokenOverseerRef.current = overseer;
+      overseer.onRpcBroken?.((error) => {
+        console.warn("RPC connection broken:", error);
+        setIsSubscribed(false);
+        // Cache persists, component will get new overseer prop and resubscribe
+      });
+    }
 
     return () => {
       isMounted = false;

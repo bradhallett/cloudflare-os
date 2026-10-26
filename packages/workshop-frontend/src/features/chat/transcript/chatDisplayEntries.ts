@@ -75,9 +75,10 @@ export type ChatDisplayEntry =
     }
   | {
       /**
-       * A user send the server definitively rejected (see FailedChatSend). Client-local: it stands
-       * in for the durable message that never arrived, rendered as a destructive bubble with a
-       * retry. Always newest — appended after everything the server recorded.
+       * A user send the server definitively rejected (see FailedChatSend). Client-local: it
+       * stands in for the durable message that never arrived, rendered as a destructive
+       * bubble with a retry, and is ordered against the durable rows by its attempt
+       * timestamp — in a multi-user chat a later-arriving message can follow it.
        */
       type: "failedSend";
       key: string;
@@ -178,8 +179,9 @@ function transcriptToolCalls(toolCalls: AiToolCall[]): AiToolCall[] {
 /**
  * Groups a chat's raw messages into the rows the transcript renders: user/agent messages with
  * their work folded in, standalone work runs, saved edits, blueprint proposals, and compaction
- * markers. `failedSends` — client-local sends the server rejected, already filtered to this chat —
- * follow as destructive bubbles; they are newer than any durable message by construction.
+ * markers. `failedSends` — client-local sends the server rejected, already filtered to this
+ * chat — follow as destructive bubbles, each inserted before the first durable row newer
+ * than the attempt (most sends are the newest thing in a solo chat, so they land at the end).
  */
 export function buildChatDisplayEntries(
   messages: AiChatMessage[],
@@ -410,10 +412,31 @@ export function buildChatDisplayEntries(
   }
 
   for (const send of failedSends ?? []) {
-    result.push({type: "failedSend", key: `failed-${send.id}`, send});
+    // A failed send stands where its message would have gone: before the first durable row
+    // newer than the attempt. Timestamp-less rows (compaction markers, model changes, other
+    // failed sends) never bound the search, so it runs past them.
+    let insertAt = result.length;
+    for (let k = 0; k < result.length; k++) {
+      const rowTimestamp = displayEntryTimestamp(result[k]);
+      if (rowTimestamp !== null && rowTimestamp > send.timestamp) {
+        insertAt = k;
+        break;
+      }
+    }
+    result.splice(insertAt, 0, {type: "failedSend", key: `failed-${send.id}`, send});
   }
 
   return result;
+}
+
+/** When a durable row happened, for ordering failed sends; marker rows have no time. */
+function displayEntryTimestamp(entry: ChatDisplayEntry): Date | null {
+  if (entry.type === "workRun") return entry.lastMessageTimestamp;
+  if (entry.type === "message" || entry.type === "savedChanges"
+    || entry.type === "blueprintProposal") {
+    return entry.message.timestamp;
+  }
+  return null;
 }
 
 // Transcript spacing helpers.
@@ -535,6 +558,18 @@ export function rhythmTopClass(
   if (continuesUserGroup(prev, curr)) return "mt-2";
   if (isUserMessageEntry(prev) || isUserMessageEntry(curr)) return "mt-5";
   if (entryEndsInWorkRow(prev) && entryStartsWithWorkRow(curr)) return "mt-2";
+  return "mt-4";
+}
+
+/**
+ * Top-margin rhythm for a live row (provisional turn, draft banner) that renders below
+ * `prev` before any durable entry for it exists. Mirrors {@link rhythmTopClass}'s
+ * prev-side decisions so spacing doesn't shift when the row commits.
+ */
+export function rhythmTopClassForLiveRow(prev: ChatDisplayEntry | null): string {
+  if (!prev) return "";
+  if (prev.type === "modelChange") return "mt-2";
+  if (isUserMessageEntry(prev)) return "mt-5";
   return "mt-4";
 }
 

@@ -108,117 +108,151 @@ export function ChatComposerBar({
   handleAcceptChanges,
 }: ChatComposerBarProps) {
   return (
-    <>
-              {/* ── Bottom: input, update state, and cost ──────────────── */}
-              <div className={`flex-shrink-0 bg-kumo-base ${sidebarMode ? "" : "border-t border-kumo-line"}`}>
-                <div className={useConstrainedChatWidth ? CONSTRAINED_CHAT_COLUMN_CLASS : ""}>
-                  {/* Remount all transient composer state when the conversation changes. */}
-                  <ChatComposer
-                    key={`${workspaceId}:${selectedChatId}`}
-                    chatKey={selectedChatId}
-                    createCapsuleGatekeeper={(accountId, url) =>
-                      overseer.newGatekeeper(accountId, url)
-                    }
-                    getOverseer={getOverseer}
-                    onSend={handleSend}
-                    isAgentActive={isAgentActive}
-                    models={availableModels}
-                    selectedModel={selectedModel === null ? null : {
-                      id: selectedModel,
-                      name: chatAgent?.id === selectedModel ? chatAgent.name : undefined,
-                    }}
-                    onModelChange={handleModelChange}
-                    bots={bots}
-                    selectedBot={selectedBot}
-                    onBotChange={handleBotChange}
-                    showModels
-                    staleBotName={staleBotName}
-                    pendingConsoleLogCount={pendingConsoleLogCount}
-                    consoleLogPreview={consoleLogPreview}
-                    consoleLogSeverity={consoleLogSeverity}
-                    onConsumeConsoleLogs={onConsumeConsoleLogs}
-                    onDiscardConsoleLogs={onDiscardConsoleLogs}
-                    onStop={handleStop}
-                    queuedSteers={queuedSteers?.map((steer) => steer.text)}
-                    showThinkingTraces={showThinkingTraces}
-                    onToggleThinkingTraces={toggleShowThinkingTraces}
-                    draftStorageKey={currentUser && workspaceId && selectedChatId !== null
-                      ? composerDraftStorageKey(
-                          currentUser.id,
-                          `workspace:${workspaceId}:chat:${selectedChatId}`,
-                        )
-                      : undefined}
-                    blockedReason={
-                      hasPendingConnectionRequest
-                        ? "Set up or deny the connection request above to continue."
-                        : hasPendingAwaitedAction
-                          ? "Approve or reject the pending action above to continue."
-                          : undefined
-                    }
-                    draftUpdateBanner={(() => {
-                      if (!currentChatMetadata ||
-                          !(chatHasProposedChanges(currentChatMetadata) ||
-                            hasPendingBlueprintProposal)) return null;
+    // ── Bottom: input, update state, and cost ────────────────
+    <div className={`flex-shrink-0 bg-kumo-base ${sidebarMode ? "" : "border-t border-kumo-line"}`}>
+      <div className={useConstrainedChatWidth ? CONSTRAINED_CHAT_COLUMN_CLASS : ""}>
+        {/* Remount all transient composer state when the conversation changes. */}
+        <ChatComposer
+          key={`${workspaceId}:${selectedChatId}`}
+          chatKey={selectedChatId}
+          createCapsuleGatekeeper={(accountId, url) =>
+            overseer.newGatekeeper(accountId, url)
+          }
+          getOverseer={getOverseer}
+          onSend={handleSend}
+          isAgentActive={isAgentActive}
+          models={availableModels}
+          selectedModel={selectedModel === null ? null : {
+            id: selectedModel,
+            name: chatAgent?.id === selectedModel ? chatAgent.name : undefined,
+          }}
+          onModelChange={handleModelChange}
+          bots={bots}
+          selectedBot={selectedBot}
+          onBotChange={handleBotChange}
+          showModels
+          staleBotName={staleBotName}
+          pendingConsoleLogCount={pendingConsoleLogCount}
+          consoleLogPreview={consoleLogPreview}
+          consoleLogSeverity={consoleLogSeverity}
+          onConsumeConsoleLogs={onConsumeConsoleLogs}
+          onDiscardConsoleLogs={onDiscardConsoleLogs}
+          onStop={handleStop}
+          queuedSteers={queuedSteers?.map((steer) => steer.text)}
+          showThinkingTraces={showThinkingTraces}
+          onToggleThinkingTraces={toggleShowThinkingTraces}
+          draftStorageKey={currentUser && workspaceId && selectedChatId !== null
+            ? composerDraftStorageKey(
+                currentUser.id,
+                `workspace:${workspaceId}:chat:${selectedChatId}`,
+              )
+            : undefined}
+          blockedReason={
+            hasPendingConnectionRequest
+              ? "Set up or deny the connection request above to continue."
+              : hasPendingAwaitedAction
+                ? "Approve or reject the pending action above to continue."
+                : undefined
+          }
+          draftUpdateBanner={
+            <PendingChangesBanner
+              chatMetadata={currentChatMetadata}
+              includesBlueprintProposal={hasPendingBlueprintProposal}
+              isAgentActive={isAgentActive}
+              discardingChangesChatIds={discardingChangesChatIds}
+              discardChangesTarget={discardChangesTarget}
+              setDiscardChangesTarget={setDiscardChangesTarget}
+              onDiscard={handleDiscardPendingChanges}
+              onAccept={handleAcceptChanges}
+            />
+          }
+        />
 
-                      // Accepting always merges everything the chat proposes (drafts swept in,
-                      // no partial accepts -- see Overseer.mergeChanges()), so the banner needs
-                      // no accept cut of its own. Discard-all still uses sequence zero, which
-                      // covers every batch including the compacted prefix's.
-                      const isDiscardingChanges = discardingChangesChatIds.has(
-                        currentChatMetadata.id,
-                      );
-                      const changesActionsDisabled = isAgentActive || isDiscardingChanges;
-                      return (
-                        <div className="themed-surface-inset relative flex items-center gap-2 overflow-hidden rounded-t-[calc(1rem-1px)] border-b border-kumo-line bg-kumo-elevated px-3.5 py-2">
-                          <span className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-kumo-brand/40 to-transparent" aria-hidden="true" />
-                          <span className="min-w-0 flex-1 truncate text-[12px] font-medium leading-4 tracking-[-0.2px] text-kumo-default">
-                            Pending changes
-                          </span>
-                          <DiscardPendingChangesPopover
-                            open={discardChangesTarget?.chatId === currentChatMetadata.id}
-                            disabled={changesActionsDisabled}
-                            isDiscarding={isDiscardingChanges}
-                            onOpenChange={(open) => {
-                              if (isDiscardingChanges) return;
-                              setDiscardChangesTarget(open ? {
-                                chatId: currentChatMetadata.id,
-                              } : null);
-                            }}
-                            onConfirm={handleDiscardPendingChanges}
-                          />
-                          <Tooltip content={isAgentActive
-                            ? "Wait for the agent to finish before accepting changes."
-                            : isDiscardingChanges
-                              ? "Wait for pending changes to finish discarding."
-                              : "Keep this draft and make it the gadget's current version."} asChild>
-                            <WorkshopButton
-                              disabled={changesActionsDisabled}
-                              onClick={() => { void handleAcceptChanges(); }}
-                              tone="primary"
-                              className="!h-7 !cursor-pointer !rounded-md !border-transparent !shadow-none gap-1 text-[12px]"
-                            >
-                              <Check size={11} weight="bold" />
-                              Accept changes
-                            </WorkshopButton>
-                          </Tooltip>
-                        </div>
-                      );
-                    })()}
-                  />
+        {/* Token / cost summary. */}
+        <div className="-mt-1 flex min-h-[1.25rem] items-start justify-end gap-4 px-4 pb-1 font-mono text-[11px] leading-4 text-kumo-inactive">
+          {currentChatMetadata?.totalTokens != null && (
+            <span>
+              {currentChatMetadata.totalTokens.toLocaleString()} tokens
+            </span>
+          )}
+          {currentChatMetadata?.totalCost != null && (
+            <span>${currentChatMetadata.totalCost.toFixed(4)}</span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
 
-                  {/* Token / cost summary. */}
-                  <div className="-mt-1 flex min-h-[1.25rem] items-start justify-end gap-4 px-4 pb-1 font-mono text-[11px] leading-4 text-kumo-inactive">
-                    {currentChatMetadata?.totalTokens != null && (
-                      <span>
-                        {currentChatMetadata.totalTokens.toLocaleString()} tokens
-                      </span>
-                    )}
-                    {currentChatMetadata?.totalCost != null && (
-                      <span>${currentChatMetadata.totalCost.toFixed(4)}</span>
-                    )}
-                  </div>
-                </div>
-              </div>
-    </>
+/** Props for {@link PendingChangesBanner}: the composer's "Pending changes" strip. */
+interface PendingChangesBannerProps {
+  /** The selected chat's metadata, undefined while it has not loaded. */
+  chatMetadata: AiChatMetadata | null | undefined;
+  /** Whether a blueprint proposal is also waiting, which the banner speaks for. */
+  includesBlueprintProposal: boolean;
+  isAgentActive: boolean;
+  discardingChangesChatIds: Set<number>;
+  discardChangesTarget: { chatId: number } | null;
+  setDiscardChangesTarget: (target: { chatId: number } | null) => void;
+  onDiscard: () => Promise<void>;
+  onAccept: () => Promise<void>;
+}
+
+/**
+ * The strip the composer hosts above its textarea while the chat proposes changes: the
+ * accept/discard affordances for everything pending. Rendered only when there is something
+ * to act on (null otherwise, which is ChatComposer's empty-banner case).
+ */
+function PendingChangesBanner({
+  chatMetadata,
+  includesBlueprintProposal,
+  isAgentActive,
+  discardingChangesChatIds,
+  discardChangesTarget,
+  setDiscardChangesTarget,
+  onDiscard,
+  onAccept,
+}: PendingChangesBannerProps) {
+  if (!chatMetadata ||
+      !(chatHasProposedChanges(chatMetadata) || includesBlueprintProposal)) return null;
+
+  // Accepting always merges everything the chat proposes (drafts swept in, no partial
+  // accepts -- see Overseer.mergeChanges()), so the banner needs no accept cut of its own.
+  // Discard-all still uses sequence zero, which covers every batch including the compacted
+  // prefix's.
+  const isDiscardingChanges = discardingChangesChatIds.has(chatMetadata.id);
+  const changesActionsDisabled = isAgentActive || isDiscardingChanges;
+  return (
+    <div className="themed-surface-inset relative flex items-center gap-2 overflow-hidden rounded-t-[calc(1rem-1px)] border-b border-kumo-line bg-kumo-elevated px-3.5 py-2">
+      <span className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-kumo-brand/40 to-transparent" aria-hidden="true" />
+      <span className="min-w-0 flex-1 truncate text-[12px] font-medium leading-4 tracking-[-0.2px] text-kumo-default">
+        Pending changes
+      </span>
+      <DiscardPendingChangesPopover
+        open={discardChangesTarget?.chatId === chatMetadata.id}
+        disabled={changesActionsDisabled}
+        isDiscarding={isDiscardingChanges}
+        onOpenChange={(open) => {
+          if (isDiscardingChanges) return;
+          setDiscardChangesTarget(open ? { chatId: chatMetadata.id } : null);
+        }}
+        onConfirm={onDiscard}
+      />
+      <Tooltip content={isAgentActive
+        ? "Wait for the agent to finish before accepting changes."
+        : isDiscardingChanges
+          ? "Wait for pending changes to finish discarding."
+          : "Keep this draft and make it the gadget's current version."} asChild>
+        <WorkshopButton
+          disabled={changesActionsDisabled}
+          onClick={() => { void onAccept(); }}
+          tone="primary"
+          className="!h-7 !cursor-pointer !rounded-md !border-transparent !shadow-none gap-1 text-[12px]"
+        >
+          <Check size={11} weight="bold" />
+          Accept changes
+        </WorkshopButton>
+      </Tooltip>
+    </div>
   );
 }

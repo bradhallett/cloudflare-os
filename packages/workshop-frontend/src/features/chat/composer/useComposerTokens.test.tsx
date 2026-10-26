@@ -64,18 +64,18 @@ const baseArgs = (doc: ComposerDocument): UseComposerTokensArgs & {textarea: HTM
   const textarea = document.createElement("textarea");
   return {
     document: doc,
-    recordDraftEdit: vi.fn(),
-    replaceDocument: vi.fn(),
+    recordDraftEdit: vi.fn<() => void>(),
+    replaceDocument: vi.fn<(document: ComposerDocument) => void>(),
     textareaRef: {current: textarea},
     // Only the no-token early return is exercised; hit tests with real spans stay in the
     // browser layout suite.
     mirrorRef: {current: {
-      tokenAtPoint: vi.fn(),
-      syncLayout: vi.fn(),
-      syncWidth: vi.fn(),
-      syncScroll: vi.fn(),
+      tokenAtPoint: vi.fn<() => null>(),
+      syncLayout: vi.fn<() => void>(),
+      syncWidth: vi.fn<() => void>(),
+      syncScroll: vi.fn<() => void>(),
       textOffsetTop: () => 0,
-      setHoveredToken: vi.fn(),
+      setHoveredToken: vi.fn<() => void>(),
     }},
     textarea,
   };

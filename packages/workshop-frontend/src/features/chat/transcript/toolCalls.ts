@@ -354,9 +354,6 @@ function describeProvisionalToolCount(toolName: AiToolCall["toolName"], count: n
       : (meta.presentPhrase ?? meta.present));
 }
 
-function getToolTarget(tc: AiToolCall): string | undefined {
-  return getToolCallSummary(tc).target;
-}
 
 /**
  * Whether a tool call is still waiting for its result. Only a tool that records an `output` can
@@ -529,7 +526,7 @@ export function buildToolCallGroup(
 
   const distinctToolNames = Array.from(new Set(toolCalls.map((tc) => tc.toolName)));
   const targets = toolCalls
-    .map((tc) => getToolTarget(tc))
+    .map((tc) => toolCallTarget(tc))
     .filter((target): target is string => Boolean(target));
   const observationTargets = observations
     .map((msg) => msg.actionLog.resourceTitle)

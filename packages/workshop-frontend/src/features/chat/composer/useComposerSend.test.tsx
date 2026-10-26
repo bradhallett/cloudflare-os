@@ -3,11 +3,11 @@
 
 import { act } from "react";
 import { createRoot } from "react-dom/client";
+import type { SetStateAction } from "react";
 import type { SlashCommandChoice } from "@gadgets/workshop-shared/api";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ComposerAttachment } from "./attachments/useComposerAttachments";
 import type { ComposerDocument } from "./composerDocument";
-import type { StoredComposerDraft } from "./draft/composerDraft";
 import { useComposerSend, type UseComposerSendArgs } from "./useComposerSend";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -81,14 +81,16 @@ const baseArgs = (): UseComposerSendArgs => ({
   isBlocked: false,
   document: emptyDocument("hello"),
   attachments: [],
-  clearSentAttachments: vi.fn(),
+  clearSentAttachments: vi.fn<(sent: readonly ComposerAttachment[]) => void>(),
   isCreatingResource: false,
-  beginSend: () => ({key: undefined, editRevision: 0, draft: {} as StoredComposerDraft}),
-  completeSend: () => true,
-  replaceDocument: vi.fn(),
-  recordDraftEdit: vi.fn(),
-  setInputValue: vi.fn(),
-  toasts: {add: vi.fn(() => "t")},
+  beginSend: vi.fn<UseComposerSendArgs["beginSend"]>(() => ({
+    key: undefined, editRevision: 0, draft: {version: 1, text: "hello", formats: []},
+  })),
+  completeSend: vi.fn<() => boolean>(() => true),
+  replaceDocument: vi.fn<(document: ComposerDocument) => void>(),
+  recordDraftEdit: vi.fn<() => void>(),
+  setInputValue: vi.fn<(value: SetStateAction<string>) => void>(),
+  toasts: {add: vi.fn<(toast: {title: string; variant: "error"}) => string>(() => "t")},
 });
 
 const mounted: Harness[] = [];
@@ -148,7 +150,7 @@ describe("useComposerSend", () => {
   });
 
   it("a transient failure keeps the draft and raises the hiccup hint", async () => {
-    const args = {...baseArgs(), onSend: vi.fn(async () => { throw transientError(); })};
+    const args = {...baseArgs(), onSend: vi.fn<() => Promise<void>>(async () => { throw transientError(); })};
     const harness = renderHook(args);
     mounted.push(harness);
     await act(async () => {
@@ -159,7 +161,7 @@ describe("useComposerSend", () => {
   });
 
   it("a definitive failure in a chat clears the draft for the failed-send bubble", async () => {
-    const args = {...baseArgs(), onSend: vi.fn(async () => { throw new Error("definitive"); })};
+    const args = {...baseArgs(), onSend: vi.fn<() => Promise<void>>(async () => { throw new Error("definitive"); })};
     const harness = renderHook(args);
     mounted.push(harness);
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -175,7 +177,7 @@ describe("useComposerSend", () => {
   });
 
   it("a definitive failure without a chat keeps the draft (no transcript to hold it)", async () => {
-    const args = {...baseArgs(), chatKey: null, onSend: vi.fn(async () => { throw new Error("definitive"); })};
+    const args = {...baseArgs(), chatKey: null, onSend: vi.fn<() => Promise<void>>(async () => { throw new Error("definitive"); })};
     const harness = renderHook(args);
     mounted.push(harness);
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -190,7 +192,7 @@ describe("useComposerSend", () => {
   });
 
   it("Stop folds queued steers back into the draft text", async () => {
-    const onStop = vi.fn(async () => {});
+    const onStop = vi.fn<() => Promise<void>>(async () => {});
     const args = {...baseArgs(), isAgentActive: true, queuedSteers: ["first", "second"], onStop};
     const harness = renderHook(args);
     mounted.push(harness);

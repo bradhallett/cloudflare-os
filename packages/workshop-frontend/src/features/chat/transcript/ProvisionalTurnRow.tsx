@@ -3,7 +3,7 @@ import styles from "../ChatInterface.module.css";
 import type { AiChatMessage } from "@gadgets/workshop-shared/api";
 import { MarkdownMessage } from "../markdown/MarkdownMessage";
 import type { ProvisionalChatState, ProvisionalToolCallState } from "../provisionalChatState";
-import { isUserMessageEntry, type ChatDisplayEntry } from "./chatDisplayEntries";
+import { rhythmTopClassForLiveRow, type ChatDisplayEntry } from "./chatDisplayEntries";
 import { ProvisionalToolGroupRow } from "./ProvisionalToolGroupRow";
 import { ThinkingTraceRow } from "./ThinkingTraceRow";
 
@@ -56,15 +56,9 @@ export const ProvisionalTurnRow = memo(function ProvisionalTurnRow({
     !hasShownReasoning &&
     toolCalls.length === 0;
 
-  // Match the spacing this response gets once finalized (see rhythmTopClass) so it doesn't
-  // shift when streaming completes.
-  const provisionalTopClass = !previousEntry
-    ? ""
-    : previousEntry.type === "modelChange"
-      ? "mt-2"
-      : isUserMessageEntry(previousEntry)
-        ? "mt-5"
-        : "mt-4";
+  // The shared live-row rhythm keeps this placeholder at the spacing the finalized response
+  // gets (see rhythmTopClassForLiveRow), so nothing shifts when streaming completes.
+  const provisionalTopClass = rhythmTopClassForLiveRow(previousEntry);
 
   return (
     <div className={`group/agent min-w-0 w-full max-w-[860px] space-y-2 ${provisionalTopClass}`}>
