@@ -27,7 +27,7 @@ import { GatekeeperConnectCallbackImpl, GatekeeperUserSelectionExchangeImpl, nor
 import { resolveBlueprintForUser } from "./blueprint-access.js";
 import { OverseerDurableObject, GatekeeperLoopback, CodeModeTailLoopback, AgentSpawnerGatekeeper, GatekeeperHookLoopback, GadgetTailLoopback, AgentSelfLoopback } from "./overseer";
 import { UserDirectoryDurableObject } from "./user-directory.js";
-import { OrgDurableObject, randomOrgId } from "./org.js";
+import { OrgDurableObject } from "./org.js";
 import { ExternalMessageGateway } from "./external-message-gateway";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { recordAnalytics } from "./analytics";
@@ -244,7 +244,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
   // Writes never retry across an org-DO reset (see whoami for the user DO's version of this).
   createOrg(name: string): Promise<OrgSummary> {
-    return this.#org(randomOrgId()).initializeOrg(name, this.#ownId);
+    return this.#org(random128BitId()).initializeOrg(name, this.#ownId);
   }
   async listMyOrgs(): Promise<OrgSummary[]> {
     // The user DO's index is discovery only; each org re-checks the membership live, which also

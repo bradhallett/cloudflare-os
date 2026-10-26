@@ -630,6 +630,20 @@ describe("plan-enforced org workspace caps", () => {
     expect(await room.inDo(org => transfer(org, "g3"))).toBeUndefined();
   });
 
+  it("the cap refusal carries the WORKSPACE_CAP_REACHED code a plan upgrade reads", async () => {
+    const capped = await orgWithPlan(plan({ maxWorkspaces: 1 }), ["g1"]);
+    // The code is read inside the Durable Object: runInDurableObject serializes a thrown
+    // error to its message, which is what `attempt` above asserts.
+    const code = await capped.inDo(async org => {
+      try {
+        await org.addOwnedGadget(OWNER, "g2", "member-1");
+      } catch (err) {
+        return getPlanRefusalCode(err);
+      }
+    });
+    expect(code).toBe("WORKSPACE_CAP_REACHED");
+  });
+
   it("a transfer its own crashed attempt left behind is not re-refused", async () => {
     // Counted, g3's own row reaches the cap of 3 — but that row is the crashed attempt's own,
     // so the retry refreshes it rather than being refused by it.
