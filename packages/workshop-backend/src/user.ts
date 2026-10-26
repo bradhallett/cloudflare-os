@@ -1,6 +1,6 @@
 import { RpcStub } from "capnweb";
 import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, createPlanRefusalError, type DeviceSessionHandoffStart, type BotDefinition, type BotInfo, type BotSelection, type BotSkillChoice, type BotSkillRef, type OrgMemberStatus, type OrgRole } from '@gadgets/workshop-shared/api';
-import { ActionDescription, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperUserSelection, GatekeeperUserSelectionExchange, RedeemedGatekeeperUserSelection, GatekeeperOrgMembership, ComposioToolkitPolicy } from "@gadgets/workshop-shared/gatekeeper";
+import { ActionDescription, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperUserSelection, GatekeeperUserSelectionExchange, RedeemedGatekeeperUserSelection, GatekeeperOrgMembership, ComposioUserPolicy } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { botKey, normalizeBotDefinition } from "./bot-config.js";
 import { isActiveMember } from "./org-access.js";
@@ -2088,8 +2088,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (!record?.description.singleton) return null;
     let allowed = await this.#allowedGatekeepers();
     if (allowed !== null && !allowed.has(record.vendorId.toLowerCase())) return null;
-    return (record.account as unknown as SingletonAccountStub).getSingletonGatekeeperClass(
-      await this.#composioToolkitPolicy(record.vendorId));
+    let cls = await (record.account as unknown as SingletonAccountStub).getSingletonGatekeeperClass();
+    await this.#pushVendorAdminPolicy(record.vendorId, record.account);
+    return cls;
   }
 
   /**
@@ -2819,25 +2820,27 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
                   typeUrlPattern: string}> {
     let account = this.storage.connectedAccounts.get(accountId);
     if (!account) throw new Error("No such account.");
-    let {class: cls, resource} = await account.account.getGatekeeperClassFor(url,
-        await this.#composioToolkitPolicy(account.vendorId));
+    let {class: cls, resource} = await account.account.getGatekeeperClassFor(url);
     await this.#assertResourceEnabled(account.vendorId, resource);
+    await this.#pushVendorAdminPolicy(account.vendorId, account.account);
     return {class: cls, vendorId: account.vendorId, typeUrlPattern: resource.urlPattern};
   }
 
   /**
-   * The composio gatekeeper can't read the admin config (its own KV bindings are freshly
-   * provisioned namespaces, not the backend's mirror), so its toolkit policy rides the mint:
-   * read here at every getGatekeeperClassFor and passed for the vendor to bake into the facet's
-   * props. Undefined for every other vendor, whose calls are unchanged.
+   * Push a vendor's admin-configured policy to its account out-of-band. A vendor with an entry in
+   * AdminConfig.vendorAdminPolicy cannot read the admin config itself (its worker runs on freshly
+   * provisioned bindings, not the backend's mirror), so the account exposes an updateToolkitPolicy
+   * extension (ComposioUserPolicy in workshop-shared) and this pushes the entry right after every
+   * capability mint — the account's stored copy stays as fresh as the config the mint was decided
+   * against. Only vendors the admin actually configured have entries, so which vendors participate
+   * is data, not a name in this file; an account that doesn't implement the extension throws, the
+   * same failure a stale policy would eventually surface. The cast follows the SingletonAccountStub
+   * pattern: the extension is optional on GatekeeperUser, declared per vendor.
    */
-  async #composioToolkitPolicy(vendorId: string): Promise<ComposioToolkitPolicy | undefined> {
-    if (vendorId !== "composio" || !this.vendors.has("composio")) return undefined;
-    let config = await readAdminConfig(this.env);
-    return {
-      excludedToolkits: config.composioExcludedToolkits,
-      autoApplyToolkits: config.composioAutoApplyToolkits,
-    };
+  async #pushVendorAdminPolicy(vendorId: string, account: Fetcher<GatekeeperUser>): Promise<void> {
+    let policy = (await readAdminConfig(this.env)).vendorAdminPolicy[vendorId.toLowerCase()];
+    if (policy === undefined) return;
+    await (account as unknown as ComposioUserPolicy).updateToolkitPolicy(policy);
   }
 
   /**

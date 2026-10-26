@@ -32,6 +32,20 @@ describe("parseAdminConfig", () => {
     expect(normalizeAdminConfig({ signupsEnabled: false }).userSearchEnabled).toBe(true);
   });
 
+  it("normalizes vendor admin policy entries and keeps configured-to-nothing distinct from absent", () => {
+    // Entry presence is the signal user.ts #pushVendorAdminPolicy reads: an entry (even with empty
+    // lists) is pushed to the vendor's accounts; an absent entry means "never configured".
+    let config = parseAdminConfig(JSON.stringify({
+      vendorAdminPolicy: {
+        Composio: { excludedToolkits: [" gitlab ", "gitlab", ""], autoApplyToolkits: "not-a-list" },
+        broken: "not-an-object",
+      },
+    }));
+    expect(config.vendorAdminPolicy).toEqual({
+      composio: { excludedToolkits: ["gitlab"], autoApplyToolkits: [] },
+    });
+  });
+
   it("drops malformed format entries rather than the whole list", () => {
     let config = parseAdminConfig(JSON.stringify({
       formats: [

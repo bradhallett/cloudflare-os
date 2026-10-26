@@ -16,6 +16,16 @@ import {
   type GatewayModelSettings, type ReasoningLevel,
 } from "@gadgets/workshop-shared/api";
 
+/**
+ * A vendor's admin-configured policy, pushed to its accounts out-of-band (see
+ * `AdminConfig.vendorAdminPolicy`). The toolkit lists are the toolkit-policy shape Composio
+ * defines (see `ComposioToolkitPolicy` in workshop-shared); a vendor whose admin policy has a
+ * different shape gets its own field rather than widening this one.
+ */
+export type VendorAdminPolicy = {
+  excludedToolkits: string[];
+  autoApplyToolkits: string[];
+};
 export type AdminConfig = {
   /**
    * Whether new account signups are allowed (default true). Note: this is an access toggle, not
@@ -55,19 +65,14 @@ export type AdminConfig = {
    */
   ambientGatekeeperModes: Record<string, AmbientGatekeeperMode>;
   /**
-   * Composio toolkits this deployment hides from every surface (facet mint, catalog, session
-   * scope). Exact Composio slugs, default [] — the admin decides what to hide; Composio never
-   * silently shadows a native gatekeeper. Passed into the composio vendor at every facet mint (see
-   * user.ts getGatekeeperClassFor).
+   * Per-vendor admin policy snapshots, keyed by vendor id (e.g. "composio"). A vendor with an
+   * entry cannot read the backend's admin config itself (its worker runs on freshly provisioned
+   * bindings), so the Workshop pushes the entry to the account out-of-band after every capability
+   * mint (see user.ts #pushVendorAdminPolicy) — the account's stored copy stays as fresh as the
+   * config the mint was decided against. An entry with empty lists means "configured to nothing";
+   * an absent entry means "never configured", which vendors read as their own defaults.
    */
-  composioExcludedToolkits: string[];
-  /**
-   * Composio toolkits whose create/update-tagged write tools are eligible for user-armed
-   * auto-apply (see plans/composio-gatekeeper.md §Execution). Default []. An entry vouches for all
-   * current and future eligible tools in that toolkit; unlisting does not de-escalate actions
-   * already pending.
-   */
-  composioAutoApplyToolkits: string[];
+  vendorAdminPolicy: Record<string, VendorAdminPolicy>;
 
   /**
    * The blueprints offered as this deployment's standard output formats. What a user gets from
@@ -173,8 +178,7 @@ export const DEFAULT_ADMIN_CONFIG: AdminConfig = {
   disabledResources: {},
   disabledGatekeepers: [],
   ambientGatekeeperModes: {},
-  composioExcludedToolkits: [],
-  composioAutoApplyToolkits: [],
+  vendorAdminPolicy: {},
   formats: [],
   deploymentBots: [],
   modelModes: {},

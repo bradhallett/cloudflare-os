@@ -1350,6 +1350,17 @@ export function isAmbientGatekeeperMode(value: unknown): value is AmbientGatekee
 }
 
 /**
+ * A vendor's admin-configured policy entry (see `AdminSettingsView.vendorAdminPolicy`). The
+ * toolkit lists are the toolkit-policy shape Composio defines (`ComposioToolkitPolicy` in
+ * gatekeeper.ts); a vendor whose admin policy needs a different shape gets its own field rather
+ * than widening this one.
+ */
+export type VendorAdminPolicy = {
+  excludedToolkits: string[];
+  autoApplyToolkits: string[];
+};
+
+/**
  * A bound gatekeeper in the admin gatekeeper-config UI, discriminated by `autoProvisions`:
  *   - an ordinary OAuth/resource gatekeeper has a binary `enabled` flag and `resources` to toggle;
  *   - an auto-provisioning ("ambient") gatekeeper has a three-state `ambientMode` and no resources.
@@ -1466,16 +1477,11 @@ export type AdminSettingsView = {
   /** Every bound gatekeeper and its resource types, with enabled state (not hidden when disabled). */
   resourceVendors: AdminResourceVendor[];
   /**
-   * Composio toolkits this deployment hides from every surface. Exact Composio slugs; a dead slug
-   * matches nothing (see AdminApi.getComposioToolkitInfo).
+   * Per-vendor admin policy snapshots, keyed by vendor id (currently "composio"; see
+   * AdminApi.setVendorAdminPolicy). Exact toolkit slugs; a dead slug matches nothing and is
+   * surfaced as a warning by the admin editor (see getComposioToolkitInfo).
    */
-  composioExcludedToolkits: string[];
-  /**
-   * Composio toolkits whose create/update-tagged write tools are eligible for user-armed
-   * auto-apply. Listing one vouches for all its current and future such tools; unlisting does not
-   * de-escalate actions already pending.
-   */
-  composioAutoApplyToolkits: string[];
+  vendorAdminPolicy: Record<string, VendorAdminPolicy>;
   /** The blueprints promoted as standard output formats, in menu order (including disabled ones). */
   formats: AdminFormat[];
   /** The models the deployment provides through AI Gateway. Absent outside AI Gateway mode. */
@@ -1684,18 +1690,12 @@ export interface AdminApi {
   setGatekeeperMode(vendorId: string, mode: AmbientGatekeeperMode): Promise<void>;
 
   /**
-   * Set the Composio toolkits this deployment hides from every surface. Slugs are exact Composio
-   * toolkit identifiers; entries matching no live toolkit match nothing and are surfaced as
-   * warnings by the admin editor (see getComposioToolkitInfo).
+   * Set one vendor's admin policy entry (currently the Composio toolkit lists). Lists hold exact
+   * toolkit slugs; entries matching no live toolkit match nothing and are surfaced as warnings by
+   * the admin editor (see getComposioToolkitInfo). An entry with empty lists means "configured to
+   * nothing" and still reaches the vendor's accounts.
    */
-  setComposioExcludedToolkits(slugs: string[]): Promise<void>;
-
-  /**
-   * Set the Composio toolkits whose create/update-tagged write tools are eligible for user-armed
-   * auto-apply. An entry vouches for all current and future eligible tools in that toolkit, and
-   * unlisting does not de-escalate actions already pending.
-   */
-  setComposioAutoApplyToolkits(slugs: string[]): Promise<void>;
+  setVendorAdminPolicy(vendorId: string, policy: VendorAdminPolicy): Promise<void>;
 
   /**
    * Check Composio toolkit slugs against the vendor's live catalog and count each one's tools:

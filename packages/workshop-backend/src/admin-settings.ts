@@ -8,7 +8,7 @@ import { sanitizeBlueprintOutput } from './blueprint-archive.js';
 import { ADMIN_CONFIG_KEY, FEATURED_BLUEPRINTS_KEY, isReservedBlueprintKey, migrateBlueprintOwnership, parseBlueprintKvRecord, readBlueprintKvRecord, serializeFeaturedBlueprints } from './storage-schema/blueprints-kv.js';
 import { MAX_AGENT_HINT, defaultOutputFormatId, isUpdateCheckInterval, isUpdateHours, listPromotedFormats, normalizeAdminConfig, reorderFormats, sanitizeAddedModel, sanitizeModelSettings, sanitizeOutputOverrides, serializeAdminConfig } from './admin-config.js';
 import { normalizeBotDefinition } from './bot-config.js';
-import { makeAdminSettingsStorage, type AdminConfig, type AdminSettingsStorage, type FormatCuration } from './storage-schema/admin-settings-storage.js';
+import { makeAdminSettingsStorage, type AdminConfig, type AdminSettingsStorage, type FormatCuration, type VendorAdminPolicy } from './storage-schema/admin-settings-storage.js';
 import { getModelTokenLimits } from './agent-compaction.js';
 import { AiGatewayConfig, GatewayModels, assertGatewayProvider, gatewayModelConfig, gatewayRunConfig, getAiGatewayConfig, isCatalogModel } from './ai-gateway.js';
 import { AgentTurnError, completeText } from './ai-invoke.js';
@@ -534,8 +534,7 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
       resourceVendors: await this.#listResourceConfig(config, adminUserId),
       formats: await this.#listFormatConfig(config),
       gatewayModels: this.#listGatewayModels(config),
-      composioExcludedToolkits: config.composioExcludedToolkits,
-      composioAutoApplyToolkits: config.composioAutoApplyToolkits,
+      vendorAdminPolicy: config.vendorAdminPolicy,
     };
   }
 
@@ -1006,19 +1005,19 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     }
   }
 
-  // --- Composio toolkit policy (see plans/composio-gatekeeper.md §Admin config) ---
+  // --- Vendor admin policy (see AdminConfig.vendorAdminPolicy) ---
 
   /**
-   * Set the Composio toolkits this deployment hides. Both lists are normalized (trimmed,
-   * deduplicated, exact slugs) by updateAdminConfig's normalizeAdminConfig pass, so the setters
-   * just persist the admin's entries.
+   * Set one vendor's admin policy entry. Lists are normalized (trimmed, deduplicated, exact
+   * slugs) by updateAdminConfig's normalizeAdminConfig pass; writing an entry with empty lists
+   * means "configured to nothing" and still reaches the vendor's accounts (see
+   * user.ts #pushVendorAdminPolicy for how entries travel).
    */
-  setComposioExcludedToolkits(slugs: string[]): Promise<void> {
-    return this.updateAdminConfig({ composioExcludedToolkits: slugs });
-  }
-
-  setComposioAutoApplyToolkits(slugs: string[]): Promise<void> {
-    return this.updateAdminConfig({ composioAutoApplyToolkits: slugs });
+  setVendorAdminPolicy(vendorId: string, policy: VendorAdminPolicy): Promise<void> {
+    return this.#mutateAdminConfig(config => {
+      config.vendorAdminPolicy = { ...config.vendorAdminPolicy, [vendorId.toLowerCase()]: policy };
+      return config;
+    });
   }
 
   /**
@@ -1223,12 +1222,8 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
     return this.admin.setGatekeeperMode(vendorId, mode);
   }
 
-  setComposioExcludedToolkits(slugs: string[]): Promise<void> {
-    return this.admin.setComposioExcludedToolkits(slugs);
-  }
-
-  setComposioAutoApplyToolkits(slugs: string[]): Promise<void> {
-    return this.admin.setComposioAutoApplyToolkits(slugs);
+  setVendorAdminPolicy(vendorId: string, policy: VendorAdminPolicy): Promise<void> {
+    return this.admin.setVendorAdminPolicy(vendorId, policy);
   }
 
   getComposioToolkitInfo(slugs: string[]): Promise<ComposioToolkitInfo[] | null> {
