@@ -56,6 +56,9 @@ function directoryEntryFromRaw(raw: DirectoryPersonRaw): DirectoryEntry | undefi
 export const MAX_CHAT_DOWNLOAD_BYTES = 25 * 1024 * 1024;
 /** Chat's own documented message size ceiling. */
 export const MAX_CHAT_MESSAGE_BYTES = 32_000;
+/** How many pages `findGroupChat`'s conversation walk and `audienceIn`'s member walk may read. */
+const MAX_FIND_GROUP_CHAT_PAGES = 20;
+const MAX_AUDIENCE_PAGES = 20;
 
 /** A status-only provider error, safe to log and to base retry decisions on. */
 export class ChatApiError extends Error {
@@ -710,7 +713,18 @@ export class ChatApi {
     // A person an email address resolved to in one match is the same person in the next.
     const resolved = new Map<string, string>();
     let pageToken: string | undefined;
+    const seenTokens = new Set<string>();
+    let pages = 0;
     do {
+      // Each space page costs a member-page walk per candidate, so the walk is bounded rather
+      // than trusting Google to end the pages; a repeated pageToken would loop forever.
+      if (++pages > MAX_FIND_GROUP_CHAT_PAGES) {
+        throw new Error("Google Chat returned too many pages of matching conversations.");
+      }
+      if (pageToken && seenTokens.has(pageToken)) {
+        throw new Error("Google Chat returned the same conversation page twice.");
+      }
+      if (pageToken) seenTokens.add(pageToken);
       const params = new URLSearchParams({ pageSize: "30", ...(pageToken ? { pageToken } : {}) });
       for (const user of users) params.append("users", chatUserName(user));
       type Page = { spaces?: ChatSpaceRaw[]; nextPageToken?: string };
@@ -979,7 +993,18 @@ export class ChatApi {
   async audienceIn(spaceName: string): Promise<Set<string>> {
     const audience = new Set<string>();
     let pageToken: string | undefined;
+    const seenTokens = new Set<string>();
+    let pages = 0;
     do {
+      // An audience of empty pages would otherwise never end, so the walk is bounded and a
+      // repeated pageToken -- which would loop forever -- is refused outright.
+      if (++pages > MAX_AUDIENCE_PAGES) {
+        throw new Error("Google Chat returned too many pages of members.");
+      }
+      if (pageToken && seenTokens.has(pageToken)) {
+        throw new Error("Google Chat returned the same member page twice.");
+      }
+      if (pageToken) seenTokens.add(pageToken);
       const page = await this.listMembers(spaceName, pageToken ? { pageToken } : {});
       for (const membership of page.items) {
         if (membership.state === "notMember") continue;

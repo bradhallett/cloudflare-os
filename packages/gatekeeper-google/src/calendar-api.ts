@@ -15,6 +15,7 @@ import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
 const CALENDAR_API_BASE = "https://www.googleapis.com/calendar/v3";
 
 const MAX_LIST_EVENTS = 2500;
+const MAX_LIST_EVENTS_PAGES = 20;
 
 export type GoogleCalendarListOptions = {
   maxResults?: number;
@@ -193,7 +194,11 @@ export function validateCalendarTimeWindow(timeMin: Date, timeMax: Date, maxDays
   }
 }
 
-class GoogleCalendarApiError extends Error {
+/**
+ * A Calendar API response that arrived but refused the request. A status of 500 or more means the
+ * write may still have landed, so callers treating one as outcome-unknown must see the class.
+ */
+export class GoogleCalendarApiError extends Error {
   constructor(readonly status: number, body: string) {
     super(`Google Calendar API request failed: ${status} ${body}`);
   }
@@ -285,8 +290,19 @@ export class GoogleCalendarApi {
   async listEvents(calendarId: string, opts: CalendarListEventsOptions): Promise<CalendarEvent[]> {
     let events: CalendarEvent[] = [];
     let pageToken: string | undefined;
+    const seenTokens = new Set<string>();
+    let pages = 0;
 
     do {
+      // The item cap below cannot answer a window whose pages come back empty, so the walk itself
+      // is bounded, and a repeated pageToken -- which would loop forever -- is refused outright.
+      if (++pages > MAX_LIST_EVENTS_PAGES) {
+        throw new Error("Google Calendar returned too many pages of events. Narrow timeMin/timeMax and try again.");
+      }
+      if (pageToken && seenTokens.has(pageToken)) {
+        throw new Error("Google Calendar returned the same events page twice.");
+      }
+      if (pageToken) seenTokens.add(pageToken);
       let params = new URLSearchParams({
         timeMin: opts.timeMin.toISOString(),
         timeMax: opts.timeMax.toISOString(),
