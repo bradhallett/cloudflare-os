@@ -512,26 +512,38 @@ const PASSTHROUGH_GATEKEEPER_VARS: Record<string, string[]> = {
   "gatekeeper-x": ["X_DAILY_READ_LIMIT"],
 };
 
-for (const gk of gatekeepers) {
-  const srcPath = join(gk.dir, "wrangler.jsonc");
+// ---------------------------------------------------------------------------
+// Generate each scanned worker's `wrangler.dev.jsonc` — gatekeepers and plain overlay workers
+// alike: the multi-config wrangler runs from the repo root, so the build command needs its
+// package cwd, and a Workers AI binding stays opt-in for every worker. Everything gatekeeper
+// specific is a name-keyed lookup that no-ops for a plain worker; core has no plain workers, so
+// those only ever come from --scan-root / WORKER_SCAN_ROOTS packages.
+// ---------------------------------------------------------------------------
+for (const pkg of [...gatekeepers, ...plainWorkers]) {
+  const srcPath = join(pkg.dir, "wrangler.jsonc");
   const config = parse(readFileSync(srcPath, "utf8"));
-  config.build = devBuildConfig(config.build, gk.dir);
-  config.vars = config.vars || {};
-  // The folded production path (see gatekeeperBaseUrl): the dev router binds
-  // GATEKEEPER_<SLUG> like the deploy service, so BASE_URL must use the same fold.
-  config.vars.BASE_URL = gatekeeperBaseUrl(gk.name, backendHost);
+  config.build = devBuildConfig(config.build, pkg.dir);
 
-  const shared = SHARED_GATEKEEPER_CREDS[gk.name];
-  if (shared && process.env[shared.id] && process.env[shared.secret]) {
-    if (config.vars.CLIENT_ID === undefined) config.vars.CLIENT_ID = process.env[shared.id];
-    if (config.vars.CLIENT_SECRET === undefined) config.vars.CLIENT_SECRET = process.env[shared.secret];
-  }
+  if (isGatekeeperPackage(pkg.name)) {
+    config.vars = config.vars || {};
+    // The folded production path (see gatekeeperBaseUrl): the dev router binds
+    // GATEKEEPER_<SLUG> like the deploy service, so BASE_URL must use the same fold.
+    config.vars.BASE_URL = gatekeeperBaseUrl(pkg.name, backendHost);
 
-  // The shell wins over the committed default, so `MCP_ALLOW_INSECURE=true` can override the
-  // `"false"` in wrangler.jsonc without editing it.
-  for (const name of PASSTHROUGH_GATEKEEPER_VARS[gk.name] ?? []) {
-    if (process.env[name] !== undefined) {
-      config.vars[name] = process.env[name];
+    const shared = SHARED_GATEKEEPER_CREDS[pkg.name];
+    if (shared && process.env[shared.id] && process.env[shared.secret]) {
+      if (config.vars.CLIENT_ID === undefined) config.vars.CLIENT_ID = process.env[shared.id];
+      if (config.vars.CLIENT_SECRET === undefined) {
+        config.vars.CLIENT_SECRET = process.env[shared.secret];
+      }
+    }
+
+    // The shell wins over the committed default, so `MCP_ALLOW_INSECURE=true` can override the
+    // `"false"` in wrangler.jsonc without editing it.
+    for (const name of PASSTHROUGH_GATEKEEPER_VARS[pkg.name] ?? []) {
+      if (process.env[name] !== undefined) {
+        config.vars[name] = process.env[name];
+      }
     }
   }
 
@@ -541,30 +553,10 @@ for (const gk of gatekeepers) {
     else delete config.ai;
   }
 
-  const outPath = join(gk.dir, "wrangler.dev.jsonc");
-  writeFileSync(outPath, JSON.stringify(config, null, 2) + "\n");
-  console.log(`generated: ${outPath}`);
-}
-
-// ---------------------------------------------------------------------------
-// Generate plain overlay workers' wrangler.dev.jsonc — same treatment as the gatekeepers' minus
-// the gatekeeper wiring: the multi-config wrangler runs from the repo root, so the build command
-// needs its package cwd, and a Workers AI binding stays opt-in the same way. Core has no plain
-// workers; this loop only ever runs for --scan-root / WORKER_SCAN_ROOTS packages.
-// ---------------------------------------------------------------------------
-for (const pkg of plainWorkers) {
-  const srcPath = join(pkg.dir, "wrangler.jsonc");
-  const config = parse(readFileSync(srcPath, "utf8"));
-  config.build = devBuildConfig(config.build, pkg.dir);
-  if (config.ai) {
-    if (useWorkersAi) config.ai.remote = true;
-    else delete config.ai;
-  }
   const outPath = join(pkg.dir, "wrangler.dev.jsonc");
   writeFileSync(outPath, JSON.stringify(config, null, 2) + "\n");
   console.log(`generated: ${outPath}`);
 }
-
 
 // ---------------------------------------------------------------------------
 // Generate packages/workshop-backend/wrangler.dev.jsonc (with gatekeeper

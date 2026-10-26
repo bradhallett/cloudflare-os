@@ -1,5 +1,5 @@
-// Declared bots, end to end (see the bots section of the plan in local://declare-bots-plan.md):
-// bot-scoped chat intake, subagents, inter-bot DMs, loop-safety budgets, and both bot scopes.
+// Declared bots, end to end: bot-scoped chat intake, subagents, inter-bot DMs, loop-safety
+// budgets, and both bot scopes.
 // Every turn below runs on a scripted model, so ordering is deterministic: a test's bots each
 // declare their own model id (the router distinguishes scripts by account, so distinct ids may
 // share one script shape), and turns that must overlap use withheld model responses (`after`) or
