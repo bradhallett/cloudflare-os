@@ -5,7 +5,8 @@
  *
  * 1. A dispatch that can no longer be reconciled is recorded terminally, never replayed. For an
  *    action set on the action journal, throwing `ActionOutcomeUnknownError` from the handler does
- *    this (see `./actions`); a claim left by a dead activation fails the same way.
+ *    this (see `./actions`); a claim left by a dead activation fails the same way. A connector
+ *    that keeps its own action records gets the same loop from `applyClaimedAction`, below.
  * 2. A dispatch that can be reconciled is marked before it goes out, and the next apply asks the
  *    provider what became of it before repeating it. `AttemptJournal` owns the marker state; the
  *    provider-specific look that settles it stays in the connector. A write whose provider state
@@ -17,6 +18,7 @@
  *    connector's, for the user it addresses.
  */
 
+import { ActionOutcomeUnknownError, APPLY_OUTCOME_UNKNOWN_MESSAGE } from "./actions";
 import type { KvScannable } from "./kv";
 
 /**
@@ -164,12 +166,116 @@ export class AttemptJournal<M> {
 }
 
 /**
+ * The lifecycle states of a connector-owned action record driven by `applyClaimedAction`, which is
+ * for connectors that keep their own action records rather than the action journal. `claimed` marks
+ * the window where the provider call is in flight: the claim is written before the call, so any
+ * later attempt that finds it knows a previous dispatch may have applied and refuses to run again.
+ * `failed` is terminal — its `failure` explains itself — and is cleared by a rejection. `reverted`
+ * is settled too: a replayed apply settles into it instead of dispatching again.
+ */
+export type ClaimedActionState = "pending" | "claimed" | "applied" | "failed" | "reverted";
+
+/** A record `applyClaimedAction` can drive. */
+export type ClaimedActionRecord = {
+  state: ClaimedActionState;
+  /** For state "failed": why, and what to answer later attempts with. */
+  failure?: string;
+};
+
+/** The record storage `applyClaimedAction` drives a connector's own action records over. */
+export type ClaimedActionStore<R extends ClaimedActionRecord> = {
+  /** Reads one action record. */
+  getAction(id: number): R | undefined;
+  /** Writes one action record. */
+  putAction(record: R): void;
+};
+
+/**
+ * The claim-state loop for a connector that keeps its own action records: the guards a replayed
+ * apply owes (settled is settled, a terminal failure answers itself, a leftover claim means a
+ * dispatch whose outcome is unknown), the claim taken before the first provider call, and the
+ * outcome-unknown classification that turns an unanswered dispatch into a terminal failure. The
+ * connector supplies only its provider dispatch — which marks the record applied itself, so it can
+ * persist intermediates (created ids, revert snapshots) on the record it was handed — and its
+ * outcome-unknown classifier.
+ *
+ * @param store The connector's action record storage.
+ * @param id The action to apply.
+ * @param dispatch Performs the action against the provider. Receives the record already in state
+ * "claimed" and must set it applied (or reverted) and store it on success.
+ * @param isOutcomeUnknown Whether an error the dispatch raised means the provider may have applied
+ * the write without a definitive answer arriving.
+ * @throws Whatever the dispatch threw; an outcome-unknown failure is rethrown as an
+ * `ActionOutcomeUnknownError` after being recorded terminally.
+ */
+export async function applyClaimedAction<R extends ClaimedActionRecord>(
+  store: ClaimedActionStore<R>,
+  id: number,
+  dispatch: (record: R) => Promise<void>,
+  isOutcomeUnknown: (error: unknown) => boolean,
+): Promise<void> {
+  const record = store.getAction(id);
+  if (record === undefined) throw new Error(`Unknown action: ${id}`);
+  // The Workshop marks its side approved only after this RPC returns, so a replayed apply
+  // (restart, retry, duplicate click) settles here instead of dispatching again.
+  if (record.state === "applied" || record.state === "reverted") return;
+  // A terminal failure answers every later attempt with the same message, no provider call.
+  if (record.state === "failed") {
+    throw new Error(record.failure ?? "This action previously failed.");
+  }
+  // A claim left behind means a previous dispatch's outcome is unknown: the call may have reached
+  // the provider. Record it terminally and surface it — never silently re-run a write.
+  if (record.state === "claimed") throw markOutcomeUnknown(store, record);
+
+  // Claim before the first provider call: the record durably says a dispatch began, so an
+  // interrupted apply can never be mistaken for never-run. A fresh copy, so the record the
+  // dispatch mutates (and persists its intermediates on) is exactly the claimed one.
+  const claimed = { ...record, state: "claimed" } as R;
+  store.putAction(claimed);
+  try {
+    await dispatch(claimed);
+  } catch (error) {
+    if (isOutcomeUnknown(error)) {
+      // No definitive answer arrived, so the write may have landed. Record the action terminally
+      // with the reason and surface it; a rejection clears the record after the user checks.
+      const message = `${APPLY_OUTCOME_UNKNOWN_MESSAGE} (${error instanceof Error ? error.message : String(error)})`;
+      store.putAction({ ...claimed, state: "failed", failure: message });
+      throw new ActionOutcomeUnknownError(message);
+    }
+    // The provider answered with a refusal (or the failure is internal): the write did not land,
+    // so the record goes back to pending and the failure stays retryable, as before. Any
+    // intermediate the dispatch already persisted survives, so a retry builds on it.
+    store.putAction({ ...claimed, state: "pending" });
+    throw error;
+  }
+}
+
+/**
+ * Records that the outcome of a dispatched action cannot be known, and returns the error that
+ * surfaces it. Terminal: only a rejection clears the record. For the apply loop above, and for a
+ * connector's reject path, which owes the same refusal while a dispatch may be unreported.
+ * @param store The connector's action record storage.
+ * @param record The claimed record whose dispatch's outcome is unknown.
+ * @returns The error to throw.
+ */
+export function markOutcomeUnknown<R extends ClaimedActionRecord>(
+  store: ClaimedActionStore<R>,
+  record: R,
+): ActionOutcomeUnknownError {
+  store.putAction({ ...record, state: "failed", failure: APPLY_OUTCOME_UNKNOWN_MESSAGE });
+  return new ActionOutcomeUnknownError(APPLY_OUTCOME_UNKNOWN_MESSAGE);
+}
+
+/**
  * Settles a re-delivered apply whose dispatch was refused, for a write whose provider state can
  * answer without a dispatch marker: a compare-and-swap'd push refused because the branch moved, a
  * merge refused with "already merged". Reads the provider's current state and compares it with the
  * one the action was approved to leave. Equality is the earlier dispatch's success -- whether it
  * landed and the reply was lost, or a third party's identical write got there first, the approved
  * end state holds and the two are indistinguishable, so the apply is settled as applied.
+ *
+ * `T` is compared by identity, so it must be a primitive or interned value; both call sites pass
+ * `string | null`.
  * @param readCurrent Reads the state the action was to leave, from the provider.
  * @param desired The state the action was approved to leave.
  * @returns The provider's current state when it is not the desired one, for the refusal to name;

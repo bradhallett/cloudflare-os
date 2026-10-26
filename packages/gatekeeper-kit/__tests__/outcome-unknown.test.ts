@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { fakeKv } from "./fake-kv";
-import { AttemptJournal, desiredStateReached } from "../src/outcome-unknown";
+import {
+  ActionOutcomeUnknownError, APPLY_OUTCOME_UNKNOWN_MESSAGE,
+} from "../src/actions";
+import {
+  applyClaimedAction, AttemptJournal, desiredStateReached, markOutcomeUnknown,
+  type ClaimedActionRecord,
+} from "../src/outcome-unknown";
 
 describe("AttemptJournal", () => {
   it("carries a marker from before the dispatch until it is settled", () => {
@@ -128,5 +134,110 @@ describe("desiredStateReached", () => {
     const failure = new Error("provider unreachable");
     await expect(desiredStateReached<string>(async () => { throw failure; }, "abc123"))
       .rejects.toBe(failure);
+  });
+});
+
+describe("applyClaimedAction", () => {
+  type TestRecord = ClaimedActionRecord & { payload: string };
+
+  /** A record store keyed by id, which is all `applyClaimedAction` needs. */
+  function storeOf(...seeded: Array<TestRecord>): {
+    store: { getAction(id: number): TestRecord | undefined; putAction(record: TestRecord): void };
+    records: Map<number, TestRecord>;
+  } {
+    const records = new Map(seeded.map(each => [Number(each.payload.slice(1)), each]));
+    return {
+      store: {
+        getAction: id => records.get(id),
+        putAction: record => void records.set(Number(record.payload.slice(1)), record),
+      },
+      records,
+    };
+  }
+
+  function record(id: number, state: ClaimedActionRecord["state"] = "pending"): TestRecord {
+    return { state, payload: `a${id}` };
+  }
+
+  const mustNotDispatch = async (): Promise<void> => {
+    throw new Error("dispatch must not run");
+  };
+
+  it("refuses an id no record answers to", async () => {
+    const { store } = storeOf();
+    await expect(applyClaimedAction(store, 9, mustNotDispatch, () => false))
+      .rejects.toThrow("Unknown action: 9");
+  });
+
+  it("settles a replayed apply over an applied or reverted record without dispatching", async () => {
+    for (const settled of ["applied", "reverted"] as const) {
+      const { store } = storeOf(record(1, settled));
+      await applyClaimedAction(store, 1, mustNotDispatch, () => false);
+    }
+  });
+
+  it("answers a failed record with its own failure, no dispatch", async () => {
+    const { store } = storeOf({ ...record(1, "failed"), failure: "quota exhausted" });
+    await expect(applyClaimedAction(store, 1, mustNotDispatch, () => false))
+      .rejects.toThrow("quota exhausted");
+  });
+
+  it("claims before the dispatch, and the dispatch's own applied state is what persists", async () => {
+    const { store, records } = storeOf(record(1));
+    let handed: TestRecord | undefined;
+    await applyClaimedAction(store, 1, async claimed => {
+      handed = { ...claimed };
+      claimed.state = "applied";
+      store.putAction(claimed);
+    }, () => false);
+
+    // The dispatch saw the claimed record, and what it persisted is the state it set itself.
+    expect(handed?.state).toBe("claimed");
+    expect(records.get(1)).toEqual({ state: "applied", payload: "a1" });
+  });
+
+  it("records an outcome-unknown dispatch failure terminally and surfaces it", async () => {
+    const { store, records } = storeOf(record(1));
+    const failure = await applyClaimedAction(
+      store, 1,
+      async () => { throw new Error("connection dropped after send"); },
+      () => true)
+      .catch(error => error);
+
+    expect(failure).toBeInstanceOf(ActionOutcomeUnknownError);
+    expect((failure as Error).message).toBe(
+      `${APPLY_OUTCOME_UNKNOWN_MESSAGE} (connection dropped after send)`);
+    expect(records.get(1)).toEqual({
+      state: "failed", payload: "a1",
+      failure: `${APPLY_OUTCOME_UNKNOWN_MESSAGE} (connection dropped after send)`,
+    });
+  });
+
+  it("returns a refused dispatch to pending, keeping the failure retryable", async () => {
+    const { store, records } = storeOf(record(1));
+    const refusal = new Error("HTTP 422");
+    await expect(
+      applyClaimedAction(store, 1, async () => { throw refusal; }, () => false))
+      .rejects.toBe(refusal);
+    expect(records.get(1)).toEqual({ state: "pending", payload: "a1" });
+  });
+
+  it("answers a leftover claim with a terminal outcome-unknown failure", async () => {
+    const { store, records } = storeOf(record(1, "claimed"));
+    await expect(applyClaimedAction(store, 1, mustNotDispatch, () => false))
+      .rejects.toThrow(APPLY_OUTCOME_UNKNOWN_MESSAGE);
+    expect(records.get(1)).toEqual({
+      state: "failed", payload: "a1", failure: APPLY_OUTCOME_UNKNOWN_MESSAGE,
+    });
+  });
+
+  it("markOutcomeUnknown records the claim terminally and returns the surfaced error", () => {
+    const { store, records } = storeOf(record(1, "claimed"));
+    const failure = markOutcomeUnknown(store, record(1, "claimed"));
+    expect(failure).toBeInstanceOf(ActionOutcomeUnknownError);
+    expect(failure.message).toBe(APPLY_OUTCOME_UNKNOWN_MESSAGE);
+    expect(records.get(1)).toEqual({
+      state: "failed", payload: "a1", failure: APPLY_OUTCOME_UNKNOWN_MESSAGE,
+    });
   });
 });

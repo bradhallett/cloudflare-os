@@ -35,7 +35,7 @@ import {
 } from "@gadgets/workshop-shared/gatekeeper";
 import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import {
-  clearConnectionSubject, commitReconnect, ConnectionSubject, pinConnectionSubject, stageReconnect,
+  commitReconnectOrThrow, ConnectionSubject, pinForConnect, stageReconnect,
 } from "@gadgets/gatekeeper-kit/credential-stage";
 import {
   CONFLUENCE_SCOPES,
@@ -393,16 +393,15 @@ export class UserAccount extends DurableObject<Env> {
       handoff = await callback.reconnectComplete(staged.stageId);
     } else {
       this.#storeGrant(grant);
-      pinConnectionSubject(this.ctx.storage.kv, subject);
-      await this.#refreshSitesAndIdentity(grant.accessToken);
-      try {
-        const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
-        handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
-      } catch (err) {
-        this.ctx.storage.kv.delete("grant");
-        clearConnectionSubject(this.ctx.storage.kv);
-        throw err;
-      }
+      const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
+      // The pin brackets the site/identity read and the handoff: either failing unpins and drops
+      // the grant stored ahead of it.
+      handoff = await pinForConnect(this.ctx.storage.kv, subject,
+        async () => {
+          await this.#refreshSitesAndIdentity(grant.accessToken);
+          return callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
+        },
+        () => { this.ctx.storage.kv.delete("grant"); });
     }
     return { handoff };
   }
@@ -411,8 +410,7 @@ export class UserAccount extends DurableObject<Env> {
    * commit is fenced on the connection's pinned subject and re-pins the staged subject, so a
    * connection made before the pin existed adopts its first reconnect's account. */
   async commitReconnect(stageId: string): Promise<void> {
-    const grant = commitReconnect<StoredGrant>(this.ctx.storage.kv, Date.now(), stageId);
-    if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+    const grant = commitReconnectOrThrow<StoredGrant>(this.ctx.storage.kv, Date.now(), stageId);
     this.#storeGrant(grant);
     await this.#refreshSitesAndIdentity(grant.accessToken);
   }

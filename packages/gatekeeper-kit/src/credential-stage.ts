@@ -289,3 +289,57 @@ export function commitReconnect<T>(kv: KvMutable, now: number, stageId: string):
   kv.delete(STAGED_CREDENTIALS_KEY);
   return staged.creds;
 }
+
+/** What `commitReconnectOrThrow` says when no stage is committable; one wording across connectors. */
+export const NO_RECONNECT_AWAITING_CONFIRMATION =
+  "No reconnect is awaiting confirmation. Please try again.";
+
+/**
+ * `commitReconnect` with the null answer turned into the refusal every connector words the same
+ * way, so the message (like the null semantics and the fence) has one home. A null means no stage
+ * is live for this `stageId`: none was made, it expired, it was already committed, or it was
+ * fenced out — in every case the remedy is the same, the user tries the reconnect again.
+ * @param kv Durable Object storage.
+ * @param now Current Unix time in milliseconds.
+ * @param stageId The id `stageReconnect` returned for the stage being committed.
+ * @returns The staged credentials.
+ * @throws Error when that stage is not committable.
+ */
+export function commitReconnectOrThrow<T>(kv: KvMutable, now: number, stageId: string): T {
+  const staged = commitReconnect<T>(kv, now, stageId);
+  if (staged === null) throw new Error(NO_RECONNECT_AWAITING_CONFIRMATION);
+  return staged;
+}
+
+/**
+ * Pins a first connect's subject for the duration of the handoff, so the pin can never outlive a
+ * connect that failed: `connect` runs with the pin written, and a throw clears it again and runs
+ * `unwind` — the connector's own cleanup of the credentials it wrote ahead of the handoff — before
+ * rethrowing. A connector that could not read a subject (`undefined`) neither pins nor clears, so
+ * an abandoned attempt pins nothing either way.
+ *
+ * Only the first connect goes through this: a reconnect commit re-pins on its own, inside
+ * `commitReconnect`.
+ * @param kv Durable Object storage.
+ * @param subject The subject the connect flow verified the grant as, when it read one.
+ * @param connect Runs the handoff (`callback.complete`), returning its result.
+ * @param unwind Drops what the connector wrote ahead of the handoff (live credential keys, an
+ * orphaned grant's revocation), on the same failure that unpins.
+ * @returns Whatever `connect` returned.
+ */
+export async function pinForConnect<S extends ConnectionSubject, T>(
+  kv: KvMutable,
+  subject: S | undefined,
+  connect: () => Promise<T>,
+  unwind: () => void | Promise<void>,
+): Promise<T> {
+  if (subject === undefined) return connect();
+  pinConnectionSubject(kv, subject);
+  try {
+    return await connect();
+  } catch (error) {
+    clearConnectionSubject(kv);
+    await unwind();
+    throw error;
+  }
+}

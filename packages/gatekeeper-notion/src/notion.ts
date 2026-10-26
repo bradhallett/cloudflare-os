@@ -34,7 +34,7 @@ import {
 } from "@gadgets/workshop-shared/gatekeeper";
 import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import {
-  clearConnectionSubject, commitReconnect, ConnectionSubject, pinConnectionSubject, stageReconnect,
+  commitReconnectOrThrow, ConnectionSubject, pinForConnect, stageReconnect,
 } from "@gadgets/gatekeeper-kit/credential-stage";
 import {
   NotionApi,
@@ -445,17 +445,16 @@ export class UserAccount extends DurableObject<Env> {
       handoff = await callback.reconnectComplete(staged.stageId);
     } else {
       this.#storeGrant(grant);
-      if (subject !== undefined) pinConnectionSubject(this.ctx.storage.kv, subject);
-      try {
-        const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
-        handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
-      } catch (err) {
-        this.ctx.storage.kv.delete("accessToken");
-        this.ctx.storage.kv.delete("refreshToken");
-        this.ctx.storage.kv.delete("accountInfo");
-        clearConnectionSubject(this.ctx.storage.kv);
-        throw err;
-      }
+      const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
+      // The pin brackets the handoff: a connect that fails unpins and drops the credentials
+      // stored ahead of it (a subjectless grant pins nothing, per the kit).
+      handoff = await pinForConnect(this.ctx.storage.kv, subject,
+        () => callback.complete(this.ctx.exports.GatekeeperUserImpl({ props })),
+        () => {
+          this.ctx.storage.kv.delete("accessToken");
+          this.ctx.storage.kv.delete("refreshToken");
+          this.ctx.storage.kv.delete("accountInfo");
+        });
     }
     return { handoff };
   }
@@ -465,8 +464,7 @@ export class UserAccount extends DurableObject<Env> {
    * connection made before the pin existed adopts its first reconnect's account; a subjectless
    * stage commits without touching the pin. */
   async commitReconnect(stageId: string): Promise<void> {
-    const grant = commitReconnect<NotionOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
-    if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+    const grant = commitReconnectOrThrow<NotionOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
     this.#storeGrant(grant);
   }
 
