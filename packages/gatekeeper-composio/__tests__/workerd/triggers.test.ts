@@ -115,7 +115,9 @@ async function armedTrigger(accountName: string): Promise<string> {
     filters: { repo: "acme/api" },
   });
   if (!created.ok) throw new Error(created.message);
-  await hooks.enableCapturedHook(facet, 0, { workspaceId: "ws-a" });
+  // The workspace is the facet's inherited scope, so enable and the later delete/disable
+  // fences agree (the controller and session both fence on that same scope).
+  await hooks.enableCapturedHook(facet, 0, { workspaceId: await hooks.facetScopeId(facet) });
   await hooks.resetInitiator();
   return created.value;
 }
@@ -206,6 +208,26 @@ describe("trigger lifecycle", () => {
     expect(await hooks.accountTriggers("trig-delete")).toEqual([]);
     expect((await hooks.triggerUpstreamState()).instances).toEqual([]);
   });
+
+  it("refuses a delete from another workspace's session, then disarms from its own", async () => {
+    const triggerId = await armedTrigger("trig-fence");
+    expect((await hooks.accountTriggers("trig-fence"))[0].workspaceId).not.toBe("");
+
+    // A second TestHooks DO is a second parent scope: the facet it mints inherits that
+    // workspace, never the armed trigger's.
+    const hooksB = env.TEST_HOOKS.getByName("hooks-b");
+    await hooksB.singletonSession("trig-fence", "trig-fence-b-f");
+
+    const refused = await hooksB.deleteTriggerOnSession("trig-fence-b-f", triggerId);
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) expect(refused.message).toContain("workspace");
+    expect(await hooks.accountTriggers("trig-fence")).toHaveLength(1);
+    expect((await hooks.triggerUpstreamState()).instances).toHaveLength(1);
+
+    const deleted = await hooks.deleteTriggerOnSession("trig-fence-f", triggerId);
+    expect(deleted.ok).toBe(true);
+    expect(await hooks.accountTriggers("trig-fence")).toEqual([]);
+  });
 });
 
 describe("webhook ingest", () => {
@@ -257,10 +279,47 @@ describe("webhook ingest", () => {
       { ageSeconds: 400 },
     )).resolves.toBe(401);
 
-    // Upstream rotated without telling us: the first delivery heals from the listing.
+    // Upstream rotated without telling us: the next delivery heals from the listing — past
+    // the self-heal throttle, which the earlier failed verifications already spent.
     await hooks.mutateTriggers({ rotateUpstreamSecret: true });
-    const healed = triggerEnvelope("evt_healed", upstreamId, "trig-sig");
-    await expect(hooks.ingestSignedWebhook("trig-sig", healed)).resolves.toBe(200);
+    vi.setSystemTime(Date.now() + 61_000);
+    try {
+      const healed = triggerEnvelope("evt_healed", upstreamId, "trig-sig");
+      await expect(hooks.ingestSignedWebhook("trig-sig", healed)).resolves.toBe(200);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("throttles the self-heal listing to one per interval per account", async () => {
+    await armedTrigger("trig-throttle");
+    const upstreamId = (await hooks.triggerUpstreamState()).instances[0].id;
+
+    // A wrong-secret delivery heals once (one billed listing) and still refuses.
+    await expect(hooks.ingestSignedWebhook(
+      "trig-throttle", triggerEnvelope("evt_t1", upstreamId, "trig-throttle"),
+      { secret: "whsec_not-the-one" },
+    )).resolves.toBe(401);
+    expect((await hooks.triggerUpstreamState()).subscriptionListings).toBe(1);
+
+    // The immediate retry is throttled: the 401 stands without a second listing.
+    await expect(hooks.ingestSignedWebhook(
+      "trig-throttle", triggerEnvelope("evt_t2", upstreamId, "trig-throttle"),
+      { secret: "whsec_still-wrong" },
+    )).resolves.toBe(401);
+    expect((await hooks.triggerUpstreamState()).subscriptionListings).toBe(1);
+
+    // Past the interval the heal runs again — and now succeeds against a rotated secret.
+    await hooks.mutateTriggers({ rotateUpstreamSecret: true });
+    vi.setSystemTime(Date.now() + 61_000);
+    try {
+      await expect(hooks.ingestSignedWebhook(
+        "trig-throttle", triggerEnvelope("evt_t3", upstreamId, "trig-throttle"),
+      )).resolves.toBe(200);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect((await hooks.triggerUpstreamState()).subscriptionListings).toBe(2);
   });
 
   it("rotates the stored secret on demand: the old secret stops verifying", async () => {
@@ -315,6 +374,36 @@ describe("delivery", () => {
     expect(delivered.firings[0]).toMatchObject({ triggerSlug: "github_issue_opened" });
     expect(delivered.observations).toHaveLength(1);
     expect(delivered.observations[0].title).toContain("github_issue_opened");
+  });
+
+  it("delivers a payload larger than the 512-byte preview cap, preview and all", async () => {
+    await armedTrigger("trig-big");
+    const upstreamId = (await hooks.triggerUpstreamState()).instances[0].id;
+    const body = "x".repeat(2048);
+    await hooks.ingestSignedWebhook("trig-big", triggerEnvelope(
+      "evt_big", upstreamId, "trig-big", { number: 7, body }));
+    await runDurableObjectAlarm(account("trig-big"));
+
+    // Before the fix, JSON.parse of the mid-JSON-cut preview threw before the observation
+    // gate, so oversized events retried for hours and were dropped.
+    const state = await hooks.readInitiator();
+    expect(state.firings).toHaveLength(1);
+    expect(JSON.parse(state.firings[0].dataJson)).toEqual({ number: 7, body });
+    expect(state.observations).toHaveLength(1);
+    expect(state.observations[0].description).toContain("github_issue_opened");
+  });
+
+  it("delivers a payload truncated at the queue cap as a marked, unparsable body", async () => {
+    await armedTrigger("trig-huge");
+    const upstreamId = (await hooks.triggerUpstreamState()).instances[0].id;
+    await hooks.ingestSignedWebhook("trig-huge", triggerEnvelope(
+      "evt_huge", upstreamId, "trig-huge", { body: "y".repeat(120 * 1024) }));
+    await runDurableObjectAlarm(account("trig-huge"));
+
+    const state = await hooks.readInitiator();
+    expect(state.firings).toHaveLength(1);
+    expect(JSON.parse(state.firings[0].dataJson)).toBeNull();
+    expect(state.observations[0].description).toContain("truncated in transit");
   });
 
   it("reconciles a missing upstream instance by re-upserting it", async () => {
@@ -376,6 +465,7 @@ describe("worker webhook route", () => {
   const uuidE2E = "1eea4d10-7c70-4d3e-9d8e-2b2a5f1b0d01";
   const uuidSig = "2ffb51c2-9f50-4b57-91e2-6db5198a3f02";
   const uuidQuiet = "3ad0e3b4-5b6c-4d7e-8f90-a1b2c3d4e5f3";
+  const uuidStray = "4b5c6d7e-8f90-a1b2-c3d4-e5f60718293a";
 
   /** POSTs one envelope to the public webhook route, signed with the fake's current secret. */
   async function signedPost(
@@ -418,6 +508,16 @@ describe("worker webhook route", () => {
     const headerless = await signedPost(
       triggerEnvelope("evt_bad2", upstreamId, uuidSig), { omitHeaders: true });
     expect(headerless.status).toBe(400);
+  });
+
+  it("spends no upstream listing on forged traffic to a never-armed account", async () => {
+    // A uuid-shaped user_id routes to an account DO with no subscription and no trigger
+    // rows: the self-heal gate refuses before any billed upstream call.
+    const response = await signedPost(
+      triggerEnvelope("evt_stray", "ti_stray", uuidStray), { secret: "whsec_forged" });
+    expect(response.status).toBe(401);
+    expect((await hooks.triggerUpstreamState()).subscriptionListings).toBe(0);
+    expect(await hooks.accountTriggers(uuidStray)).toEqual([]);
   });
 
   it("acknowledges events for accounts this deployment never minted, without routing", async () => {

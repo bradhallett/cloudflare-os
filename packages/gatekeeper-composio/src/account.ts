@@ -135,6 +135,8 @@ const MAX_TRIGGER_EVENT_BYTES = 96 * 1024;
 const EXPIRY_NOTICES_LIMIT = 50;
 /** How long envelope-id dedupe markers live (mirrors the delivery queue's retention). */
 const WEBHOOK_SEEN_TTL_MS = 24 * 60 * 60 * 1000;
+/** Minimum spacing between upstream subscription listings for the signature self-heal. */
+const WEBHOOK_SECRET_REFRESH_MIN_INTERVAL_MS = 60 * 1000;
 
 /** KV key of one trigger's stored initiator capability. */
 function triggerCapsKey(triggerId: string): string {
@@ -821,15 +823,22 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
   /**
    * Disarms one trigger: the upstream instance is deleted first (a failure is logged and left
    * to reconciliation), then the queued deliveries are cancelled, the initiator disposed, and
-   * the row and capability record dropped. Idempotent: an unknown id is a no-op.
+   * the row and capability record dropped. Idempotent: an unknown id is a no-op. The
+   * `workspaceId` fence refuses a row armed by another workspace (the scheduler's rule).
    */
-  async disableTrigger(triggerId: string): Promise<void> {
+  async disableTrigger(triggerId: string, workspaceId: string): Promise<void> {
     await this.#serialized(async () => {
       const row = this.#triggerRow(triggerId);
       this.#triggerQueue.cancel(triggerId);
       if (row === undefined) {
         await this.#planAlarmAfterMutation();
         return;
+      }
+      if (row.workspace_id !== workspaceId) {
+        // The scheduler's fence: a session of one workspace cannot disarm another
+        // workspace's trigger by its bare id.
+        throw new Error(
+          `Trigger ${quoteUntrusted(triggerId, 80)} does not belong to this workspace.`);
       }
       if (row.upstream_trigger_id !== null) {
         try {
@@ -896,12 +905,15 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
         status = 200; // A redelivery of an already-ingested envelope: ACK and do nothing.
         return;
       }
-      await this.ctx.storage.put(seenKey, Date.now());
+      // The marker goes down only after the ingest succeeded: a crash mid-ingest leaves it
+      // absent, so the redelivery retries instead of ACKing a lost event (the queue's own
+      // message-id dedupe still suppresses a double delivery).
       if (event.kind === "trigger") {
         await this.#ingestTriggerEvent(event);
       } else {
         await this.#recordExpiryNotice(event);
       }
+      await this.ctx.storage.put(seenKey, Date.now());
     });
     return status;
   }
@@ -938,9 +950,10 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
     this.#triggerQueue.enqueue(row.trigger_id, event.eventId, {
       eventId: event.eventId,
       triggerSlug: event.triggerSlug,
-      timestamp: event.timestamp !== undefined
-        ? Date.parse(event.timestamp)
-        : null,
+      timestamp: event.timestamp === undefined
+        || !Number.isFinite(Date.parse(event.timestamp))
+        ? null
+        : Date.parse(event.timestamp),
       dataJson,
       truncated: dataJson.length < serializedData.length,
     }, Date.now());
@@ -1046,13 +1059,20 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
         throw new Error("The workspace refused the trigger delivery (startHook).");
       }
       const preview = capUtf8(message.dataJson, 512);
+      let previewValue: unknown = preview;
+      try {
+        previewValue = JSON.parse(preview);
+      } catch {
+        // The preview cut mid-JSON (any payload over the cap), or the payload itself was
+        // truncated at ingest: either way the raw capped text still describes it.
+      }
       await hookResult.approvalQueue.authorizeObservation({
         title: row.title,
         description: buildDescription(
           `Deliver Composio trigger ${quoteUntrusted(message.triggerSlug, 80)} event ` +
             `${quoteUntrusted(message.eventId, 80)} to this workspace.` +
             (message.truncated ? " The payload was truncated in transit." : ""),
-        ).json("Payload preview", JSON.parse(preview) ?? preview).finish().description,
+        ).json("Payload preview", previewValue).finish().description,
       });
       let data: unknown = null;
       try {
@@ -1203,7 +1223,10 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
   /**
    * Verifies one inbound delivery against the stored secret for `mode`, self-healing once
    * through the subscription listing when the stored secret no longer matches (an upstream
-   * rotation, or another deployment-mode account rotating the shared project secret).
+   * rotation, or another deployment-mode account rotating the shared project secret). The
+   * heal spends a billed upstream listing, so it never runs for an account holding nothing
+   * to verify against (no stored subscription and no trigger rows) and at most once per
+   * interval per mode: forged traffic on the unauthenticated route must not burn quota.
    */
   async #verifyInboundWebhook(
     mode: ComposioKeyMode,
@@ -1219,6 +1242,11 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
       })) {
       return true;
     }
+    if (stored === undefined && this.#triggerRows().length === 0) {
+      // Nothing of this account's was ever armed or subscribed: the signature can only be
+      // verified by spending upstream quota, so refuse instead (the 401 stands).
+      return false;
+    }
     const healed = await this.#refreshSubscriptionSecret(mode);
     return healed !== null && healed.secret !== ""
       && await verifyWebhookSignature({
@@ -1229,9 +1257,16 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
   /** Re-reads the subscription secret from the listing, storing what it finds. */
   async #refreshSubscriptionSecret(mode: ComposioKeyMode): Promise<StoredWebhookSubscription | null> {
     const stored = await this.#storedSubscription(mode);
+    const refreshKey = `webhookSecretRefresh:${mode}`;
+    if (Date.now() - (await this.ctx.storage.get<number>(refreshKey) ?? 0)
+      < WEBHOOK_SECRET_REFRESH_MIN_INTERVAL_MS) {
+      return stored ?? null;
+    }
     try {
       const api = await this.#api();
       const subscriptions = await api.listWebhookSubscriptions();
+      // The stamp goes down even on a miss, so a heal storm (forged or failing) stays throttled.
+      await this.ctx.storage.put(refreshKey, Date.now());
       const ours = subscriptions.find(sub => stored !== undefined && sub.id === stored.id)
         ?? subscriptions.find(sub => sub.webhookUrl === (stored?.url ?? ""))
         ?? subscriptions[0];

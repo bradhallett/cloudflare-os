@@ -170,10 +170,16 @@ abstract class ComposioFacetCore<Props> extends DurableObject<Cloudflare.Env, Pr
    */
   @skipRpcValidation()
   createTriggerController(
-    props: Omit<ComposioTriggerControllerProps, "accountObjectId">,
+    props: Omit<ComposioTriggerControllerProps, "accountObjectId" | "workspaceId">,
   ): Fetcher<ComposioTriggerControllerService> {
     return this.ctx.exports.ComposioTriggerHookController({
-      props: { ...props, accountObjectId: this.accountObjectId },
+      props: {
+        ...props,
+        accountObjectId: this.accountObjectId,
+        // The facet's inherited DO id names the workspace scope the session lives in; the
+        // controller carries it so disable is fenced exactly like the scheduler's.
+        workspaceId: this.ctx.id.toString(),
+      },
     });
   }
 
@@ -658,6 +664,7 @@ export class ComposioSingletonGatekeeper
       scopeToolkits: undefined,
       account: this.account(),
       facet: this,
+      workspaceId: this.ctx.id.toString(),
       arming: undefined,
     };
     return new ComposioSessionImpl(host, queue.dup() as RpcStub<ApprovalQueue>);
@@ -708,6 +715,7 @@ export class ComposioToolkitGatekeeper
       scopeToolkits: [this.ctx.props.toolkitSlug],
       account: this.account(),
       facet: this,
+      workspaceId: this.ctx.id.toString(),
       arming: {
         toolkitSlug: this.ctx.props.toolkitSlug,
         autoApply: this.ctx.props.autoApply,

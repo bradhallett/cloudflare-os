@@ -211,6 +211,7 @@ class FakeTriggerUpstream {
   readonly subscriptionPatches: { id: string; url?: string; events?: string[] }[] = [];
   readonly rotations: string[] = [];
   readonly subscriptionDeletes: string[] = [];
+  subscriptionListings = 0;
   failUpserts = 0;
   failListing = false;
   #nextId = 1;
@@ -239,6 +240,7 @@ class FakeTriggerUpstream {
       return Response.json(this.#row(created, true));
     }
     if (method === "GET" && path === "/webhook_subscriptions") {
+      this.subscriptionListings++;
       return Response.json({
         items: [...this.subscriptions.values()].map(sub => this.#row(sub, true)),
         nextCursor: null,
@@ -367,6 +369,8 @@ export type Attempt<T> = { ok: true; value: T } | { ok: false; name: string; mes
 type HeldFacet = {
   stub: Fetcher<ComposioSingletonGatekeeper> | Fetcher<ComposioToolkitGatekeeper>;
   facetId: string;
+  /** This TestHooks DO's id — the workspace scope every facet it mints inherits. */
+  scopeId: string;
 };
 
 type AnySession = ComposioSessionImpl | ComposioToolkitSessionImpl;
@@ -498,6 +502,7 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
     subscriptionPatches: { id: string; url?: string; events?: string[] }[];
     rotations: string[];
     subscriptionDeletes: string[];
+    subscriptionListings: number;
     instances: { id: string; triggerName: string; userId: string; disabled: boolean }[];
     subscriptions: { id: string; url: string }[];
   } {
@@ -511,6 +516,7 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
       subscriptionPatches: t.subscriptionPatches.map(call => ({ ...call })),
       rotations: [...t.rotations],
       subscriptionDeletes: [...t.subscriptionDeletes],
+      subscriptionListings: t.subscriptionListings,
       instances: [...t.instances.values()].map(row => ({
         id: row.id, triggerName: row.trigger_name, userId: row.user_id,
         disabled: row.disabled_at !== null,
@@ -622,7 +628,7 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
 
   /** The trigger initiator's recordings, as plain JSON (the full firing type does not cross RPC). */
   async readInitiator(): Promise<{
-    firings: { triggerId: string; eventId: string; triggerSlug: string }[];
+    firings: { triggerId: string; eventId: string; triggerSlug: string; dataJson: string }[];
     observations: { title: string; description: string }[];
     startHookCalls: number;
     initiatorDisposed: number;
@@ -632,6 +638,7 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
     return {
       firings: read.firings.map(firing => ({
         triggerId: firing.triggerId, eventId: firing.eventId, triggerSlug: firing.triggerSlug,
+        dataJson: JSON.stringify(firing.data ?? null),
       })),
       observations: read.observations,
       startHookCalls: read.startHookCalls,
@@ -771,6 +778,7 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
       stub,
       // The runtime hands back a DurableObjectStub; its id names the DO for storage access.
       facetId: (stub as unknown as DurableObjectStub<ComposioToolkitGatekeeper>).id.toString(),
+      scopeId: this.ctx.id.toString(),
     });
     this.#queues.set(facetName, queue);
     this.#sessions.set(facetName, session);
@@ -873,6 +881,13 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
     const facet = this.#facets.get(facetName);
     if (facet === undefined) throw new Error(`no facet named "${facetName}" in the test hooks`);
     return facet.facetId;
+  }
+
+  /** The workspace scope every facet minted by this TestHooks DO inherits (its own id). */
+  facetScopeId(facetName: string): string {
+    const facet = this.#facets.get(facetName);
+    if (facet === undefined) throw new Error(`no facet named "${facetName}" in the test hooks`);
+    return facet.scopeId;
   }
 
   // -- Driving a session ------------------------------------------------------

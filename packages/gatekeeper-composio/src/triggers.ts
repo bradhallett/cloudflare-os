@@ -59,6 +59,8 @@ export interface ComposioTriggerControllerService extends WorkerEntrypoint {
 export interface ComposioTriggerControllerProps {
   /** The account DO's id, as a hex string — the controller's only way back to its state. */
   accountObjectId: string;
+  /** The minting facet's inherited workspace scope; fences disable as the scheduler's does. */
+  workspaceId: string;
   /** The local trigger id the session generated and will return to the agent. */
   triggerId: string;
   /** The upstream Composio trigger slug. */
@@ -111,7 +113,8 @@ export class ComposioTriggerHookController
 
   /** Disarms the trigger: upstream instance deleted, initiator disposed, rows dropped. */
   disable(): Promise<void> {
-    return this.#account().disableTrigger(this.ctx.props.triggerId);
+    return this.#account().disableTrigger(
+      this.ctx.props.triggerId, this.ctx.props.workspaceId);
   }
 
   #account(): ComposioAccount {

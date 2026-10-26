@@ -87,7 +87,7 @@ export interface FacetHost {
   syncPending(): Promise<void>;
   /** Mints one trigger hook controller bound to this facet's account (triggers.ts). */
   createTriggerController(
-    props: Omit<ComposioTriggerControllerProps, "accountObjectId">,
+    props: Omit<ComposioTriggerControllerProps, "accountObjectId" | "workspaceId">,
   ): Fetcher<ComposioTriggerControllerService>;
 }
 
@@ -105,6 +105,8 @@ export interface ComposioSessionHost {
   readonly account: ComposioAccount;
   /** The facet that owns this session's queued actions and continuations. */
   readonly facet: FacetHost;
+  /** The facet's inherited workspace scope, fencing cross-workspace trigger deletes. */
+  readonly workspaceId: string;
   /** The toolkit binding's mint-frozen auto-apply arming; undefined on the singleton. */
   readonly arming: ToolkitArming | undefined;
 }
@@ -579,7 +581,7 @@ export class ComposioSessionImpl extends ComposioSessionBase implements Composio
           `upstream instance.`,
       ).finish().description,
     });
-    await this.host.account.disableTrigger(triggerId);
+    await this.host.account.disableTrigger(triggerId, this.host.workspaceId);
   }
 }
 
