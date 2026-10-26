@@ -2139,8 +2139,10 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     return realId;
   }
 
-  // Claim-before-dispatch, retry on a plain provider error, and the terminal unknown outcome all
-  // belong to the engine; see `SPOTIFY_ACTIONS` for the per-kind behavior.
+  /**
+   * Claim-before-dispatch, retry on a plain provider error, and the terminal unknown outcome all
+   * belong to the engine; see `SPOTIFY_ACTIONS` for the per-kind behavior.
+   */
   async applyAction(actionId: number): Promise<void> {
     await this.#actions.apply(actionId);
   }
