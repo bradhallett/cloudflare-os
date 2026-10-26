@@ -2,9 +2,11 @@
 // place the OSS core emits meterable model usage — no vendor code lives here. When the binding
 // is absent — every self-hosted/OSS deployment — emission is a synchronous no-op with no RPC,
 // so behavior is byte-identical to pre-port code. When a port is bound, emission is
-// fire-and-forget: the promise is never awaited on the model-call path, and a failing port is
-// logged and dropped (usage metering must never block or break a chat or binding call; the
-// bound service's own queue retries its vendor writes).
+// fire-and-forget: the promise is never awaited on the model-call path — it is registered on
+// the caller's `ctx` via `waitUntil` (the analytics seam's pattern), so an event fired late in
+// a turn cannot be dropped by runtime teardown — and a failing port is logged and dropped
+// (usage metering must never block or break a chat or binding call; the bound service's own
+// queue retries its vendor writes).
 
 import { createLogger } from "@gadgets/observability/logger";
 import type { Usage } from "@earendil-works/pi-ai";
@@ -45,16 +47,21 @@ export function usageTokens(usage: Usage): UsageEventTokens {
 
 /**
  * Emits one usage event to the bound `SAAS_USAGE_EVENTS` port, fire-and-forget: returns
- * immediately, never throws, and does nothing at all when no port is bound. The only
- * bookkeeping is the failure log — the service owns every retry beyond this seam.
+ * immediately, never throws, and does nothing at all when no port is bound. The emission is
+ * registered on `ctx` via `waitUntil`, so the emitting invocation stays open until the port
+ * settles — the analytics seam's pattern. The only bookkeeping is the failure log inside that
+ * chain — the service owns every retry beyond this seam.
  */
-export function emitUsageEvent(env: Cloudflare.Env, event: Omit<UsageEvent, "id">): void {
+export function emitUsageEvent(
+    ctx: ExecutionContext | DurableObjectState,
+    env: Cloudflare.Env,
+    event: Omit<UsageEvent, "id">): void {
   const port = env.SAAS_USAGE_EVENTS;
   if (!port) return;
   const full: UsageEvent = {...event, id: usageEventId(event.aiGatewayLogId)};
-  void port.recordUsage(full).catch(err => {
+  ctx.waitUntil(port.recordUsage(full).catch(err => {
     logger.warn("usage-event emission failed", {
       event: "usage_events.emit_failed", surface: full.surface, error: err,
     });
-  });
+  }));
 }

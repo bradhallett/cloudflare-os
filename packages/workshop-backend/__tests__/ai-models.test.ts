@@ -1591,7 +1591,9 @@ describe("model binding usage gate", () => {
       env: env({ ...LIMITS_ENV, ...envOverrides, BLUEPRINTS: {
         get: async () => serializeAdminConfig(DEFAULT_ADMIN_CONFIG),
       } as unknown as KVNamespace }),
-      ctx: { props, exports: { UserDurableObject: users } },
+      // waitUntil: the usage-emission seam registers its fire-and-forget promise here, as a
+      // real DurableObjectState would receive it; a no-op keeps the promise running on its own.
+      ctx: { props, exports: { UserDurableObject: users }, waitUntil: () => {} },
     };
   }
 

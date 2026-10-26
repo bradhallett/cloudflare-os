@@ -610,7 +610,7 @@ export abstract class OverseerPublishing extends OverseerFacets {
       // null form, and guessing an id would bill the wrong price row. The spend stays in the
       // chat's cost record (addRequestCost below); only the port goes unmetered.
       if (model !== undefined) {
-        emitUsageEvent(this.env, {
+        emitUsageEvent(this.ctx, this.env, {
           modelId: model,
           tokens: usageTokens(usage),
           userId: this.ownerId,

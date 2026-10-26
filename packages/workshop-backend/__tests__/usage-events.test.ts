@@ -1,8 +1,10 @@
 // The SAAS_USAGE_EVENTS port is the seam a hosted deployment meters model usage through (see
 // src/usage-events.ts and @gadgets/workshop-shared/usage-events). These tests pin its
 // contract: emission is a synchronous no-op when no port is bound (every OSS deployment —
-// byte-identical behavior, no RPC), fire-and-forget when one is (a failing port is logged and
-// dropped, never thrown into the model-call path), the dedupe id is derived from the gateway
+// byte-identical behavior, no RPC, no ctx registration), fire-and-forget when one is (the
+// emission is registered on the caller's ctx via waitUntil, analytics parity, so runtime
+// teardown cannot drop a late-in-turn event; a failing port is logged and dropped inside that
+// chain, never thrown into the model-call path), the dedupe id is derived from the gateway
 // log id when one exists, and the chat emission seam (OverseerPublishing.addChatMessages, the
 // accounting barrier every agent step crosses) delivers the exact payload the billing side
 // meters.
@@ -60,27 +62,44 @@ describe("usageEventId", () => {
 });
 
 describe("emitUsageEvent", () => {
-  it("is a synchronous no-op with no port bound: no RPC, no throw", () => {
+  // A stand-in for the ExecutionContext/DurableObjectState every seam passes: records what is
+  // registered on it, and — like a real ctx — keeps the promise running on its own.
+  function fakeCtx(): {ctx: DurableObjectState, waited: Promise<unknown>[]} {
+    const waited: Promise<unknown>[] = [];
+    const ctx = {
+      waitUntil: (promise: Promise<unknown>) => { waited.push(promise); },
+    } as unknown as DurableObjectState;
+    return {ctx, waited};
+  }
+
+  it("is a synchronous no-op with no port bound: no RPC, no ctx registration, no throw", () => {
     // `{}` is every OSS deployment's env: the binding is simply absent (undefined), so there
-    // is no port to call and nothing can throw — reading the missing binding is the only work.
+    // is no port to call and nothing can throw — reading the missing binding is the only work,
+    // and the ctx is never touched.
+    const {ctx, waited} = fakeCtx();
     expect(() =>
-        emitUsageEvent({} as Cloudflare.Env, {modelId: "m", tokens: usageTokens(usage()),
+        emitUsageEvent(ctx, {} as Cloudflare.Env, {modelId: "m", tokens: usageTokens(usage()),
             userId: "u", surface: "chat"})).not.toThrow();
+    expect(waited).toEqual([]);
   });
 
-  it("fires the port fire-and-forget: a failing port never throws into the caller", async () => {
+  it("registers the emission on ctx and survives a failing port: waitUntil is handed a promise that resolves, never a rejection", async () => {
     const calls: UsageEvent[] = [];
     const failing = {
       recordUsage: async (event: UsageEvent) => { calls.push(event); throw new Error("port down"); },
     };
+    const {ctx, waited} = fakeCtx();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     expect(() =>
-        emitUsageEvent({SAAS_USAGE_EVENTS: failing} as unknown as Cloudflare.Env,
+        emitUsageEvent(ctx, {SAAS_USAGE_EVENTS: failing} as unknown as Cloudflare.Env,
             {modelId: "m", tokens: usageTokens(usage()), userId: "u", surface: "binding"}))
         .not.toThrow();
-    // The rejection and the catch that handles it are both microtasks; drain the queue
-    // deterministically rather than sleeping (no wall-clock timer is involved).
-    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(waited).toHaveLength(1);
+    // The log-and-survive catch lives inside the waitUntil chain, so the promise the runtime
+    // holds open settles rather than rejecting — and the failure is logged, never thrown into
+    // the model-call path. Settling it also drains the rejection's microtasks deterministically
+    // (no wall-clock timer is involved).
+    await expect(waited[0]).resolves.toBeUndefined();
     expect(calls).toHaveLength(1);
     expect(warn).toHaveBeenCalledTimes(1);
     warn.mockRestore();
@@ -88,7 +107,7 @@ describe("emitUsageEvent", () => {
 
   it("derives the dedupe id from the gateway log id when the event carries one", async () => {
     await env.SAAS_USAGE_EVENTS.reset();
-    emitUsageEvent(env, {
+    emitUsageEvent(fakeCtx().ctx, env, {
       modelId: "m", tokens: usageTokens(usage()), userId: "u", aiGatewayLogId: "log-9",
       surface: "chat",
     });
@@ -103,7 +122,8 @@ describe("emitUsageEvent", () => {
 // The chat seam: addChatMessages is the accounting barrier every agent step crosses, with the
 // usage, the model of the step's snapshot, the chat, the owner, and the gateway log id in
 // scope. The event must fire exactly once per step with that payload — fire-and-forget, so the
-// barrier itself stays synchronous.
+// barrier itself stays synchronous; the emission rides the real Durable Object's waitUntil, so
+// it survives past the barrier's return.
 describe("addChatMessages emission", () => {
   beforeEach(() => env.SAAS_USAGE_EVENTS.reset());
 

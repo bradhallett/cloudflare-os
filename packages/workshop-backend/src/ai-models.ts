@@ -1197,7 +1197,7 @@ export class LanguageModelGatekeeper
     // hook fires only on completions (never errors), fire-and-forget at the port (OSS unbound:
     // no-op). pi reports usage per request; completeText would otherwise discard it.
     let onUsage = this.ctx.props.ownerUserId === undefined ? undefined
-        : (usage: Usage) => emitUsageEvent(this.env, {
+        : (usage: Usage) => emitUsageEvent(this.ctx, this.env, {
               modelId: model.model.id,
               tokens: usageTokens(usage),
               userId: this.ctx.props.ownerUserId!,
@@ -1281,7 +1281,7 @@ export class DecisionModelGatekeeper
     // result. Fire-and-forget at the port (OSS unbound: no-op); config.model is the catalog id
     // the classifier catalog is keyed by, so it is the id a price table resolves.
     let onUsage = this.ctx.props.ownerUserId === undefined ? undefined
-        : (usage: Usage) => emitUsageEvent(this.env, {
+        : (usage: Usage) => emitUsageEvent(this.ctx, this.env, {
               modelId: config.model,
               tokens: usageTokens(usage),
               userId: this.ctx.props.ownerUserId!,
