@@ -4,17 +4,18 @@ import { DownloadSimple, GitBranch, List } from '@phosphor-icons/react'
 import type {
   FileAtCommit, Overseer, WorkpieceId, WorkpieceSummary,
 } from '@gadgets/workshop-shared/api'
-import type { CodeChange, FileChange, TextChange } from '@gadgets/workshop-shared/code-change'
+import type { CodeChange, FileChange } from '@gadgets/workshop-shared/code-change'
 import { RpcStub } from 'capnweb'
 import FileBrowser, { isOpenableKind, type ExpandedDirs, type FileBrowserHandle } from './FileBrowser'
 import { WorkshopButton, WorkshopIconButton } from '../../components/WorkshopControls'
 import CodeEditor, { type EditSession } from './CodeEditor'
 import CodeDiffEditor from './CodeDiffEditor'
 import type {
-  ChatCodeChanges, ChatLiveChangeRows, ChatLiveEditPreviews, EditPreviewEvent,
+  ChatCodeChanges, ChatLiveChangeRows, ChatLiveEditPreviews,
 } from '../chat/liveCodeStreams'
-import { fileKey, RemoteFileListeners } from './remoteFileListeners'
+import { RemoteFileListeners } from './remoteFileListeners'
 import { ChatOtClient, type ChatContentReader, type RemoteFileEvent } from './otClient'
+import { PreviewAttachment } from './previewAttachment'
 import { commitFileStore, type CommitFileReader } from './commitFileStore'
 import { useChangedPaths, useCommitTree, useFilesAtCommit } from './useCommitContent'
 import {
@@ -106,6 +107,8 @@ interface WorkpieceCodeInterfaceProps {
 const NO_PENDING_GADGETS: ReadonlySet<WorkpieceId> = new Set()
 const NO_PATHS: readonly string[] = []
 const NO_REMOVED: ReadonlySet<string> = new Set()
+// Never mutated; the branchless (repo-browser) mode has no previews to override with.
+const NO_PREVIEW_OVERRIDES: ReadonlyMap<string, string> = new Map()
 const NO_CHANGES: readonly ChangedFile[] = []
 
 // The workpiece's accepted commit -- the content and review base while it is unpinned in the
@@ -124,91 +127,6 @@ function areArraysEqual(left: readonly string[], right: readonly string[]) {
   return true
 }
 
-// ---- streaming edit previews (see ChatLiveEditPreviews) ---------------------------------------
-//
-// The agent's writeFile/editFile calls, overlaid on the displayed content as their text streams
-// in. Display-only: none of it ever enters the OT client. Because tool calls execute only after
-// the whole model response has streamed, previews outlive their streaming: each finished
-// preview's final text stays displayed as a *pending* entry until the call's durable change row
-// arrives (rows land in call order; see the interception in the client's onRemoteChange) or an
-// editPreviewClear withdraws it. Same-file previews stack: a later call's span is located in the
-// text of the finished preview beneath it, mirroring how the agent computes each edit against
-// content that includes its earlier edits. A preview targets a file whose text may not be
-// loaded yet (content is read lazily): attachment then waits for the read, deltas accumulating
-// meanwhile, and a preview that finishes streaming before the read lands is *deferred* and
-// joins its file's pending chain once it does -- never dropped.
-
-// The call whose content is currently streaming, attached to the display or not (attachment
-// waits for the target's content to load; `text` is cumulative, so attaching can happen late).
-// Also the shape of a deferred preview (see deferredPreviewsRef).
-type StreamingPreview = {
-  toolCallId: string
-  gadgetId: WorkpieceId
-  path: string
-  // editFile's replaced text; absent for writeFile (the streamed text replaces the whole file).
-  textToReplace?: string
-  // The streamed text received so far.
-  text: string
-}
-
-// Where a preview's streamed text goes in `fileText`: the whole file for writeFile, editFile's
-// uniquely matched span otherwise. Null when there is no unique match -- the tool call itself
-// will fail the same test (or our copy has diverged, and anchoring the preview would show it in
-// the wrong place), so no preview is shown.
-function locatePreviewSpan(
-  preview: StreamingPreview, fileText: string | undefined,
-): { from: number; to: number } | null {
-  if (preview.textToReplace === undefined) return { from: 0, to: fileText?.length ?? 0 }
-  const matchPos = fileText !== undefined ? fileText.indexOf(preview.textToReplace) : -1
-  if (matchPos < 0 || fileText!.indexOf(preview.textToReplace, matchPos + 1) >= 0) return null
-  return { from: matchPos, to: matchPos + preview.textToReplace.length }
-}
-
-// The streaming preview's rendering: the streamed `text` replaces [from, to) of `base` -- the
-// file's displayed text when the preview attached ('' for a file being created); the whole file
-// for writeFile, editFile's matched span otherwise. `text` mirrors the StreamingPreview's (all
-// of it is dispatched into open editors as it arrives).
-type PreviewOverlay = {
-  toolCallId: string
-  gadgetId: WorkpieceId
-  path: string
-  base: string
-  from: number
-  to: number
-  text: string
-}
-
-// A finished preview awaiting its durable row: the full file text that row should produce.
-type PendingPreview = {
-  toolCallId: string
-  text: string
-}
-
-// Preview maps are keyed like the remote-delta listener map (see remoteFileListeners.ts, whose
-// fileKey is the one definition of the scheme).
-
-function splitFileKey(key: string): [WorkpieceId, string] {
-  const sep = key.indexOf('\u0000')
-  return [Number(key.slice(0, sep)), key.slice(sep + 1)]
-}
-
-// The previewed file's full display text: the base with the streamed text in place of the span.
-function previewedText(overlay: PreviewOverlay): string {
-  return overlay.base.slice(0, overlay.from) + overlay.text + overlay.base.slice(overlay.to)
-}
-
-// Build the compact-JSON text change replacing [from, to) of a document of length `docLen` with
-// `insert`. Only ever consumed by the editors' remote-change converters (see CodeEditor's
-// specFromTextChange) -- these synthetic changes never reach the OT client or the server.
-function replaceSpanTextChange(
-  docLen: number, from: number, to: number, insert: string,
-): TextChange {
-  const change: TextChange = []
-  if (from > 0) change.push(from)
-  change.push(insert === '' ? [to - from] : [to - from, ...insert.split('\n')])
-  if (docLen > to) change.push(docLen - to)
-  return change
-}
 
 export default function WorkpieceCodeInterface({
   overseer, summary, height = '100%', selectedChatId = null, chatChanges,
@@ -288,22 +206,42 @@ export default function WorkpieceCodeInterface({
     setResetToken(token => token + 1)
   }, [])
 
-  // Streaming edit-preview state (see the module comment above PreviewOverlay): the call whose
-  // content is streaming, its display overlay once attached, finished previews awaiting their
-  // durable rows (per file, in call order), finished previews that could not attach because
-  // their file's base text was still loading (in call order; they join the pending chains once
-  // it lands -- see attachDeferred), and the call whose preview could not attach (no unique
-  // textToReplace match) and stays skipped. `retryPreviewAttachRef` is the attach function,
-  // installed by the subscription effect (it closes over the OT client) so readiness changes
-  // and the row interception can retry/re-anchor attachment. `previewBaseReadsRef` dedupes the
-  // base reads attachment kicks off, keyed like the previews.
-  const streamingPreviewRef = useRef<StreamingPreview | null>(null)
-  const activeOverlayRef = useRef<PreviewOverlay | null>(null)
-  const pendingPreviewsRef = useRef(new Map<string, PendingPreview[]>())
-  const deferredPreviewsRef = useRef<StreamingPreview[]>([])
-  const skippedPreviewRef = useRef<string | null>(null)
-  const retryPreviewAttachRef = useRef<(() => void) | null>(null)
-  const previewBaseReadsRef = useRef(new Set<string>())
+  // The streaming edit-preview machine (see previewAttachment.ts), owning the call whose
+  // content is streaming, its display overlay, finished previews awaiting their durable rows,
+  // deferred and skipped ones, and the base reads attachment waits on. One instance spans
+  // chats and clients: its host reads content through the refs above and dispatches display
+  // changes into the same per-file listener channel as OT remote changes.
+  const previewAttachment = useState(() => new PreviewAttachment({
+    clientReady: () => clientRef.current?.isReady() ?? false,
+    clientFileText: (gadgetId, path) => {
+      const files = clientRef.current?.getFiles(gadgetId)
+      const held = files?.get(path)
+      if (held !== undefined) return held
+      return files !== undefined && clientRef.current !== null &&
+        clientRef.current.getRemovedPaths(gadgetId).has(path) ? null : undefined
+    },
+    baseFileText: (gadgetId, path) => {
+      // Only the selected gadget's base is known; another gadget's preview attaches once
+      // selected. A pending gadget has nothing but the overlay.
+      if (gadgetId !== workpieceIdRef.current) return undefined
+      const base = contentBaseRef.current
+      if (base === undefined) return null
+      const known = commitFileStore.peekFile(base, path)
+      if (known === undefined) return undefined
+      return known.kind === 'text' ? known.text : null
+    },
+    requestBaseText: (gadgetId, path, onSettled) => {
+      if (gadgetId !== workpieceIdRef.current || contentBaseRef.current === undefined) {
+        onSettled(false)  // not this gadget's base / a pending gadget: retry on the next
+        return             // readiness/selection change instead (see the retry effect)
+      }
+      commitFileStore.readFiles(readerRef.current, contentBaseRef.current, [path])
+        .then(() => onSettled(true), () => onSettled(false))
+    },
+    dispatchFileChange: (gadgetId: WorkpieceId, path: string, change: FileChange) =>
+      dispatchFileChange(gadgetId, path, change),
+    onContentChanged: () => bumpContentVersion(),
+  }))[0]
 
   const dispatchFileChange = useCallback(
     (gadgetId: WorkpieceId, path: string, change: FileChange) => {
@@ -348,81 +286,12 @@ export default function WorkpieceCodeInterface({
         if (events.length === 0) {
           // Coarse change (rebuild / epoch reset): open editors reload from the client. Any
           // preview state was part of what's being discarded.
-          streamingPreviewRef.current = null
-          activeOverlayRef.current = null
-          pendingPreviewsRef.current.clear()
-          deferredPreviewsRef.current.length = 0
+          previewAttachment.handleCoarseReset()
           reloadEditors()
         } else {
+          // Finished previews resolve against their durable rows here (see handleRow).
           for (const event of events) {
-            const key = fileKey(event.gadgetId, event.path)
-            const chain = pendingPreviewsRef.current.get(key)
-            if (chain !== undefined && chain.length > 0) {
-              // The oldest finished preview of this file resolves: rows arrive in call order,
-              // so this row should be that call's completion, making the client's new content
-              // exactly the preview's final text. The doc -- showing that text, or a later
-              // preview stacked on it -- is then already consistent, so forward nothing.
-              const confirmed = chain.shift()!
-              if (chain.length === 0) pendingPreviewsRef.current.delete(key)
-              const clientText = client.getFiles(event.gadgetId)?.get(event.path)
-              if (clientText === confirmed.text) continue
-              // Divergence (a call this preview stack didn't cover, or our span anchoring
-              // drifted): drop the file's whole stack, reset its editors from the client, and
-              // re-anchor the streaming preview on the fresh content.
-              pendingPreviewsRef.current.delete(key)
-              const overlay = activeOverlayRef.current
-              if (overlay !== null && overlay.gadgetId === event.gadgetId &&
-                  overlay.path === event.path) {
-                activeOverlayRef.current = null
-              }
-              dispatchFileChange(event.gadgetId, event.path,
-                typeof clientText === 'string' ? { set: clientText } : { remove: true })
-              retryPreviewAttachRef.current?.()
-              continue
-            }
-            // A finished preview still waiting for its base text is resolved by its row the
-            // same way -- except that nothing was ever displayed for it, so the row applies as
-            // an ordinary change. Left in place, it would attach later against the post-row
-            // text and show the edit twice (or fail to match and be skipped).
-            const deferred = deferredPreviewsRef.current
-            const deferredIndex = deferred.findIndex(preview =>
-              preview.gadgetId === event.gadgetId && preview.path === event.path)
-            if (deferredIndex >= 0) {
-              deferred.splice(deferredIndex, 1)
-              dispatchFileChange(event.gadgetId, event.path, event.change)
-              continue
-            }
-            const overlay = activeOverlayRef.current
-            const streaming = streamingPreviewRef.current
-            if (overlay === null && streaming !== null && streaming.gadgetId === event.gadgetId &&
-                streaming.path === event.path) {
-              // The streaming call completed before its preview could attach (its base text
-              // was still loading): its row is the whole of its effect.
-              streamingPreviewRef.current = null
-              dispatchFileChange(event.gadgetId, event.path, event.change)
-              continue
-            }
-            if (overlay !== null && overlay.gadgetId === event.gadgetId &&
-                overlay.path === event.path) {
-              activeOverlayRef.current = null
-              const text = client.getFiles(event.gadgetId)?.get(event.path)
-              if (text === previewedText(overlay)) {
-                // The streaming call's own completion (the ordinary end for the response's last
-                // edit, whose preview no later start finalizes): the doc already shows exactly
-                // this content, so the preview simply resolves.
-                streamingPreviewRef.current = null
-                continue
-              }
-              // Otherwise a row landed *under* the still-streaming preview (a call of this
-              // response that streamed no preview, or another producer). Reset the doc from the
-              // client -- the incremental change's offsets are against the client's pre-row
-              // content, not the previewed document -- and re-anchor the preview on top.
-              dispatchFileChange(event.gadgetId, event.path,
-                typeof text === 'string' ? { set: text } : { remove: true })
-              retryPreviewAttachRef.current?.()
-              continue
-            }
-            dispatchFileChange(event.gadgetId, event.path, event.change)
+            previewAttachment.handleRow(event)
           }
         }
         bumpContentVersion()
@@ -497,290 +366,26 @@ export default function WorkpieceCodeInterface({
     client?.setPendingCreations(pendingGadgetIds ?? NO_PENDING_GADGETS)
   }, [client, pendingGadgetIds])
 
-  // Feed the edit-preview event stream into the preview state (see the module comment above
-  // PreviewOverlay): attach a starting call's overlay -- locating the replaced span in this
-  // client's own copy of the file (or the finished preview stacked beneath it), which mirrors
-  // the content the agent computes its edit against -- extend it as text streams in, keep
-  // finished previews displayed as pending entries until their rows resolve them, and withdraw
-  // cleared ones. Content deltas reach open editors through the same per-file listener channel
-  // as OT remote changes; the file list and diff statuses re-derive from the overlaid text via
+  // Feed the edit-preview event stream into the preview machine (see previewAttachment.ts),
+  // which attaches each starting call's overlay, extends it as text streams in, keeps finished
+  // previews displayed as pending entries until their rows resolve them, and withdraws cleared
+  // ones. Content deltas reach open editors through the same per-file listener channel as OT
+  // remote changes; the file list and diff statuses re-derive from the overlaid text via
   // contentVersion.
   useEffect(() => {
+    // The chatId gate matters on chat switches: the previews prop lags the selection by a
+    // render, and another chat's previews must never enter this chat's display.
     if (client === null || liveEditPreviews === undefined ||
         liveEditPreviews.chatId !== selectedChatId) return
-
-    // The file's real (non-previewed) text: the chat's content when it holds the path (or shows
-    // it removed), else the path's text at the selected gadget's content base. `undefined`
-    // while still loading -- a base text not yet in the store is fetched, and attachment
-    // retried when it lands (`text` is cumulative, so attaching late loses nothing). Only the
-    // selected gadget's base is known here; another gadget's preview attaches once selected.
-    const resolveRealText = (gadgetId: WorkpieceId, path: string): { text?: string } | undefined => {
-      if (!client.isReady()) return undefined
-      const files = client.getFiles(gadgetId)
-      if (files !== undefined) {
-        const text = files.get(path)
-        if (text !== undefined) return typeof text === 'string' ? { text } : {}
-        if (client.getRemovedPaths(gadgetId).has(path)) return {}
-      }
-      if (gadgetId !== workpieceIdRef.current) return undefined
-      const base = contentBaseRef.current
-      if (base === undefined) return {}  // a pending gadget: nothing but the overlay
-      const known = commitFileStore.peekFile(base, path)
-      if (known === undefined) {
-        const readKey = fileKey(gadgetId, path)
-        if (!previewBaseReadsRef.current.has(readKey)) {
-          previewBaseReadsRef.current.add(readKey)
-          commitFileStore.readFiles(readerRef.current, base, [path]).then(
-            () => {
-              previewBaseReadsRef.current.delete(readKey)
-              retryPreviewAttachRef.current?.()
-            },
-            () => { previewBaseReadsRef.current.delete(readKey) })
-        }
-        return undefined
-      }
-      return known.kind === 'text' ? { text: known.text } : {}
-    }
-
-    // Restore one file's open editors to what the display shows without the streaming overlay:
-    // its newest pending preview, else the real content (skipped while that is still loading --
-    // rare, and the next row or reset settles it).
-    const restoreFileDoc = (gadgetId: WorkpieceId, path: string) => {
-      const chain = pendingPreviewsRef.current.get(fileKey(gadgetId, path))
-      let text: string | undefined
-      if (chain !== undefined && chain.length > 0) {
-        text = chain[chain.length - 1].text
-      } else {
-        const real = resolveRealText(gadgetId, path)
-        if (real === undefined) return
-        text = real.text
-      }
-      dispatchFileChange(gadgetId, path, text !== undefined ? { set: text } : { remove: true })
-    }
-
-    // The text a preview of `path` stacks on: the newest finished preview of the file (the
-    // agent computed its edit against content that includes that call's edit, whose row hasn't
-    // landed yet), else the real text. Undefined while the real text is still loading.
-    const previewBaseText = (gadgetId: WorkpieceId, path: string): { text?: string } | undefined => {
-      const chain = pendingPreviewsRef.current.get(fileKey(gadgetId, path))
-      if (chain !== undefined && chain.length > 0) return { text: chain[chain.length - 1].text }
-      return resolveRealText(gadgetId, path)
-    }
-
-    // Move finished previews whose base text has since arrived onto their files' pending
-    // chains, in call order, dispatching each file's resulting text to its open editors. A
-    // preview whose base is still loading blocks only the later previews of its own file (they
-    // stack on it); other files' previews proceed.
-    const attachDeferred = () => {
-      const deferred = deferredPreviewsRef.current
-      const blocked = new Set<string>()
-      for (let i = 0; i < deferred.length;) {
-        const preview = deferred[i]
-        const key = fileKey(preview.gadgetId, preview.path)
-        const base = blocked.has(key) ? undefined : previewBaseText(preview.gadgetId, preview.path)
-        if (base === undefined) {
-          blocked.add(key)
-          i++
-          continue
-        }
-        deferred.splice(i, 1)
-        const span = locatePreviewSpan(preview, base.text)
-        if (span === null) continue  // no unique match: nothing to show (see locatePreviewSpan)
-        const fileText = base.text ?? ''
-        const text = fileText.slice(0, span.from) + preview.text + fileText.slice(span.to)
-        let chain = pendingPreviewsRef.current.get(key)
-        if (chain === undefined) {
-          chain = []
-          pendingPreviewsRef.current.set(key, chain)
-        }
-        chain.push({ toolCallId: preview.toolCallId, text })
-        dispatchFileChange(preview.gadgetId, preview.path, { set: text })
-        bumpContentVersion()
-      }
-    }
-
-    // Attach the streaming preview's overlay, if its base content is available. Idempotent and
-    // late-callable (`text` is cumulative): retried on every delta, on readiness changes (the
-    // client's first snapshot, a base text arriving), and by the row interception's
-    // re-anchoring. Deferred previews go first: the streaming one may stack on them.
-    const tryAttach = () => {
-      attachDeferred()
-      const streaming = streamingPreviewRef.current
-      if (streaming === null || activeOverlayRef.current !== null) return
-      if (skippedPreviewRef.current === streaming.toolCallId) return
-      const streamingBase = previewBaseText(streaming.gadgetId, streaming.path)
-      if (streamingBase === undefined) return // still loading; retried per the note above
-      const fileText = streamingBase.text
-      const span = locatePreviewSpan(streaming, fileText)
-      if (span === null) {
-        skippedPreviewRef.current = streaming.toolCallId
-        return
-      }
-      const { from, to } = span
-      const base = fileText ?? ''
-      activeOverlayRef.current = {
-        toolCallId: streaming.toolCallId,
-        gadgetId: streaming.gadgetId,
-        path: streaming.path,
-        base, from, to,
-        text: streaming.text,
-      }
-      // Bring open editors to the previewed state in one dispatch: the span replaced by the
-      // text streamed so far. (A file being created has no open editor yet -- the overlay makes
-      // it appear in the file list, and an editor opened on it builds from getText().)
-      if (from !== to || streaming.text !== '') {
-        dispatchFileChange(streaming.gadgetId, streaming.path,
-          { edit: replaceSpanTextChange(base.length, from, to, streaming.text) })
-      }
-      bumpContentVersion()
-    }
-    retryPreviewAttachRef.current = tryAttach
-
-    // End the streaming preview's delta stream, keeping its final text displayed as a pending
-    // entry until its durable row (or a clear) resolves it -- restoring the file here would
-    // make each edit vanish until the calls execute, which happens only after the whole model
-    // response has streamed. One that never attached because its base text is still loading
-    // is deferred rather than dropped: with content read lazily, a short edit followed by the
-    // next call routinely finishes inside that read's round trip.
-    const finalizeStreaming = () => {
-      const streaming = streamingPreviewRef.current
-      streamingPreviewRef.current = null
-      const overlay = activeOverlayRef.current
-      if (overlay === null) {
-        if (streaming !== null && skippedPreviewRef.current !== streaming.toolCallId) {
-          deferredPreviewsRef.current.push(streaming)
-        }
-        return
-      }
-      activeOverlayRef.current = null
-      const key = fileKey(overlay.gadgetId, overlay.path)
-      let chain = pendingPreviewsRef.current.get(key)
-      if (chain === undefined) {
-        chain = []
-        pendingPreviewsRef.current.set(key, chain)
-      }
-      chain.push({ toolCallId: overlay.toolCallId, text: previewedText(overlay) })
-    }
-
-    const unsubscribe = liveEditPreviews.subscribe((event: EditPreviewEvent) => {
-      switch (event.kind) {
-        case 'start':
-          finalizeStreaming()
-          streamingPreviewRef.current = {
-            toolCallId: event.toolCallId,
-            gadgetId: event.workpieceId,
-            path: event.filename,
-            ...(event.textToReplace !== undefined
-              ? { textToReplace: event.textToReplace } : {}),
-            text: '',
-          }
-          tryAttach()
-          break
-
-        case 'delta': {
-          const streaming = streamingPreviewRef.current
-          if (streaming === null || streaming.toolCallId !== event.toolCallId ||
-              event.delta === '') break
-          streaming.text += event.delta
-          const overlay = activeOverlayRef.current
-          if (overlay !== null) {
-            // Attached: dispatch just the new characters at the growing insertion point.
-            const docLen = overlay.base.length - (overlay.to - overlay.from) + overlay.text.length
-            const pos = overlay.from + overlay.text.length
-            overlay.text = streaming.text
-            dispatchFileChange(overlay.gadgetId, overlay.path,
-              { edit: replaceSpanTextChange(docLen, pos, pos, event.delta) })
-            bumpContentVersion()
-          } else {
-            tryAttach()
-          }
-          break
-        }
-
-        case 'clear': {
-          // The named call will produce no row (it failed -- possibly surfacing only at
-          // execution, after later calls' previews streamed -- or was a no-op).
-          const streaming = streamingPreviewRef.current
-          if (streaming !== null && streaming.toolCallId === event.toolCallId) {
-            streamingPreviewRef.current = null
-            const overlay = activeOverlayRef.current
-            if (overlay !== null) {
-              activeOverlayRef.current = null
-              restoreFileDoc(overlay.gadgetId, overlay.path)
-              bumpContentVersion()
-            }
-            break
-          }
-          // A finished preview still waiting for its base: nothing is displayed for it.
-          const deferred = deferredPreviewsRef.current
-          const deferredIndex = deferred.findIndex(entry => entry.toolCallId === event.toolCallId)
-          if (deferredIndex >= 0) {
-            deferred.splice(deferredIndex, 1)
-            break
-          }
-          // A finished preview: remove its pending entry. Only a tail removal changes the
-          // display; a mid-chain removal leaves the later previews' stacked text visible, and
-          // the row interception's mismatch check self-heals when their rows arrive.
-          for (const [key, chain] of pendingPreviewsRef.current) {
-            const index = chain.findIndex(entry => entry.toolCallId === event.toolCallId)
-            if (index < 0) continue
-            const wasTail = index === chain.length - 1
-            chain.splice(index, 1)
-            if (chain.length === 0) pendingPreviewsRef.current.delete(key)
-            if (wasTail) {
-              const [gadgetId, path] = splitFileKey(key)
-              const overlay = activeOverlayRef.current
-              if (overlay !== null && overlay.gadgetId === gadgetId && overlay.path === path) {
-                // The streaming preview was stacked on the removed text; re-anchor it.
-                activeOverlayRef.current = null
-                restoreFileDoc(gadgetId, path)
-                tryAttach()
-              } else {
-                restoreFileDoc(gadgetId, path)
-              }
-              bumpContentVersion()
-            }
-            break
-          }
-          break
-        }
-
-        case 'reset': {
-          // Turn over / stream lost: drop everything and restore affected files' editors to
-          // the real content.
-          const affected = new Set<string>(pendingPreviewsRef.current.keys())
-          const overlay = activeOverlayRef.current
-          if (overlay !== null) affected.add(fileKey(overlay.gadgetId, overlay.path))
-          streamingPreviewRef.current = null
-          activeOverlayRef.current = null
-          pendingPreviewsRef.current.clear()
-          deferredPreviewsRef.current.length = 0
-          if (affected.size > 0) {
-            for (const key of affected) {
-              const [gadgetId, path] = splitFileKey(key)
-              const real = resolveRealText(gadgetId, path)
-              if (real === undefined) continue
-              dispatchFileChange(gadgetId, path,
-                real.text !== undefined ? { set: real.text } : { remove: true })
-            }
-            bumpContentVersion()
-          }
-          break
-        }
-      }
-    })
+    const unsubscribe = liveEditPreviews.subscribe(
+      event => previewAttachment.handlePreviewEvent(event))
     return () => {
       unsubscribe()
-      retryPreviewAttachRef.current = null
       // Chat/client switches tear down the editor sessions these overlays were dispatched
       // into; drop the state rather than restoring into documents being rebuilt anyway.
-      streamingPreviewRef.current = null
-      activeOverlayRef.current = null
-      pendingPreviewsRef.current.clear()
-      deferredPreviewsRef.current.length = 0
-      previewBaseReadsRef.current.clear()
+      previewAttachment.reset()
     }
-  }, [client, liveEditPreviews, selectedChatId, dispatchFileChange, bumpContentVersion])
+  }, [client, liveEditPreviews, selectedChatId, previewAttachment])
 
   // The client is ready once its first durable snapshot has been folded.
   const clientReady = branchMode && client !== null && chatChanges !== undefined &&
@@ -794,8 +399,8 @@ export default function WorkpieceCodeInterface({
   // selected gadget). Without this, a short edit (whose whole preview streams before the base
   // is available) would deliver no further delta to retry on and never appear.
   useEffect(() => {
-    retryPreviewAttachRef.current?.()
-  }, [clientReady, contentBase, workpieceId])
+    previewAttachment.retryAttach()
+  }, [clientReady, contentBase, workpieceId, previewAttachment])
 
   // The chat's content for the selected gadget -- its touched paths' text and its removed
   // paths -- or undefined when the gadget is not part of the chat's content (it then tracks
@@ -807,20 +412,10 @@ export default function WorkpieceCodeInterface({
 
   // The preview state's display overrides for the selected gadget: each previewed file shows
   // its preview text -- the streaming overlay's, or its newest finished (pending) preview's --
-  // and a file mid-creation appears in the list. Read from the refs per render; the preview
-  // handlers bump contentVersion whenever any of it changes.
-  const previewOverrides = new Map<string, string>()
-  if (branchMode) {
-    for (const [key, chain] of pendingPreviewsRef.current) {
-      if (chain.length === 0) continue
-      const [gadgetId, path] = splitFileKey(key)
-      if (gadgetId === workpieceId) previewOverrides.set(path, chain[chain.length - 1].text)
-    }
-    const overlay = activeOverlayRef.current
-    if (overlay !== null && overlay.gadgetId === workpieceId) {
-      previewOverrides.set(overlay.path, previewedText(overlay))
-    }
-  }
+  // and a file mid-creation appears in the list. Read per render; the preview handlers bump
+  // contentVersion whenever any of it changes.
+  const previewOverrides =
+    branchMode ? previewAttachment.previewOverridesFor(workpieceId) : NO_PREVIEW_OVERRIDES
 
   // The text the view displays for a path, without reading any base content: a preview's, the
   // chat's, or -- for a path the chat removed -- null. Undefined means the path is untouched
@@ -1130,25 +725,17 @@ export default function WorkpieceCodeInterface({
     if (!branchMode || client === null || activeFile === null) return undefined
     const gadgetId = workpieceId
     const path = activeFile
-    const listenerKey = fileKey(gadgetId, path)
     return {
       key: `${selectedChatId}:${resetToken}:${gadgetId}:${path}`,
       getText: () => {
-        // An editor (re)built while previews cover this file starts from the previewed text:
-        // the streaming overlay's (subsequent deltas continue from it), else the newest
-        // finished preview's (still displayed while awaiting its row).
-        const overlay = activeOverlayRef.current
-        if (overlay !== null && overlay.gadgetId === gadgetId && overlay.path === path) {
-          return previewedText(overlay)
-        }
-        const chain = pendingPreviewsRef.current.get(listenerKey)
-        if (chain !== undefined && chain.length > 0) {
-          return chain[chain.length - 1].text
-        }
-        // The chat's text when it holds the path; a path the chat removed is *deleted* and
-        // surfaces as empty (the diff view's original side shows the removed content), not as
-        // the base text masquerading as unchanged; anything else is untouched and reads from
-        // the content base, which the store has loaded (the editor renders only once it has).
+        // An editor (re)built while previews cover this file starts from the previewed text
+        // (see previewedFileText); the chat's text when it holds the path; a path the chat
+        // removed is *deleted* and surfaces as empty (the diff view's original side shows the
+        // removed content), not as the base text masquerading as unchanged; anything else is
+        // untouched and reads from the content base, which the store has loaded (the editor
+        // renders only once it has).
+        const preview = previewAttachment.previewedFileText(gadgetId, path)
+        if (preview !== undefined) return preview
         const files = client.getFiles(gadgetId)
         if (files !== undefined) {
           const text = files.get(path)
@@ -1194,7 +781,7 @@ export default function WorkpieceCodeInterface({
       subscribeRemote: listener => remoteListenersRef.current.subscribe(gadgetId, path, listener),
     }
   }, [branchMode, client, activeFile, workpieceId, selectedChatId, resetToken,
-      bumpContentVersion])
+      previewAttachment])
 
   // ---- file management (create / delete / rename / download) --------------------------------
 
