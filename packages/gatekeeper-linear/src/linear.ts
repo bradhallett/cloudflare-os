@@ -26,7 +26,7 @@ import {
 } from "@gadgets/gatekeeper-kit/actions";
 import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import {
-  clearConnectionSubject, commitReconnect, ConnectionSubject, pinConnectionSubject, stageReconnect,
+  commitReconnectOrThrow, ConnectionSubject, pinForConnect, stageReconnect,
 } from "@gadgets/gatekeeper-kit/credential-stage";
 import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
 import type {
@@ -669,16 +669,15 @@ export class UserAccount extends DurableObject<Env> {
       handoff = await callback.reconnectComplete(staged.stageId);
     } else {
       this.ctx.storage.kv.put<LinearOAuthGrant>("grant", grant);
-      pinConnectionSubject(this.ctx.storage.kv, subject);
       clearCredentialExpiryLatch(this.ctx.storage.kv);
-      try {
-        const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
-        handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
-      } catch (err) {
-        this.ctx.storage.kv.delete("grant");
-        clearConnectionSubject(this.ctx.storage.kv);
-        throw err;
-      }
+      // The pin lives only as long as the handoff: a connect that fails unpins again and drops
+      // the grant stored ahead of it.
+      handoff = await pinForConnect(this.ctx.storage.kv, subject,
+        () => {
+          const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
+          return callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
+        },
+        () => { this.ctx.storage.kv.delete("grant"); });
     }
 
     await this.ctx.storage.deleteAlarm();
@@ -688,8 +687,7 @@ export class UserAccount extends DurableObject<Env> {
   /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. The kit
    * re-pins the staged subject, adopting a connection made before the pin existed. */
   async commitReconnect(stageId: string): Promise<void> {
-    const grant = commitReconnect<LinearOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
-    if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+    const grant = commitReconnectOrThrow<LinearOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
     this.ctx.storage.kv.put<LinearOAuthGrant>("grant", grant);
     clearCredentialExpiryLatch(this.ctx.storage.kv);
   }

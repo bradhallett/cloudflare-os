@@ -21,8 +21,8 @@ import { buildDescription, codeSpan } from "@gadgets/gatekeeper-kit/action-descr
 import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import { ActionOutcomeUnknownError, APPLY_OUTCOME_UNKNOWN_MESSAGE } from "@gadgets/gatekeeper-kit/actions";
 import {
-  clearConnectionSubject, commitReconnect, ConnectionSubject, pinConnectionSubject,
-  pinnedConnectionSubject, stageReconnect,
+  commitReconnectOrThrow, ConnectionSubject,
+  pinnedConnectionSubject, pinForConnect, stageReconnect,
 } from "@gadgets/gatekeeper-kit/credential-stage";
 import {
   ZoomInfoApi,
@@ -537,16 +537,18 @@ export class UserAccount extends DurableObject<Env> {
       handoff = await callback.reconnectComplete(staged.stageId);
     } else {
       this.#writeGrant(storedGrant);
-      if (subject !== undefined) pinConnectionSubject(this.ctx.storage.kv, subject);
-      try {
-        const props: ZoomInfoGatekeeperImplProps = { userObjectId: this.ctx.id.toString() };
-        handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
-      } catch (err) {
-        this.ctx.storage.kv.delete("refreshToken");
-        this.ctx.storage.kv.delete("accessToken");
-        clearConnectionSubject(this.ctx.storage.kv);
-        throw err;
-      }
+      // The pin lives only as long as the handoff: a connect that fails unpins again and drops
+      // the credentials stored ahead of it. A keyless grant carries no subject, so it pins
+      // nothing (see `pinForConnect`).
+      handoff = await pinForConnect(this.ctx.storage.kv, subject,
+        () => {
+          const props: ZoomInfoGatekeeperImplProps = { userObjectId: this.ctx.id.toString() };
+          return callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
+        },
+        () => {
+          this.ctx.storage.kv.delete("refreshToken");
+          this.ctx.storage.kv.delete("accessToken");
+        });
     }
 
     await this.ctx.storage.deleteAlarm();
@@ -557,8 +559,7 @@ export class UserAccount extends DurableObject<Env> {
    * re-pins the staged subject when the grant carried one, adopting a connection made before any
    * pin and never moving an established one. */
   async commitReconnect(stageId: string): Promise<void> {
-    const grant = commitReconnect<StoredGrant>(this.ctx.storage.kv, Date.now(), stageId);
-    if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+    const grant = commitReconnectOrThrow<StoredGrant>(this.ctx.storage.kv, Date.now(), stageId);
     this.#writeGrant(grant);
   }
 

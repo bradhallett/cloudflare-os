@@ -19,7 +19,7 @@ import {
 import { buildDescription, codeSpan } from "@gadgets/gatekeeper-kit/action-description";
 import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import {
-  clearConnectionSubject, commitReconnect, ConnectionSubject, pinConnectionSubject, stageReconnect,
+  commitReconnectOrThrow, ConnectionSubject, pinForConnect, stageReconnect,
 } from "@gadgets/gatekeeper-kit/credential-stage";
 import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
 import {
@@ -533,18 +533,19 @@ export class UserAccount extends DurableObject<Env> {
       handoff = await callback.reconnectComplete(staged.stageId);
     } else {
       this.#storeGrant(grant);
-      pinConnectionSubject(this.ctx.storage.kv, subject);
       clearCredentialExpiryLatch(this.ctx.storage.kv);
-      try {
-        const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
-        handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
-      } catch (error) {
-        this.ctx.storage.kv.delete("accessToken");
-        this.ctx.storage.kv.delete("refreshToken");
-        this.ctx.storage.kv.delete("accessTokenExpiresAt");
-        clearConnectionSubject(this.ctx.storage.kv);
-        throw error;
-      }
+      // The pin lives only as long as the handoff: a connect that fails unpins again and drops
+      // the credentials stored ahead of it.
+      handoff = await pinForConnect(this.ctx.storage.kv, subject,
+        () => {
+          const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
+          return callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
+        },
+        () => {
+          this.ctx.storage.kv.delete("accessToken");
+          this.ctx.storage.kv.delete("refreshToken");
+          this.ctx.storage.kv.delete("accessTokenExpiresAt");
+        });
     }
 
     await this.ctx.storage.deleteAlarm();
@@ -554,8 +555,7 @@ export class UserAccount extends DurableObject<Env> {
   /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. The kit
    * re-pins the staged subject, adopting a connection made before the pin existed. */
   async commitReconnect(stageId: string): Promise<void> {
-    const grant = commitReconnect<StoredGrant>(this.ctx.storage.kv, Date.now(), stageId);
-    if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+    const grant = commitReconnectOrThrow<StoredGrant>(this.ctx.storage.kv, Date.now(), stageId);
     this.#storeGrant(grant);
     clearCredentialExpiryLatch(this.ctx.storage.kv);
   }

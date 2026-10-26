@@ -37,7 +37,7 @@ import {
   type RejectionVerdict,
 } from "@gadgets/gatekeeper-kit/credentials";
 import { notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
-import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import { commitReconnectOrThrow, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import { createPkce } from "@gadgets/gatekeeper-kit/oauth-client";
 import { PreviewOAuth, PreviewOAuthConfigurationError } from "@gadgets/gatekeeper-kit/preview-oauth";
 import {
@@ -445,8 +445,7 @@ export class UserAccount extends DurableObject<Env> implements AccountCredential
    * committed over the newer grant: its tokens are revoked instead.
    */
   async commitReconnect(stageId: string): Promise<void> {
-    const staged = commitStagedCredentials<ReconnectStage>(this.ctx.storage.kv, Date.now(), stageId);
-    if (!staged) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+    const staged = commitReconnectOrThrow<ReconnectStage>(this.ctx.storage.kv, Date.now(), stageId);
     try {
       this.#creds.connect(staged.grant, { ifGeneration: staged.startedUnder });
     } catch (error) {

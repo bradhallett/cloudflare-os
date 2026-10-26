@@ -16,8 +16,9 @@ import { DurableObject } from "cloudflare:workers";
 import type { ConnectHandoff, GatekeeperConnectCallback, GatekeeperUser }
   from "@gadgets/workshop-shared/gatekeeper";
 import {
-  commitStagedCredentials,
+  commitReconnectOrThrow,
   discardStagedCredentials,
+  NO_RECONNECT_AWAITING_CONFIRMATION,
   stageCredentials,
 } from "@gadgets/gatekeeper-kit/credential-stage";
 import {
@@ -784,13 +785,12 @@ export abstract class McpAccountBase<E extends AccountEnv, P = unknown>
    * staged now.
    */
   async commitReconnect(stageId: string): Promise<void> {
-    const staged = commitStagedCredentials<StagedReconnect>(
+    const staged = commitReconnectOrThrow<StagedReconnect>(
       this.ctx.storage.kv, Date.now(), stageId);
-    if (!staged) throw new Error("No reconnect is awaiting confirmation. Please try again.");
     // A repoint discards the stage (see `beginConnect`); the stage's own record says which endpoint
     // it was for, so one that somehow outlives a move still cannot restore the old server.
     if (!sameEndpoint(staged.server.endpoint, this.requireServer().endpoint)) {
-      throw new Error("No reconnect is awaiting confirmation. Please try again.");
+      throw new Error(NO_RECONNECT_AWAITING_CONFIRMATION);
     }
     const kv = this.ctx.storage.kv;
     // The reconnect observed a server that takes no OAuth credential, so the live grant is retired

@@ -33,10 +33,9 @@ import {
   clearCredentialExpiryLatch, notifyCredentialsExpiredOnce,
 } from "@gadgets/gatekeeper-kit/credential-expiry";
 import {
-  clearConnectionSubject,
-  commitReconnect,
+  commitReconnectOrThrow,
   type ConnectionSubject,
-  pinConnectionSubject,
+  pinForConnect,
   stageReconnect,
 } from "@gadgets/gatekeeper-kit/credential-stage";
 import { CredentialCoordinator, type RejectionVerdict } from "@gadgets/gatekeeper-kit/credentials";
@@ -1535,15 +1534,14 @@ export class UserAccount extends DurableObject<Env> {
       handoff = await callback.reconnectComplete(staged.stageId);
     } else {
       this.#creds.connect(grant);
-      pinConnectionSubject(this.ctx.storage.kv, viewer);
-      try {
-        const props = { userObjectId: this.ctx.id.toString() };
-        handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
-      } catch (error) {
-        this.#creds.clear();
-        clearConnectionSubject(this.ctx.storage.kv);
-        throw error;
-      }
+      // The pin lives only as long as the handoff: a connect that fails unpins again and drops
+      // the credentials stored ahead of it.
+      handoff = await pinForConnect(this.ctx.storage.kv, viewer,
+        () => {
+          const props = { userObjectId: this.ctx.id.toString() };
+          return callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
+        },
+        () => { this.#creds.clear(); });
       // Auth-only sign-in grants are transient: the caller read the email via complete(), so
       // schedule a prompt self-destruct. Only the local copy is dropped, with no provider revoke
       // call: the token grants nothing worth revoking, and this is the sign-in path.
@@ -1564,8 +1562,7 @@ export class UserAccount extends DurableObject<Env> {
    * rename is followed.
    */
   async commitReconnect(stageId: string): Promise<void> {
-    const grant = commitReconnect<GitHubOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
-    if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+    const grant = commitReconnectOrThrow<GitHubOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
     this.#creds.connect(grant);
     // The same user, perhaps renamed, whose own comments and reviews are then the ones its hooks
     // skip (a reconnect as anyone else is refused above). Should this be lost, the driver's hourly
