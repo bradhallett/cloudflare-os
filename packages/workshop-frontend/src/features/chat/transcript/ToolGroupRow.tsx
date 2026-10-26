@@ -6,11 +6,50 @@ import type { CreatedWorkpieceName } from "./messageTypes";
 import { NestedObservationRow } from "./NestedObservationRow";
 import { NestedToolCallRow } from "./NestedToolCallRow";
 import { ObservationDetails } from "./ObservationDetails";
-import { getDiscardLabel } from "./pendingTurnChanges";
+import { getDiscardLabel, type PendingTurnChanges } from "./pendingTurnChanges";
 import { ToolCallDetails } from "./ToolCallDetails";
 import { ToolRunningIndicator } from "./ToolRunningIndicator";
 import type { ToolCallGroup, ToolOutputResolver } from "./toolCalls";
 import { WorkIcon } from "./WorkIcon";
+
+/**
+ * The revert footer a work group carries when its turn left pending changes: everything
+ * about it travels together, so it is one object rather than five coincident props.
+ */
+export interface ToolGroupFooter {
+  /** The sequence reverting from undoes the turn's pending changes. */
+  changeSequence: number;
+  timestamp: Date;
+  /** Whether the turn's changes are the chat's last durable pending ones (label wording). */
+  isTrailing: boolean;
+  createdWorkpieces?: CreatedWorkpieceName[];
+  disabled?: boolean;
+  onRevert: (sequence: number) => void;
+}
+
+/**
+ * Builds the footer a turn's work group carries when the turn left pending changes, from the
+ * pending batch itself. Both row kinds that render groups (work runs and agent messages)
+ * share this, so their footers cannot drift apart.
+ */
+export function turnFooterProps(
+  pendingChange: PendingTurnChanges | null,
+  isTrailing: boolean,
+  timestamp: Date,
+  disabled: boolean,
+  onRevert: (sequence: number) => void,
+): ToolGroupFooter | undefined {
+  return pendingChange
+    ? {
+        changeSequence: pendingChange.revertFrom,
+        timestamp,
+        isTrailing,
+        createdWorkpieces: pendingChange.createdWorkpieces,
+        disabled,
+        onRevert,
+      }
+    : undefined;
+}
 
 /** A transcript work-run group row: the summary button, its expanded calls, and its revert footer. */
 export const ToolGroupRow = memo(function ToolGroupRow({
@@ -18,29 +57,17 @@ export const ToolGroupRow = memo(function ToolGroupRow({
   open,
   expandedKeys,
   onToggle,
-  footerChangeSequence,
-  footerTimestamp,
-  footerIsTrailing,
-  footerCreatedWorkpieces,
-  footerDisabled = false,
-  onFooterRevert,
+  footer,
   outputOf,
 }: {
   group: ToolCallGroup;
   open: boolean;
   expandedKeys: ReadonlySet<string>;
   onToggle: (key: string) => void;
-  footerChangeSequence?: number;
-  footerTimestamp?: Date;
-  footerIsTrailing?: boolean;
-  footerCreatedWorkpieces?: CreatedWorkpieceName[];
-  footerDisabled?: boolean;
-  onFooterRevert?: (sequence: number) => void;
+  footer?: ToolGroupFooter;
   outputOf?: ToolOutputResolver;
 }) {
-  const footerLabel = footerChangeSequence !== undefined
-    ? getDiscardLabel(footerIsTrailing, footerCreatedWorkpieces)
-    : null;
+  const footerLabel = footer ? getDiscardLabel(footer.isTrailing, footer.createdWorkpieces) : null;
   return (
     <div className="group -ml-0.5">
       <button
@@ -111,22 +138,22 @@ export const ToolGroupRow = memo(function ToolGroupRow({
           </div>
         )
       )}
-      {footerChangeSequence !== undefined && footerTimestamp && footerLabel && onFooterRevert && (
+      {footer && footerLabel && (
         <div className="ml-0 mt-0.5 flex items-center gap-1 opacity-100 transition-opacity duration-150 ease-out sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100">
           <Tooltip content={footerLabel} asChild>
             <button
               type="button"
-              disabled={footerDisabled}
-              onClick={() => onFooterRevert(footerChangeSequence)}
+              disabled={footer.disabled}
+              onClick={() => footer.onRevert(footer.changeSequence)}
               className="flex cursor-pointer items-center rounded-md p-1 text-kumo-inactive transition-[color,opacity,transform] duration-150 ease-out hover:text-kumo-default focus-visible:text-kumo-default focus-visible:outline-none active:scale-[0.96] disabled:cursor-not-allowed disabled:opacity-40"
               aria-label={footerLabel}
             >
               <ArrowUUpLeft size={15} />
             </button>
           </Tooltip>
-          <Tooltip content={formatFullTimestamp(footerTimestamp)} asChild>
+          <Tooltip content={formatFullTimestamp(footer.timestamp)} asChild>
             <span className="px-1 font-mono text-[11px] leading-4 text-kumo-inactive">
-              {footerTimestamp.toLocaleTimeString([], {
+              {footer.timestamp.toLocaleTimeString([], {
                 hour: "2-digit",
                 minute: "2-digit",
               })}
