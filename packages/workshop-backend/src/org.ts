@@ -20,7 +20,7 @@ import {
   gadgetBaselineRole, isActiveMember, invitableView, wouldLoseLastOwner, type OrgAccess,
 } from "./org-access";
 import { makeOrgStorage, type OrgRecord, type OrgSettings } from "./storage-schema/org-storage";
-import { resolveEntitlements, workspaceCapFrom } from "./entitlements.js";
+import { refuseUnverifiableWorkspaceCap, resolveEntitlements, workspaceCapFrom } from "./entitlements.js";
 import { notifyOrgMembersChanged } from "./commerce.js";
 
 const logger = createWorkshopLogger("workshop.org");
@@ -429,10 +429,7 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
       // plan service that failed — refuses the transfer, as the personal-creation cap does (see
       // UserDurableObject.newGadget); "unbound" is unlimited.
       let gate = workspaceCapFrom(await resolveEntitlements(this.env, transferringUserId));
-      if (gate.status === "unavailable") {
-        throw new Error(
-            "Your plan couldn't be verified, so the workspace wasn't transferred. Please try again.");
-      }
+      refuseUnverifiableWorkspaceCap(gate, "transferred");
       if (gate.status === "capped") {
         // Count the org's owned workspaces, excluding this one: a retried transfer must not be
         // refused by the index entry its own crashed attempt left behind.

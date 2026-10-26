@@ -1,4 +1,4 @@
-import { resolveEntitlements } from "./entitlements.js";
+import { allowedSetFrom, resolveEntitlements } from "./entitlements.js";
 
 /**
  * The model tiers the user's plan may run, or null while no entitlements service is bound
@@ -9,23 +9,18 @@ import { resolveEntitlements } from "./entitlements.js";
  */
 export async function allowedModelTiers(
     env: Cloudflare.Env, userId: string): Promise<ReadonlySet<string> | null> {
-  let answer = await resolveEntitlements(env, userId);
-  if (answer.status === "unbound") return null;
-  if (answer.status === "unavailable") return new Set();
-  return new Set(answer.entitlements.allowedModelTiers);
+  return allowedSetFrom(await resolveEntitlements(env, userId), e => e.allowedModelTiers);
 }
 
 /**
- * The gatekeeper vendors the user's plan may connect, or null while no entitlements service
- * is bound (no gate, as pre-port behavior and every OSS deployment). A bound service that
+ * The gatekeeper vendors the user's plan may connect, or null while no entitlements service is
+ * bound (no gate, as pre-port behavior and every OSS deployment). A bound service that
  * fails yields the empty set — every vendor is withheld — so an outage fails closed. Shared
  * by the connector surfaces (listing, connect, ambient provisioning and surfacing) and
  * resource gating, the same way allowedModelTiers serves the model surfaces.
  */
 export async function allowedGatekeepers(
     env: Cloudflare.Env, userId: string): Promise<ReadonlySet<string> | null> {
-  let answer = await resolveEntitlements(env, userId);
-  if (answer.status === "unbound") return null;
-  if (answer.status === "unavailable") return new Set();
-  return new Set(answer.entitlements.allowedGatekeepers.map(id => id.toLowerCase()));
+  return allowedSetFrom(await resolveEntitlements(env, userId),
+      e => e.allowedGatekeepers.map(id => id.toLowerCase()));
 }

@@ -26,7 +26,7 @@ import { deleteBlueprintContent } from "./blueprint-archive.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./storage-schema/blueprints-kv.js";
 import { resolveBlueprintForUser } from "./blueprint-access.js";
 import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./admin-config.js";
-import { resolveEntitlements } from "./entitlements.js";
+import { refuseUnverifiableWorkspaceCap, resolveEntitlements, workspaceCapFrom } from "./entitlements.js";
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
 import { CONNECT_FLOW_LIFETIME_MS, handoffTargetOrigin, hashPresentedSecret, hashSecret, newSecretToken, PENDING_HANDOFF_LIFETIME_MS } from "./connect-handoff.js";
 import { deliver, registerDevice } from "./notification-service.js";
@@ -1290,21 +1290,17 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (this.storage.gadgets.get(id)) return;
 
     // A bound SaaS's plan may cap how many workspaces a user owns; counted are only the rows
-    // without an `owner` — the user's own, never ones shared with them. A bound service that
-    // fails refuses creation (fail closed): an outage must not hand out workspaces past a cap
-    // it couldn't read. The cap governs *creating* a workspace only; registering one that
-    // already exists is ensureGadgetRegistered(), which is never capped.
-    let answer = await resolveEntitlements(this.env, this.ctx.id.toString());
-    if (answer.status === "unavailable") {
-      throw new Error(
-          "Your plan couldn't be verified, so the workspace wasn't created. Please try again.");
-    }
-    let cap = answer.status === "resolved" ? answer.entitlements.maxWorkspaces : undefined;
-    if (cap !== undefined) {
+    // without an `owner` — the user's own, never ones shared with them. The cap is folded from
+    // the answer once (see workspaceCapFrom): an unavailable port refuses creation (fail
+    // closed). The cap governs *creating* a workspace only; registering one that already
+    // exists is ensureGadgetRegistered(), which is never capped.
+    let gate = workspaceCapFrom(await resolveEntitlements(this.env, this.ctx.id.toString()));
+    refuseUnverifiableWorkspaceCap(gate, "created");
+    if (gate.status === "capped") {
       let owned = [...this.storage.gadgets.list()].filter(record => !record.owner).length;
-      if (owned >= cap) {
+      if (owned >= gate.cap) {
         throw createPlanRefusalError("WORKSPACE_CAP_REACHED",
-            `You've reached your plan's limit of ${cap} workspaces.`);
+            `You've reached your plan's limit of ${gate.cap} workspaces.`);
       }
     }
     let created = new Date();
