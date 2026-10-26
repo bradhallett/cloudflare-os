@@ -1,5 +1,5 @@
 import { memo } from "react";
-import styles from "../ChatInterface.module.css";
+import styles from "../../../ChatInterface.module.css";
 import { MarkdownMessage } from "../markdown/MarkdownMessage";
 
 /** A message's reasoning text, rendered as markdown inside the trace disclosure. */

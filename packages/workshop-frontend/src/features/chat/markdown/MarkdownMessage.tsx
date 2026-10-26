@@ -13,7 +13,7 @@ import { useAuthenticatedApi } from "../../../AuthContext";
 import { useVendorBranding } from "../../../useVendorBranding";
 import { safeExternalUrl } from "../../../utils/safeExternalUrl";
 import { copyToClipboard } from "../../../clipboard";
-import styles from "../ChatInterface.module.css";
+import styles from "../../../ChatInterface.module.css";
 import {
   buildTokenizedCapsuleMessage,
   createCapsuleRemarkPlugin,

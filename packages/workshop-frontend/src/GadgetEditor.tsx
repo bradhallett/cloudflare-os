@@ -52,7 +52,7 @@ import ChatInterface, {
   type ChatCodeChanges,
   type ChatLiveChangeRows,
   type ChatLiveEditPreviews,
-} from './features/chat/ChatInterface'
+} from './ChatInterface'
 import { formatOf } from './components/format/formats'
 import { FormatGlyph } from './components/format/FormatVisuals'
 import ShareModal from './ShareModal'

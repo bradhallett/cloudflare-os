@@ -21,7 +21,7 @@ vi.mock('./useAlwaysApproveTag', () => ({
 
 import { deferred, entry, makeOverseer } from './action-test-harness'
 import Activity from './Activity'
-import ChatInterface from './features/chat/ChatInterface'
+import ChatInterface from './ChatInterface'
 import Connections from './Connections'
 
 // The harness holds animation frames for jsdom suites to release by hand; this one has real ones.

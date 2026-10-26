@@ -12,7 +12,7 @@ const read = (name: string) => readFileSync(join(srcDir, name), 'utf8');
 
 const shimmerCss = read('shimmer.css');
 const stylesCss = read('styles.css');
-const moduleCss = read('features/chat/ChatInterface.module.css');
+const moduleCss = read('ChatInterface.module.css');
 const transcript = read('features/chat/ChatTranscript.tsx');
 
 describe('vendored shimmer utility', () => {

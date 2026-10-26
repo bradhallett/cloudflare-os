@@ -39,7 +39,7 @@ vi.mock('@cloudflare/kumo', async (importOriginal) => {
   }
 })
 
-vi.mock('../../AuthContext', () => {
+vi.mock('./AuthContext', () => {
   const context = {
     authenticatedApi: {
       listGatekeeperVendors: async () => [],
@@ -58,7 +58,7 @@ vi.mock('../../AuthContext', () => {
 // The upgrade prompt navigates on its primary action; ChatInterface itself has no router use.
 vi.mock('@tanstack/react-router', () => ({ useNavigate: () => vi.fn<() => void>() }))
 
-import { makeTestRoot } from '../../action-test-harness'
+import { makeTestRoot } from './action-test-harness'
 
 const testRoot = makeTestRoot()
 

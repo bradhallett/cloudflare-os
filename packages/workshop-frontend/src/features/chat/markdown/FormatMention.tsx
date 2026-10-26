@@ -1,6 +1,6 @@
 import type { MessageFormatRef } from "@gadgets/workshop-shared/api";
 import { FORMAT_ICONS } from "../../../components/format/formats";
-import styles from "../ChatInterface.module.css";
+import styles from "../../../ChatInterface.module.css";
 
 /**
  * A format the message named, drawn the way the composer drew it. Shares the capsule's chip

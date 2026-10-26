@@ -35,7 +35,7 @@ vi.mock('@cloudflare/kumo', async (importOriginal) => {
   }
 })
 
-vi.mock('../../AuthContext', () => {
+vi.mock('./AuthContext', () => {
   const context = {
     authenticatedApi: { listGatekeeperVendors: async () => [], listBots: async () => [] },
     currentUser: null,
@@ -48,11 +48,11 @@ vi.mock('../../AuthContext', () => {
 
 import {
   clickHookSwitch, deferred, entry, flushFrames, hookSwitch, makeOverseer, makeTestRoot,
-} from '../../action-test-harness'
+} from './action-test-harness'
 import ChatInterface from './ChatInterface'
-import { INCOMPLETE_DESCRIPTION_COPY } from '../../components/IncompleteDescriptionNotice'
-import { RESTRICTED_APPROVAL_COPY } from '../../components/RestrictedApprovalNotice'
-import { linkActionLog } from '../../useActions'
+import { INCOMPLETE_DESCRIPTION_COPY } from './components/IncompleteDescriptionNotice'
+import { RESTRICTED_APPROVAL_COPY } from './components/RestrictedApprovalNotice'
+import { linkActionLog } from './useActions'
 
 const testRoot = makeTestRoot()
 

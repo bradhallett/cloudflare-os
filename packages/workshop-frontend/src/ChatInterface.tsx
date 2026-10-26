@@ -14,7 +14,7 @@ import {
   getStoredSelectedBot,
   getStoredSelectedModel,
   sameBotSelection,
-} from "../../modelSelection";
+} from "./modelSelection";
 import {
   Overseer,
   AiChatAuthorInfo,
@@ -28,48 +28,48 @@ import {
   WorkpieceId,
   BlueprintOutput,
 } from "@gadgets/workshop-shared/api";
-import { isTransientRpcError, logRpcFailure } from "../../rpcErrors";
-import type { FailedChatSend } from "./transcript/failedSends";
-import { ChatListPanel, type ChatListScope } from "./ChatListPanel";
-import { ChatTranscript } from "./ChatTranscript";
-import { ChatDialogs } from "./ChatDialogs";
-import { ChatHeaderBar } from "./ChatHeaderBar";
-import { ChatComposerBar } from "./ChatComposerBar";
-import { useChatActions } from "./useChatActions";
-import type { ChatContentReader } from "../code/otClient";
-import { useAlwaysApproveTag } from "../../useAlwaysApproveTag";
-import { useResolveAction } from "../../useResolveAction";
-import { useAuthenticatedApi } from "../../AuthContext";
+import { isTransientRpcError, logRpcFailure } from "./rpcErrors";
+import type { FailedChatSend } from "./features/chat/transcript/failedSends";
+import { ChatListPanel, type ChatListScope } from "./features/chat/ChatListPanel";
+import { ChatTranscript } from "./features/chat/ChatTranscript";
+import { ChatDialogs } from "./features/chat/ChatDialogs";
+import { ChatHeaderBar } from "./features/chat/ChatHeaderBar";
+import { ChatComposerBar } from "./features/chat/ChatComposerBar";
+import { useChatActions } from "./features/chat/useChatActions";
+import type { ChatContentReader } from "./features/code/otClient";
+import { useAlwaysApproveTag } from "./useAlwaysApproveTag";
+import { useResolveAction } from "./useResolveAction";
+import { useAuthenticatedApi } from "./AuthContext";
 import {
   type UnresolvedConflict,
-} from "./mergeConflicts";
+} from "./features/chat/mergeConflicts";
 import {
   type ActiveFileTarget,
   type ChatCodeChanges,
   type ChatLiveChangeRows,
   type ChatLiveEditPreviews,
-} from "./liveCodeStreams";
+} from "./features/chat/liveCodeStreams";
 import {
   getStoredShowThinkingTraces,
   persistShowThinkingTraces,
-} from "./thinkingTracesPreference";
-import { resolveToolCallOutput } from "./transcript/toolCalls";
+} from "./features/chat/thinkingTracesPreference";
+import { resolveToolCallOutput } from "./features/chat/transcript/toolCalls";
 import {
   buildChatDisplayEntries,
   computeMessageStates,
   EARLIER_PAGE_PREFETCH_PX,
   inferChatAgentFromMessages,
   rhythmTopClass,
-} from "./transcript/chatDisplayEntries";
-import { usePendingTurnChanges } from "./transcript/usePendingTurnChanges";
-import { useMessageScroller } from "./transcript/useMessageScroller";
-import { JumpToLatestPill } from "./transcript/JumpToLatestPill";
-import { MissedMessagesStatus } from "./transcript/MissedMessagesStatus";
-import { type AutoApproveTarget } from "./transcript/ActionCard";
-import { useChatSubscription } from "./useChatSubscription";
+} from "./features/chat/transcript/chatDisplayEntries";
+import { usePendingTurnChanges } from "./features/chat/transcript/usePendingTurnChanges";
+import { useMessageScroller } from "./features/chat/transcript/useMessageScroller";
+import { JumpToLatestPill } from "./features/chat/transcript/JumpToLatestPill";
+import { MissedMessagesStatus } from "./features/chat/transcript/MissedMessagesStatus";
+import { type AutoApproveTarget } from "./features/chat/transcript/ActionCard";
+import { useChatSubscription } from "./features/chat/useChatSubscription";
 
-// Re-exported so the module's importers (GadgetEditor, WorkpieceCodeInterface, and the
-// ChatInterface unit tests) keep a single import surface for the chat feature's stable types.
+// Re-exported so the module's former importers (GadgetEditor, WorkpieceCodeInterface, and the
+// ChatInterface unit tests) keep their `./ChatInterface` import surface.
 export type {
   ActiveFileTarget,
   ChatCodeChanges,
@@ -77,15 +77,15 @@ export type {
   ChatLiveEditPreviews,
   EditPreviewEvent,
   StreamingEditPreview,
-} from "./liveCodeStreams";
-export type { CompactionBoundary } from "./transcript/chatDisplayEntries";
+} from "./features/chat/liveCodeStreams";
+export type { CompactionBoundary } from "./features/chat/transcript/chatDisplayEntries";
 export {
   buildChatDisplayEntries,
   computeChatEpochChanges,
   computeMessageStates,
-} from "./transcript/chatDisplayEntries";
-export { resolveToolCallOutput } from "./transcript/toolCalls";
-export { MarkdownMessage } from "./markdown/MarkdownMessage";
+} from "./features/chat/transcript/chatDisplayEntries";
+export { resolveToolCallOutput } from "./features/chat/transcript/toolCalls";
+export { MarkdownMessage } from "./features/chat/markdown/MarkdownMessage";
 
 function fallbackToStoredModelSelection(
   modelId: string | null,

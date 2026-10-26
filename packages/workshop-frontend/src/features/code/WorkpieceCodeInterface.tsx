@@ -12,7 +12,7 @@ import CodeEditor, { type EditSession } from './CodeEditor'
 import CodeDiffEditor from './CodeDiffEditor'
 import type {
   ChatCodeChanges, ChatLiveChangeRows, ChatLiveEditPreviews, EditPreviewEvent,
-} from '../chat/ChatInterface'
+} from '../../ChatInterface'
 import { fileKey, RemoteFileListeners } from './remoteFileListeners'
 import { ChatOtClient, type ChatContentReader, type RemoteFileEvent } from './otClient'
 import { commitFileStore, type CommitFileReader } from './commitFileStore'
