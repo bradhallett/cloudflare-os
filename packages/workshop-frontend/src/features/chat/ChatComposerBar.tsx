@@ -14,6 +14,7 @@ import type { OverseerSource } from "../../components/chat/slash-command-catalog
 import { ChatComposer } from "./composer/ChatComposer";
 import { composerDraftStorageKey } from "./composer/draft/composerDraft";
 import { chatHasProposedChanges } from "./chatHasProposedChanges";
+import { CONSTRAINED_CHAT_COLUMN_CLASS } from "./chatColumn";
 import { DiscardPendingChangesPopover } from "./transcript/DiscardPendingChangesPopover";
 
 type ComposerSend = ComponentProps<typeof ChatComposer>["onSend"];
@@ -110,7 +111,7 @@ export function ChatComposerBar({
     <>
               {/* ── Bottom: input, update state, and cost ──────────────── */}
               <div className={`flex-shrink-0 bg-kumo-base ${sidebarMode ? "" : "border-t border-kumo-line"}`}>
-                <div className={useConstrainedChatWidth ? "mx-auto w-full max-w-[920px]" : ""}>
+                <div className={useConstrainedChatWidth ? CONSTRAINED_CHAT_COLUMN_CLASS : ""}>
                   {/* Remount all transient composer state when the conversation changes. */}
                   <ChatComposer
                     key={`${workspaceId}:${selectedChatId}`}

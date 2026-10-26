@@ -22,6 +22,7 @@ import type { useAuthenticatedApi } from "../../AuthContext";
 import { ChatComposer } from "./composer/ChatComposer";
 import { composerDraftStorageKey } from "./composer/draft/composerDraft";
 import { chatHasProposedChanges } from "./chatHasProposedChanges";
+import { CONSTRAINED_CHAT_COLUMN_CLASS } from "./chatColumn";
 
 type ChatComposerProps = ComponentProps<typeof ChatComposer>;
 /** Which chats the sidebar list shows: everyone's, only people's, or only agents'. */
@@ -420,7 +421,7 @@ export function ChatListPanel({
           horizontal padding, so the wrapper just adds the top divider; no
           extra p-4 (which would shrink the input vs. the in-chat composer). */}
       <div className="flex-shrink-0 border-t border-kumo-line">
-        <div className={useConstrainedChatWidth ? "mx-auto w-full max-w-[920px]" : ""}>
+        <div className={useConstrainedChatWidth ? CONSTRAINED_CHAT_COLUMN_CLASS : ""}>
           {/* Attachments and pending resource operations belong to this workspace's composer. */}
           <ChatComposer
             key={workspaceId}
@@ -432,6 +433,7 @@ export function ChatListPanel({
             isAgentActive={false}
             models={availableModels}
             selectedModel={selectedModel === null ? null : { id: selectedModel }}
+            defaultModelId={selectedModel ?? availableModels[0]?.id ?? null}
             onModelChange={handleModelChange}
             bots={bots}
             selectedBot={selectedBot}

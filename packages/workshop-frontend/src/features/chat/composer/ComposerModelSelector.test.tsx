@@ -73,6 +73,7 @@ type RenderOptions = {
   selectedBot?: BotSelection | null;
   onBotChange?: (bot: BotSelection | null) => void;
   showModels?: boolean;
+  defaultModelId?: string | null;
   staleBotName?: string;
   onModelChange?: (modelId: string | null) => void;
 };
@@ -87,6 +88,7 @@ function renderSelector(options: RenderOptions = {}): HTMLDivElement {
     selectedBot = null,
     onBotChange,
     showModels,
+    defaultModelId,
     staleBotName,
     onModelChange = () => {},
   } = options;
@@ -99,6 +101,7 @@ function renderSelector(options: RenderOptions = {}): HTMLDivElement {
       selectedBot={selectedBot}
       onBotChange={onBotChange}
       showModels={showModels}
+      defaultModelId={defaultModelId}
       staleBotName={staleBotName}
     />,
   ));
@@ -152,7 +155,7 @@ describe("ComposerModelSelector", () => {
   });
 
   it("hides the raw model list unless showModels, offering Default agent instead", () => {
-    renderSelector({ bots: [userBot], onBotChange: () => {} });
+    renderSelector({ bots: [userBot], onBotChange: () => {}, defaultModelId: models[0].id });
     const texts = menuButtons().map(buttonText);
     expect(texts.some((t) => t.includes("GPT-6"))).toBe(false);
     const defaultRow = texts.find((t) => t.includes("Default agent"));
@@ -180,11 +183,11 @@ describe("ComposerModelSelector", () => {
     expect(onModelChange).toHaveBeenCalledWith(null);
   });
 
-  it("choosing Default agent sends the stored (or first) model id", () => {
+  it("choosing Default agent sends the intake row's model id", () => {
     const onModelChange = vi.fn<(modelId: string | null) => void>();
-    renderSelector({ bots: [userBot], onBotChange: () => {}, onModelChange });
+    renderSelector({ bots: [userBot], onBotChange: () => {}, onModelChange, defaultModelId: models[1].id });
     act(() => menuButtons().find((b) => buttonText(b).includes("Default agent"))!.click());
-    expect(onModelChange).toHaveBeenCalledWith(models[0].id);
+    expect(onModelChange).toHaveBeenCalledWith(models[1].id);
   });
 
   it("shows a deleted chat bot as a disabled no-longer-available row", () => {

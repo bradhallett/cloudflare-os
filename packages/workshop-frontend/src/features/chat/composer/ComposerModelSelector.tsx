@@ -1,7 +1,7 @@
 import { DropdownMenu } from "@cloudflare/kumo";
 import { CaretDown, Check } from "@phosphor-icons/react";
 import type { AiChatAuthorInfo, BotInfo, BotSelection } from "@gadgets/workshop-shared/api";
-import { getStoredSelectedModel, sameBotSelection } from "../../../modelSelection";
+import { sameBotSelection } from "../../../modelSelection";
 
 /**
  * The composer's model, or null for "No agent". `name` labels it when `models` doesn't offer it,
@@ -25,6 +25,12 @@ type ComposerModelSelectorProps = {
    */
   showModels?: boolean;
   /**
+   * The intake row's model id: the caller's stored selection (see getStoredSelectedModel),
+   * falling back to the first model. Read from a prop rather than storage so the row stays
+   * pure; only the intake callers (showModels off) need it.
+   */
+  defaultModelId?: string | null;
+  /**
    * The chat's own bot name when that bot no longer resolves in `bots` (deleted, or removed from
    * the deployment). Shown as a disabled row so the chat's state is legible while its sends fall
    * back to bare-model sends.
@@ -44,15 +50,13 @@ export const ComposerModelSelector = ({
   selectedBot,
   onBotChange,
   showModels = false,
+  defaultModelId = null,
   staleBotName,
 }: ComposerModelSelectorProps) => {
   const botRows = onBotChange != null && (bots == null || bots.length > 0 || staleBotName != null);
   const selectedBotInfo = bots?.find((bot) =>
     selectedBot != null && sameBotSelection(bot.selection, selectedBot));
 
-  // Intake's single non-bot row: the stored (or first) model, by name, without offering the list.
-  // A persisted "No agent" falls back to the first model so the row stays available to re-pick.
-  const defaultModelId = getStoredSelectedModel([...models]) ?? models[0]?.id ?? null;
   const defaultModelName = defaultModelId === null
     ? undefined
     : models.find((model) => model.id === defaultModelId)?.name ?? defaultModelId;
