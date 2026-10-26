@@ -521,6 +521,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       }
     }
     for (let account of accounts) this.storage.connectedAccounts.delete(account.id);
+    this.storage.passwordHashHash.put(null);
+    this.storage.notificationSubscriptions.put({});
     this.storage.cloudflareBilling.put(null);
     this.storage.dailyLlmCount.put(null);
     if (this.storage.created.get()) {
