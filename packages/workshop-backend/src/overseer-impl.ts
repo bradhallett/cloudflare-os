@@ -163,6 +163,21 @@ export class OverseerImpl extends OverseerBots implements AgentHooks {
       }
     }
 
+    // Clear busy markers left without an execution row. cancelAgent() deletes the row and
+    // defers clearing chatMeta.activeAgent to the cancelled turn's teardown; a reset in between
+    // orphans the marker, and this construction-time sweep is the only thing left to clear it.
+    // (It also covers chats from before the activeAgents table existed, whose only trace of a
+    // running agent is the marker itself; those cannot be resumed, only cancelled.)
+    for (let thread of Array.from(this.storage.chatMeta.list())) {
+      if (thread.activeAgent && !this.runningAgents.has(thread.id)) {
+        this.postAgentErrorMessage(thread.id, thread.activeAgent,
+            "Agent interrupted due to server restart.");
+        delete thread.activeAgent;
+        this.storage.chatMeta.put(thread);
+        this.deliverWaitingExternalMessageResponse(thread.id);
+      }
+    }
+
     // Deliver any calls to callable agents that were recorded but not yet appended to their chat
     // when the previous instance went away. (A chat whose turn was just resumed drains at the end
     // of that turn instead.)
