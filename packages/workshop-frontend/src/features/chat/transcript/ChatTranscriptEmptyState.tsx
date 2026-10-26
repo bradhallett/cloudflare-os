@@ -1,5 +1,5 @@
 import { ChatsIcon } from "@phosphor-icons/react";
-import styles from "../../../ChatInterface.module.css";
+import styles from "../ChatInterface.module.css";
 
 /**
  * The zero-message transcript's empty state (HextaUI `empty` composition, small size: media tile,

@@ -1,7 +1,7 @@
 import { Brain, CaretRight } from "@phosphor-icons/react";
 import type { CompactionBoundary, ChatDisplayEntry } from "./chatDisplayEntries";
 import { MarkdownMessage } from "../markdown/MarkdownMessage";
-import styles from "../../../ChatInterface.module.css";
+import styles from "../ChatInterface.module.css";
 
 /** The boundary's summary, shown while the marker is expanded. */
 function CompactionSummary({

@@ -1,4 +1,4 @@
-import styles from "../../../ChatInterface.module.css";
+import styles from "../ChatInterface.module.css";
 import type { AiChatMessage } from "@gadgets/workshop-shared/api";
 import { MarkdownMessage } from "../markdown/MarkdownMessage";
 import type { ProvisionalChatState, ProvisionalToolCallState } from "../provisionalChatState";

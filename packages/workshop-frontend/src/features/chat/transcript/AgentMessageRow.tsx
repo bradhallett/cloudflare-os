@@ -1,7 +1,7 @@
 import { ArrowUUpLeft, Copy } from "@phosphor-icons/react";
 import { Tooltip } from "@cloudflare/kumo";
 import type { AiChatMessage, WorkpieceId } from "@gadgets/workshop-shared/api";
-import styles from "../../../ChatInterface.module.css";
+import styles from "../ChatInterface.module.css";
 import { formatFullTimestamp } from "../../../utils/formatTimestamp";
 import { MarkdownMessage } from "../markdown/MarkdownMessage";
 import { CreatedWorkpieceChatCard, type CreatedWorkpieceCardInfo } from "./CreatedWorkpieceChatCard";

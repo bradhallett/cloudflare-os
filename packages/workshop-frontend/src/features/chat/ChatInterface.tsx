@@ -14,7 +14,7 @@ import {
   getStoredSelectedBot,
   getStoredSelectedModel,
   sameBotSelection,
-} from "./modelSelection";
+} from "../../modelSelection";
 import {
   Overseer,
   AiChatAuthorInfo,
@@ -28,64 +28,45 @@ import {
   WorkpieceId,
   BlueprintOutput,
 } from "@gadgets/workshop-shared/api";
-import { logRpcFailure } from "./rpcErrors";
-import { ChatListPanel, type ChatListScope } from "./features/chat/ChatListPanel";
-import { ChatTranscript } from "./features/chat/ChatTranscript";
-import { ChatDialogs } from "./features/chat/ChatDialogs";
-import { ChatHeaderBar } from "./features/chat/ChatHeaderBar";
-import { ChatComposerBar } from "./features/chat/ChatComposerBar";
-import { useChatActions } from "./features/chat/useChatActions";
-import { useChatListActions } from "./features/chat/useChatListActions";
-import { useChatChanges } from "./features/chat/useChatChanges";
-import { useConnectionRequests } from "./features/chat/useConnectionRequests";
-import type { ChatContentReader } from "./features/code/otClient";
-import { triggerBlobDownload } from "./fileTransfers";
-import { useAlwaysApproveTag } from "./useAlwaysApproveTag";
-import { useResolveAction } from "./useResolveAction";
-import { useAuthenticatedApi } from "./AuthContext";
+import { logRpcFailure } from "../../rpcErrors";
+import { ChatListPanel, type ChatListScope } from "./ChatListPanel";
+import { ChatTranscript } from "./ChatTranscript";
+import { ChatDialogs } from "./ChatDialogs";
+import { ChatHeaderBar } from "./ChatHeaderBar";
+import { ChatComposerBar } from "./ChatComposerBar";
+import { useChatActions } from "./useChatActions";
+import { useChatListActions } from "./useChatListActions";
+import { useChatChanges } from "./useChatChanges";
+import { useConnectionRequests } from "./useConnectionRequests";
+import type { ChatContentReader } from "../code/otClient";
+import { triggerBlobDownload } from "../../fileTransfers";
+import { useAlwaysApproveTag } from "../../useAlwaysApproveTag";
+import { useResolveAction } from "../../useResolveAction";
+import { useAuthenticatedApi } from "../../AuthContext";
 import {
   type ActiveFileTarget,
   type ChatCodeChanges,
   type ChatLiveChangeRows,
   type ChatLiveEditPreviews,
-} from "./features/chat/liveCodeStreams";
+} from "./liveCodeStreams";
 import {
   getStoredShowThinkingTraces,
   persistShowThinkingTraces,
-} from "./features/chat/thinkingTracesPreference";
-import { resolveToolCallOutput } from "./features/chat/transcript/toolCalls";
+} from "./thinkingTracesPreference";
+import { resolveToolCallOutput } from "./transcript/toolCalls";
 import {
   buildChatDisplayEntries,
   computeMessageStates,
   EARLIER_PAGE_PREFETCH_PX,
   inferChatAgentFromMessages,
   rhythmTopClass,
-} from "./features/chat/transcript/chatDisplayEntries";
-import { usePendingTurnChanges } from "./features/chat/transcript/usePendingTurnChanges";
-import { useMessageScroller } from "./features/chat/transcript/useMessageScroller";
-import { JumpToLatestPill } from "./features/chat/transcript/JumpToLatestPill";
-import { MissedMessagesStatus } from "./features/chat/transcript/MissedMessagesStatus";
-import { type AutoApproveTarget } from "./features/chat/transcript/ActionCard";
-import { useChatSubscription } from "./features/chat/useChatSubscription";
-
-// Re-exported so the module's former importers (GadgetEditor, WorkpieceCodeInterface, and the
-// ChatInterface unit tests) keep their `./ChatInterface` import surface.
-export type {
-  ActiveFileTarget,
-  ChatCodeChanges,
-  ChatLiveChangeRows,
-  ChatLiveEditPreviews,
-  EditPreviewEvent,
-  StreamingEditPreview,
-} from "./features/chat/liveCodeStreams";
-export type { CompactionBoundary } from "./features/chat/transcript/chatDisplayEntries";
-export {
-  buildChatDisplayEntries,
-  computeChatEpochChanges,
-  computeMessageStates,
-} from "./features/chat/transcript/chatDisplayEntries";
-export { resolveToolCallOutput } from "./features/chat/transcript/toolCalls";
-export { MarkdownMessage } from "./features/chat/markdown/MarkdownMessage";
+} from "./transcript/chatDisplayEntries";
+import { usePendingTurnChanges } from "./transcript/usePendingTurnChanges";
+import { useMessageScroller } from "./transcript/useMessageScroller";
+import { JumpToLatestPill } from "./transcript/JumpToLatestPill";
+import { MissedMessagesStatus } from "./transcript/MissedMessagesStatus";
+import { type AutoApproveTarget } from "./transcript/ActionCard";
+import { useChatSubscription } from "./useChatSubscription";
 
 function fallbackToStoredModelSelection(
   modelId: string | null,

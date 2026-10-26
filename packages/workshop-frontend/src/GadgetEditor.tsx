@@ -47,12 +47,13 @@ import WorkpiecePicker, {
   WORKPIECE_RAIL_COLLAPSED_WIDTH,
   WORKPIECE_RAIL_EXPANDED_WIDTH,
 } from './WorkpiecePicker'
-import ChatInterface, {
+import ChatInterface from './features/chat/ChatInterface'
+import {
   type ActiveFileTarget,
   type ChatCodeChanges,
   type ChatLiveChangeRows,
   type ChatLiveEditPreviews,
-} from './ChatInterface'
+} from './features/chat/liveCodeStreams'
 import { formatOf } from './components/format/formats'
 import { FormatGlyph } from './components/format/FormatVisuals'
 import ShareModal from './ShareModal'

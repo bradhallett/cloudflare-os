@@ -98,7 +98,7 @@ vi.mock('./features/blueprint-updates/useBlueprintUpdateAvailable', () => ({
 }))
 
 // The two children whose reports decide when the editor's layout is ready.
-vi.mock('./ChatInterface', () => ({
+vi.mock('./features/chat/ChatInterface', () => ({
   default: ({ onChatCountChange }: { onChatCountChange: (count: number, hasChatZero: boolean) => void }) => {
     useEffect(() => { onChatCountChange(0, false) }, [onChatCountChange])
     return <div>chat pane</div>
