@@ -3,7 +3,7 @@ import { WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, ChatCodeBase, AiCh
 import type { FileContent, CodeContent, CodeChange } from "@gadgets/workshop-shared/code-change";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { chatKeyPrefix, makeOverseerStorage } from "./storage-schema/overseer-storage";
-import type { BindingRecord, ChatChangeRecord, ExternalMessageRecord, GadgetRecord, OverseerStorage, WorkpieceRecord, WorktreeRecord } from "./storage-schema/overseer-storage";
+import type { BindingRecord, ChatChangeRecord, ExternalMessageRecord, GadgetRecord, OverseerStorage, WorkpieceRecord, WorktreeRecord, WorkspaceOwnerSubject } from "./storage-schema/overseer-storage";
 import { GitStore } from "./git-store";
 import { WorkspaceGitCache } from "./git-cache";
 import type { WorktreeTurnAccess } from "./agent";
@@ -16,6 +16,7 @@ import type { ProductAnalyticsGadgetInput } from "./analytics";
 import { AutoApprovalDrainer } from "./auto-approval";
 import { createWorkshopLogger, type WorkshopLogger } from "./observability";
 import type { LiveChatContext, SessionKind } from "./overseer-support";
+import { LiveChatState } from "./live-chat-state";
 import { AGENT_KEEPALIVE_ALARM_MS, AGENT_RESPONSE_DELIVERED_RETENTION_MS, CHAT_CHANGE_RETIRED_TTL_MS } from "./overseer-support";
 import { ChatCacheWarmer } from "./chat-cache-warming";
 import { CHAT_ATTACHMENT_EXTENSION_BY_MIME } from "./overseer-chat-attachments";
@@ -41,8 +42,8 @@ export abstract class OverseerCore {
     this.gitStore = new GitStore(this.storage.gitObjects);
     this.users = this.ctx.exports.UserDurableObject;
     this.ownerId = this.storage.ownerId.get();
-    const subject = this.storage.ownerSubject.get();
-    if (subject?.type === "org") this.adoptOwningOrg(subject.id);
+    const owner = this.workspaceOwner();
+    if (owner?.type === "org") this.adoptOwningOrg(owner.id);
   }
   public storage: OverseerStorage;
 
@@ -61,6 +62,18 @@ export abstract class OverseerCore {
   adoptOwningOrg(orgId: string): void {
     this.#owningOrgId = orgId;
     this.#logger = logger.with({ gadgetId: this.ctx.id.toString(), orgId });
+  }
+
+  /**
+   * Who owns this workspace: the owning org once transferred (transferToOrg), otherwise the
+   * creating user while the workspace still has one (`ownerId` goes at deletion). The durable
+   * owner subject is written only by transferToOrg — it holds either nothing or an org subject —
+   * so this accessor is the one home of that dual representation: read sites ask it instead of
+   * re-deriving "which org, if any, owns this workspace" from the raw record.
+   */
+  workspaceOwner(): WorkspaceOwnerSubject | undefined {
+    return this.storage.ownerSubject.get()
+        ?? (this.ownerId ? {type: "user", id: this.ownerId} : undefined);
   }
 
 
@@ -102,8 +115,11 @@ export abstract class OverseerCore {
    */
   gitCache!: WorkspaceGitCache;
 
-  /** Per-chat in-memory state for running agents. */
-  protected liveChats = new Map<number, LiveChatContext>();
+  /**
+   * Per-chat in-memory state for running agents: each chat's LiveChatContext, the single-flight
+   * pending-agent-call drains, and the delegateToBot subagent waiters (see LiveChatState).
+   */
+  protected readonly liveChats = new LiveChatState(() => this.wakeIdleWaiters());
 
   #chatSubscribers: Set<RpcStub<AiChatSubscriber>> = new Set();
 
@@ -145,28 +161,9 @@ export abstract class OverseerCore {
 
   protected scheduledAlarm: number | null | undefined;
 
-  /** Drains of pending agent calls currently in flight, by chat (see drainPendingAgentCalls). */
-  protected pendingCallDrains = new Map<number, Promise<void>>();
 
-  /**
-   * Chats with a delegateToBot call awaiting a subagent's turn (see runBotSubagent), keyed by
-   * the *child* chat: every turn-terminal path calls settleSubagentWaiters(chatId), so however
-   * the child's turn ends -- reply, error, approval park, abort -- the parent's tool call
-   * resolves. Rebuilt from the durable pendingDelegations record when a reset re-executes the
-   * tool call, so the await survives DO restarts.
-   */
-  protected subagentWaiters = new Map<number, Set<() => void>>();
-
-  /**
-   * Resolve however the chat's turn ends: wake every delegateToBot await keyed to it and mark
-   * its delegation records done (the await re-arms if the parent re-executes the tool call).
-   */
   protected settleSubagentWaiters(chatId: number): void {
-    let waiters = this.subagentWaiters.get(chatId);
-    if (waiters) {
-      this.subagentWaiters.delete(chatId);
-      for (let waiter of waiters) waiter();
-    }
+    this.liveChats.resolveSubagents(chatId);
     for (let record of this.storage.pendingDelegations.byChildChatId.get(chatId)) {
       if (!record.done) this.storage.pendingDelegations.put({...record, done: true});
     }
@@ -314,14 +311,7 @@ export abstract class OverseerCore {
   }
 
   protected getLiveChat(chatId: number): LiveChatContext {
-    let ctx = this.liveChats.get(chatId);
-    if (!ctx) {
-      ctx = {
-        cancelController: new AbortController(),
-      };
-      this.liveChats.set(chatId, ctx);
-    }
-    return ctx;
+    return this.liveChats.getOrCreate(chatId);
   }
 
   /**
@@ -436,7 +426,7 @@ export abstract class OverseerCore {
     // drain in flight is that handoff mid-flight -- it starts the next turn after its first
     // await -- so waiting on it too keeps this wait from resolving between a turn's end and the
     // turn it hands off to (runAlarmTasks' pass loop checks the same two conditions).
-    while (this.runningAgents.size > 0 || this.pendingCallDrains.size > 0) {
+    while (this.runningAgents.size > 0 || this.liveChats.hasDrains()) {
       let {promise, resolve} = Promise.withResolvers<void>();
       this.#allAgentsIdleWaiters.push(resolve);
       await promise;

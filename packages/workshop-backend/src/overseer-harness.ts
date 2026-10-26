@@ -3,7 +3,7 @@ import type { ChatBindingEntry } from "./storage-schema/overseer-storage";
 import { OverseerImpl } from "./overseer-impl";
 
 /** Split out of the former overseer.ts (internal). */
-export let CODE_MODE_HARNESS =
+export const CODE_MODE_HARNESS =
 `import { WorkerEntrypoint, restore } from "cloudflare:workers";
 import agent from "agent.js";
 
@@ -41,7 +41,7 @@ export default class extends WorkerEntrypoint {
 // ctx.restore() (see OverseerRestoreParams.codeId), so this worker's self-token names the target
 // gadget; the persistent stubs its forge() method creates therefore restore through that gadget's
 // [restore]() method.
-let RESTORE_FORGER_HARNESS =
+const RESTORE_FORGER_HARNESS =
 `import { WorkerEntrypoint, restore, RpcStub, RpcTarget } from "cloudflare:workers";
 
 export default class extends WorkerEntrypoint {
@@ -86,7 +86,7 @@ class PlaceholderRpcTarget extends RpcTarget {
 `;
 
 /** Split out of the former overseer.ts (internal). */
-export let RESTORE_FORGER_WORKER: WorkerLoaderWorkerCode = {
+export const RESTORE_FORGER_WORKER: WorkerLoaderWorkerCode = {
   compatibilityDate: "2026-02-01",
   compatibilityFlags: [
     // The forger holds no bindings, but lock it down like the code-mode worker anyway.
@@ -139,17 +139,4 @@ export class RestoreForgerImpl extends NativeRpcTarget {
         this.#chatId, this.#bindings, bindingName, params);
   }
 }
-
-// =======================================================================================
-
-// Per-chat in-memory state, used while an agent is running.
-
-
-
-
-
-
-
-
-
 

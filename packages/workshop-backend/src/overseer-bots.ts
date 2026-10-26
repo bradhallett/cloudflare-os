@@ -32,42 +32,6 @@ export abstract class OverseerBots extends OverseerGatekeepers {
   static readonly MAX_BOT_DMS_PER_CHAT = 50;
   static readonly MAX_BOT_DMS_PER_TREE = 100;
 
-  /**
-   * Stops the chat's running agent. Its queued steers are dropped: the client that stops puts them
-   * in its draft (see Overseer.stopAgent).
-   */
-  cancelAgent(chatId: number) {
-    let meta = this.storage.chatMeta.get(chatId);
-    if (meta?.queuedSteers) {
-      delete meta.queuedSteers;
-      meta.lastActive = this.getChatTimestamp();
-      this.storage.chatMeta.put(meta);
-    }
-    // Stop prevents resumption even if the DO disappears before the aborted task's finally runs;
-    // restart recovery clears any busy marker left without an execution row.
-    this.storage.activeAgents.delete(chatId);
-    this.resumeErrors.delete(chatId);
-    let author = this.storage.chatMeta.get(chatId)?.activeAgent ?? this.decisionWait(chatId)?.agent;
-    if (author) this.addChatMessages(chatId, author,
-        [{type: "agentNudge", text: "The user stopped this turn. Wait for a new request."}]);
-    let ctx = this.liveChats.get(chatId);
-    if (ctx) {
-      ctx.cancelController.abort(new Error("User requested to stop agent."));
-    }
-    // A retryable lookup has already released its task to the alarm, so no finally is left to
-    // clear the busy marker. Stop must finish that handoff synchronously too.
-    if (!this.runningAgents.has(chatId)) {
-      let meta = this.storage.chatMeta.get(chatId);
-      if (meta?.activeAgent) {
-        delete meta.activeAgent;
-        meta.lastActive = this.getChatTimestamp();
-        this.storage.chatMeta.put(meta);
-      }
-      this.updateAlarm();
-      this.finishAgentTurn(chatId);
-    }
-  }
-
   /** AgentHooks.invokeBotSkill: activate one of this chat's bot skills on demand. */
   async invokeBotSkill(chatId: number, skill: string): Promise<string> {
     let botSkills = this.getChatAgentContext(chatId).botSkills;
@@ -241,10 +205,7 @@ export abstract class OverseerBots extends OverseerGatekeepers {
           "The bot ended its turn without a reply — it may be waiting for an approval; " +
           "see its thread.";
     }
-    let waiter = Promise.withResolvers<void>();
-    let waiters = this.subagentWaiters.get(childChatId) ?? new Set();
-    waiters.add(() => waiter.resolve());
-    this.subagentWaiters.set(childChatId, waiters);
+    let waiter = this.liveChats.armSubagentWaiter(childChatId);
     let timedOut = false;
     let timer = setTimeout(() => {
       timedOut = true;
@@ -261,7 +222,7 @@ export abstract class OverseerBots extends OverseerGatekeepers {
     };
     signal.addEventListener("abort", onAbort, {once: true});
     try {
-      await waiter.promise;
+      await waiter;
     } finally {
       clearTimeout(timer);
       signal.removeEventListener("abort", onAbort);
