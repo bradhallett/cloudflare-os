@@ -13,7 +13,7 @@ const read = (name: string) => readFileSync(join(srcDir, name), 'utf8');
 const shimmerCss = read('shimmer.css');
 const stylesCss = read('styles.css');
 const moduleCss = read('ChatInterface.module.css');
-const transcript = read('features/chat/ChatTranscript.tsx');
+const provisionalTurn = read('features/chat/transcript/ProvisionalTurnRow.tsx');
 
 describe('vendored shimmer utility', () => {
   it('carries MIT attribution for HextaUI/shadcn', () => {
@@ -40,7 +40,7 @@ describe('vendored shimmer utility', () => {
   it('replaced the hand-rolled .thinkingShimmer', () => {
     expect(moduleCss).not.toContain('thinkingShimmer');
     expect(moduleCss).not.toContain('thinking-shimmer');
-    expect(transcript).not.toContain('thinkingShimmer');
-    expect(transcript).toMatch(/inline-flex shimmer /);
+    expect(provisionalTurn).not.toContain('thinkingShimmer');
+    expect(provisionalTurn).toMatch(/inline-flex shimmer /);
   });
 });
