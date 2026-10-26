@@ -25,11 +25,12 @@
 //
 // Separable domains live in sibling modules and are re-exported below with unchanged names:
 // errors.ts (the coded-error family factory), orgs.ts (organizations), commerce.ts (SaaS
-// billing, beside its port), bots.ts (declared bots). This file stays the single import
-// surface for the API, so importers are unaffected by where a domain's code lives.
+// billing, beside its port), bots.ts (declared bots), chat.ts (the chat wire grammar: messages,
+// tool calls, stream events). This file stays the single import surface for the API, so
+// importers are unaffected by where a domain's code lives.
 
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
-import { AccountDescription, ActionKind, ActionDescription, AgentCatalog, AvatarImage, ComposioToolkitInfo, GatekeeperUiFrame, GatekeeperUserSelection, ObservationDescription, ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorDescription, HookDescription } from "./gatekeeper.js";
+import { AccountDescription, ActionKind, ActionDescription, AvatarImage, ComposioToolkitInfo, GatekeeperUiFrame, GatekeeperUserSelection, ObservationDescription, ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorDescription, HookDescription } from "./gatekeeper.js";
 import type { CodeChange } from "./code-change.js";
 import type { GitOid } from "./gatekeeper.js";
 import type { UiFeatureFlags } from "./feature-flags.js";
@@ -948,10 +949,11 @@ export interface AuthenticatedApi extends RpcTarget, OrgApiMethods, CommerceApiM
   /**
    * Mint a single-use ticket for a user selected on behalf of a gatekeeper app,
    * redeemable through that gatekeeper app's exchange capability (see
-   * this user, does not exist, or is outside the caller's directory scope (the
-   * active co-members of their orgs, plus owners of workspaces shared with
-   * them) — the same scope `searchUsers()` covers. The ticket records the orgs
-   * that justified the pick, and redemption re-checks them live, so a pick dies
+   * `GatekeeperUserSelectionExchange`). Returns null if the selected user does
+   * not exist, or is outside the caller's directory scope (the active
+   * co-members of their orgs, plus owners of workspaces shared with them) —
+   * the same scope `searchUsers()` covers. The ticket records the orgs that
+   * justified the pick, and redemption re-checks them live, so a pick dies
    * with the membership it was justified by.
    */
   createGatekeeperUserSelection(
@@ -1438,6 +1440,10 @@ export interface AdminApi extends DeploymentBotAdminMethods {
    * those eligible for auto-apply (tagged createHint or updateHint, not destructiveHint) and those
    * tagged destructive. Returns null when the Composio gatekeeper isn't bound, so the editor can
    * say it cannot validate rather than show a wrong answer.
+   *
+   * Vendor-named deliberately, per the `VendorAdminPolicy` principle above: the counts follow
+   * Composio's own tag grammar, and a second vendor growing toolkit validation gets its own
+   * extension method set, not a parameterized version of this one.
    */
   getComposioToolkitInfo(slugs: string[]): Promise<ComposioToolkitInfo[] | null>;
 
@@ -5766,14 +5772,22 @@ export interface GadgetClient extends WorkpieceClient {
    */
   getUiBundle(chatId?: number): Promise<UiBundle | null>;
 
-  // Open an RPC interface to the gadget's server-side Durable Object facet. The frontend may pass
-  // this stub into the gadget's iframe sandbox, so that the gadget UI can communicate with its
-  // server side. It can also permit the coding agent to make direct calls.
-  //
-  // If `chatId` is specified, then the gadget will include changes currently proposed in the given
-  // chat.
-  //
-  // @ts-ignore - TODO: Fix type instantiation issue
+  /**
+   * Open an RPC interface to the gadget's server-side Durable Object facet. The frontend may pass
+   * this stub into the gadget's iframe sandbox, so that the gadget UI can communicate with its
+   * server side. It can also permit the coding agent to make direct calls.
+   *
+   * If `chatId` is specified, then the gadget will include changes currently proposed in the given
+   * chat.
+   *
+   * The facet's shape is the gadget author's to declare, so the stub is deliberately `any`-typed
+   * here: callers (and tests) pin it to their facet interface with an assertion at the call site.
+   * A type parameter is the intended shape but is currently unimplementable: capnweb's `Stub<T>`
+   * is a deferred conditional, so a `<T extends RpcCompatible<T>>(chatId?: number):
+   * Promise<RpcStub<T>>` declaration fails TS2416 at every implementer (the implementation's
+   * return collapses to `StubBase<unknown>` during signature comparison) — this was tried and
+   * reverted, not assumed.
+   */
   connectToGadget(chatId?: number): Promise<RpcStub<any>>;
 
   /**
