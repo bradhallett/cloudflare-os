@@ -1,7 +1,8 @@
 // Drives the Workshop over its real Cap'n Web WebSocket API, the same transport the browser uses.
 
 import { createHash } from "node:crypto";
-import { RpcStub, RpcTarget, newWebSocketRpcSession } from "capnweb";
+import { RpcSession, RpcStub, RpcTarget, WebSocketTransport } from "capnweb";
+import type { RpcTransport } from "capnweb";
 import type {
   AiChatSubscriber, AuthenticatedApi, ConnectedAccountsFilter, ConnectedAccountsSubscriber,
   ObserverAccountChoice, ObserverBindingNeed, ObserverConfigCallback, Overseer, PublicApi,
@@ -46,11 +47,77 @@ export function nextUsernames(...prefixes: string[]): string[] {
   return prefixes.map(prefix => `${prefix}${n}`);
 }
 
-/** Open an RPC session against the Workshop's /api endpoint. */
+// The harness redeploys the Workshop by swapping it under a live server (redeployWorkshop), and a
+// WebSocket whose upgrade lands in that window can fail before the socket ever opens -- which
+// permanently breaks capnweb's WebSocketTransport with "WebSocket connection failed." (the
+// bots.test.ts CI flake). A socket that never opened delivered nothing, so reconnecting and
+// replaying the messages sent so far is side-effect-free. This transport retries exactly that
+// case and nothing else: once any socket has opened, a failure is a real disconnect and is thrown
+// to the session as-is.
+const CONNECT_RETRY_DEADLINE_MS = 10_000;
+const CONNECT_RETRY_BACKOFF_MS = 200;
+
+class RetryingWebSocketTransport implements RpcTransport {
+  readonly #url: string;
+  readonly #deadline: number;
+  #current: WebSocketTransport;
+  #established = false;
+  #aborted = false;
+  #sent: string[] = [];
+
+  constructor(url: string) {
+    this.#url = url;
+    this.#deadline = Date.now() + CONNECT_RETRY_DEADLINE_MS;
+    this.#current = this.#open();
+  }
+
+  #open(): WebSocketTransport {
+    const socket = new WebSocket(this.#url);
+    // WebSocketTransport flushes its own queue on this same event, so once this listener has run
+    // everything logged in #sent has reached the wire and must never be replayed.
+    socket.addEventListener("open", () => {
+      this.#established = true;
+      this.#sent = [];
+    });
+    return new WebSocketTransport(socket);
+  }
+
+  send(message: string): void {
+    if (!this.#established) this.#sent.push(message);
+    this.#current.send(message);
+  }
+
+  async receive(): Promise<string> {
+    for (;;) {
+      try {
+        return await this.#current.receive();
+      } catch (error) {
+        if (this.#established || this.#aborted || Date.now() >= this.#deadline) throw error;
+        await new Promise(resolve => setTimeout(resolve, CONNECT_RETRY_BACKOFF_MS));
+        if (this.#aborted) throw error;
+        this.#current = this.#open();
+        for (const message of this.#sent) this.#current.send(message);
+      }
+    }
+  }
+
+  abort(reason: unknown): void {
+    this.#aborted = true;
+    this.#current.abort(reason);
+  }
+}
+
+/**
+ * Open an RPC session against the Workshop's /api endpoint.
+ *
+ * The connection retries while its WebSocket keeps dying before opening (the redeploy swap
+ * window, say) for up to 10 seconds; a failure after the socket has opened propagates as-is.
+ */
 export function connect(baseUrl: URL): RpcStub<PublicApi> {
   const wsUrl = new URL("/api", baseUrl);
   wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
-  return newWebSocketRpcSession<PublicApi>(wsUrl.toString());
+  return new RpcSession<PublicApi>(new RetryingWebSocketTransport(wsUrl.toString()))
+      .getRemoteMain();
 }
 
 /**
