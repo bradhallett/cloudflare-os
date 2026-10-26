@@ -58,6 +58,10 @@
     "./errors": {
       "types": "./src/errors.ts",
       "import": "./src/errors.ts"
+    },
+    "./chat": {
+      "types": "./src/chat.ts",
+      "import": "./src/chat.ts"
     }
   },
   "scripts": {
