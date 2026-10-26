@@ -11,8 +11,7 @@ import {
   PICKER_CAPTION, PICKER_EMPTY, PICKER_ROW, PICKER_ROW_ACTIVE, KeyHint,
 } from './components/pickerRows'
 import { AccountsSubscriberAdapter } from './accountsSubscriber'
-import { openConnectWindow } from './connectHandoff'
-import { AuthPopupCancelledError } from './features/native-app/authPopup'
+import { useConnectAccountActions } from './useConnectAccountActions'
 
 export interface VendorOption {
   id: string
@@ -114,9 +113,8 @@ export default function ResourcePicker({
   const [vendorsLoading, setVendorsLoading] = useState(false)
   // The subscription reports the accounts it already has before calling `ready()`.
   const [accountsLoaded, setAccountsLoaded] = useState(snapshot !== undefined)
-  const [connectingVendor, setConnectingVendor] = useState<string | null>(null)
-  const [reconnectingAccount, setReconnectingAccount] = useState<number | null>(null)
-  const [grantingAccount, setGrantingAccount] = useState<number | null>(null)
+  const connectActions = useConnectAccountActions(authenticatedApi)
+  const { connectingVendor, reconnectingAccountId: reconnectingAccount, grantingAccountId: grantingAccount } = connectActions
 
   // Subscribe to connected accounts on mount.
   useEffect(() => {
@@ -130,9 +128,7 @@ export default function ResourcePicker({
           return next
         })
         // Clear reconnecting state if this account was being reconnected and is now valid.
-        if (credentialsValid) {
-          setReconnectingAccount(prev => prev === id ? null : prev)
-        }
+        if (credentialsValid) connectActions.clearReconnecting(id)
       },
       remove(id) {
         setAllAccounts(prev => {
@@ -392,54 +388,27 @@ export default function ResourcePicker({
 
   // --- Connect new account handler ---
 
-  const handleConnectNew = async (vendorId: string, resourceUrlPatterns?: string[]) => {
-    setConnectingVendor(vendorId)
-    try {
-      await openConnectWindow(await authenticatedApi.connectAccount(vendorId, resourceUrlPatterns), authenticatedApi)
-    } catch (error) {
-      if (error instanceof AuthPopupCancelledError) return
-      console.error('Failed to initiate connection:', error)
-      toasts.add({ title: error instanceof Error ? error.message : 'Could not complete connection flow', variant: 'error' })
-    } finally {
-      setConnectingVendor(null)
-    }
+  const handleConnectNew = (vendorId: string, resourceUrlPatterns?: string[]) => {
+    void connectActions.connect(vendorId, resourceUrlPatterns)
   }
 
   // --- Grant additional resource access handler ---
 
   const handleGrantResourceAccess = useCallback(async (accountId: number, resourceUrlPatterns: string[]) => {
     if (resourceUrlPatterns.length === 0) return
-    setGrantingAccount(accountId)
-    try {
-      const flow = await authenticatedApi.ensureAccountResources(accountId, resourceUrlPatterns)
-      if (flow) {
-        const outcome = await openConnectWindow(flow, authenticatedApi)
-        toasts.add({ title: outcome === 'connected' ? 'Access granted.' : 'Grant the additional access in the pop-up window.', variant: 'success' })
-      }
-    } catch (error) {
-      if (error instanceof AuthPopupCancelledError) return
-      console.error('Failed to request additional access:', error)
-      toasts.add({ title: error instanceof Error ? error.message : 'Failed to request additional access', variant: 'error' })
-    } finally {
-      setGrantingAccount(current => current === accountId ? null : current)
+    const outcome = await connectActions.grant(accountId, resourceUrlPatterns)
+    if (outcome && outcome !== 'already-granted') {
+      toasts.add({ title: outcome === 'connected' ? 'Access granted.' : 'Grant the additional access in the pop-up window.', variant: 'success' })
     }
-  }, [authenticatedApi, toasts])
+  }, [connectActions, toasts])
 
   // --- Reconnect expired account handler ---
 
-  const handleReconnect = useCallback(async (accountId: number) => {
-    setReconnectingAccount(accountId)
-    try {
-      await openConnectWindow(await authenticatedApi.reconnectAccount(accountId), authenticatedApi)
-      // After ticket redemption the account arrives through the accounts subscription,
-      // whose add() with credentialsValid: true clears the reconnectingAccount state.
-    } catch (error) {
-      if (error instanceof AuthPopupCancelledError) { setReconnectingAccount(null); return }
-      console.error('Failed to initiate reconnection:', error)
-      toasts.add({ title: error instanceof Error ? error.message : 'Could not complete re-authentication flow', variant: 'error' })
-      setReconnectingAccount(null)
-    }
-  }, [authenticatedApi])
+  const handleReconnect = useCallback((accountId: number) => {
+    // Busy stays held until the accounts subscription reports the account back: its add() with
+    // credentialsValid: true clears the reconnectingAccount state.
+    void connectActions.reconnect(accountId, { holdBusy: true })
+  }, [connectActions])
 
   // --- Render ---
 
