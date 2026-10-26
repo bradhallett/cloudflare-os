@@ -188,7 +188,8 @@ function ChatInterface({
     chatListVersion,
     chatListReady,
     isLoading,
-    updateCounter,
+    messagesVersion,
+    provisionalTick,
     availableModels,
     selectedModel,
     setSelectedModel,
@@ -337,17 +338,19 @@ function ChatInterface({
   }, [sidebarMode, selectedChatId, chatListReady, chatList]);
 
   // Get messages for selected chat (filter out any undefined slots in sparse array)
-  // Memoized to prevent creating new array on every render
+  // Memoized on `messagesVersion` alone: stream ticks (provisionalTick) never touch the
+  // durable caches, so streaming must not churn these memos or anything derived from them
+  // (message states, display entries).
   const currentMessages = useMemo(() => {
     if (selectedChatId === null) return [];
     return (cacheRef.current.messages.get(selectedChatId) || []).filter(
       (msg) => msg !== undefined,
     );
-  }, [selectedChatId, updateCounter]);
+  }, [selectedChatId, messagesVersion]);
   const currentCompactions = useMemo(() => {
     if (selectedChatId === null) return [];
     return cacheRef.current.compacted.get(selectedChatId) ?? [];
-  }, [selectedChatId, updateCounter]);
+  }, [selectedChatId, messagesVersion]);
   const messageStates = useMemo(() => computeMessageStates(currentMessages), [currentMessages]);
   // Declared bots for the composer's agent picker, plus its pick (a chat's own bot wins while
   // that chat is open; Home's stored pick covers the no-chat case).
@@ -653,12 +656,15 @@ function ChatInterface({
   });
 
   // Auto-scroll to the live edge when messages change, but only while the reader still follows it.
+  // `provisionalTick` rides along so growing stream text keeps following too: the durable deps
+  // (currentMessages, hasVisibleProvisionalContent) hold steady while a turn streams.
   useLayoutEffect(() => {
     scroller.followContent();
   }, [
     currentMessages,
     hasVisibleProvisionalContent,
     isAgentActive,
+    provisionalTick,
     queuedSteers?.length,
     scroller.followContent,
   ]);
@@ -1041,6 +1047,7 @@ function ChatInterface({
                     currentProvisionalState={currentProvisionalState}
                     provisionalToolCalls={provisionalToolCalls}
                     isCompacting={isCompacting}
+                    provisionalTick={provisionalTick}
                     currentMessages={currentMessages}
                     queuedSteers={queuedSteers}
                   />

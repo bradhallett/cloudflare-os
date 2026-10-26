@@ -121,6 +121,12 @@ export interface ChatTranscriptProps {
   currentProvisionalState: ProvisionalChatState | null;
   provisionalToolCalls: ProvisionalToolCallState[];
   isCompacting: boolean;
+  /**
+   * The rAF-coalesced stream tick: the provisional state objects are mutated in place with
+   * stable identity, so this counter is what re-renders the live turn's placeholder while a
+   * response streams. Every other prop holds steady across ticks.
+   */
+  provisionalTick: number;
   /** Re-sends a failed user send's exact payload (the row's owner drops it on success). */
   onRetryFailedSend: (send: FailedChatSend) => void;
   /** Drops a failed user send's message for good. */
@@ -189,6 +195,7 @@ export function ChatTranscript({
   currentProvisionalState,
   provisionalToolCalls,
   isCompacting,
+  provisionalTick,
   currentMessages,
   onRetryFailedSend,
   onDismissFailedSend,
@@ -368,6 +375,7 @@ export function ChatTranscript({
               provisionalState={currentProvisionalState}
               toolCalls={provisionalToolCalls}
               isCompacting={isCompacting}
+              provisionalTick={provisionalTick}
               showThinkingTraces={showThinkingTraces}
               currentMessages={currentMessages}
               previousEntry={lastEntry}

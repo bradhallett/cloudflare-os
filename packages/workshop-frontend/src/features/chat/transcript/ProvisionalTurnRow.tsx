@@ -1,3 +1,4 @@
+import { memo } from "react";
 import styles from "../ChatInterface.module.css";
 import type { AiChatMessage } from "@gadgets/workshop-shared/api";
 import { MarkdownMessage } from "../markdown/MarkdownMessage";
@@ -11,7 +12,7 @@ import { ThinkingTraceRow } from "./ThinkingTraceRow";
  * thinking notices, reasoning, partial text, in-flight tool calls — shown only while the
  * agent is active; once real output appears, that speaks for itself.
  */
-export function ProvisionalTurnRow({
+export const ProvisionalTurnRow = memo(function ProvisionalTurnRow({
   provisionalState,
   toolCalls,
   isCompacting,
@@ -24,6 +25,13 @@ export function ProvisionalTurnRow({
   provisionalState: ProvisionalChatState | null;
   toolCalls: ProvisionalToolCallState[];
   isCompacting: boolean;
+  /**
+   * The rAF-coalesced stream tick. The provisional state and tool calls are mutated in place
+   * with stable identity, so this counter is the only prop that changes while a response
+   * streams -- exactly what the memo wrapper needs to repaint the row per tick while the
+   * durable transcript around it holds still.
+   */
+  provisionalTick: number;
   showThinkingTraces: boolean;
   /** The chat's messages, read for whether the agent has answered anything yet. */
   currentMessages: AiChatMessage[];
@@ -91,4 +99,4 @@ export function ProvisionalTurnRow({
       )}
     </div>
   );
-}
+});

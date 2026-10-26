@@ -35,6 +35,7 @@ function transcriptProps(displayEntries: ChatDisplayEntry[]): ChatTranscriptProp
     currentUser: null,
     chatEpoch: 0,
     isAgentActive: false,
+    provisionalTick: 0,
     activeAgent: undefined,
     lastDurablePendingChange: null,
     pendingChangeByTurnItemSeq: new Map(),

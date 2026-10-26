@@ -546,6 +546,11 @@ export function computeMessageStates(messages: AiChatMessage[]): MessageState {
   const mergeTimestamps = new Map<number, Date>();
   const revertTimestamps = new Map<number, Date>();
 
+  // Timestamps by sequence, so merge/revert lookups stay O(1) instead of a rescan per row.
+  const timestampBySequence = new Map<number, Date>(
+    messages.map((msg) => [msg.sequence, msg.timestamp]),
+  );
+
   // Sequences of the changes still proposed as we scan
   let pending: number[] = [];
 
@@ -558,20 +563,20 @@ export function computeMessageStates(messages: AiChatMessage[]): MessageState {
       while (pending.length > 0 && pending[0] <= msg.mergeThrough) {
         changeStatus.set(pending.shift()!, "merged");
       }
-      // Find timestamp for the merged-through message
-      const refMsg = messages.find((m) => m.sequence === msg.mergeThrough);
-      if (refMsg) {
-        mergeTimestamps.set(msg.sequence, refMsg.timestamp);
+      // Timestamp of the merged-through message
+      const refTimestamp = timestampBySequence.get(msg.mergeThrough);
+      if (refTimestamp !== undefined) {
+        mergeTimestamps.set(msg.sequence, refTimestamp);
       }
     } else if (msg.type === "revert") {
       // Mark changes as reverted and drop from active set
       while (pending.length > 0 && pending[pending.length - 1] >= msg.revertFrom) {
         changeStatus.set(pending.pop()!, "reverted");
       }
-      // Find timestamp for the reverted-from message
-      const refMsg = messages.find((m) => m.sequence === msg.revertFrom);
-      if (refMsg) {
-        revertTimestamps.set(msg.sequence, refMsg.timestamp);
+      // Timestamp of the reverted-from message
+      const refTimestamp = timestampBySequence.get(msg.revertFrom);
+      if (refTimestamp !== undefined) {
+        revertTimestamps.set(msg.sequence, refTimestamp);
       }
     }
   }
