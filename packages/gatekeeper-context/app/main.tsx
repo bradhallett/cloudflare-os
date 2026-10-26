@@ -10,7 +10,7 @@ import type {
   GatekeeperAppTheme,
   GatekeeperAppThemeReceiver,
 } from '@gadgets/workshop-shared/theme'
-import ContextLibraryPage from './ContextLibraryPage'
+import ContextLibraryPage from './context-library/ContextLibraryPage'
 import {
   ContextApiProvider,
   PresentationProvider,
