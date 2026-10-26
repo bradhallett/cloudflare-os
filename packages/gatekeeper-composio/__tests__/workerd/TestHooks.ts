@@ -37,7 +37,7 @@ import type {
   ComposioTriggerFiring,
 } from "../../src/types.js";
 import { signWebhook } from "../../src/webhooks.js";
-import { GatekeeperVendor, setComposioFetchForTests } from "../../src/worker.js";
+import { GatekeeperVendor, accountByName, setComposioFetchForTests } from "../../src/worker.js";
 import { BindMarkerCallback } from "../worker.js";
 
 /** The initiator entrypoint's test surface (minted through ctx.exports, never imported). */
@@ -700,7 +700,7 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
 
   #account(accountName: string): ComposioAccount {
     this.#accountNames.add(accountName);
-    return this.ctx.exports.ComposioAccount.getByName(accountName) as unknown as ComposioAccount;
+    return accountByName(this.ctx.exports.ComposioAccount, accountName);
   }
 
   /**
@@ -749,12 +749,21 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
 
   // -- Mints (the account's validation chokepoint) ------------------------------
 
-  /** Runs the account's mint validation and reports the refusal, if any. */
-  mintCheck(
-    accountName: string, url: string, policy?: ComposioToolkitPolicy,
-  ): Promise<Attempt<null>> {
+  /**
+   * Pushes a toolkit policy to the account the way the Workshop does — out-of-band, ahead of
+   * any mint (ComposioUserPolicy.updateToolkitPolicy).
+   */
+  setPolicy(accountName: string, policy: ComposioToolkitPolicy): Promise<Attempt<null>> {
     return this.#attempt(async () => {
-      await this.#account(accountName).getGatekeeperClassFor(url, policy);
+      await this.#account(accountName).updateToolkitPolicy(policy);
+      return null;
+    });
+  }
+
+  /** Runs the account's mint validation and reports the refusal, if any. */
+  mintCheck(accountName: string, url: string): Promise<Attempt<null>> {
+    return this.#attempt(async () => {
+      await this.#account(accountName).getGatekeeperClassFor(url);
       return null;
     });
   }
@@ -788,13 +797,11 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
   async toolkitSession(
     accountName: string,
     facetName: string,
-    arming: { toolkitSlug: string; autoApply?: boolean; excluded?: boolean },
+    { toolkitSlug }: { toolkitSlug: string },
   ): Promise<void> {
     const props: ToolkitFacetProps = {
       accountObjectId: this.#accountObjectId(accountName),
-      toolkitSlug: arming.toolkitSlug,
-      excluded: arming.excluded === true,
-      autoApply: arming.autoApply === true,
+      toolkitSlug,
       generation: (await this.#account(accountName).keyState()).generation,
     };
     await this.#startSession(
@@ -806,9 +813,8 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
     accountName: string,
     facetName: string,
     url: string,
-    policy?: ComposioToolkitPolicy,
   ): Promise<void> {
-    const minted = await this.#account(accountName).getGatekeeperClassFor(url, policy);
+    const minted = await this.#account(accountName).getGatekeeperClassFor(url);
     await this.#startSession(facetName, () => minted.class as DurableObjectClass<
       ComposioToolkitGatekeeper
     >);
@@ -816,19 +822,23 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
 
   /**
    * The ambient singleton facet for one account, and a session on it. With a policy the mint
-   * goes through the account (persisting it, as the kernel's mint does); without one the facet
-   * is instantiated directly, the state an older deployment's facet is left in.
+   * goes through the account (persisting it first, as the kernel's out-of-band push does);
+   * without one the facet is instantiated directly, the state an older deployment's facet is
+   * left in.
    */
   async singletonSession(
     accountName: string,
     facetName: string,
     policy?: ComposioToolkitPolicy,
   ): Promise<void> {
+    if (policy !== undefined) {
+      await this.#account(accountName).updateToolkitPolicy(policy);
+    }
     const klass = policy === undefined
       ? this.ctx.exports.ComposioSingletonGatekeeper({
         props: { accountObjectId: this.#accountObjectId(accountName) },
       })
-      : (await this.#account(accountName).getSingletonGatekeeperClass(policy)) as DurableObjectClass<ComposioSingletonGatekeeper>;
+      : (await this.#account(accountName).getSingletonGatekeeperClass()) as DurableObjectClass<ComposioSingletonGatekeeper>;
     await this.#startSession(facetName, () => klass);
   }
 

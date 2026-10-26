@@ -29,7 +29,7 @@ import {
   VENDOR_ID,
 } from "./config.js";
 
-import { isAutoApplyEligible, ToolkitPolicy } from "./policy.js";
+import { isAutoApplyEligible } from "./policy.js";
 import { MAX_ENVELOPE_BYTES, parseWebhookEnvelope } from "./webhooks.js";
 import TYPES_CODE from "./types.txt";
 export { default as TYPES_CODE } from "./types.txt";
@@ -207,23 +207,48 @@ export class GatekeeperVendor
       if (!known.has(slug)) {
         return { slug, exists: false, eligibleToolCount: 0, destructiveToolCount: 0 };
       }
-      // Count under the rule the auto-apply classification applies: the slug itself listed (the
-      // admin is deciding whether to list it), then the affirmative-tag rule from policy.ts.
-      const policy = new ToolkitPolicy([], [slug]);
+      // Count under the rule the auto-apply classification applies — the affirmative-tag rule
+      // from policy.ts; the listing itself is what the admin is deciding here.
       let eligibleToolCount = 0;
       let destructiveToolCount = 0;
       await api.forEachTool(slug, batch => {
         for (const tool of batch) {
           if (tool.tags.includes("destructiveHint")) destructiveToolCount++;
-          else if (isAutoApplyEligible(policy, tool.toolkitSlug, {
-            tags: tool.tags,
-            readOnly: tool.readOnlyHint === true,
-          })) eligibleToolCount++;
+          else if (isAutoApplyEligible(tool)) eligibleToolCount++;
         }
       });
       return { slug, exists: true, eligibleToolCount, destructiveToolCount };
     }));
   }
+}
+
+// ---------------------------------------------------------------------------
+// Account addressing. The account is a stateful DO reached through ctx.exports, whose runtime
+// stub type drops `unknown`-bearing members (`ExecuteEnvelope.result`, `ToolInfo.inputSchema`)
+// that are in fact delivered verbatim — one shared cast per addressing mode keeps that fact
+// written down once instead of copied at every call site.
+
+/** The slice of a Durable Object namespace that addresses an account. */
+type AccountNamespace = {
+  idFromString(hexId: string): DurableObjectId;
+  get(id: DurableObjectId): DurableObjectStub;
+  getByName(name: string): DurableObjectStub;
+};
+
+/** The account DO by its hex object id, re-typed to its declared surface. */
+export function accountById(
+  ns: AccountNamespace,
+  hexId: string,
+): import("./account.js").ComposioAccount {
+  return ns.get(ns.idFromString(hexId)) as unknown as import("./account.js").ComposioAccount;
+}
+
+/** The account DO by its stable name, re-typed to its declared surface. */
+export function accountByName(
+  ns: AccountNamespace,
+  name: string,
+): import("./account.js").ComposioAccount {
+  return ns.getByName(name) as unknown as import("./account.js").ComposioAccount;
 }
 
 // ---------------------------------------------------------------------------
@@ -317,7 +342,7 @@ async function handleWebhook(request: Request, ctx: ExecutionContext): Promise<R
     });
     return new Response(null, { status: 200 });
   }
-  const account = ctx.exports.ComposioAccount.getByName(event.routedAccountId);
+  const account = accountByName(ctx.exports.ComposioAccount, event.routedAccountId);
   const status = await account.ingestWebhook(rawBody, webhookId, timestamp, signature);
   return new Response(null, { status });
 }

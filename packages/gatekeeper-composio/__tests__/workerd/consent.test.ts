@@ -49,9 +49,11 @@ describe("observer consent", () => {
     // Arming listings read the toolkit catalog, which needs a key: provision the owner's own.
     await expect(hooks.provisionOwnKey("consent-3", "own-1"))
       .resolves.toEqual({ ok: true, value: null });
-    await hooks.toolkitSession("consent-3", "consent-3-facet", {
-      toolkitSlug: "github", autoApply: true,
-    });
+    await expect(hooks.setPolicy("consent-3", {
+      excludedToolkits: [],
+      autoApplyToolkits: ["github"],
+    })).resolves.toEqual({ ok: true, value: null });
+    await hooks.toolkitSession("consent-3", "consent-3-facet", { toolkitSlug: "github" });
     // The armed facet really does list auto-apply actions first.
     await expect(hooks.autoApprovableActions("consent-3-facet")).resolves.toHaveLength(1);
 
@@ -71,9 +73,11 @@ describe("observer consent", () => {
     await expect(hooks.setSharing("consent-4", true)).resolves.toEqual({ ok: true, value: null });
 
     // ...then arm a facet anyway: the sharing fence inside the facet disarms its listings.
-    await hooks.toolkitSession("consent-4", "consent-4-armed", {
-      toolkitSlug: "github", autoApply: true,
-    });
+    await expect(hooks.setPolicy("consent-4", {
+      excludedToolkits: [],
+      autoApplyToolkits: ["github"],
+    })).resolves.toEqual({ ok: true, value: null });
+    await hooks.toolkitSession("consent-4", "consent-4-armed", { toolkitSlug: "github" });
     await expect(hooks.autoApprovableActions("consent-4-armed")).resolves.toEqual([]);
   });
 });

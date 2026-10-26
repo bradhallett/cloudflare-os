@@ -93,7 +93,9 @@ page's existing toggles) yield one toolkit-level kind `composio:<slug>:write`. A
 `createHint` or `updateHint` and do not include `destructiveHint` — Composio's silence never
 enables anything, and the absence of a destructive tag alone never suffices (tags are
 third-party-influenced). Auto-apply never covers meta-tool slugs, outcome-unknown/blocked
-settlement paths, or continuations. Arming is refused while observer sharing is on.
+settlement paths, or continuations. Arming is refused while observer sharing is on. The listing
+is consulted **live** at every classification and `getAutoApprovableActions()` call — nothing is
+frozen at mint — so unlisting a toolkit disarms its already-minted bindings immediately.
 
 ## Observer consent
 
@@ -108,12 +110,14 @@ chats can read through it — in every shared workspace, every toolkit, both key
 
 ## Admin policy chokepoint
 
-The gatekeeper cannot read `AdminConfig`; the Workshop passes
-`ComposioToolkitPolicy { excludedToolkits, autoApplyToolkits }` into every
-`getGatekeeperClassFor` mint, and the connector resolves it at one `toolkitPolicy(slug)`
-chokepoint (**excluded always wins**), consulted at facet mint (unknown/excluded slug → no
-class), catalog filter, session scope, and the auto-apply classification site. Nothing is baked
-into account state, so admin exclusions reach new facets and sessions immediately.
+The gatekeeper cannot read `AdminConfig`; the Workshop pushes
+`ComposioToolkitPolicy { excludedToolkits, autoApplyToolkits }` to the account out-of-band
+(`ComposioUserPolicy.updateToolkitPolicy`, ahead of any mint), and the connector resolves the
+stored copy at one chokepoint (**excluded always wins**), consulted at facet mint
+(unknown/excluded slug → no class), catalog filter, session scope, and the auto-apply
+classification site. Facets freeze only the key-mode generation; exclusions and unlistings
+reach already-minted facets and sessions immediately, because every use re-reads the stored
+policy.
 
 ## Quotas
 

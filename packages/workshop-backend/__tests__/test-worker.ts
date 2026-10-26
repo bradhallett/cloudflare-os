@@ -92,11 +92,11 @@ const stashedTickets = new Map<string, string>();
 /**
  * A gatekeeper account as the Workshop sees one: a persistent stub it can store and call back into.
  * Records calls by `props.name` so a test can ask any instance what happened (`calls()`); with
- * `failRevoke` / `failDescribe`, that method rejects after being recorded.
+ * `failRevoke` / `failDescribe` / `failToolkitPolicy`, that method rejects after being recorded.
  */
 export class FakeGatekeeperAccount extends WorkerEntrypoint<Cloudflare.Env, {
   name: string; failRevoke?: boolean; failDescribe?: boolean; providesUi?: boolean;
-  singleton?: { tsType: string };
+  singleton?: { tsType: string }; failToolkitPolicy?: boolean;
 }> {
   #record(call: string) {
     const calls = accountCalls.get(this.ctx.props.name) ?? [];
@@ -122,6 +122,34 @@ export class FakeGatekeeperAccount extends WorkerEntrypoint<Cloudflare.Env, {
   async getSingletonGatekeeperClass(): Promise<{ fakeSessionClass: true }> {
     this.#record("getSingletonGatekeeperClass");
     return { fakeSessionClass: true };
+  }
+
+  /**
+   * The resource mint (UserDurableObject.getGatekeeperClassFor) calls this for the URL's class;
+   * the values only need to be non-null for the tests (the user DO records the pattern, and
+   * nothing in these tests loads the class).
+   */
+  async getGatekeeperClassFor(url: string): Promise<{
+      class: { fakeResourceClass: true };
+      resource: { urlPattern: string; title: string };
+  }> {
+    this.#record(`getGatekeeperClassFor(${url})`);
+    return {
+      class: { fakeResourceClass: true },
+      resource: { urlPattern: url, title: this.ctx.props.name },
+    };
+  }
+
+  /**
+   * The vendor-admin-policy push (user.ts #pushVendorAdminPolicy) calls this ComposioUserPolicy
+   * extension after a mint when the admin configured this vendor; the record proves the push, and
+   * `failToolkitPolicy` proves its failure never fails the mint it rode.
+   */
+  async updateToolkitPolicy(
+      policy: { excludedToolkits: string[]; autoApplyToolkits: string[] }): Promise<void> {
+    this.#record(
+        `updateToolkitPolicy(${policy.excludedToolkits.join(",")}|${policy.autoApplyToolkits.join(",")})`);
+    if (this.ctx.props.failToolkitPolicy) throw new Error("updateToolkitPolicy failed");
   }
 
   async revoke(): Promise<void> {

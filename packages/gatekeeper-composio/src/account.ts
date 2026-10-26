@@ -14,6 +14,7 @@ import type {
   AgentCatalog,
   AppUiContext,
   ComposioToolkitPolicy,
+  ComposioUserPolicy,
   Gatekeeper,
   GatekeeperUiFrame,
   GatekeeperUserVerifier,
@@ -47,7 +48,7 @@ import { HookDeliveryQueue } from "@gadgets/gatekeeper-kit/hook-delivery-queue";
 import { buildDescription, quoteUntrusted } from "@gadgets/gatekeeper-kit/action-description";
 import { capUtf8 } from "./composio-api.js";
 import type { SingletonFacetProps, ToolkitFacetProps } from "./facet.js";
-import { QuotaTable, quotaDay, type QuotaCounters } from "./quota.js";
+import { QuotaTable, quotaDay, quotaKey, type QuotaCounters } from "./quota.js";
 import { startAppUi } from "./app-ui.js";
 import type { ComposioTriggerInitiator, ComposioTriggerMessage } from "./triggers.js";
 import { TOOLKIT_RESOURCE, composioFetch, logger } from "./worker.js";
@@ -110,13 +111,12 @@ export type ComposioKeyState = {
   ownKeySet: boolean;
 };
 
-/** What registerFacet() records for the key-mode fence and the sharing arming check. */
+/** What registerFacet() records for the key-mode fence. */
 export type ComposioFacetRegistration = {
   /** Which DO class the facet is, so the key-switch fan-out pings the right namespace. */
   kind: "singleton" | "toolkit";
   toolkitSlug?: string;
   generation: number;
-  autoApplyListed: boolean;
 };
 
 const CATALOG_TTL_MS = 6 * 60 * 60 * 1000;
@@ -202,7 +202,7 @@ function disposeStub(value: unknown): void {
 
 
 @validateRpc()
-export class ComposioAccount extends DurableObject<Cloudflare.Env> {
+export class ComposioAccount extends DurableObject<Cloudflare.Env> implements ComposioUserPolicy {
   readonly #quota: QuotaTable;
   readonly #triggerQueue: HookDeliveryQueue<ComposioTriggerMessage>;
   #mutex: Promise<unknown> = Promise.resolve();
@@ -219,16 +219,22 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
       facet_kind TEXT NOT NULL CHECK (facet_kind IN ('singleton', 'toolkit')),
       toolkit_slug TEXT,
       generation INTEGER NOT NULL,
-      auto_apply_listed INTEGER NOT NULL,
       pending_actions INTEGER NOT NULL DEFAULT 0,
       registered_at INTEGER NOT NULL
     ) STRICT`);
-    // Counters recorded before the column existed (dev storages) backfill to fail-closed zero.
+    // Arming is computed live from the stored policy (armedAutoApplySlugs), not frozen per
+    // facet; the column an earlier dev build carried goes. Counters recorded before the
+    // pending_actions column existed (dev storages) backfill to fail-closed zero.
     try {
       ctx.storage.sql.exec(
         "ALTER TABLE composio_facets ADD COLUMN pending_actions INTEGER NOT NULL DEFAULT 0");
     } catch {
       // Column already present.
+    }
+    try {
+      ctx.storage.sql.exec("ALTER TABLE composio_facets DROP COLUMN auto_apply_listed");
+    } catch {
+      // Column already gone (or the storage predates it).
     }
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS composio_triggers (
       trigger_id TEXT PRIMARY KEY,
@@ -290,13 +296,13 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
   /**
    * Mints the facet for one toolkit resource URL. Fails closed — unknown slug (checked against
    * the live catalog), admin-excluded toolkit, or a deployment-mode account with no deployment
-   * key all refuse the mint — and freezes the deployment's toolkit policy and the account's
-   * current key-mode generation into the facet's props, so a later exclusion or key switch can
-   * never widen what an already-minted facet allows.
+   * key all refuse the mint — and freezes the account's current key-mode generation into the
+   * facet's props. Nothing policy-shaped freezes: the facets and sessions re-check the stored
+   * policy (kept fresh out-of-band, see updateToolkitPolicy) at every use, so a later exclusion
+   * or unlisting cannot leave an already-minted facet armed.
    */
   async getGatekeeperClassFor(
     url: string,
-    composioPolicy?: ComposioToolkitPolicy,
   ): Promise<{ class: DurableObjectClass<Gatekeeper<unknown>>; resource: SupportedResource }> {
     const slug = parseToolkitUrl(url);
     if (slug === null) {
@@ -316,9 +322,8 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
       throw new Error(`"${slug}" is not a toolkit in Composio's catalog.`);
     }
 
-    const policy = await this.#refreshPolicy(composioPolicy);
-    const excluded = !policy.allows(slug);
-    if (excluded) {
+    const policy = resolveToolkitPolicy(await this.policyState());
+    if (!policy.allows(slug)) {
       throw new Error(
         `The "${entry.name}" toolkit is excluded by this deployment's Composio policy.`);
     }
@@ -326,8 +331,6 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
     const props: ToolkitFacetProps = {
       accountObjectId: this.ctx.id.toString(),
       toolkitSlug: slug,
-      excluded,
-      autoApply: policy.autoApplyListed(slug),
       generation: keyState.generation,
     };
     return {
@@ -425,11 +428,9 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
   }
 
   /** The ambient singleton's facet; it serves every toolkit at once (see facet.ts). */
-  async getSingletonGatekeeperClass(composioPolicy?: ComposioToolkitPolicy)
-      : Promise<DurableObjectClass<Gatekeeper<unknown>>> {
-    // The singleton facet carries no frozen policy: it re-reads the persisted one at use time.
-    // The kernel passes it fresh at every mint, so this is the policy's main refresh channel.
-    await this.#refreshPolicy(composioPolicy);
+  async getSingletonGatekeeperClass(): Promise<DurableObjectClass<Gatekeeper<unknown>>> {
+    // The singleton facet carries no frozen policy: it re-reads the persisted one — kept fresh
+    // out-of-band through updateToolkitPolicy — at use time.
     const props: SingletonFacetProps = { accountObjectId: this.ctx.id.toString() };
     return this.ctx.exports.ComposioSingletonGatekeeper({ props });
   }
@@ -440,24 +441,26 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * Persists `composioPolicy` when the call carried one, then resolves the freshest policy seen
-   * (facet mint, singleton mint). An undefined policy never overwrites: absence means "this call
-   * carried none", never "the deployment emptied its lists".
+   * The policy channel (ComposioUserPolicy): the Workshop pushes the admin config's lists here,
+   * out-of-band from any mint. The stored copy is the freshest the account has seen; facets and
+   * sessions re-read it at every use, so an exclusion or unlisting reaches already-minted
+   * bindings immediately.
    */
-  async #refreshPolicy(composioPolicy?: ComposioToolkitPolicy): Promise<ToolkitPolicy> {
-    if (composioPolicy !== undefined) {
-      await this.ctx.storage.put("toolkitPolicy", {
-        excludedToolkits: composioPolicy.excludedToolkits,
-        autoApplyToolkits: composioPolicy.autoApplyToolkits,
-      });
-    }
-    return resolveToolkitPolicy(
-      await this.ctx.storage.get<ComposioToolkitPolicy>("toolkitPolicy"));
+  async updateToolkitPolicy(policy: ComposioToolkitPolicy): Promise<void> {
+    await this.ctx.storage.put("toolkitPolicy", {
+      excludedToolkits: policy.excludedToolkits,
+      autoApplyToolkits: policy.autoApplyToolkits,
+    });
   }
 
-  /** The freshest toolkit policy seen, for the facets' and sessions' use-time re-checks. */
+  /** The freshest toolkit policy pushed, for the facets' and sessions' use-time re-checks. */
   async policyState(): Promise<ComposioToolkitPolicy | undefined> {
     return await this.ctx.storage.get<ComposioToolkitPolicy>("toolkitPolicy");
+  }
+
+  /** The stored policy as its chokepoint type, for this class's own use-time checks. */
+  async #policy(): Promise<ToolkitPolicy> {
+    return resolveToolkitPolicy(await this.policyState());
   }
 
   // -- Key mode and quota ----------------------------------------------------
@@ -650,7 +653,7 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
         message: `The "${request.tool}" meta-tool is disabled by this deployment.`,
       };
     }
-    const policy = await this.#refreshPolicy();
+    const policy = await this.#policy();
     const toolkitSlug = request.toolkitSlug ?? await this.#cachedToolToolkit(request.tool);
     if (toolkitSlug !== undefined && !policy.allows(toolkitSlug)) {
       // Use-time exclusion: the admin excluded this toolkit after the action staged, so the
@@ -672,11 +675,11 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
       return { status: "refused", message: err instanceof Error ? err.message : String(err) };
     }
 
-    const quotaKey = `${keyState.keyMode}:${quotaDay()}`;
+    const key = quotaKey(keyState.keyMode, quotaDay());
     const limit = keyState.keyMode === "own"
       ? Number.MAX_SAFE_INTEGER
       : dailyCallLimit(this.env);
-    const reservation = this.#quota.reserve(quotaKey, limit);
+    const reservation = this.#quota.reserve(key, limit);
     if (!reservation.allowed) {
       logger.info("call refused: daily quota exhausted", {
         event: "account.execute.quota-refused",
@@ -698,7 +701,7 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
       if (await this.ctx.storage.get<number>("generation") !== keyState.generation) {
         // A key switch interleaved after the entry check (a read holds no pending-action
         // fence): nothing was dispatched, so give the reservation back and strand the call.
-        this.#quota.release(quotaKey);
+        this.#quota.release(key);
         return {
           status: "stranded",
           message:
@@ -718,9 +721,9 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
       // upstream: both release the reservation. Everything else settled against it.
       if (envelope.resultType === "input_required"
         || (envelope.resultType === "blocked" && envelope.logId === null)) {
-        this.#quota.release(quotaKey);
+        this.#quota.release(key);
       } else {
-        this.#quota.settle(quotaKey);
+        this.#quota.settle(key);
       }
       return { status: "envelope", envelope };
     } catch (err) {
@@ -728,7 +731,7 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
         // Composio answered a definite pre-execution failure (bad request, auth, unknown
         // tool/session, unprocessable): the call provably never ran, so the reservation goes
         // back and the caller settles not-dispatched rather than outcome-unknown.
-        this.#quota.release(quotaKey);
+        this.#quota.release(key);
         logger.info("composio refused the call before execution", {
           event: "account.execute.pre-execution-refused",
           keyMode: keyState.keyMode, status: err.status,
@@ -739,7 +742,7 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
         };
       }
       // A transport failure may still have landed at Composio: settle, never release.
-      this.#quota.settle(quotaKey);
+      this.#quota.settle(key);
       if (err instanceof ComposioApiError) {
         logger.warn("composio request failed mid-execute", {
           event: "account.execute.transport-failed",
@@ -765,8 +768,8 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
       "SELECT delivered, dropped FROM composio_events WHERE day = ?", day,
     ).toArray();
     return {
-      deployment: this.#quota.counts(`deployment:${day}`),
-      own: this.#quota.counts(`own:${day}`),
+      deployment: this.#quota.counts(quotaKey("deployment", day)),
+      own: this.#quota.counts(quotaKey("own", day)),
       limit: dailyCallLimit(this.env),
       events: {
         delivered: eventRows.reduce((sum, row) => sum + row.delivered, 0),
@@ -1338,17 +1341,27 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
     if (stale.length > 0) await this.ctx.storage.delete(stale);
   }
 
-  /** Replans the alarm from scratch (called from inside a firing alarm). */
-  async #planAlarm(): Promise<void> {
-    const now = Date.now();
-    const due = this.#triggerQueue.nextDue();
-    const hasTriggers = this.#triggerRows().length > 0;
-    let next: number | undefined = due;
-    if (hasTriggers) {
-      const last = await this.ctx.storage.get<number>("lastReconcileAt") ?? now;
+  /**
+   * The next deadline the alarm must cover: the delivery queue's next due message, pulled in
+   * by the reconcile cadence while any trigger row exists. `neverReconciledAt` is the instant
+   * an account with no recorded reconcile counts as last reconciled (the two planners below
+   * differ only there: a firing alarm replans around now, a mutation pulls in from zero).
+   */
+  async #nextAlarmTime(neverReconciledAt: number): Promise<number | undefined> {
+    let next = this.#triggerQueue.nextDue();
+    if (this.#triggerRows().length > 0) {
+      const last = await this.ctx.storage.get<number>("lastReconcileAt")
+        ?? neverReconciledAt;
       const reconcileDue = last + RECONCILE_INTERVAL_MS;
       next = next === undefined ? reconcileDue : Math.min(next, reconcileDue);
     }
+    return next;
+  }
+
+  /** Replans the alarm from scratch (called from inside a firing alarm). */
+  async #planAlarm(): Promise<void> {
+    const now = Date.now();
+    const next = await this.#nextAlarmTime(now);
     if (next === undefined) {
       await this.ctx.storage.deleteAlarm();
     } else {
@@ -1358,14 +1371,7 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
 
   /** After a mutation outside the alarm: pull the alarm in, never push it out. */
   async #planAlarmAfterMutation(): Promise<void> {
-    const due = this.#triggerQueue.nextDue();
-    const hasTriggers = this.#triggerRows().length > 0;
-    let next: number | undefined = due;
-    if (hasTriggers) {
-      const reconcileDue = (await this.ctx.storage.get<number>("lastReconcileAt") ?? 0)
-        + RECONCILE_INTERVAL_MS;
-      next = next === undefined ? reconcileDue : Math.min(next, reconcileDue);
-    }
+    const next = await this.#nextAlarmTime(0);
     if (next === undefined) return;
     const current = await this.ctx.storage.getAlarm();
     if (current === null || next < current) {
@@ -1398,18 +1404,16 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
   async registerFacet(facetId: string, registration: ComposioFacetRegistration): Promise<void> {
     this.ctx.storage.sql.exec(
       `INSERT INTO composio_facets
-         (facet_id, facet_kind, toolkit_slug, generation, auto_apply_listed, registered_at)
-       VALUES (?, ?, ?, ?, ?, ?)
+         (facet_id, facet_kind, toolkit_slug, generation, registered_at)
+       VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(facet_id) DO UPDATE SET
          facet_kind = excluded.facet_kind,
          toolkit_slug = excluded.toolkit_slug,
-         generation = excluded.generation,
-         auto_apply_listed = excluded.auto_apply_listed`,
+         generation = excluded.generation`,
       facetId,
       registration.kind,
       registration.toolkitSlug ?? null,
       registration.generation,
-      registration.autoApplyListed ? 1 : 0,
       Date.now(),
     );
     logger.info("facet registered", {
@@ -1424,7 +1428,7 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
   /** Enables observer sharing; refused while any facet has auto-apply armed (see README). */
   async setSharingEnabled(on: boolean): Promise<void> {
     if (on) {
-      const armed = this.armedAutoApplySlugs();
+      const armed = await this.armedAutoApplySlugs();
       if (armed.length > 0) {
         throw new Error(
           "Observer sharing cannot be enabled while auto-apply is armed for: " +
@@ -1437,13 +1441,18 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
     });
   }
 
-  /** The toolkits whose facets have auto-apply armed, for the sharing refusal above. */
-  armedAutoApplySlugs(): string[] {
+  /**
+   * The toolkits whose registered facets auto-apply right now, for the sharing refusal above:
+   * the live policy's listed slugs that have at least one toolkit facet registered. Arming is
+   * never frozen per facet — the facets compute the same verdict from the same stored policy —
+   * so this can be derived, not recorded.
+   */
+  async armedAutoApplySlugs(): Promise<string[]> {
+    const listed = new Set((await this.#policy()).autoApplyListedSlugs());
     const rows = this.ctx.storage.sql.exec<{ toolkit_slug: string }>(
-      `SELECT toolkit_slug FROM composio_facets WHERE auto_apply_listed = 1
-         AND toolkit_slug IS NOT NULL`,
+      `SELECT DISTINCT toolkit_slug FROM composio_facets WHERE toolkit_slug IS NOT NULL`,
     ).toArray();
-    return [...new Set(rows.map(row => row.toolkit_slug))];
+    return rows.map(row => row.toolkit_slug).filter(slug => listed.has(slug));
   }
 
   /** The app's sharing panel state. */
@@ -1513,20 +1522,20 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
    * Excluded toolkits are hidden here too: to the agent their tools do not exist.
    */
   async toolBySlug(toolSlug: string): Promise<ToolInfo | undefined> {
-    const policy = await this.#refreshPolicy();
+    const policy = await this.#policy();
     const tool = (await this.#catalog()).toolsBySlug.get(toolSlug);
     return tool !== undefined && policy.allows(tool.toolkitSlug) ? tool : undefined;
   }
 
   /** One toolkit's tools, as the toolkit facet and the session list them; excluded → none. */
   async toolkitTools(toolkitSlug: string): Promise<ToolInfo[]> {
-    if (!(await this.#refreshPolicy()).allows(toolkitSlug)) return [];
+    if (!(await this.#policy()).allows(toolkitSlug)) return [];
     return toolsForToolkit(await this.#catalog(), toolkitSlug);
   }
 
   /** The whole catalog for the session's listTools()-free surfaces; facets scope by slug. */
   async #catalogEntries(): Promise<CatalogEntry[]> {
-    const policy = await this.#refreshPolicy();
+    const policy = await this.#policy();
     return (await this.#catalog()).entries.filter(entry => policy.allows(entry.slug));
   }
 
@@ -1717,7 +1726,7 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
     const key = mode === "own" ? "ownSessionId" : "deploymentSessionId";
     const existing = await this.ctx.storage.get<string>(key);
     if (existing !== undefined) return existing;
-    const autoApplyToolkits = (await this.#refreshPolicy()).autoApplyListedSlugs();
+    const autoApplyToolkits = (await this.#policy()).autoApplyListedSlugs();
     const { sessionId } = await api.createSession(this.composioUserId, autoApplyToolkits);
     if (await this.ctx.storage.get<number>("generation") !== generation) {
       await api.deleteSession(sessionId).catch(() => {});

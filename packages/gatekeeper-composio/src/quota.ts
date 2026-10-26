@@ -4,8 +4,15 @@
 // reservations to settled once a call took effect (a settled call still counts toward the day's
 // limit — only a release frees capacity).
 
-/** Quota counter key: `${KeyMode}:${utcDate}`. */
-export type QuotaKey = string;
+import type { ComposioKeyMode } from "./account.js";
+
+/** Quota counter key: `${keyMode}:${utcDate}` — build with {@link quotaKey}. */
+export type QuotaKey = `${"deployment" | "own"}:${string}`;
+
+/** The quota counter key for one key mode and UTC day. */
+export function quotaKey(mode: ComposioKeyMode, day: string): QuotaKey {
+  return `${mode}:${day}`;
+}
 
 /** The three counters kept per key. */
 export interface QuotaCounters {

@@ -55,18 +55,16 @@ function hasWriteHint(tags: ReadonlySet<string>): boolean {
 }
 
 /**
- * Auto-apply eligibility: adminListed && write-classified && tags affirmatively include
- * `createHint` or `updateHint` AND do not include `destructiveHint`. Composio's silence never
- * enables anything, and the absence of `destructiveHint` alone never suffices — tags are
- * third-party metadata (possibly inferred from an MCP server's own hints), so an injected
- * `destructiveHint: false` must not be able to arm a write.
+ * The tool-half of auto-apply eligibility: write-classified (not read-only) with tags that
+ * affirmatively include `createHint` or `updateHint` AND do not include `destructiveHint`.
+ * Composio's silence never enables anything, and the absence of `destructiveHint` alone never
+ * suffices — tags are third-party metadata (possibly inferred from an MCP server's own hints),
+ * so an injected `destructiveHint: false` must not be able to arm a write. The admin-listing
+ * half lives in the caller's live `ToolkitPolicy.autoApplyListed()` consult.
  */
 export function isAutoApplyEligible(
-  policy: ToolkitPolicy,
-  toolkitSlug: string,
   tool: { tags?: string[]; readOnly?: boolean },
 ): boolean {
-  if (!policy.autoApplyListed(toolkitSlug)) return false;
   if (tool.readOnly) return false;
   const tags = new Set(tool.tags ?? []);
   return hasWriteHint(tags) && !tags.has("destructiveHint");

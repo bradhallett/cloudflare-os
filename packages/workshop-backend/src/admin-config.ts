@@ -13,7 +13,7 @@ import { AiModelProvider, AmbientGatekeeperMode, BlueprintBinding, BlueprintMeta
 import { SupportedResource } from "@gadgets/workshop-shared/gatekeeper";
 import { normalizeBotDefinition } from "./bot-config.js";
 import { sanitizeBlueprintOutput } from "./blueprint-archive.js";
-import { DEFAULT_ADMIN_CONFIG, type AdminConfig, type FormatCuration } from "./storage-schema/admin-settings-storage.js";
+import { DEFAULT_ADMIN_CONFIG, type AdminConfig, type FormatCuration, type VendorAdminPolicy } from "./storage-schema/admin-settings-storage.js";
 import { ADMIN_CONFIG_KEY, BlueprintKvEnv, readBlueprintKvRecord } from "./storage-schema/blueprints-kv.js";
 
 /**
@@ -334,6 +334,33 @@ function strings(value: unknown): string[] {
 function toolkitSlugs(value: unknown): string[] {
   return [...new Set(strings(value).map(slug => slug.trim()).filter(slug => slug !== ""))];
 }
+// Vendor-keyed admin policy: only keys the patch actually carries survive, so a vendor's entry
+// means "the admin configured this vendor" (empty lists = configured-to-nothing) and an absent
+// entry means "never configured" — the distinction user.ts #pushVendorAdminPolicy relies on.
+function vendorAdminPolicy(value: unknown): Record<string, VendorAdminPolicy> {
+  let record: Record<string, VendorAdminPolicy> = {};
+  if (typeof value !== "object" || value === null) return record;
+  for (let [vendorId, policy] of Object.entries(value)) {
+    if (typeof policy !== "object" || policy === null) continue;
+    record[vendorId.trim().toLowerCase()] = {
+      excludedToolkits: toolkitSlugs((policy as {excludedToolkits?: unknown}).excludedToolkits),
+      autoApplyToolkits: toolkitSlugs((policy as {autoApplyToolkits?: unknown}).autoApplyToolkits),
+    };
+  }
+  return record;
+}
+// A record stored before `vendorAdminPolicy` existed carries the two composio lists instead (the
+// field pair this record replaced). Read-time mapping only: while the stored record is absent, a
+// configured pair becomes the composio entry, so an upgraded deployment keeps hiding what its
+// admin hid; both lists empty (never configured) stays absent, and the first write that persists
+// the record ends the mapping for good.
+function legacyVendorAdminPolicy(p: Partial<AdminConfig>): Record<string, VendorAdminPolicy> | undefined {
+  let excluded = toolkitSlugs((p as {composioExcludedToolkits?: unknown}).composioExcludedToolkits);
+  let autoApply = toolkitSlugs((p as {composioAutoApplyToolkits?: unknown}).composioAutoApplyToolkits);
+  return excluded.length === 0 && autoApply.length === 0
+    ? undefined
+    : { composio: { excludedToolkits: excluded, autoApplyToolkits: autoApply } };
+}
 
 /**
  * Apply defaults to a partial admin config loaded from either authoritative DO
@@ -385,8 +412,7 @@ export function normalizeAdminConfig(p: Partial<AdminConfig>): AdminConfig {
     accentColor: typeof p.accentColor === "string" ? p.accentColor : "",
     disabledResources,
     disabledGatekeepers: strings(p.disabledGatekeepers).map(v => v.toLowerCase()),
-    composioExcludedToolkits: toolkitSlugs(p.composioExcludedToolkits),
-    composioAutoApplyToolkits: toolkitSlugs(p.composioAutoApplyToolkits),
+    vendorAdminPolicy: vendorAdminPolicy(p.vendorAdminPolicy ?? legacyVendorAdminPolicy(p)),
     ambientGatekeeperModes,
     formats: parseFormats(p.formats),
     deploymentBots: parseDeploymentBots(p.deploymentBots),

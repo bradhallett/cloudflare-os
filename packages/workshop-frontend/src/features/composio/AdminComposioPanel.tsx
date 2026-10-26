@@ -165,10 +165,12 @@ export const AdminComposioPanel = ({
   const save = async (which: 'excluded' | 'autoApply', slugs: string[]) => {
     setSaving(which)
     try {
-      const setter = which === 'excluded'
-        ? admin.setComposioExcludedToolkits
-        : admin.setComposioAutoApplyToolkits
-      await setter(slugs)
+      // One vendor-keyed setter carries both lists, so the untouched list keeps its saved value:
+      // a save still changes only the list the admin edited.
+      await admin.setVendorAdminPolicy('composio', {
+        excludedToolkits: which === 'excluded' ? slugs : excludedToolkits,
+        autoApplyToolkits: which === 'autoApply' ? slugs : autoApplyToolkits,
+      })
       // Canonicalize the draft to what the server kept, matching the seed above.
       if (which === 'excluded') setExcludedDraft(slugs.join('\n'))
       else setAutoApplyDraft(slugs.join('\n'))

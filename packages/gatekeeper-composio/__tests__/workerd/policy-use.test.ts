@@ -115,19 +115,21 @@ describe("use-time exclusion re-check", () => {
     await expect(hooks.provisionOwnKey("pol-recheck", "own-1"))
       .resolves.toEqual({ ok: true, value: null });
 
-    // Armed before any exclusion existed.
-    await hooks.toolkitSession("pol-recheck", "stale", {
-      toolkitSlug: "github", autoApply: true,
-    });
+    // Armed before any exclusion existed (the Workshop's out-of-band listing push).
+    await expect(hooks.setPolicy("pol-recheck", {
+      excludedToolkits: [],
+      autoApplyToolkits: ["github"],
+    })).resolves.toEqual({ ok: true, value: null });
+    await hooks.toolkitSession("pol-recheck", "stale", { toolkitSlug: "github" });
     await expect(hooks.autoApprovableActions("stale")).resolves.toEqual([
       { kind: "composio:github:write", label: "all current and future write tools in GitHub" },
     ]);
 
-    // The exclusion lands through the singleton mint, the kernel's refresh channel.
-    await hooks.singletonSession("pol-recheck", "refresh", {
+    // The exclusion lands out-of-band; excluded wins over the surviving listing.
+    await expect(hooks.setPolicy("pol-recheck", {
       excludedToolkits: ["github"],
       autoApplyToolkits: ["github"],
-    });
+    })).resolves.toEqual({ ok: true, value: null });
 
     await expect(hooks.autoApprovableActions("stale")).resolves.toEqual([]);
     const queued = await hooks.callTool("stale", WRITE_TOOL, { repo: "acme/api" });
@@ -137,6 +139,33 @@ describe("use-time exclusion re-check", () => {
       expect(queued.message).toContain(`no tool named "${WRITE_TOOL}"`);
     }
     await expect(hooks.pendingActionCount("stale")).resolves.toBe(0);
+  });
+
+  it("unlisting a toolkit disarms its already-minted facet immediately", async () => {
+    hooks.installFake(githubSpec(completed));
+    await expect(hooks.provisionOwnKey("pol-unlist", "own-1"))
+      .resolves.toEqual({ ok: true, value: null });
+    await expect(hooks.setPolicy("pol-unlist", {
+      excludedToolkits: [],
+      autoApplyToolkits: ["github"],
+    })).resolves.toEqual({ ok: true, value: null });
+    await hooks.toolkitSession("pol-unlist", "armed", { toolkitSlug: "github" });
+    await expect(hooks.autoApprovableActions("armed")).resolves.toHaveLength(1);
+
+    // The admin empties the auto-apply list: the live listing disarms at once (README:92).
+    await expect(hooks.setPolicy("pol-unlist", {
+      excludedToolkits: [],
+      autoApplyToolkits: [],
+    })).resolves.toEqual({ ok: true, value: null });
+    await expect(hooks.autoApprovableActions("armed")).resolves.toEqual([]);
+
+    // The session's classification agrees: the write tool queues with no auto-apply verdict.
+    const queued = await hooks.callTool("armed", WRITE_TOOL, { repo: "acme/api" });
+    expect(queued.ok).toBe(true);
+    if (!queued.ok) throw new Error(queued.message ?? "callTool failed");
+    const { submissions } = await hooks.queueState("armed");
+    expect(submissions).toHaveLength(1);
+    expect(submissions[0].autoApprovable).not.toBe(true);
   });
 });
 
