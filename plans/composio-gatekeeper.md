@@ -141,7 +141,11 @@ behind a generic card.
   against a 1,600-toolkit catalog — and Composio's own docs advise keeping session toolsets
   narrow. The account DO therefore assembles and caches the catalog from REST
   (`GET /toolkits` + `GET /tools`, cursor-paginated at the documented `limit=500`), filtering
-  per facet by exact toolkit slug. The session MCP endpoint is used for **execution only**.
+  per facet by exact toolkit slug. **Transport pivot (owner-approved 2026-10-26, integration
+  review): execution is REST too** — `POST /tool_router/session/{id}/execute` with the key on
+  `x-api-key` — so the connector never constructs an MCP client; the session MCP endpoint is
+  unused and line 147's PR-1 change below is **withdrawn and reverted** (the auth-scheme option
+  shipped in PR 1 with zero consumers and was removed in the integration-fixes follow-up).
   `preload: {tools:"all"}` is not used — it is unsupported when multi-account mode is enabled.
 
 - **Session MCP needs `x-api-key`, so mcp-shared gains an auth-scheme option.** Composio's
