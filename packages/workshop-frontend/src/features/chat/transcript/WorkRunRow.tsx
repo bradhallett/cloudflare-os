@@ -39,19 +39,19 @@ export function WorkRunRow({
   const pendingChange = pendingChangeByTurnItemSeq.get(entry.lastMessageSequence) ?? null;
   const createdWorkpieces =
     createdWorkpiecesByTurnItemSeq.get(entry.lastMessageSequence) ?? [];
-  const showFooterOnGroupIndex = pendingChange ? entry.toolCallGroups.length - 1 : -1;
+  const { workGroup } = entry;
   return (
     <div className={`${className} min-w-0 w-full max-w-[860px] space-y-2`}>
-      {entry.toolCallGroups.map((group, groupIndex) => (
+      {workGroup && (
         <ToolGroupRow
           outputOf={resolveToolOutput}
-          key={group.key}
-          group={group}
-          open={expandedToolCalls.has(group.key)}
+          key={workGroup.key}
+          group={workGroup}
+          open={expandedToolCalls.has(workGroup.key)}
           expandedKeys={expandedToolCalls}
           onToggle={toggleToolCallExpansion}
           footer={
-            groupIndex === showFooterOnGroupIndex && pendingChange
+            pendingChange
               ? turnFooterProps(
                   pendingChange,
                   pendingChange.through === lastDurablePendingChange?.sequence,
@@ -62,7 +62,7 @@ export function WorkRunRow({
               : undefined
           }
         />
-      ))}
+      )}
       {createdWorkpieces.map((created) => (
         <CreatedWorkpieceChatCard
           key={created.workpieceId}

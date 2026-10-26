@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { AiToolCall } from "@gadgets/workshop-shared/api";
 import type { ProvisionalToolCallState } from "../provisionalChatState";
-import { buildProvisionalToolSummary, buildToolCallGroups, isToolCallRunning } from "./toolCalls";
+import { buildProvisionalToolSummary, buildToolCallGroup, isToolCallRunning } from "./toolCalls";
 
 // An executeCode call, overridable with the fields the running state keys off.
 const codeCall = (
@@ -45,27 +45,27 @@ describe("isToolCallRunning", () => {
   });
 });
 
-describe("buildToolCallGroups running", () => {
+describe("buildToolCallGroup running", () => {
   it("marks a group running while its only call lacks output, and clears it when output lands", () => {
-    expect(buildToolCallGroups([codeCall()])[0].running).toBe(true);
-    expect(buildToolCallGroups([codeCall({ output: "done" })])[0].running).toBe(false);
+    expect(buildToolCallGroup([codeCall()])!.running).toBe(true);
+    expect(buildToolCallGroup([codeCall({ output: "done" })])!.running).toBe(false);
   });
 
   it("keys off the latest call of the run", () => {
     const earlier = codeCall({ toolCallId: "call-0", output: "done" });
-    expect(buildToolCallGroups([earlier, codeCall()])[0].running).toBe(true);
-    expect(buildToolCallGroups([earlier, codeCall({ output: "done" })])[0].running).toBe(false);
+    expect(buildToolCallGroup([earlier, codeCall()])!.running).toBe(true);
+    expect(buildToolCallGroup([earlier, codeCall({ output: "done" })])!.running).toBe(false);
   });
 
   it("never shows running and error together", () => {
-    const group = buildToolCallGroups([codeCall({ error: "boom" })])[0];
+    const group = buildToolCallGroup([codeCall({ error: "boom" })])!;
     expect(group.hasError).toBe(true);
     expect(group.running).toBe(false);
   });
 
   it("never shows running once any call of the run failed, even a later one still running", () => {
     const failed = codeCall({ toolCallId: "call-0", error: "boom" });
-    const group = buildToolCallGroups([failed, codeCall({ toolCallId: "call-1" })])[0];
+    const group = buildToolCallGroup([failed, codeCall({ toolCallId: "call-1" })])!;
     expect(group.hasError).toBe(true);
     expect(group.running).toBe(false);
   });

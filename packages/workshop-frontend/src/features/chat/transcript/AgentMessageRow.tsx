@@ -19,7 +19,7 @@ import type { ToolCallGroup, ToolOutputResolver } from "./toolCalls";
  */
 export function AgentMessageRow({
   msg,
-  toolCallGroups,
+  workGroup,
   lastMessageSequence,
   showThinkingTraces,
   isAgentActive,
@@ -36,7 +36,7 @@ export function AgentMessageRow({
   onRevertChanges,
 }: {
   msg: Extract<AiChatMessage, { type: "message" }>;
-  toolCallGroups: ToolCallGroup[] | undefined;
+  workGroup: ToolCallGroup | null | undefined;
   lastMessageSequence: number | undefined;
   showThinkingTraces: boolean;
   isAgentActive: boolean;
@@ -59,19 +59,12 @@ export function AgentMessageRow({
   const createdWorkpieces = createdWorkpiecesByTurnItemSeq.get(actionMessageSeq) ?? [];
   // With no text of its own, the reply's actions (and the turn's discard) attach to its
   // tool-group footer instead of an actions row of their own.
-  const attachActionsToToolGroups =
-    !hasMessageText &&
-    !!pendingChange &&
-    !!toolCallGroups &&
-    toolCallGroups.length > 0;
+  const attachActionsToToolGroups = !hasMessageText && !!pendingChange && !!workGroup;
   const showActions =
     completedAgentTurnMessageSeqs.has(actionMessageSeq) &&
     (hasMessageText || (!!pendingChange && !attachActionsToToolGroups));
   const keepActionsVisible = actionMessageSeq === latestCompletedAgentTurnMessageSeq;
   const isTrailing = pendingChange?.through === lastDurablePendingChange?.sequence;
-  const showFooterOnGroupIndex = attachActionsToToolGroups && pendingChange && toolCallGroups
-    ? toolCallGroups.length - 1
-    : -1;
   return (
     <div className="min-w-0 w-full max-w-[860px] space-y-2">
       <div className="group/agentMessage relative space-y-1.5">
@@ -144,29 +137,27 @@ export function AgentMessageRow({
         />
       ))}
 
-      {toolCallGroups && toolCallGroups.length > 0 && (
+      {workGroup && (
         <div className="space-y-1">
-          {toolCallGroups.map((group, groupIndex) => (
-            <ToolGroupRow
-              outputOf={resolveToolOutput}
-              key={group.key}
-              group={group}
-              open={expandedToolCalls.has(group.key)}
-              expandedKeys={expandedToolCalls}
-              onToggle={toggleToolCallExpansion}
-              footer={
-                groupIndex === showFooterOnGroupIndex && pendingChange
-                  ? turnFooterProps(
-                      pendingChange,
-                      isTrailing,
-                      msg.timestamp,
-                      isAgentActive,
-                      onRevertChanges,
-                    )
-                  : undefined
-              }
-            />
-          ))}
+          <ToolGroupRow
+            outputOf={resolveToolOutput}
+            key={workGroup.key}
+            group={workGroup}
+            open={expandedToolCalls.has(workGroup.key)}
+            expandedKeys={expandedToolCalls}
+            onToggle={toggleToolCallExpansion}
+            footer={
+              attachActionsToToolGroups && pendingChange
+                ? turnFooterProps(
+                    pendingChange,
+                    isTrailing,
+                    msg.timestamp,
+                    isAgentActive,
+                    onRevertChanges,
+                  )
+                : undefined
+            }
+          />
         </div>
       )}
     </div>

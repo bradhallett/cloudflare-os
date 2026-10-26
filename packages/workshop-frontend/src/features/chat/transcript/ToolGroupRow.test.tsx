@@ -6,7 +6,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AiToolCall } from "@gadgets/workshop-shared/api";
 import { ToolGroupRow } from "./ToolGroupRow";
-import { buildToolCallGroups } from "./toolCalls";
+import { buildToolCallGroup } from "./toolCalls";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -40,7 +40,7 @@ describe("ToolGroupRow running indicator", () => {
     act(() =>
       root.render(
         <ToolGroupRow
-          group={buildToolCallGroups(calls)[0]}
+          group={buildToolCallGroup(calls)!}
           open={false}
           expandedKeys={new Set()}
           onToggle={() => {}}

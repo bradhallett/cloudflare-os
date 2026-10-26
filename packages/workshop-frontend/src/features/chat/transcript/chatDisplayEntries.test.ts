@@ -40,9 +40,7 @@ const workRun = (lastMessageSequence: number): ChatDisplayEntry =>
   ({
     type: "workRun",
     key: `work-${lastMessageSequence}`,
-    toolCalls: [],
-    observations: [],
-    toolCallGroups: [],
+    workGroup: null,
     lastMessageSequence,
     lastMessageTimestamp: new Date(),
   }) as unknown as ChatDisplayEntry;
