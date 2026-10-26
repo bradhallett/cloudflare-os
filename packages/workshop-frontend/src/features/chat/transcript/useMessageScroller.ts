@@ -227,8 +227,9 @@ export function useMessageScroller({
     if (!el) return;
     const grew = el.scrollHeight > lastScrollHeightRef.current + 0.5;
     lastScrollHeightRef.current = el.scrollHeight;
-    if (atBottomRef.current && modeRef.current === "following") {
-      // Still following: the caller's follow effect scrolls to the new edge, so nothing is missed.
+    if (atBottomRef.current && modeRef.current !== "readerOwns") {
+      // Still riding the live edge — following it, or mid-glide back to it (a jump): content
+      // growth must retarget the follow, not strand it. The caller's follow effect scrolls.
       markFollowing();
       return;
     }

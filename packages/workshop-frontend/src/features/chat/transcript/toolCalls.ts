@@ -28,7 +28,8 @@ function formatGadgetBindingTarget(
   name: string | undefined,
 ): string | undefined {
   if (gadget === undefined) return name;
-  return name === undefined ? undefined : `${gadget}.${name}`;
+  if (name === undefined) return gadget;
+  return `${gadget}.${name}`;
 }
 /**
  * What a `createGadget` call produced. Read from the gadget's own stamped output rather than
@@ -243,7 +244,8 @@ const TOOL_META: Record<AiToolCall["toolName"], ToolMeta> = {
   requestConnection: {
     summary: "Requested connection",
     past: "Requested",
-    noun: "connection",
+    countLabel: (count) =>
+      count === 1 ? "Requested a connection" : `Requested ${count} connections`,
     present: "Requesting",
     presentPhrase: "Requesting a connection",
     icon: Question,
