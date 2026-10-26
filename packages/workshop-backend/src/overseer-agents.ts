@@ -145,6 +145,42 @@ export abstract class OverseerAgents extends OverseerMainline {
   }
 
   /**
+   * Stops the chat's running agent. Its queued steers are dropped: the client that stops puts them
+   * in its draft (see Overseer.stopAgent).
+   */
+  cancelAgent(chatId: number) {
+    let meta = this.storage.chatMeta.get(chatId);
+    if (meta?.queuedSteers) {
+      delete meta.queuedSteers;
+      meta.lastActive = this.getChatTimestamp();
+      this.storage.chatMeta.put(meta);
+    }
+    // Stop prevents resumption even if the DO disappears before the aborted task's finally runs;
+    // restart recovery clears any busy marker left without an execution row.
+    this.storage.activeAgents.delete(chatId);
+    this.resumeErrors.delete(chatId);
+    let author = this.storage.chatMeta.get(chatId)?.activeAgent ?? this.decisionWait(chatId)?.agent;
+    if (author) this.addChatMessages(chatId, author,
+        [{type: "agentNudge", text: "The user stopped this turn. Wait for a new request."}]);
+    let ctx = this.liveChats.get(chatId);
+    if (ctx) {
+      ctx.cancelController.abort(new Error("User requested to stop agent."));
+    }
+    // A retryable lookup has already released its task to the alarm, so no finally is left to
+    // clear the busy marker. Stop must finish that handoff synchronously too.
+    if (!this.runningAgents.has(chatId)) {
+      let meta = this.storage.chatMeta.get(chatId);
+      if (meta?.activeAgent) {
+        delete meta.activeAgent;
+        meta.lastActive = this.getChatTimestamp();
+        this.storage.chatMeta.put(meta);
+      }
+      this.updateAlarm();
+      this.finishAgentTurn(chatId);
+    }
+  }
+
+  /**
    * The hand-off once a chat's turn is over and its running-agent state has been torn down: drop
    * the turn's live context, then deliver whatever was waiting for the chat to go idle -- steers
    * the turn never read, calls to the agent recorded during the turn (which start another turn),
@@ -980,18 +1016,7 @@ export abstract class OverseerAgents extends OverseerMainline {
    * resolving the model twice or reporting a failure twice.
    */
   drainPendingAgentCalls(chatId: number): Promise<void> {
-    let drain = this.pendingCallDrains.get(chatId);
-    if (!drain) {
-      drain = this.#drainPendingAgentCalls(chatId)
-          .finally(() => {
-            this.pendingCallDrains.delete(chatId);
-            // A drain can also settle without starting a turn (its chat was deleted, or its
-            // initiator has no model), which unregistering a running agent never observes.
-            this.wakeIdleWaiters();
-          });
-      this.pendingCallDrains.set(chatId, drain);
-    }
-    return drain;
+    return this.liveChats.drain(chatId, () => this.#drainPendingAgentCalls(chatId));
   }
 
   async #drainPendingAgentCalls(chatId: number): Promise<void> {

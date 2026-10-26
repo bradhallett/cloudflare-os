@@ -658,7 +658,7 @@ export abstract class OverseerMainline extends OverseerChanges {
    * ownerInvitesOnly sweep) can fetch it once.
    */
   async getOwningOrgRoles(): Promise<ReadonlyMap<string, OrgRole> | null> {
-    const subject = this.storage.ownerSubject.get();
+    const subject = this.workspaceOwner();
     if (subject?.type !== "org") return null;
     const members = await this.ctx.exports.OrgDurableObject.getByName(subject.id).activeMembers();
     return new Map(members.map(m => [m.userId, m.role]));

@@ -112,7 +112,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
    * workspace (the org's index cannot name one; a stale entry costs nothing).
    */
   async severOrgMemberSessions(): Promise<void> {
-    if (this.impl.storage.ownerSubject.get()?.type !== "org") return;
+    if (this.impl.workspaceOwner()?.type !== "org") return;
     if (this.impl.hasCollaboratorSession()) {
       this.impl.scheduleAccessRestart(
           "Gadget restarted because your organization membership changed.");
@@ -160,7 +160,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     // An org-owned workspace (see transferToOrg) has no user owner: every caller -- the
     // operating owner included -- is authorized through the sharing graph, which baselines each
     // active org member's role at their org role and re-checks membership live on every open.
-    let isOwner = isOperatingOwner && this.impl.storage.ownerSubject.get()?.type !== "org";
+    let isOwner = isOperatingOwner && this.impl.workspaceOwner()?.type !== "org";
 
     // Cache the owner's profileId in memory when the owner opens.
     if (isOperatingOwner) {

@@ -108,7 +108,7 @@ export class OverseerImpl extends OverseerBots implements AgentHooks {
           if (result.status === "rejected") throw result.reason;
         }
         if (this.resumeErrors.size > 0) throw this.resumeErrors.values().next().value;
-      } while (this.runningAgents.size > 0 || this.pendingCallDrains.size > 0);
+      } while (this.runningAgents.size > 0 || this.liveChats.hasDrains());
     } catch (error) {
       failed = true;
       throw error;

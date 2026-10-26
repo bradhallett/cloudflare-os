@@ -326,8 +326,8 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
   async deleteSelf(): Promise<void> {
     // The session owner may delete their workspace; once an org owns it, only an owner/admin of
     // that org may. Read the owning org before the storage goes away.
-    const subject = this.impl.storage.ownerSubject.get();
-    const owningOrgId = subject?.type === "org" ? subject.id : undefined;
+    const owner = this.impl.workspaceOwner();
+    const owningOrgId = owner?.type === "org" ? owner.id : undefined;
     if (!this.isOwner &&
         !(owningOrgId !== undefined && await this.impl.isOwningOrgAdmin(this.clientProfileId))) {
       throw new Error("Only the workspace owner can delete it.");
@@ -1617,7 +1617,7 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
     if (!this.isOwner) {
       throw new Error("Only the workspace owner can transfer it to an organization.");
     }
-    if (this.impl.storage.ownerSubject.get() !== undefined) {
+    if (this.impl.workspaceOwner()?.type === "org") {
       throw new Error("This workspace already belongs to an organization.");
     }
     const gadgetId = this.impl.ctx.id.toString();

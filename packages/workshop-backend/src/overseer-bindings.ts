@@ -26,7 +26,7 @@ export abstract class OverseerBindings extends OverseerAgents {
   #catalogless = new Set<number>();
 
   destroyAllLiveChats() {
-    for (let chatId of Array.from(this.liveChats.keys())) {
+    for (let chatId of this.liveChats.chatIds()) {
       this.destroyLiveChat(chatId);
     }
   }
