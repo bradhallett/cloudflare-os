@@ -1690,12 +1690,14 @@ export interface AdminApi {
   setGatekeeperMode(vendorId: string, mode: AmbientGatekeeperMode): Promise<void>;
 
   /**
-   * Set one vendor's admin policy entry (currently the Composio toolkit lists). Lists hold exact
-   * toolkit slugs; entries matching no live toolkit match nothing and are surfaced as warnings by
-   * the admin editor (see getComposioToolkitInfo). An entry with empty lists means "configured to
-   * nothing" and still reaches the vendor's accounts.
+   * Set one vendor's admin policy entry (currently the Composio toolkit lists), or remove the
+   * vendor's entry with null so the vendor reads its own defaults again, as if never configured.
+   * Lists hold exact toolkit slugs; entries matching no live toolkit match nothing and are
+   * surfaced as warnings by the admin editor (see getComposioToolkitInfo). An entry with empty
+   * lists means "configured to nothing" and still reaches the vendor's accounts. An upsert for a
+   * vendor that isn't bound is rejected.
    */
-  setVendorAdminPolicy(vendorId: string, policy: VendorAdminPolicy): Promise<void>;
+  setVendorAdminPolicy(vendorId: string, policy: VendorAdminPolicy | null): Promise<void>;
 
   /**
    * Check Composio toolkit slugs against the vendor's live catalog and count each one's tools:

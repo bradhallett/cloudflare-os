@@ -1008,15 +1008,24 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   // --- Vendor admin policy (see AdminConfig.vendorAdminPolicy) ---
 
   /**
-   * Set one vendor's admin policy entry. Lists are normalized (trimmed, deduplicated, exact
-   * slugs) by updateAdminConfig's normalizeAdminConfig pass; writing an entry with empty lists
-   * means "configured to nothing" and still reaches the vendor's accounts (see
-   * user.ts #pushVendorAdminPolicy for how entries travel).
+   * Set one vendor's admin policy entry, or remove the vendor's entry when `policy` is null (the
+   * vendor then reads its own defaults again, as if never configured). Lists are normalized
+   * (trimmed, deduplicated, exact slugs) by updateAdminConfig's normalizeAdminConfig pass; writing
+   * an entry with empty lists means "configured to nothing" and still reaches the vendor's
+   * accounts (see user.ts #pushVendorAdminPolicy for how entries travel). An upsert validates the
+   * vendorId against the bound gatekeepers so the record can't gain an entry no account will ever
+   * claim; removal takes any id, so a stale entry (a vendor since uninstalled) stays clearable —
+   * and the mint-time push is best-effort anyway.
    */
-  setVendorAdminPolicy(vendorId: string, policy: VendorAdminPolicy): Promise<void> {
-    return this.#mutateAdminConfig(config => {
-      config.vendorAdminPolicy = { ...config.vendorAdminPolicy, [vendorId.toLowerCase()]: policy };
-      return config;
+  async setVendorAdminPolicy(vendorId: string, policy: VendorAdminPolicy | null): Promise<void> {
+    vendorId = vendorId.toLowerCase();
+    if (policy !== null && !this.vendors.has(vendorId)) {
+      throw new Error(`"${vendorId}" is not a bound gatekeeper.`);
+    }
+    await this.#mutateAdminConfig(config => {
+      let entries = { ...config.vendorAdminPolicy };
+      if (policy === null) delete entries[vendorId]; else entries[vendorId] = policy;
+      return { ...config, vendorAdminPolicy: entries };
     });
   }
 
@@ -1222,9 +1231,10 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
     return this.admin.setGatekeeperMode(vendorId, mode);
   }
 
-  setVendorAdminPolicy(vendorId: string, policy: VendorAdminPolicy): Promise<void> {
+  setVendorAdminPolicy(vendorId: string, policy: VendorAdminPolicy | null): Promise<void> {
     return this.admin.setVendorAdminPolicy(vendorId, policy);
   }
+
 
   getComposioToolkitInfo(slugs: string[]): Promise<ComposioToolkitInfo[] | null> {
     return this.admin.getComposioToolkitInfo(slugs);

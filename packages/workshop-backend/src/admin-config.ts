@@ -349,6 +349,18 @@ function vendorAdminPolicy(value: unknown): Record<string, VendorAdminPolicy> {
   }
   return record;
 }
+// A record stored before `vendorAdminPolicy` existed carries the two composio lists instead (the
+// field pair this record replaced). Read-time mapping only: while the stored record is absent, a
+// configured pair becomes the composio entry, so an upgraded deployment keeps hiding what its
+// admin hid; both lists empty (never configured) stays absent, and the first write that persists
+// the record ends the mapping for good.
+function legacyVendorAdminPolicy(p: Partial<AdminConfig>): Record<string, VendorAdminPolicy> | undefined {
+  let excluded = toolkitSlugs((p as {composioExcludedToolkits?: unknown}).composioExcludedToolkits);
+  let autoApply = toolkitSlugs((p as {composioAutoApplyToolkits?: unknown}).composioAutoApplyToolkits);
+  return excluded.length === 0 && autoApply.length === 0
+    ? undefined
+    : { composio: { excludedToolkits: excluded, autoApplyToolkits: autoApply } };
+}
 
 /**
  * Apply defaults to a partial admin config loaded from either authoritative DO
@@ -400,7 +412,7 @@ export function normalizeAdminConfig(p: Partial<AdminConfig>): AdminConfig {
     accentColor: typeof p.accentColor === "string" ? p.accentColor : "",
     disabledResources,
     disabledGatekeepers: strings(p.disabledGatekeepers).map(v => v.toLowerCase()),
-    vendorAdminPolicy: vendorAdminPolicy(p.vendorAdminPolicy),
+    vendorAdminPolicy: vendorAdminPolicy(p.vendorAdminPolicy ?? legacyVendorAdminPolicy(p)),
     ambientGatekeeperModes,
     formats: parseFormats(p.formats),
     deploymentBots: parseDeploymentBots(p.deploymentBots),

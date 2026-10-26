@@ -2089,7 +2089,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let allowed = await this.#allowedGatekeepers();
     if (allowed !== null && !allowed.has(record.vendorId.toLowerCase())) return null;
     let cls = await (record.account as unknown as SingletonAccountStub).getSingletonGatekeeperClass();
-    await this.#pushVendorAdminPolicy(record.vendorId, record.account);
+    await this.#pushVendorAdminPolicy(record);
     return cls;
   }
 
@@ -2822,7 +2822,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (!account) throw new Error("No such account.");
     let {class: cls, resource} = await account.account.getGatekeeperClassFor(url);
     await this.#assertResourceEnabled(account.vendorId, resource);
-    await this.#pushVendorAdminPolicy(account.vendorId, account.account);
+    await this.#pushVendorAdminPolicy(account);
     return {class: cls, vendorId: account.vendorId, typeUrlPattern: resource.urlPattern};
   }
 
@@ -2833,14 +2833,23 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * extension (ComposioUserPolicy in workshop-shared) and this pushes the entry right after every
    * capability mint — the account's stored copy stays as fresh as the config the mint was decided
    * against. Only vendors the admin actually configured have entries, so which vendors participate
-   * is data, not a name in this file; an account that doesn't implement the extension throws, the
-   * same failure a stale policy would eventually surface. The cast follows the SingletonAccountStub
-   * pattern: the extension is optional on GatekeeperUser, declared per vendor.
+   * is data, not a name in this file. The push is best-effort, shaped like the deprovision revokes:
+   * an account that doesn't implement the extension (a stale entry, a vendor since changed) logs
+   * and leaves the account on its last-stored policy rather than failing the mint it rode. The
+   * cast follows the SingletonAccountStub pattern: the extension is optional on GatekeeperUser,
+   * declared per vendor.
    */
-  async #pushVendorAdminPolicy(vendorId: string, account: Fetcher<GatekeeperUser>): Promise<void> {
-    let policy = (await readAdminConfig(this.env)).vendorAdminPolicy[vendorId.toLowerCase()];
+  async #pushVendorAdminPolicy(record: ConnectedAccountRecord): Promise<void> {
+    let policy = (await readAdminConfig(this.env)).vendorAdminPolicy[record.vendorId.toLowerCase()];
     if (policy === undefined) return;
-    await (account as unknown as ComposioUserPolicy).updateToolkitPolicy(policy);
+    try {
+      await (record.account as unknown as ComposioUserPolicy).updateToolkitPolicy(policy);
+    } catch (err) {
+      logger.error("failed to push vendor admin policy", {
+        event: "vendor.policy.push.failed",
+        vendorId: record.vendorId, accountId: record.id, error: err,
+      });
+    }
   }
 
   /**

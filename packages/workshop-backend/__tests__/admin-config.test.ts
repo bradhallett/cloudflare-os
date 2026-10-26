@@ -46,6 +46,29 @@ describe("parseAdminConfig", () => {
     });
   });
 
+  it("derives the composio entry from a legacy record's composio toolkit lists", () => {
+    // A config stored before vendorAdminPolicy existed carries the composio pair instead (the
+    // fields this record replaced); while the record is absent, a configured pair maps to the
+    // composio entry so an upgraded deployment keeps hiding what its admin hid.
+    let config = parseAdminConfig(JSON.stringify({
+      composioExcludedToolkits: [" gitlab ", "gitlab"],
+      composioAutoApplyToolkits: ["slack"],
+    }));
+    expect(config.vendorAdminPolicy).toEqual({
+      composio: { excludedToolkits: ["gitlab"], autoApplyToolkits: ["slack"] },
+    });
+    // The mapping is one-shot: an explicit record — even an empty one — is authoritative, and a
+    // legacy pair that configured nothing (both lists empty) stays "never configured".
+    expect(parseAdminConfig(JSON.stringify({
+      vendorAdminPolicy: {},
+      composioExcludedToolkits: ["gitlab"],
+    })).vendorAdminPolicy).toEqual({});
+    expect(parseAdminConfig(JSON.stringify({
+      composioExcludedToolkits: [],
+      composioAutoApplyToolkits: [],
+    })).vendorAdminPolicy).toEqual({});
+  });
+
   it("drops malformed format entries rather than the whole list", () => {
     let config = parseAdminConfig(JSON.stringify({
       formats: [

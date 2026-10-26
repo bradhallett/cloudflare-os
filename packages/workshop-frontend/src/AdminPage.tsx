@@ -143,8 +143,8 @@ export default function AdminPage() {
     setBannerColorDraft(view.banner.color)
     setSavedAccent(view.accentColor)
     setAccentDraft(view.accentColor)
-    setComposioExcluded(view.composioExcludedToolkits)
-    setComposioAutoApply(view.composioAutoApplyToolkits)
+    setComposioExcluded(view.vendorAdminPolicy.composio?.excludedToolkits ?? [])
+    setComposioAutoApply(view.vendorAdminPolicy.composio?.autoApplyToolkits ?? [])
     setFormats(view.formats)
     setGatewayModels(view.gatewayModels)
   }
