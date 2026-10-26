@@ -37,8 +37,7 @@ import {
   AiGatewayConfig, getAiGatewayConfig, getGatewayModels, type AiGatewayLogRoute,
 } from "./ai-gateway.js";
 import { completeText } from "./ai-invoke.js";
-import { bindingUsageGate } from "./ai-model-usage-gate.js";
-import { emitUsageEvent, usageTokens } from "./usage-events.js";
+import { bindingMetering } from "./ai-model-usage-gate.js";
 import { allowedSetFrom, resolveEntitlements } from "./entitlements.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
 import {
@@ -1116,7 +1115,7 @@ export type AiModelGatekeeperProps = {
    * The workspace owner whose LLM allowance the binding's calls count against, set at mint.
    * Also the user whose plan re-approves the binding's model tier on every session (see
    * refuseRevokedModel). Undefined only on bindings minted before spend gating existed (see
-   * bindingUsageGate).
+   * bindingMetering).
    */
   ownerUserId?: string,
 };
@@ -1190,18 +1189,8 @@ export class LanguageModelGatekeeper
     let model = getModel(this.env, config, this.ctx.props.initiator, {
       metadata: this.ctx.props.metadata,
     });
-    let usageGate = bindingUsageGate(
-        this.env, this.ctx.props.ownerUserId, this.ctx.exports.UserDurableObject);
-    // Meter the binding's one-shot calls (#17's seam): the owner is in scope here, and the
-    // hook fires only on completions (never errors), fire-and-forget at the port (OSS unbound:
-    // no-op). pi reports usage per request; completeText would otherwise discard it.
-    let onUsage = this.ctx.props.ownerUserId === undefined ? undefined
-        : (usage: Usage) => emitUsageEvent(this.ctx, this.env, {
-              modelId: model.model.id,
-              tokens: usageTokens(usage),
-              userId: this.ctx.props.ownerUserId!,
-              surface: "binding",
-            });
+    let { usageGate, onUsage } = bindingMetering(
+        this.env, this.ctx, this.ctx.props.ownerUserId, model.model.id);
     return new LanguageModelBindingImpl(model, usageGate, onUsage);
   }
 
@@ -1273,19 +1262,8 @@ export class DecisionModelGatekeeper
       : Promise<DecisionModelBinding> {
     let { config, initiator, metadata } = this.ctx.props;
     await refuseRevokedModel(this.env, this.ctx.props);
-    let usageGate = bindingUsageGate(
-        this.env, this.ctx.props.ownerUserId, this.ctx.exports.UserDurableObject);
-    // Meter the binding's classifier calls as the LLM binding meters run() (#17's seam): the
-    // owner is in scope here, and decide() would otherwise discard the usage pi reports on the
-    // result. Fire-and-forget at the port (OSS unbound: no-op); config.model is the catalog id
-    // the classifier catalog is keyed by, so it is the id a price table resolves.
-    let onUsage = this.ctx.props.ownerUserId === undefined ? undefined
-        : (usage: Usage) => emitUsageEvent(this.ctx, this.env, {
-              modelId: config.model,
-              tokens: usageTokens(usage),
-              userId: this.ctx.props.ownerUserId!,
-              surface: "binding",
-            });
+    let { usageGate, onUsage } = bindingMetering(
+        this.env, this.ctx, this.ctx.props.ownerUserId, config.model);
     return new DecisionModelBindingImpl(
         getDecisionModel(this.env, config, initiator, metadata), usageGate, onUsage);
   }
