@@ -1,6 +1,7 @@
 import { WorkpieceId, AiChatMessage, AiChatAuthorInfo, AiModelConfig, validateBindingName } from "@gadgets/workshop-shared/api";
 import type { AgentCatalog } from "@gadgets/workshop-shared/gatekeeper";
 import type { BoundHookRecord, ChatBindingEntry } from "./storage-schema/overseer-storage";
+import { chatKeyPrefix } from "./storage-schema/overseer-storage";
 import { ChatBindingScope, applyMessageBindings } from "./project-chat-log";
 import { SeedBindingInfo, alwaysAvailableResources, GIT_BINDING_NAME } from "./agent";
 import { reportIssue } from "@gadgets/observability/error-reporting";
@@ -91,6 +92,84 @@ export abstract class OverseerBindings extends OverseerAgents {
       }
     }
     this.deleteBindingEdges(edge => edge.pending?.chatId === chatId);
+  }
+
+  /**
+   * Delete a chat outright: the single cleanup point for every table keyed by it. Cancels any
+   * waiting external-message response first (so its waiter settles rather than hanging), then
+   * removes the workpiece footprint (see removeChatWorkpieces), then sweeps every chat-keyed
+   * record in one durable step -- metadata, context, compaction checkpoints, the change stream
+   * and its per-client dedupe records, legacy drafts, messages with their attachment content,
+   * callback args, undelivered agent calls, bot delegations (either side), model-facing
+   * snapshots, and the resume record (so a deleted chat is never resumed; aborting the live
+   * agent also clears it via the tracked promise's finally, but the chat may have no live agent
+   * in memory, e.g. after a restart before resumption ran). Finally drops the in-memory live
+   * state (see destroyLiveChat).
+   */
+  async destroyChat(chatId: number): Promise<void> {
+    let startedAt = Date.now();
+    let response = this.storage.gadgetResponseDeliveries.undeliveredByChatId.get(chatId);
+    if (response?.status === "waiting") {
+      this.deliverExternalMessageResponse(response,
+          "The chat was deleted before the agent responded.");
+    }
+
+    await this.removeChatWorkpieces(chatId);
+
+    // Buffer prefix scans first: deleting records invalidates the list cursors.
+    let checkpoints = Array.from(this.storage.chatCompactions.list({prefix: chatKeyPrefix(chatId)}));
+    let changeClients = Array.from(
+        this.storage.chatChangeClients.list({prefix: chatKeyPrefix(chatId)}));
+    let drafts = Array.from(this.storage.chatDraftUpdates.list({prefix: chatKeyPrefix(chatId)}));
+    let messages = Array.from(this.storage.chats.list({prefix: chatKeyPrefix(chatId)}));
+    let callbackArgs = Array.from(this.storage.agentCallbackArgs.list({prefix: chatKeyPrefix(chatId)}));
+    let pendingCalls = Array.from(this.storage.pendingAgentCalls.list({prefix: chatKeyPrefix(chatId)}));
+    let delegations = Array.from([
+      ...this.storage.pendingDelegations.byParentChatId.get(chatId),
+      ...this.storage.pendingDelegations.byChildChatId.get(chatId),
+    ]);
+    let modelData = Array.from(this.storage.chatModelData.list({prefix: chatKeyPrefix(chatId)}));
+
+    this.ctx.storage.transactionSync(() => {
+      this.storage.chatMeta.delete(chatId);
+      this.storage.chatContext.delete(chatId);
+      for (let checkpoint of checkpoints) this.storage.chatCompactions.deleteRecord(checkpoint);
+      // The chat's change stream: rows (retired included), the straggler-bridge boundary, and the
+      // per-client dedupe records (which live exactly as long as the chat -- see submitCodeChange).
+      this.deleteAllChatChanges(chatId);
+      for (let client of changeClients) this.storage.chatChangeClients.deleteRecord(client);
+      // Any pre-conversion legacy drafts (see ChatDraftUpdateRecord).
+      for (let draft of drafts) this.storage.chatDraftUpdates.deleteRecord(draft);
+      // Delete the chat's messages and the attachment content referenced by them. Attachment
+      // metadata is canonical in each message's ChatAttachmentRef, so no separate attachment
+      // index is needed.
+      for (let msg of messages) {
+        if (msg.type === "message") {
+          for (let attachment of msg.attachments ?? []) {
+            let content = this.storage.chatAttachmentContent.get(attachment.id);
+            if (content?.state.type === "committed" && content.state.chatId === chatId) {
+              this.storage.chatAttachmentContent.delete(attachment.id);
+            }
+          }
+        }
+        this.storage.chats.deleteRecord(msg);
+      }
+      for (let entry of callbackArgs) this.storage.agentCallbackArgs.deleteRecord(entry);
+      for (let entry of pendingCalls) this.storage.pendingAgentCalls.deleteRecord(entry);
+      // Bot delegations involving this chat, from either side: a parent's records die with it
+      // (nothing will await the children), and a child's die because its awaiting parent must
+      // not treat a deleted thread as still running.
+      for (let record of delegations) this.storage.pendingDelegations.deleteRecord(record);
+      for (let entry of modelData) this.storage.chatModelData.deleteRecord(entry);
+      this.storage.activeAgents.delete(chatId);
+    });
+
+    // Clean up all in-memory live state for this chat.
+    this.destroyLiveChat(chatId);
+
+    this.logger.info("deleted chat", {
+      event: "chat.delete.completed", chatId, durationMs: Date.now() - startedAt,
+    });
   }
 
   /**
