@@ -19,7 +19,7 @@ import {
 } from "@gadgets/workshop-shared/gatekeeper";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import {
-  clearConnectionSubject, commitReconnect, ConnectionSubject, pinConnectionSubject, stageReconnect,
+  commitReconnectOrThrow, ConnectionSubject, pinForConnect, stageReconnect,
 } from "@gadgets/gatekeeper-kit/credential-stage";
 import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
 import { readTextCapped } from "@gadgets/gatekeeper-kit/response-body";
@@ -48,12 +48,13 @@ import {
 import {
   applyRevertForEntity,
   canRevert,
-  describeAction,
   executeAction,
   fetchDashboardConfig,
   resolveTargets,
 } from "./approvals";
-import { HomeAssistantActionStore } from "./action-store";
+import {
+  HOME_ASSISTANT_ACTIONS, appliedAction, homeAssistantJournal, withActionId,
+} from "./action-store";
 import {
   indexPendingByEntity,
   overlayDashboardConfig,
@@ -526,14 +527,15 @@ export class UserAccount extends DurableObject<Env> {
       }
     } else {
       this.ctx.storage.kv.put<StoredCredentials>("credentials", { baseUrl, token });
-      pinConnectionSubject(this.ctx.storage.kv, { id: baseUrl });
       clearCredentialExpiryLatch(this.ctx.storage.kv);
       try {
         const props: HomeAssistantUserImplProps = { userObjectId: this.ctx.id.toString() };
-        handoff = await callback.complete(this.ctx.exports.HomeAssistantUserImpl({ props }));
+        // The pin brackets the handoff: a connect that fails unpins and drops the credentials
+        // stored ahead of it.
+        handoff = await pinForConnect(this.ctx.storage.kv, { id: baseUrl },
+          () => callback.complete(this.ctx.exports.HomeAssistantUserImpl({ props })),
+          () => { this.ctx.storage.kv.delete("credentials"); });
       } catch (e) {
-        this.ctx.storage.kv.delete("credentials");
-        clearConnectionSubject(this.ctx.storage.kv);
         return { kind: "error", message: `Failed to notify workshop: ${e instanceof Error ? e.message : e}` };
       }
     }
@@ -555,8 +557,7 @@ export class UserAccount extends DurableObject<Env> {
    * kit's commit is fenced on the connection's pinned subject and re-pins the staged subject, so
    * an account made before the pin existed adopts its first reconnect's instance. */
   async commitReconnect(stageId: string): Promise<void> {
-    const creds = commitReconnect<StoredCredentials>(this.ctx.storage.kv, Date.now(), stageId);
-    if (!creds) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+    const creds = commitReconnectOrThrow<StoredCredentials>(this.ctx.storage.kv, Date.now(), stageId);
     this.ctx.storage.kv.put<StoredCredentials>("credentials", creds);
     clearCredentialExpiryLatch(this.ctx.storage.kv);
   }
@@ -1100,10 +1101,11 @@ export class HomeAssistantGatekeeperImpl
 {
   // Claim-before-apply lifecycle for device actions, over this object's storage. Credentials are
   // resolved per dispatch, so a reconnect between approval and apply is picked up.
-  readonly #actions = new HomeAssistantActionStore({
-    kv: this.ctx.storage.kv,
+  readonly #journal = homeAssistantJournal(this.ctx.storage.kv);
+  readonly #actions = HOME_ASSISTANT_ACTIONS.bind(this.#journal, {
     dispatch: async action => executeAction(action, await this.#getCreds()),
     snapshotForRevert: async action => this.#snapshotForRevert(action, await this.#getCreds()),
+    fetchRegistrySnapshot: async () => fetchRegistrySnapshot(await this.#getCreds()),
     onAuthError: () => this.#userAccount().noteCredentialsExpired(),
   });
 
@@ -1226,10 +1228,10 @@ export class HomeAssistantGatekeeperImpl
   async revertAction(
     actionId: number,
   ): Promise<void | { message?: string; canRetry?: boolean; restart?: boolean }> {
-    // The overseer passes back only the action ID; we stored everything we need (including the
-    // original action, inside `stateSnapshot.originalAction` / `dashboardSnapshot`) under
-    // `applied:<id>` when the action was applied.
-    const applied = this.#actions.getApplied(actionId);
+    // The overseer passes back only the action ID; the apply retained everything we need
+    // (including the original action, inside `stateSnapshot.originalAction` /
+    // `dashboardSnapshot`) on the journal's applied record.
+    const applied = appliedAction(this.#journal, this.ctx.storage.kv, actionId);
     if (!applied) {
       throw new Error(`No applied Home Assistant action exists with id ${actionId}.`);
     }
@@ -1324,43 +1326,20 @@ export class HomeAssistantGatekeeperImpl
         // (rather than ending up in the approval queue or hitting Home Assistant later).
         validateWriteBody(body);
 
-        const action = self.#actions.allocate(body);
-
-        let description;
-        try {
-          const registry = await fetchRegistrySnapshot(creds);
-          description = describeAction(action, registry);
-        } catch {
-          // If registry fetch fails, fall back to a minimal description.
-          const emptyRegistry: RegistrySnapshot = {
-            areas: [],
-            floors: [],
-            labels: [],
-            devices: [],
-            entities: [],
-            states: new Map(),
-          };
-          description = describeAction(action, emptyRegistry);
-        }
-
-        try {
-          await approvalQueue.submitAction(action.id, description);
-        } catch (e) {
-          // The submit failed (e.g., the approval queue stub is gone). Roll the staged record back.
-          self.#actions.rollbackSubmission(action.id);
-          throw e;
-        }
-        self.#actions.markSubmitted(action.id);
+        // The set's submit describes the action -- registry names when reachable, minimal text
+        // otherwise -- allocates, and stages it on the approval queue, rolling back a submission
+        // the queue refused.
+        await self.#actions.submit(approvalQueue, body.type, body);
       },
       async registrySnapshot() {
         return await fetchRegistrySnapshot(creds);
       },
       listPendingActions() {
-        return self.#actions.pendingActions();
+        return self.#journal.listPending().map(({ id, action }) => withActionId(action.payload, id));
       },
       async registrySnapshotWithOverlay() {
         const snapshot = await fetchRegistrySnapshot(creds);
-        const pending = self.#actions.pendingActions();
+        const pending = self.#journal.listPending().map(({ id, action }) => withActionId(action.payload, id));
         if (pending.length === 0) {
           return { snapshot, appliedCount: 0 };
         }
