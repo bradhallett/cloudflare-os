@@ -1,4 +1,5 @@
-import { WorkpieceId, ChatGadgetPinRecord, AiChatMetadata, AiChatMessage, AiChatAuthorInfo, CollaboratorRole, ChatAttachmentHandle, ChatAttachmentRef, validateBindingName } from "@gadgets/workshop-shared/api";
+import { RpcStub } from "capnweb";
+import { WorkpieceId, ChatGadgetPinRecord, AiChatMetadata, AiChatMessage, AiChatAuthorInfo, CollaboratorRole, ChatAttachmentHandle, ChatAttachmentRef, AiChatSubscriber, validateBindingName } from "@gadgets/workshop-shared/api";
 import { applyCodeChange, codeChangeSerializedSize } from "@gadgets/workshop-shared/code-change";
 import type { CodeContent } from "@gadgets/workshop-shared/code-change";
 import { chatKey, chatKeyPrefix } from "./storage-schema/overseer-storage";
@@ -8,6 +9,7 @@ import { getAiGatewayConfig } from "./ai-gateway";
 import { GIT_BINDING_NAME } from "./agent";
 import { chatChangeStatuses } from "./agent-compaction";
 import { WebFetchEnv } from "./web-fetch";
+import { actionRecordToLog } from "./overseer-action-log";
 import { UserDurableObject } from "./user";
 import { isLoopLimitError } from "./do-retry";
 import { assertChatAttachmentSize, isAllowedChatAttachmentImageMimeType, validateChatAttachmentUpload } from "./chat-attachment-validation";
@@ -487,13 +489,20 @@ export abstract class OverseerChats extends OverseerCore {
   }
 
   /**
-   * Prepare a stored chat message for delivery to a client: inline image attachment bytes
-   * (non-image attachments are fetched on demand via getChatAttachmentContent()), strip the
-   * retired Yjs payload from pre-conversion "changes" messages -- it is kept on disk as
+   * Prepare a stored chat message for delivery to a client: attach the action log entry an
+   * "action" message's record carries (nothing to attach if the record is gone), inline image
+   * attachment bytes (non-image attachments are fetched on demand via getChatAttachmentContent()),
+   * strip the retired Yjs payload from pre-conversion "changes" messages -- it is kept on disk as
    * rollback insurance (see overseer-git-migration.ts) but nothing can apply it, so it must not
    * ship as dead weight on the wire (it is not part of the message's API type).
    */
   hydrateChatMessageForClient(msg: StoredChatMessage): AiChatMessage {
+    if (msg.type === "action") {
+      let record = this.storage.actions.get(msg.actionId);
+      if (record) {
+        msg.actionLog = actionRecordToLog(record);
+      }
+    }
     if (msg.type === "changes" && "update" in msg) {
       let {update: _, ...rest} = msg;
       msg = rest;
@@ -512,6 +521,51 @@ export abstract class OverseerChats extends OverseerCore {
       return {...a, content: content.data};
     });
     return {...msg, attachments};
+  }
+
+  /**
+   * A new chat subscriber's catch-up replay: metadata and messages since `startAfter` (messages
+   * first, then the metadata they establish the durable state for), then every currently
+   * retained (not-yet-materialized) change row -- so the subscriber can reconstruct uncommitted
+   * chat content without a separate fetch. Rows a "changes" message has absorbed are not
+   * replayed -- the message's watermark covers them -- and the rows are delivered after the
+   * message catch-up, matching their position in the stream (rows are strictly newer than every
+   * materialized message of their generation). Change rows are delivered unconditionally (no
+   * startAfter filtering): the client dedupes by (generation, revision). Each delivery routes
+   * through `unsubscribe` on failure, like the live subscriber's deliveries. Returns the number
+   * of replayed records, for the subscription's debug log.
+   */
+  replayChatSubscription(subscriber: RpcStub<AiChatSubscriber>, startAfter: Date | undefined,
+                         unsubscribe: () => void): number {
+    let replayCount = 0;
+    let changedChatMetadata: AiChatMetadata[] = [];
+    if (startAfter !== undefined) {
+      for (let meta of this.storage.chatMeta.byLastActive.list({startAfter: startAfter.valueOf()})) {
+        changedChatMetadata.push(meta);
+        ++replayCount;
+      }
+    }
+    if (startAfter !== undefined) {
+      for (let msg of this.storage.chats.byTimestamp.list({startAfter: startAfter.valueOf()})) {
+        subscriber.message(this.hydrateChatMessageForClient(msg)).catch(unsubscribe);
+        ++replayCount;
+      }
+      // Messages establish the durable state that the corresponding metadata describes.
+      for (let meta of changedChatMetadata) {
+        subscriber.metadata(this.chatMetaForClient(meta)).catch(unsubscribe);
+      }
+    }
+    for (let row of this.storage.chatChanges.list()) {
+      if (row.retired) continue;
+      subscriber.changeApplied(row.chatId, row.generation, row.revision, row.author, row.change,
+                               row.submission).catch(unsubscribe);
+      ++replayCount;
+    }
+    this.logger.debug("chat subscription replay completed", {
+      event: "chat.subscription.replay.completed",
+      size: replayCount,
+    });
+    return replayCount;
   }
 
   /**

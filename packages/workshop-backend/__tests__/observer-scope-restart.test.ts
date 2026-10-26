@@ -917,6 +917,7 @@ describe("subscriptions count as sessions", () => {
     }, { impl: {
       addChatSubscriber() {},
       removeChatSubscriber: () => unsubs.push("removeChatSubscriber"),
+      replayChatSubscription() { return 0; },
       streamGeneration: 1,
       logger: { debug() {} },
     } });

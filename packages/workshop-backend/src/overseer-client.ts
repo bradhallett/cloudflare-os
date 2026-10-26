@@ -7,7 +7,7 @@ import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { keyString } from "@gadgets/typed-storage";
 import type { ListOptions } from "@gadgets/typed-storage";
 import { actionLastChangedKey, chatKey, chatKeyPrefix } from "./storage-schema/overseer-storage";
-import type { ActionRecord, AgentSpawnerBindingProps, BlueprintGadgetRecord, StoredChatMessage } from "./storage-schema/overseer-storage";
+import type { ActionRecord, AgentSpawnerBindingProps, BlueprintGadgetRecord } from "./storage-schema/overseer-storage";
 import { commitIdentityForAuthor } from "./git-store";
 import { AiModelGatekeeperProps } from "./ai-models";
 import { UserDurableObject } from "./user";
@@ -976,7 +976,7 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
       end: beforeSequence === undefined ? undefined : chatKey(chatId, beforeSequence),
     })];
     return {
-      messages: result.map((msg) => this.#getChatMessageForClient(msg)),
+      messages: result.map((msg) => this.impl.hydrateChatMessageForClient(msg)),
       compacted: checkpoint && {
         to: checkpoint.compactedTo,
         summary: checkpoint.summary,
@@ -987,25 +987,14 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async getChatMessage(chatId: number, sequence: number): Promise<AiChatMessage | undefined> {
     let msg = this.impl.storage.chats.get(chatKey(chatId, sequence));
-    return msg && this.#getChatMessageForClient(msg);
+    return msg && this.impl.hydrateChatMessageForClient(msg);
   }
 
-  #getChatMessageForClient(msg: StoredChatMessage): AiChatMessage {
-    if (msg.type === "action") {
-      let record = this.impl.storage.actions.get(msg.actionId);
-      if (record) {
-        msg.actionLog = actionRecordToLog(record);
-      }
-    }
-    return this.impl.hydrateChatMessageForClient(msg);
-  }
 
   async subscribeToChat(subscriber: RpcStub<AiChatSubscriber>, startAfter?: Date)
       : Promise<RpcStub<{}>> {
     let chats = this.impl.storage.chats;
     let chatMeta = this.impl.storage.chatMeta;
-    let changedChatMetadata: AiChatMetadata[] = [];
-    let replayCount = 0;
 
     subscriber = subscriber.dup();  // keep stub after return
     this.impl.addChatSubscriber(subscriber);
@@ -1030,7 +1019,7 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
 
     let self = this;
     function deliverMessage(record: AiChatMessage) {
-      subscriber.message(self.#getChatMessageForClient(record)).catch(unsubscribe);
+      subscriber.message(self.impl.hydrateChatMessageForClient(record)).catch(unsubscribe);
     }
 
     let msgSubscriber = {
@@ -1058,43 +1047,7 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
       subscriber[Symbol.dispose]();
     };
 
-    if (startAfter !== undefined) {
-      // Catch up on metadata changes.
-      for (let meta of chatMeta.byLastActive.list({startAfter: startAfter.valueOf()})) {
-        changedChatMetadata.push(meta);
-        ++replayCount;
-      }
-    }
-
-    if (startAfter !== undefined) {
-      // Catch up on messages.
-      for (let msg of chats.byTimestamp.list({startAfter: startAfter.valueOf()})) {
-        deliverMessage(msg);
-        ++replayCount;
-      }
-      // Messages establish the durable state that the corresponding metadata describes.
-      for (let meta of changedChatMetadata) {
-        subscriber.metadata(impl.chatMetaForClient(meta)).catch(unsubscribe);
-      }
-    }
-
-    // Replay every currently retained (not-yet-materialized) change row so the subscriber can
-    // reconstruct uncommitted chat content without a separate fetch. Rows a "changes" message
-    // has absorbed are not replayed -- the message's watermark covers them -- and the rows are
-    // delivered after the message catch-up above, matching their position in the stream (rows
-    // are strictly newer than every materialized message of their generation). Delivered
-    // unconditionally (no startAfter filtering): the client dedupes by (generation, revision).
-    for (let row of this.impl.storage.chatChanges.list()) {
-      if (row.retired) continue;
-      subscriber.changeApplied(row.chatId, row.generation, row.revision, row.author, row.change,
-                               row.submission).catch(unsubscribe);
-      ++replayCount;
-    }
-
-    this.impl.logger.debug("chat subscription replay completed", {
-      event: "chat.subscription.replay.completed",
-      size: replayCount,
-    });
+    this.impl.replayChatSubscription(subscriber, startAfter, unsubscribe);
 
     chatMeta.subscribe(metaSubscriber);
     chats.subscribe(msgSubscriber);
