@@ -14,7 +14,6 @@ import {
   McpSessionExpiredError,
   type McpToolFilter,
   type ToolCatalog,
-  type McpAuthScheme,
 }
   from "./client.js";
 import { fetchOptions, type InsecureEnv } from "./fetch.js";
@@ -41,11 +40,6 @@ export type WithClientOptions = {
 export type McpConnection = {
   /** Bearer token, or null for a public server. */
   authorization: string | null;
-  /**
-   * How `authorization` is presented, when the server expects it somewhere other than
-   * `Authorization: Bearer`. Absent means the default Bearer header; see `McpAuthScheme`.
-   */
-  authScheme?: McpAuthScheme;
   /** Transport session id from a previous `initialize`, if one is cached. */
   sessionId: string | null;
   /**
@@ -105,7 +99,7 @@ export async function withClient<T>(
   } catch (err) {
     throw notDispatched(err);
   }
-  const { authorization, authScheme, sessionId, generation } = connection;
+  const { authorization, sessionId, generation } = connection;
   const client = new McpClient(
     endpoint, async method => {
       if (method === "tools/call") {
@@ -115,7 +109,7 @@ export async function withClient<T>(
     }, sessionId, {
       ...fetchOptions(env),
       deadline: options.deadline,
-    }, authScheme);
+    });
   let persistedSessionId = sessionId;
 
   const persistSession = async (): Promise<void> => {

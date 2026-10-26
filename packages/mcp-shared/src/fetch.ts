@@ -23,13 +23,6 @@ export type FetchOptions = {
   allowInsecure?: boolean;
   /** Bounds the complete operation, including redirects and response-body streaming. */
   timeoutMs?: number;
-  /**
-   * Additional credential-bearing header names, dropped on a cross-origin redirect hop alongside
-   * `Authorization`. For a connector whose credential travels in its own header (e.g.
-   * `x-api-key`) rather than `Authorization`; naming it here keeps a redirect from forwarding
-   * that key to a third-party host.
-   */
-  credentialHeaders?: readonly string[];
   /** Absolute deadline shared by every request in a multi-page or retried operation. */
   deadline?: number;
 };
@@ -199,7 +192,6 @@ export async function guardedFetch(
       headers = new Headers(headers);
       headers.delete("Authorization");
       headers.delete("Mcp-Session-Id");
-      for (const header of options.credentialHeaders ?? []) headers.delete(header);
     }
 
     // 303 means "fetch the result of this with GET", and browsers downgrade 301/302 on POST too.

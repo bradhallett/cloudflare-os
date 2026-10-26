@@ -6,10 +6,10 @@ import {
 export default defineGadgetsWorker({
   name: "gatekeeper-composio",
   entrypoint: ".wrangler/validate/src/worker.ts",
-  // `allow_irrevocable_stub_storage`: hook initiator stubs (triggers land in PR 4, the flag ships
-  // with the worker so the migration never changes). `global_fetch_strictly_public` is required,
-  // not hygiene: `session.mcp.url` is third-party response data that never passes user-pasted
-  // validation. `nodejs_als` backs the observability context.
+  // `allow_irrevocable_stub_storage`: trigger hook initiator stubs are stored durably, and the
+  // flag ships with the worker so the migration never changes. `global_fetch_strictly_public` is
+  // required, not hygiene: `session.mcp.url` is third-party response data that never passes
+  // user-pasted validation. `nodejs_als` backs the observability context.
   compatibilityFlags: ["allow_irrevocable_stub_storage", "global_fetch_strictly_public", "nodejs_als"],
   observability: OBSERVABILITY,
 });
