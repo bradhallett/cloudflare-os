@@ -39,6 +39,23 @@ export class ArrayCursor<T> extends RpcTarget implements Cursor<T> {
 }
 
 /**
+ * The page size a listing serves per `next()`: the caller's `resultsPerPage`, or the method's
+ * `fallback` when absent. Session facets call this once, at the RPC boundary, because cursors
+ * assume a positive integer: a zero page would make one cursor answer `[]` forever and another
+ * `null` at once, hiding a non-empty result. Capped at one remote page (100), which is also the
+ * most a `next()` buffers.
+ * @param options The caller's page options, if any.
+ * @param fallback Size when the caller requested none.
+ * @returns The clamped page size.
+ */
+export function requestedPageSize(options: { resultsPerPage?: number } | undefined, fallback = 50): number {
+  const requested = options?.resultsPerPage;
+  if (requested === undefined) return fallback;
+  if (!Number.isInteger(requested) || requested < 1) throw new Error("resultsPerPage must be a positive integer.");
+  return Math.min(requested, 100);
+}
+
+/**
  * Rows the agent's own simulation adds to a provider listing, such as an item it created that the
  * provider does not list yet. Each is merged before the first visible provider row it sorts
  * at-or-before; the rest follow the last provider page. They are not provider rows: they never

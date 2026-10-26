@@ -78,7 +78,7 @@ import {
   parseUnifiedPatch,
   type TreeDiffSource,
 } from "@gadgets/gatekeeper-kit/git-diff";
-import { ArrayCursor, SessionGitCache } from "@gadgets/gatekeeper-kit/cursors";
+import { ArrayCursor, SessionGitCache, requestedPageSize } from "@gadgets/gatekeeper-kit/cursors";
 import {
   commitIdsOfSummary,
   isCommitOid,
@@ -5708,18 +5708,6 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async removeObserver(_id: string): Promise<void> {}
 }
 
-/**
- * The page size a listing serves per `next()`: the caller's `resultsPerPage`, or the method's
- * default. Checked once here, at the RPC boundary, because the cursors assume a positive
- * integer (a zero page would answer `[]` forever). Capped at one remote page (100).
- */
-function pageSizeOf(options: GitHubPageOptions | undefined, fallback = 50): number {
-  const requested = options?.resultsPerPage;
-  if (requested === undefined) return fallback;
-  if (!Number.isInteger(requested) || requested < 1) throw new Error("resultsPerPage must be a positive integer.");
-  return Math.min(requested, 100);
-}
-
 // Exported (like the impls below) for the workerd wiring tests, which instantiate sessions
 // directly against fake gatekeepers -- see __tests__/workerd/session-git.test.ts.
 @validateRpc()
@@ -5786,7 +5774,7 @@ export class GitHubRepoSessionImpl extends RpcTarget implements GitHubRepoSessio
       title: `List issues`,
       description: `List issues in the GitHub repository.`,
     });
-    return this.#gatekeeper.listIssues(options, pageSizeOf(options));
+    return this.#gatekeeper.listIssues(options, requestedPageSize(options));
   }
 
   async searchIssues(query: GitHubIssueSearch): Promise<Cursor<GitHubIssueSummary>> {
@@ -5794,7 +5782,7 @@ export class GitHubRepoSessionImpl extends RpcTarget implements GitHubRepoSessio
       title: `Search issues for "${query.text}"`,
       description: `Search issues in the GitHub repository for "${query.text}".`,
     });
-    return this.#gatekeeper.searchIssues(query, pageSizeOf(query));
+    return this.#gatekeeper.searchIssues(query, requestedPageSize(query));
   }
 
   async listPullRequests(options?: GitHubPullRequestFilter): Promise<Cursor<GitHubPullRequestSummary>> {
@@ -5803,7 +5791,7 @@ export class GitHubRepoSessionImpl extends RpcTarget implements GitHubRepoSessio
       description: `List pull requests in the GitHub repository.`,
     });
     const cursor = await this.#gatekeeper.listPullRequests(
-      options, pageSizeOf(options), await this.#gitCache.stub());
+      options, requestedPageSize(options), await this.#gitCache.stub());
     // Simulated ids -- heads of queued pushes, which listings show as if already pushed -- are
     // withheld from advertising: they are not on GitHub yet, and the hint would outlive a
     // rejection (see GitHubGatekeeperImpl.isSimulatedCommitId). Checked live per page, since a
@@ -5817,7 +5805,7 @@ export class GitHubRepoSessionImpl extends RpcTarget implements GitHubRepoSessio
       description: `Search pull requests in the GitHub repository for "${query.text}".`,
     });
     const cursor = await this.#gatekeeper.searchPullRequests(
-      query, pageSizeOf(query), await this.#gitCache.stub());
+      query, requestedPageSize(query), await this.#gitCache.stub());
     // Simulated ids withheld from advertising, as in listPullRequests.
     return await this.#gitCache.wrap(cursor, commitIdsOfPullSummary);
   }
@@ -5827,7 +5815,7 @@ export class GitHubRepoSessionImpl extends RpcTarget implements GitHubRepoSessio
       title: `List branches`,
       description: `List branches in the GitHub repository.`,
     });
-    const cursor = await this.#gatekeeper.listBranches(options, pageSizeOf(options));
+    const cursor = await this.#gatekeeper.listBranches(options, requestedPageSize(options));
     // A simulated head -- a queued push's commit, which the listing shows as if already pushed
     // -- is withheld from advertising: it is not on GitHub yet, and the hint would outlive a
     // rejection (see GitHubGatekeeperImpl.isSimulatedCommitId). Checked live per page, since a
@@ -5840,7 +5828,7 @@ export class GitHubRepoSessionImpl extends RpcTarget implements GitHubRepoSessio
       title: `List tags`,
       description: `List tags in the GitHub repository.`,
     });
-    const cursor = await this.#gatekeeper.listTags(pageSizeOf(options));
+    const cursor = await this.#gatekeeper.listTags(requestedPageSize(options));
     return await this.#gitCache.wrap(cursor, tag => [tag.commit]);
   }
 
@@ -5900,7 +5888,7 @@ export class GitHubRepoSessionImpl extends RpcTarget implements GitHubRepoSessio
       description: `List commits in the GitHub repository.`,
     });
     const cursor = await this.#gatekeeper.listCommits(
-      options, pageSizeOf(options), await this.#gitCache.stub());
+      options, requestedPageSize(options), await this.#gitCache.stub());
     // Pending (queued-push) commits in a simulated listing are withheld from advertising; their
     // GitHub-known parents still advertise.
     return await this.#gitCache.wrap(cursor, commitIdsOfSummary);
@@ -5997,7 +5985,7 @@ class GitHubIssueImpl extends RpcTarget implements GitHubIssue {
       title: `Read discussion for #${this.logicalId}`,
       description: `Read the discussion thread for #${this.logicalId}.`,
     });
-    return this.gatekeeper.issueDiscussion(this.kind, this.logicalId, pageSizeOf(options));
+    return this.gatekeeper.issueDiscussion(this.kind, this.logicalId, requestedPageSize(options));
   }
 
   async postComment(bodyMarkdown: string): Promise<void> {
@@ -6048,7 +6036,7 @@ export class GitHubPullRequestImpl extends GitHubIssueImpl implements GitHubPull
       description: `Read the diff for pull request #${this.logicalId}.`,
     });
     const diff = await this.gatekeeper.pullDiff(
-      this.logicalId, pageSizeOf(options, 20), await this.#gitCache.stub());
+      this.logicalId, requestedPageSize(options, 20), await this.#gitCache.stub());
     // A simulated head revision (a queued push's commit) is withheld from advertising.
     await this.#gitCache.advertise(
       [diff.revision.baseSha, diff.revision.headSha, diff.revision.mergeBaseSha ?? ""]);
@@ -6074,7 +6062,7 @@ export class GitHubPullRequestImpl extends GitHubIssueImpl implements GitHubPull
       description: `List the commits of pull request #${this.logicalId}.`,
     });
     const cursor = await this.gatekeeper.pullCommits(
-      this.logicalId, pageSizeOf(options), await this.#gitCache.stub());
+      this.logicalId, requestedPageSize(options), await this.#gitCache.stub());
     // Pending (queued-push) commits in a simulated listing are withheld from advertising; their
     // GitHub-known parents still advertise. Checked live per page.
     return await this.#gitCache.wrap(cursor, commitIdsOfSummary);
@@ -6085,7 +6073,7 @@ export class GitHubPullRequestImpl extends GitHubIssueImpl implements GitHubPull
       title: `Read diff threads for #${this.logicalId}`,
       description: `Read diff discussion threads for pull request #${this.logicalId}.`,
     });
-    return this.gatekeeper.pullThreads(this.logicalId, pageSizeOf(options, 20));
+    return this.gatekeeper.pullThreads(this.logicalId, requestedPageSize(options, 20));
   }
 
   async postReview(review: GitHubPullRequestReviewDraft): Promise<void> {
