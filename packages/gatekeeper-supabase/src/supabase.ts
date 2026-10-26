@@ -36,7 +36,7 @@ import {
 } from "./supabase-api";
 import { PendingActionStore, SupabaseCache, type StoredExecuteAction } from "./supabase-storage";
 import {
-  APPLY_OUTCOME_UNKNOWN_MESSAGE, ActionOutcomeUnknownError,
+  APPLY_OUTCOME_UNKNOWN_MESSAGE, ActionOutcomeUnknownError, type ActionJournal,
 } from "@gadgets/gatekeeper-kit/actions";
 import { describeTable, listSchemas, listTables } from "./supabase-introspection";
 import {
@@ -980,7 +980,7 @@ class SupabaseSessionContext {
  * surfaces it. Terminal: only a rejection clears the record.
  */
 function failUnknownOutcome(
-  journal: PendingActionStore["journal"] extends () => infer J ? J : never,
+  journal: ActionJournal<StoredExecuteAction>,
   actionId: number,
 ): ActionOutcomeUnknownError {
   journal.markFailed(actionId, APPLY_OUTCOME_UNKNOWN_MESSAGE, { outcome: "unknown" });

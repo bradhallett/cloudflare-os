@@ -1217,7 +1217,7 @@ export class HomeAssistantGatekeeperImpl
 
   async applyAction(actionId: number): Promise<void> {
     // The overseer only knows the numeric action ID; the full action and its claim-before-apply
-    // lifecycle live in DO storage, via HomeAssistantActionStore.
+    // lifecycle live on the resource's action journal in DO storage (action-store.ts).
     await this.#actions.apply(actionId);
   }
 
