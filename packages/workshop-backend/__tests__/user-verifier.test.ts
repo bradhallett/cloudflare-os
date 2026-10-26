@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { GatekeeperUser, GatekeeperUserVerifier } from "@gadgets/workshop-shared/gatekeeper";
 import { UserDurableObject } from "../src/user.js";
+import { UserAccountStore } from "../src/user-accounts.js";
 
 function makeUserWithAccount(vendorId: string) {
   const verifier = {} as Fetcher<GatekeeperUserVerifier>;
@@ -11,15 +12,20 @@ function makeUserWithAccount(vendorId: string) {
       return verifier;
     },
   } as Fetcher<GatekeeperUser>;
+  const storageSlice = {
+    connectedAccounts: {
+      get: (accountId: number) => accountId === 7
+        ? { id: accountId, account, vendorId }
+        : undefined,
+    },
+  };
   const user = Object.create(UserDurableObject.prototype) as UserDurableObject;
   Object.assign(user, {
-    storage: {
-      connectedAccounts: {
-        get: (accountId: number) => accountId === 7
-          ? { id: accountId, account, vendorId }
-          : undefined,
-      },
-    },
+    storage: storageSlice,
+    // getVerifier lives on the account store (user-accounts.ts); the empty env binds no vendors,
+    // which this path never touches.
+    accounts: new UserAccountStore({} as DurableObjectState, {} as Cloudflare.Env,
+        storageSlice, {} as never, async () => {}),
   });
   return { user, verifier, verifierRequests: () => verifierRequests };
 }

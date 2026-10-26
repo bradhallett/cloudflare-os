@@ -18,6 +18,9 @@ declare module "cloudflare:test" {
 // The typed collection behind the public methods, as a test reaches into the selector's DO.
 type UserInternals = UserDurableObject & {
   env: Cloudflare.Env;
+  // The account store (user-accounts.ts) snapshots env at construction; production never
+  // swaps it, and this test keeps its rewrite visible to both holders.
+  accounts: { env: Cloudflare.Env };
   storage: {
     connectedAccounts: {
       get(id: number): { id: number; autoProvisioned?: boolean } | undefined;
@@ -39,6 +42,7 @@ const BLUEPRINTS = {
 async function installAdminConfig(userId: string): Promise<void> {
   await inUser(userId, user => {
     user.env = { ...user.env, BLUEPRINTS };
+    user.accounts.env = user.env;
   });
 }
 
