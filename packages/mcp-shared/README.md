@@ -1,7 +1,9 @@
 # MCP shared
 
-The protocol client, policy decisions, and stateful machinery common to the two MCP-speaking
-gatekeepers. Not a Worker: a library both of them import.
+The protocol client, policy decisions, and stateful machinery behind the two MCP-speaking
+gatekeepers, plus the vendor-neutral pieces other gatekeepers import without speaking MCP at
+all (the Composio connector takes its action store, not-dispatched taxonomy, session error
+types, and log vocabulary from here). Not a Worker: a library its consumers import.
 
 | Package | Endpoint comes from | Grant is scoped to |
 | --- | --- | --- |
@@ -10,9 +12,12 @@ gatekeepers. Not a Worker: a library both of them import.
 
 Code lives here when two copies of it would eventually disagree and the disagreement would be a
 security bug: tool classification, the scope grammar, the OAuth lifecycle, the approval-queue
-wiring. A Worker's own vendor entrypoint, Durable Object classes and migrations, `Env`, connect
-form, and configurator UI stay in the connector. Where a connector must vary shared behaviour it
-does so through a named hook (`staticToken`, `mintAccount`), not a private copy.
+wiring. The action lifecycle and error taxonomy are here today only because the MCP connectors
+needed them first; their long-term home is `gatekeeper-kit`, beside the other kit machinery
+every gatekeeper shares. A Worker's own vendor entrypoint, Durable Object classes and
+migrations, `Env`, connect form, and configurator UI stay in the connector. Where a connector
+must vary shared behaviour it does so through a named hook (`staticToken`, `mintAccount`), not a
+private copy.
 
 ## Modules
 
@@ -32,12 +37,12 @@ does so through a named hook (`staticToken`, `mintAccount`), not a private copy.
 | `facet` | Common session, catalog, action, and sharing behavior for connector-owned Durable Object facets |
 | `catalog` | One binding's tool list: fetched, cached, scoped to the grant, classified; plus the cache for tools hydrated past that list |
 | `connection` | `withClient` — transport sessions, retries, credential-expiry reporting |
-| `action-store` | Staged to applied/rejected/failed, with a bound on what is retained and a claim so one approval is never sent twice |
+| `action-store` | Staged to applied/rejected/failed, with a bound on what is retained and a claim so one approval is never sent twice — vendor-neutral, so the Composio connector stages its actions through it too |
 | `session` | The Gadget-facing capability, and the one path every tool call takes |
 | `sharing-policy` | The owner-only sharing rule |
 | `html` | The connect-flow pages, so both connectors look like one product |
 | `http` | Base-path, OAuth callback, and connect-link routing shared by both Workers |
-| `log` | The field vocabulary both connectors log against |
+| `log` | The field vocabulary the connectors — and the Composio gatekeeper, which speaks no MCP — log against |
 | `user` | The common account description, revocation, and reconnect lifecycle |
 | `util` | Hex encoding, host extraction, binding-name slugs; no policy |
 | `types.d.ts` | Base types prepended to every generated per-server `.d.ts` |

@@ -13,6 +13,7 @@ import type {
 } from "@gadgets/workshop-shared/gatekeeper";
 
 import type { ComposioAccount } from "./account.js";
+import { accountById } from "./worker.js";
 import type { ComposioTriggerFiring, ComposioTriggerHook } from "./types.js";
 
 /** The hook target a gadget implements for `onTrigger` (see types.d.ts for the agent docs). */
@@ -118,9 +119,6 @@ export class ComposioTriggerHookController
   }
 
   #account(): ComposioAccount {
-    const account = this.ctx.exports.ComposioAccount;
-    return account.get(
-      account.idFromString(this.ctx.props.accountObjectId),
-    ) as unknown as ComposioAccount;
+    return accountById(this.ctx.exports.ComposioAccount, this.ctx.props.accountObjectId);
   }
 }

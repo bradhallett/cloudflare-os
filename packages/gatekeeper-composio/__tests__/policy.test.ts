@@ -50,43 +50,45 @@ describe("ToolkitPolicy chokepoint", () => {
 });
 
 describe("isAutoApplyEligible", () => {
-  const policy = resolveToolkitPolicy({
-    excludedToolkits: [],
-    autoApplyToolkits: ["notion"],
-  });
-
   it("requires affirmative createHint or updateHint", () => {
-    expect(isAutoApplyEligible(policy, "notion", { tags: ["createHint"] })).toBe(true);
-    expect(isAutoApplyEligible(policy, "notion", { tags: ["updateHint"] })).toBe(true);
-    expect(isAutoApplyEligible(policy, "notion", { tags: ["createHint", "updateHint"] })).toBe(true);
+    expect(isAutoApplyEligible({ tags: ["createHint"] })).toBe(true);
+    expect(isAutoApplyEligible({ tags: ["updateHint"] })).toBe(true);
+    expect(isAutoApplyEligible({ tags: ["createHint", "updateHint"] })).toBe(true);
   });
 
   it("silence never enables: untagged or empty tags queue normally", () => {
-    expect(isAutoApplyEligible(policy, "notion", { tags: [] })).toBe(false);
-    expect(isAutoApplyEligible(policy, "notion", {})).toBe(false);
-    expect(isAutoApplyEligible(policy, "notion", { tags: ["other"] })).toBe(false);
+    expect(isAutoApplyEligible({ tags: [] })).toBe(false);
+    expect(isAutoApplyEligible({})).toBe(false);
+    expect(isAutoApplyEligible({ tags: ["other"] })).toBe(false);
   });
 
   it("destructiveHint vetoes even with an affirmative hint present", () => {
-    expect(isAutoApplyEligible(policy, "notion", { tags: ["createHint", "destructiveHint"] })).toBe(false);
-    expect(isAutoApplyEligible(policy, "notion", { tags: ["updateHint", "destructiveHint"] })).toBe(false);
+    expect(isAutoApplyEligible({ tags: ["createHint", "destructiveHint"] })).toBe(false);
+    expect(isAutoApplyEligible({ tags: ["updateHint", "destructiveHint"] })).toBe(false);
   });
 
   it("absence of destructiveHint alone never suffices", () => {
-    expect(isAutoApplyEligible(policy, "notion", { tags: ["deleteHint"] })).toBe(false);
+    expect(isAutoApplyEligible({ tags: ["deleteHint"] })).toBe(false);
   });
 
-  it("requires the admin listing and excludes read-only tools", () => {
-    expect(isAutoApplyEligible(policy, "slack", { tags: ["createHint"] })).toBe(false);
-    expect(isAutoApplyEligible(policy, "notion", { tags: ["createHint"], readOnly: true })).toBe(false);
+  it("excludes read-only tools", () => {
+    expect(isAutoApplyEligible({ tags: ["createHint"], readOnly: true })).toBe(false);
   });
 
-  it("never eligible for an excluded toolkit even when listed", () => {
+  it("the admin listing half lives in ToolkitPolicy.autoApplyListed", () => {
+    const policy = resolveToolkitPolicy({
+      excludedToolkits: [],
+      autoApplyToolkits: ["notion"],
+    });
+    expect(policy.autoApplyListed("notion")).toBe(true);
+    // Unlisted toolkit: never eligible regardless of tags.
+    expect(policy.autoApplyListed("slack")).toBe(false);
+    // Excluded always wins over a surviving listing.
     const excluded = resolveToolkitPolicy({
       excludedToolkits: ["notion"],
       autoApplyToolkits: ["notion"],
     });
-    expect(isAutoApplyEligible(excluded, "notion", { tags: ["createHint"] })).toBe(false);
+    expect(excluded.autoApplyListed("notion")).toBe(false);
   });
 
   it("ToolkitPolicy can be constructed directly", () => {

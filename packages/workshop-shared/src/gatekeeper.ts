@@ -863,12 +863,8 @@ export interface GatekeeperUser extends WorkerEntrypoint {
    *
    * The returned class is imbued (via `ctx.props`) with the user's credentials and the resource
    * ID. The returned `resource` indicates which SupportedResource matched the URL.
-   *
-   * `composioPolicy` is the deployment's Composio toolkit policy (see ComposioToolkitPolicy),
-   * passed only when the account's vendor is `composio` so the vendor can bake it into each
-   * facet's props at mint. Every other vendor ignores it.
    */
-  getGatekeeperClassFor(url: string, composioPolicy?: ComposioToolkitPolicy): Promise<{
+  getGatekeeperClassFor(url: string): Promise<{
     class: DurableObjectClass<Gatekeeper<any>>;
     resource: SupportedResource;
   }>;
@@ -971,13 +967,8 @@ export interface GatekeeperUser extends WorkerEntrypoint {
    *
    * The returned class is imbued (via `ctx.props`) with whatever the account needs to serve the
    * singleton (e.g. the account id and sharing domain).
-   *
-   * `composioPolicy` mirrors the getGatekeeperClassFor channel: the deployment's Composio toolkit
-   * policy (see ComposioToolkitPolicy), passed only when the account's vendor is `composio` so the
-   * account can refresh the policy it re-reads at use time. Every other vendor ignores it.
    */
-  getSingletonGatekeeperClass?(composioPolicy?: ComposioToolkitPolicy)
-    : Promise<DurableObjectClass<Gatekeeper<any>>>;
+  getSingletonGatekeeperClass?(): Promise<DurableObjectClass<Gatekeeper<any>>>;
 
   /**
    * The account's full-page management UI (iframe HTML + ui capability). `context` is passed fresh
@@ -994,9 +985,10 @@ export interface GatekeeperUser extends WorkerEntrypoint {
 /**
  * The deployment-admin toolkit policy for the Composio vendor: which of Composio's toolkits this
  * deployment hides, and which are eligible for user-armed auto-apply of write tools. Composio
- * slugs are exact-match identifiers. The Workshop reads these from its AdminConfig and passes them
- * at every facet mint (see GatekeeperUser.getGatekeeperClassFor) — the gatekeeper cannot read the
- * admin config itself, and nothing is baked into account state.
+ * slugs are exact-match identifiers. The Workshop reads these from its AdminConfig and pushes
+ * them to the account out-of-band through the ComposioUserPolicy extension — the gatekeeper
+ * cannot read the admin config itself. The account stores the freshest policy it was pushed and
+ * re-reads that stored copy at every use, so facet props freeze none of it.
  */
 export type ComposioToolkitPolicy = {
   /** Toolkits hidden from every surface (facet mint, catalog, session scope). Excluded wins. */
@@ -1032,6 +1024,19 @@ export type ComposioToolkitInfo = {
  */
 export interface ComposioVendorAdmin {
   getToolkitInfo(slugs: string[]): Promise<ComposioToolkitInfo[]>;
+}
+
+/**
+ * Vendor extension served by the Composio gatekeeper's accounts: the out-of-band channel for the
+ * deployment's toolkit policy (see ComposioToolkitPolicy). The Workshop casts an account's
+ * GatekeeperUser stub to this interface only when the account's vendor is `composio` (the
+ * ComposioVendorAdmin pattern) and pushes the policy it just read from its AdminConfig, so the
+ * account's stored copy is as fresh as the config the mint was decided against. Optional because
+ * only the Composio vendor implements it.
+ */
+export interface ComposioUserPolicy {
+  /** Replaces the account's stored toolkit policy, which every use site re-reads live. */
+  updateToolkitPolicy(policy: ComposioToolkitPolicy): Promise<void>;
 }
 
 /**

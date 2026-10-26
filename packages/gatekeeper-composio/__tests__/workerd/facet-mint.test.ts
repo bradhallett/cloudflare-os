@@ -1,8 +1,8 @@
 // The mint chokepoint: every toolkit facet is minted through ComposioAccount.getGatekeeperClassFor,
-// which fails closed on an unconfigured deployment key, an unknown slug, or an admin exclusion —
-// and freezes the deployment's policy into the facet's props, so two mints under different
-// policies never widen each other. Delete a check in getGatekeeperClassFor, or the arming read in
-// facet.ts's getAutoApprovableActions, and this file fails.
+// which fails closed on an unconfigured deployment key, an unknown slug, or an admin exclusion.
+// Only the key-mode generation freezes at mint — arming follows the account's stored policy
+// live, pushed out-of-band by the Workshop. Delete a check in getGatekeeperClassFor, or the
+// live-listing read in facet.ts's getAutoApprovableActions, and this file fails.
 
 import { env } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
@@ -48,35 +48,39 @@ describe("mint validation (the account's chokepoint)", () => {
     await expect(hooks.provisionOwnKey("mint-excluded", "own-1"))
       .resolves.toEqual({ ok: true, value: null });
 
-    const mint = await hooks.mintCheck("mint-excluded", "composio://toolkit/github", {
+    await expect(hooks.setPolicy("mint-excluded", {
       excludedToolkits: ["github"],
       autoApplyToolkits: [],
-    });
+    })).resolves.toEqual({ ok: true, value: null });
+
+    const mint = await hooks.mintCheck("mint-excluded", "composio://toolkit/github");
     expect(mint.ok).toBe(false);
     if (!mint.ok) expect(mint.message).toContain("excluded by this deployment's Composio policy");
   });
 });
 
-describe("mint-frozen props", () => {
-  it("freezes auto-apply arming at mint time, per facet", async () => {
+describe("live arming", () => {
+  it("arms by the live admin listing, not the state at mint", async () => {
     hooks.installFake(githubSpec(completed));
     await expect(hooks.provisionOwnKey("mint-props", "own-1"))
       .resolves.toEqual({ ok: true, value: null });
 
-    await hooks.mintedToolkitSession("mint-props", "armed", "composio://toolkit/github", {
+    // Minted while nothing was listed: the facet starts calm.
+    await hooks.mintedToolkitSession("mint-props", "armed", "composio://toolkit/github");
+    await expect(hooks.autoApprovableActions("armed")).resolves.toEqual([]);
+
+    // The admin lists the toolkit afterwards: the already-minted facet arms immediately.
+    await expect(hooks.setPolicy("mint-props", {
       excludedToolkits: [],
       autoApplyToolkits: ["github"],
-    });
-    const armed = await hooks.autoApprovableActions("armed");
-    expect(armed).toEqual([
+    })).resolves.toEqual({ ok: true, value: null });
+    expect(await hooks.autoApprovableActions("armed")).toEqual([
       { kind: "composio:github:write", label: "all current and future write tools in GitHub" },
     ]);
 
-    await hooks.mintedToolkitSession("mint-props", "calm", "composio://toolkit/github", {
-      excludedToolkits: [],
-      autoApplyToolkits: [],
-    });
-    await expect(hooks.autoApprovableActions("calm")).resolves.toEqual([]);
+    // A second facet minted under the same policy agrees — nothing diverged per mint.
+    await hooks.mintedToolkitSession("mint-props", "calm", "composio://toolkit/github");
+    await expect(hooks.autoApprovableActions("calm")).resolves.toHaveLength(1);
   });
 
   it("never offers auto-apply for destructive tools", async () => {
@@ -84,10 +88,12 @@ describe("mint-frozen props", () => {
     await expect(hooks.provisionOwnKey("mint-props", "own-1"))
       .resolves.toEqual({ ok: true, value: null });
 
-    // Arm via the session: the write tool lists, the destructive one does not.
-    await hooks.toolkitSession("mint-props", "armed-direct", {
-      toolkitSlug: "github", autoApply: true,
-    });
+    // Arm via the policy listing: the write tool lists, the destructive one does not.
+    await expect(hooks.setPolicy("mint-props", {
+      excludedToolkits: [],
+      autoApplyToolkits: ["github"],
+    })).resolves.toEqual({ ok: true, value: null });
+    await hooks.toolkitSession("mint-props", "armed-direct", { toolkitSlug: "github" });
     const listed = await hooks.autoApprovableActions("armed-direct");
     expect(listed.map(entry => entry.kind)).toEqual(["composio:github:write"]);
 

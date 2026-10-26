@@ -1,3 +1,11 @@
+// The frame adapter from the gatekeeper-context app, parameterized only by this app's
+// failure-site prefix ("composio.*") and the shared VITE_FRONTEND_ERROR_REPORTING gate: the
+// management app runs as an opaque-origin srcDoc frame, so reports travel to the Workshop host
+// via postMessage rather than a same-origin POST (the host adds surface context there). The
+// long-term home for this adapter is @gadgets/error-reporting itself alongside the shared
+// serialization core — proposed to the coordinator; it stays a small local copy until then,
+// because the configurator-ui frame runtime is Preact-based and not importable here.
+
 import {
   FRONTEND_ERROR_MESSAGE_TYPE,
   serializeException,

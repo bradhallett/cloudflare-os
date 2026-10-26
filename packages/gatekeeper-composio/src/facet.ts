@@ -54,16 +54,22 @@ import type {
   ComposioTriggerControllerService,
 } from "./triggers.js";
 import type { ComposioSession, ComposioToolkitSession } from "./types.js";
-import { TYPES_CODE, actionStoreLog, composioTestHooksEnabled, logger } from "./worker.js";
+import {
+  TYPES_CODE,
+  accountById,
+  actionStoreLog,
+  composioTestHooksEnabled,
+  logger,
+} from "./worker.js";
 
-/** Props the account freezes into a per-toolkit facet at mint (see account.getGatekeeperClassFor). */
+/**
+ * Props the account freezes into a per-toolkit facet at mint (see account.getGatekeeperClassFor):
+ * identity plus the key-mode generation. Nothing policy-shaped freezes — the facet re-checks the
+ * account's stored policy live at every use.
+ */
 export type ToolkitFacetProps = {
   accountObjectId: string;
   toolkitSlug: string;
-  /** Always false at mint today (excluded slugs refuse the mint); frozen so it can only narrow. */
-  excluded: boolean;
-  /** The deployment's auto-apply listing for this toolkit at mint. */
-  autoApply: boolean;
   /** The account's key-mode generation at mint; a mismatch strands staged actions. */
   generation: number;
 };
@@ -145,8 +151,7 @@ abstract class ComposioFacetCore<Props> extends DurableObject<Cloudflare.Env, Pr
   protected abstract readonly toolkitSlug: string | undefined;
   /** The key-mode generation this facet was minted under (1 for the singleton). */
   protected abstract readonly mintGeneration: number;
-  /** Whether the account should count this facet as having auto-apply armed. */
-  protected abstract readonly autoApplyListed: boolean;
+
 
   /**
    * The owning account, which every upstream call funnels back through. Delivered over RPC
@@ -155,8 +160,7 @@ abstract class ComposioFacetCore<Props> extends DurableObject<Cloudflare.Env, Pr
    * fact delivered verbatim.
    */
   protected account(): ComposioAccount {
-    const account = this.ctx.exports.ComposioAccount;
-    return account.get(account.idFromString(this.accountObjectId)) as unknown as ComposioAccount;
+    return accountById(this.ctx.exports.ComposioAccount, this.accountObjectId);
   }
 
   /**
@@ -197,7 +201,6 @@ abstract class ComposioFacetCore<Props> extends DurableObject<Cloudflare.Env, Pr
       kind: this.facetKind,
       ...(this.toolkitSlug === undefined ? {} : { toolkitSlug: this.toolkitSlug }),
       generation: this.mintGeneration,
-      autoApplyListed: this.autoApplyListed,
     });
     await this.syncPending();
   }
@@ -655,7 +658,6 @@ export class ComposioSingletonGatekeeper
   protected override readonly accountObjectId = this.ctx.props.accountObjectId;
   protected override readonly toolkitSlug: string | undefined = undefined;
   protected override readonly mintGeneration = 1;
-  protected override readonly autoApplyListed = false;
 
   async startSession(queue: RpcStub<ApprovalQueue>): Promise<ComposioSessionImpl> {
     await this.register();
@@ -665,7 +667,6 @@ export class ComposioSingletonGatekeeper
       account: this.account(),
       facet: this,
       workspaceId: this.ctx.id.toString(),
-      arming: undefined,
     };
     return new ComposioSessionImpl(host, queue.dup() as RpcStub<ApprovalQueue>);
   }
@@ -706,7 +707,6 @@ export class ComposioToolkitGatekeeper
   protected override readonly accountObjectId = this.ctx.props.accountObjectId;
   protected override readonly toolkitSlug = this.ctx.props.toolkitSlug;
   protected override readonly mintGeneration = this.ctx.props.generation;
-  protected override readonly autoApplyListed = this.ctx.props.autoApply;
 
   async startSession(queue: RpcStub<ApprovalQueue>): Promise<ComposioToolkitSessionImpl> {
     await this.register();
@@ -716,11 +716,6 @@ export class ComposioToolkitGatekeeper
       account: this.account(),
       facet: this,
       workspaceId: this.ctx.id.toString(),
-      arming: {
-        toolkitSlug: this.ctx.props.toolkitSlug,
-        autoApply: this.ctx.props.autoApply,
-        excluded: this.ctx.props.excluded,
-      },
     };
     return new ComposioToolkitSessionImpl(host, queue.dup() as RpcStub<ApprovalQueue>);
   }
@@ -757,24 +752,23 @@ export class ComposioToolkitGatekeeper
   }
 
   /**
-   * The potential auto-apply set: armed only when the mint froze auto-apply for this toolkit,
-   * the account has not enabled observer sharing (the two are mutually exclusive), and the
-   * toolkit is not excluded under the *live* admin policy — a facet minted before an exclusion
-   * must stop offering auto-apply the moment the exclusion lands, not when it is next minted.
-   * The per-action verdict at submit time is the binding gate.
+   * The potential auto-apply set, from the *live* admin listing: the facet consults the
+   * account's stored policy (kept fresh out-of-band, see updateToolkitPolicy) at every call, so
+   * an unlisting or exclusion reaches already-minted bindings immediately — nothing was frozen
+   * at mint. Observer sharing stays mutually exclusive with auto-apply. The per-action verdict
+   * at submit time is the binding gate.
    */
   async getAutoApprovableActions(): Promise<ActionKind[]> {
     await this.register();
-    const props = this.ctx.props;
-    if (!props.autoApply || props.excluded) return [];
-    const live = resolveToolkitPolicy(await this.account().policyState());
-    if (!live.allows(props.toolkitSlug)) return [];
-    if ((await this.account().sharingState()).enabled) return [];
-    const { toolkits } = await this.account().agentToolkits();
-    const name = toolkits.find(entry => entry.slug === props.toolkitSlug)?.name
-      ?? props.toolkitSlug;
+    const account = this.account();
+    const live = resolveToolkitPolicy(await account.policyState());
+    if (!live.autoApplyListed(this.ctx.props.toolkitSlug)) return [];
+    if ((await account.sharingState()).enabled) return [];
+    const { toolkits } = await account.agentToolkits();
+    const name = toolkits.find(entry => entry.slug === this.ctx.props.toolkitSlug)?.name
+      ?? this.ctx.props.toolkitSlug;
     return [{
-      ...toolkitWriteActionKind(props.toolkitSlug),
+      ...toolkitWriteActionKind(this.ctx.props.toolkitSlug),
       label: `all current and future write tools in ${name}`,
     }];
   }

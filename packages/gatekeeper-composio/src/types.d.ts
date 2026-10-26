@@ -38,7 +38,7 @@ export type ComposioToolInfo = {
   description?: string;
   /** Whether calls are observations or approval-gated actions. */
   mode: ComposioToolMode;
-  /** Why the tool was classified this way: always "server-annotation" — Composio's own hint. */
+  /** Why the tool was classified this way: "server-annotation" when Composio's own hint classified it, "default" when it had none. */
   classifiedBy: "server-annotation" | "default";
   /** JSON Schema for the tool's arguments, when Composio supplies one. */
   inputSchema?: unknown;

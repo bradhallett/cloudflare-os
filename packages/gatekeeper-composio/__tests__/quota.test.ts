@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { QuotaTable, quotaDay } from "../src/quota.js";
+import { QuotaTable, quotaDay, quotaKey } from "../src/quota.js";
 
 type Row = { reserved: number; settled: number; refused: number };
 
@@ -76,7 +76,7 @@ describe("quotaDay", () => {
 describe("QuotaTable reserve/settle/release", () => {
   it("counts reservations against the limit and refuses past it", () => {
     const { quota } = table();
-    const key = "deployment:2026-10-25";
+    const key = quotaKey("deployment", "2026-10-25");
     expect(quota.reserve(key, 2)).toEqual({ allowed: true, used: 1 });
     expect(quota.reserve(key, 2)).toEqual({ allowed: true, used: 2 });
     expect(quota.reserve(key, 2)).toEqual({ allowed: false, used: 2 });
@@ -85,7 +85,7 @@ describe("QuotaTable reserve/settle/release", () => {
 
   it("settle moves reservations to settled and they still count toward the limit", () => {
     const { quota } = table();
-    const key = "own:2026-10-25";
+    const key = quotaKey("own", "2026-10-25");
     quota.reserve(key, 2);
     quota.reserve(key, 2);
     quota.settle(key);
@@ -98,7 +98,7 @@ describe("QuotaTable reserve/settle/release", () => {
 
   it("settle supports batch counts", () => {
     const { quota } = table();
-    const key = "deployment:2026-10-25";
+    const key = quotaKey("deployment", "2026-10-25");
     quota.reserve(key, 10);
     quota.reserve(key, 10);
     quota.settle(key, 2);
@@ -107,7 +107,7 @@ describe("QuotaTable reserve/settle/release", () => {
 
   it("release gives reservations back and frees capacity", () => {
     const { quota } = table();
-    const key = "deployment:2026-10-25";
+    const key = quotaKey("deployment", "2026-10-25");
     quota.reserve(key, 1);
     quota.release(key);
     expect(quota.counts(key)).toEqual({ reserved: 0, settled: 0, refused: 0 });
@@ -116,7 +116,7 @@ describe("QuotaTable reserve/settle/release", () => {
 
   it("release supports batch counts", () => {
     const { quota } = table();
-    const key = "deployment:2026-10-25";
+    const key = quotaKey("deployment", "2026-10-25");
     quota.reserve(key, 10);
     quota.reserve(key, 10);
     quota.release(key, 2);
@@ -124,7 +124,7 @@ describe("QuotaTable reserve/settle/release", () => {
   });
 
   it("counts returns zeros for an unseen key", () => {
-    expect(table().quota.counts("own:2026-01-01")).toEqual({
+    expect(table().quota.counts(quotaKey("own", "2026-01-01"))).toEqual({
       reserved: 0, settled: 0, refused: 0,
     });
   });
@@ -132,9 +132,9 @@ describe("QuotaTable reserve/settle/release", () => {
   it("keeps key modes independent within one day", () => {
     const { quota } = table();
     const day = quotaDay(Date.UTC(2026, 9, 25));
-    quota.reserve(`deployment:${day}`, 1);
-    expect(quota.reserve(`own:${day}`, 1)).toEqual({ allowed: true, used: 1 });
-    expect(quota.counts(`deployment:${day}`)).toEqual({ reserved: 1, settled: 0, refused: 0 });
+    quota.reserve(quotaKey("deployment", day), 1);
+    expect(quota.reserve(quotaKey("own", day), 1)).toEqual({ allowed: true, used: 1 });
+    expect(quota.counts(quotaKey("deployment", day))).toEqual({ reserved: 1, settled: 0, refused: 0 });
   });
 });
 
@@ -143,8 +143,8 @@ describe("UTC day boundaries", () => {
     const { quota } = table();
     const endOfDay = Date.UTC(2026, 9, 25, 23, 59, 59);
     const nextDay = Date.UTC(2026, 9, 26, 0, 0, 0);
-    const dayA = `deployment:${quotaDay(endOfDay)}`;
-    const dayB = `deployment:${quotaDay(nextDay)}`;
+    const dayA = quotaKey("deployment", quotaDay(endOfDay));
+    const dayB = quotaKey("deployment", quotaDay(nextDay));
     expect(quotaDay(endOfDay)).not.toBe(quotaDay(nextDay));
 
     expect(quota.reserve(dayA, 1)).toEqual({ allowed: true, used: 1 });

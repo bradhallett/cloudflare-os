@@ -50,7 +50,7 @@ import {
   CONTINUATION_ACTION_KIND,
   isAutoApplyEligible,
   resolveToolkitPolicy,
-  ToolkitPolicy,
+  type ToolkitPolicy,
   toolkitWriteActionKind,
 } from "./policy.js";
 
@@ -107,16 +107,16 @@ export interface ComposioSessionHost {
   readonly facet: FacetHost;
   /** The facet's inherited workspace scope, fencing cross-workspace trigger deletes. */
   readonly workspaceId: string;
-  /** The toolkit binding's mint-frozen auto-apply arming; undefined on the singleton. */
-  readonly arming: ToolkitArming | undefined;
 }
 
-/** A toolkit facet's mint-frozen policy, as the session's classification consults it. */
-export interface ToolkitArming {
-  readonly toolkitSlug: string;
-  readonly autoApply: boolean;
-  readonly excluded: boolean;
-}
+/**
+ * One consistent policy + sharing view of the account, hoisted per listing or lookup so a
+ * whole tool list classifies against a single state rather than one RPC per tool.
+ */
+type ClassificationState = {
+  readonly policy: ToolkitPolicy;
+  readonly sharingEnabled: boolean;
+};
 
 /** One staged answering round, as the facet hands it to continueTool(). */
 export type ContinuationRound = {
@@ -180,21 +180,30 @@ abstract class ComposioSessionBase extends RpcTarget {
     (this.queue as RpcStub<ApprovalQueue> & { [Symbol.dispose](): void })[Symbol.dispose]();
   }
 
+  /**
+   * One policy + sharing snapshot of the account, for {@link classify}. Hoisted per listing
+   * or lookup so a whole tool list classifies against one consistent state — one RPC pair,
+   * not one per tool.
+   */
+  protected async classificationState(): Promise<ClassificationState> {
+    const [policy, sharing] = await Promise.all([
+      this.host.account.policyState(),
+      this.host.account.sharingState(),
+    ]);
+    return {
+      policy: resolveToolkitPolicy(policy),
+      sharingEnabled: sharing.enabled,
+    };
+  }
+
   /** Classifies one catalog tool and computes the per-action auto-apply verdict. */
-  protected async classify(tool: ToolInfo): Promise<ScopedToolInfo> {
-    const arming = this.host.arming;
-    // Live admin policy, not the facet's mint-time snapshot: a session minted before an
-    // exclusion must stop offering auto-apply the moment the exclusion lands.
-    const policy = resolveToolkitPolicy(await this.host.account.policyState());
-    const autoApprovable = arming !== undefined
-      && arming.autoApply
-      && !arming.excluded
-      && policy.allows(tool.toolkitSlug)
-      && !(await this.host.account.sharingState()).enabled
-      && isAutoApplyEligible(new ToolkitPolicy([], [tool.toolkitSlug]), tool.toolkitSlug, {
-        tags: tool.tags,
-        readOnly: tool.readOnlyHint === true,
-      });
+  protected classify(tool: ToolInfo, state: ClassificationState): ScopedToolInfo {
+    // Only a per-toolkit binding arms, and only under the live admin listing: a session
+    // minted before an unlisting or exclusion stops offering auto-apply the moment it lands.
+    const autoApprovable = this.host.scopeToolkits !== undefined
+      && state.policy.autoApplyListed(tool.toolkitSlug)
+      && !state.sharingEnabled
+      && isAutoApplyEligible(tool);
     return {
       ...tool,
       mode: tool.readOnlyHint === true ? "read" : "action",
@@ -231,7 +240,7 @@ abstract class ComposioSessionBase extends RpcTarget {
     ) {
       throw new Error(`This binding does not grant a tool named "${tool}".`);
     }
-    return await this.classify(found);
+    return this.classify(found, await this.classificationState());
   }
 
   /** Maps one read's four-state envelope to a result, refusing known-absent outcomes. */
@@ -505,7 +514,8 @@ export class ComposioSessionImpl extends ComposioSessionBase implements Composio
     if (tools.length === 0) {
       throw new Error(`"${toolkit}" is not a toolkit in Composio's catalog.`);
     }
-    const scoped = await Promise.all(tools.map(tool => this.classify(tool)));
+    const state = await this.classificationState();
+    const scoped = tools.map(tool => this.classify(tool, state));
     await this.queue.authorizeObservation({
       title: `${this.host.serverName}: list ${toolkit} tools`,
       description: buildDescription(
@@ -589,10 +599,11 @@ export class ComposioSessionImpl extends ComposioSessionBase implements Composio
 @validateRpc()
 export class ComposioToolkitSessionImpl extends ComposioSessionBase implements ComposioToolkitSession {
   async listTools(): Promise<ComposioToolInfo[]> {
-    const slug = this.host.arming?.toolkitSlug;
+    const slug = this.host.scopeToolkits?.[0];
     if (slug === undefined) throw new Error("This binding is not scoped to a toolkit.");
     const tools = await this.host.account.toolkitTools(slug);
-    const scoped = await Promise.all(tools.map(tool => this.classify(tool)));
+    const state = await this.classificationState();
+    const scoped = tools.map(tool => this.classify(tool, state));
     await this.queue.authorizeObservation({
       title: `${this.host.serverName}: list ${slug} tools`,
       description: buildDescription(
