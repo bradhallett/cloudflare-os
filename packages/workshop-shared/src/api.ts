@@ -22,14 +22,22 @@
 // except postMessage() to the parent frame. Through postMessage() exchanges, the Gadget can speak
 // RPC to the Workshop. Among other things, through this interface, the Workshop provides the
 // Gadget a stub pointing to the Gadget's server-side Durable Object interface.
+//
+// Separable domains live in sibling modules and are re-exported below with unchanged names:
+// errors.ts (the coded-error family factory), orgs.ts (organizations), commerce.ts (SaaS
+// billing, beside its port), bots.ts (declared bots). This file stays the single import
+// surface for the API, so importers are unaffected by where a domain's code lives.
 
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { AccountDescription, ActionKind, ActionDescription, AgentCatalog, AvatarImage, ComposioToolkitInfo, GatekeeperUiFrame, GatekeeperUserSelection, ObservationDescription, ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorDescription, HookDescription } from "./gatekeeper.js";
 import type { CodeChange } from "./code-change.js";
 import type { GitOid } from "./gatekeeper.js";
 import type { UiFeatureFlags } from "./feature-flags.js";
-import type { ModelTier, EntitlementsPlanId } from "./entitlements.js";
+import type { ModelTier } from "./entitlements.js";
 import { codedErrorFamily } from "./errors.js";
+import type { OrgApiMethods, OrgMembership } from "./orgs.js";
+import type { CommerceApiMethods } from "./commerce.js";
+import type { BotApiMethods, BotSelection, DeploymentBotAdminMethods } from "./bots.js";
 
 export const SERVICE_SALT = new Uint8Array([
   0xd9, 0x4e, 0x54, 0x1d, 0x29, 0xc1, 0x03, 0x74, 0x73, 0x7e, 0xb3, 0xe3, 0x34, 0x6d, 0x8f, 0x21
@@ -473,7 +481,7 @@ export type DeviceSessionHandoffStart = {
 };
 
 /** Top-level API exposed to the user after they have authenticated. */
-export interface AuthenticatedApi extends RpcTarget {
+export interface AuthenticatedApi extends RpcTarget, OrgApiMethods, CommerceApiMethods, BotApiMethods {
   /**
    * Get profile info for the user who is logged in, plus their organization memberships
    * (see `WhoamiInfo`). The memberships are the user's mirrored index — a display snapshot;
@@ -635,41 +643,6 @@ export interface AuthenticatedApi extends RpcTarget {
 
   /** Mark the onboarding wizard as completed. */
   completeOnboarding(): Promise<void>;
-
-  // --- Bots ---
-
-  /**
-   * List the bots offered to this user: their own plus the deployment's (see AdminApi), merged.
-   * A bot whose model no longer resolves for this user is listed with `available: false` rather
-   * than dropped, so it stays visible wherever it was picked.
-   */
-  listBots(): Promise<BotInfo[]>;
-
-  /**
-   * Get one of this user's own bots' definitions. Deployment bots are public metadata already
-   * covered by `listBots()` and are never read through this method, so a deployment slug
-   * colliding with a user bot id is impossible.
-   */
-  getBot(id: string): Promise<BotDefinition>;
-
-  /**
-   * Create a bot owned by this user and return its id. `name` must be unique among the user's
-   * own bots; lengths and skill counts are capped as the MAX_BOT_* constants declare.
-   */
-  createBot(def: BotDefinition): Promise<string>;
-
-  /** Replace one of this user's own bots' definitions. */
-  updateBot(id: string, def: BotDefinition): Promise<void>;
-
-  /** Delete one of this user's own bots. Chats that used it keep their frozen snapshot. */
-  deleteBot(id: string): Promise<void>;
-
-  /**
-   * List the skills this user can declare on a bot: the slash commands offered by their
-   * connected accounts' agent singletons (e.g. the Context Library). Vendors whose singleton
-   * cannot be reached are skipped, not fatal.
-   */
-  listBotSkills(): Promise<BotSkillChoice[]>;
 
   // --- Optional Cloudflare limits / top-up flow (only meaningful when enabled server-side) ---
 
@@ -985,100 +958,6 @@ export interface AuthenticatedApi extends RpcTarget {
       vendorId: string, selectedUserId: string,
   ): Promise<GatekeeperUserSelection | null>;
 
-  // --- Organizations (see the Org* types below) ---
-
-  /**
-   * Create an organization with the caller as its first owner and only member. The name is
-   * trimmed, and must be non-empty and at most MAX_ORG_NAME_LENGTH characters.
-   */
-  createOrg(name: string): Promise<OrgSummary>;
-
-  /**
-   * The caller's organizations, one entry per membership (one person may be in many). Read from
-   * the user's membership index and re-checked against each org, so an entry disappears once its
-   * membership ends even if the index is briefly stale.
-   */
-  listMyOrgs(): Promise<OrgSummary[]>;
-
-  /**
-   * Every membership of one organization — pending invitations included — sorted by user id.
-   * Only an active member of the org may call this.
-   */
-  getOrgMembers(orgId: string): Promise<OrgMember[]>;
-
-  /**
-   * Invite `userId` (a canonical user id; the person need not have signed in yet) to the org at
-   * `role`, defaulting to "member". Creates — or, for a pending invitation to the same person,
-   * refreshes — an invitation that stays acceptable for seven days. The caller must be an active
-   * member allowed to invite by the org's invite policy, and may not grant a role above their
-   * own. An already-active member cannot be invited.
-   */
-  inviteOrgMember(orgId: string, userId: string, role?: OrgRole): Promise<OrgMember>;
-
-  /**
-   * Accept the caller's pending invitation, making the membership active. Throws when there is
-   * no pending invitation for the caller, or it has expired.
-   */
-  acceptOrgInvitation(orgId: string): Promise<OrgSummary>;
-
-  /**
-   * Change a member's role. Owners only, and the caller may not grant a role above their own.
-   * Refused when it would leave the organization with no owner (the last owner cannot be
-   * demoted).
-   */
-  changeOrgMemberRole(orgId: string, userId: string, role: OrgRole): Promise<OrgMember>;
-
-  /**
-   * Remove a membership, or revoke its pending invitation. Owners may remove anyone; admins may
-   * remove members; a member may remove no one but themself (prefer leaveOrg). Refused when it
-   * would leave the organization with no owner. Removing the caller themself is exactly
-   * leaveOrg().
-   */
-  removeOrgMember(orgId: string, userId: string): Promise<void>;
-
-  /**
-   * The caller leaves the organization: their membership (or pending invitation) is removed.
-   * Refused for a sole owner, who must first hand ownership to someone else.
-   */
-  leaveOrg(orgId: string): Promise<void>;
-
-  /**
-   * Update the org's settings (see OrgInvitePolicy). Owners only.
-   */
-  updateOrgSettings(
-      orgId: string, settings: { invitePolicy: OrgInvitePolicy }): Promise<OrgSummary>;
-
-  // --- SaaS commerce (org billing; see the OrgBilling* types and @gadgets/workshop-shared/commerce) ---
-
-  /**
-   * The subscription plans this deployment's commerce service offers, for the plan picker.
-   * Empty when no commerce service is bound (self-hosted deployments).
-   */
-  listCommercePlans(): Promise<CommercePlan[]>;
-
-  /**
-   * The org's billing overview for the org settings page: derived plan, licensed and claimed
-   * seats, spend cap, overage allowance, subscription status, and the current billing cycle's
-   * usage (#17's usage report). Active owners and admins only. Throws when no commerce service
-   * is bound.
-   */
-  getOrgBilling(orgId: string): Promise<OrgBillingOverview>;
-
-  /**
-   * Starts a hosted checkout session to subscribe the org to `plan` at `seats` seats, returning
-   * the checkout URL for the browser to redirect to; the checkout host returns the buyer to the
-   * Workshop's SaaS checkout-return page afterwards. Active owners and admins only. Throws when
-   * no commerce service is bound.
-   */
-  startOrgCheckout(orgId: string, plan: string, seats: number): Promise<{ url: string }>;
-
-  /**
-   * Mints a scoped customer-portal URL for the org (payment method, invoices, seat billing) and
-   * returns it for the browser to open. Active owners and admins only. Throws when no commerce
-   * service is bound.
-   */
-  openOrgBillingPortal(orgId: string): Promise<{ url: string }>;
-
   // --- Deployment admin ---
 
   /**
@@ -1116,70 +995,19 @@ export type GatekeeperAppInfo = {
 // ---------------------------------------------------------------------------
 // Organizations
 // ---------------------------------------------------------------------------
+// The org grammar and the org-management methods of AuthenticatedApi live in ./orgs.ts, the
+// single home of the org-role grammar (import it rather than re-declaring the literals);
+// re-exported here so this file stays the one import surface.
 
-/**
- * A member's role in an organization. Owners manage roles and settings; admins manage members;
- * members belong to the org. An organization always keeps at least one owner.
- */
-export type OrgRole = "owner" | "admin" | "member";
-
-/** Whether a membership is standing (`active`) or still awaiting the invitee's acceptance. */
-export type OrgMemberStatus = "active" | "invited";
-
-/**
- * Who may invite new members: `admin` (the default) restricts invitations to owners and admins;
- * `member` additionally lets every active member invite, at the `member` role only.
- */
-export type OrgInvitePolicy = "admin" | "member";
-
-/** The longest organization name createOrg() accepts, after trimming. */
-export const MAX_ORG_NAME_LENGTH = 100;
-
-/**
- * One membership of an organization, as stored by the org itself and returned by
- * `AuthenticatedApi.getOrgMembers()`.
- */
-export type OrgMember = {
-  /**
-   * Canonical user identifier of the member (email for Access / sign-in accounts, username for
-   * password accounts). The invitee need not have signed in yet.
-   */
-  userId: string;
-  role: OrgRole;
-  status: OrgMemberStatus;
-  /** The inviting member's user id, or null for the org's creating owner. */
-  invitedBy: string | null;
-  invitedAt: Date;
-  /** When the member accepted their invitation; null while it is pending. */
-  joinedAt: Date | null;
-};
-
-/**
- * An organization as one member sees it: its record and settings together with the caller's own
- * membership. Returned by every org method that acts for a particular member.
- */
-export type OrgSummary = {
-  /** The org's random id, also identifying it in API calls. */
-  id: string;
-  name: string;
-  invitePolicy: OrgInvitePolicy;
-  /** The caller's role in this org. */
-  role: OrgRole;
-  /** The caller's membership status in this org. */
-  status: OrgMemberStatus;
-};
-
-/**
- * One of the signed-in user's organization memberships, as `whoami()` reports it. Read from the
- * user's mirrored membership index, so it is a snapshot for display: the org re-checks membership
- * live wherever it carries authority (search scoping, picker tickets, org methods).
- */
-export type OrgMembership = {
-  /** The org's random id, as in `OrgSummary.id`. */
-  orgId: string;
-  role: OrgRole;
-  status: OrgMemberStatus;
-};
+export type {
+  OrgRole,
+  OrgMemberStatus,
+  OrgInvitePolicy,
+  OrgMember,
+  OrgSummary,
+  OrgMembership,
+} from "./orgs.js";
+export { MAX_ORG_NAME_LENGTH } from "./orgs.js";
 
 /**
  * The signed-in user's own profile and organization memberships, as returned by
@@ -1194,72 +1022,16 @@ export type WhoamiInfo = AiChatAuthorInfo & {
 // ---------------------------------------------------------------------------
 // SaaS commerce — org billing (see @gadgets/workshop-shared/commerce for the port)
 // ---------------------------------------------------------------------------
+// The billing display types and the commerce methods of AuthenticatedApi live in ./commerce.ts
+// beside the port that consumes them; re-exported here so this file stays the one import
+// surface.
 
-/**
- * A subscription plan the deployment's commerce service offers, as
- * `AuthenticatedApi.listCommercePlans()` lists it for the plan picker.
- */
-export type CommercePlan = {
-  /** The plan's opaque id, exactly what `startOrgCheckout()` expects. */
-  id: string;
-  /** Display name (e.g. "Pro"). */
-  name: string;
-};
-
-/**
- * One member of an org as the commerce member-sync carries them: enough to claim and release
- * the org's subscription seats (an invited member claims their seat immediately) without
- * re-deriving membership, which the org Durable Object has already authority-checked.
- */
-export type OrgCommerceMember = {
-  /** Canonical user identifier (email for Access / sign-in accounts, username otherwise). */
-  userId: string;
-  role: OrgRole;
-  status: OrgMemberStatus;
-};
-
-/** The org's usage in one billing cycle, as `getOrgBilling()` reports it. */
-export type OrgUsageSummary = {
-  /** Start of the billing cycle the totals cover. */
-  cycleStart: Date;
-  /** Prompt tokens not served from a cache, across the org's metered model calls. */
-  inputTokens: number;
-  /** Prompt tokens served from a cache. */
-  cacheReadTokens: number;
-  /** Prompt tokens written to a cache. */
-  cacheWriteTokens: number;
-  /** Completion tokens, reasoning included. */
-  outputTokens: number;
-  /**
-   * The cycle's estimated metered cost (USD) at the billing service's own pinned price table —
-   * an estimate for reconciliation, never the invoice. Null while any metered model is unpriced.
-   */
-  estimatedCostUsd: number | null;
-};
-
-/**
- * The org's billing state for the org settings page, as `getOrgBilling()` reports it. Mirror of
- * the derived entitlements plus the subscription's status and the current cycle's usage.
- */
-export type OrgBillingOverview = {
-  /** The plan the org's subscription currently derives; "free" until one is active. */
-  plan: EntitlementsPlanId;
-  /** Licensed seats on the subscription. */
-  seats: number;
-  /** Seats claimed per the member mirror — active members plus pending invitations. */
-  assignedSeats: number;
-  /** Maximum metered spend (USD) per billing cycle. */
-  monthlySpendCapUsd: number;
-  /** Whether spend past the cap proceeds, billed as metered overage. */
-  overageAllowed: boolean;
-  /**
-   * The subscription's status as the billing service derives it from the vendor's state (e.g.
-   * "active", "trialing", "past_due"; "none" with no subscription). Display-only.
-   */
-  subscriptionStatus: string;
-  /** The current cycle's usage; null while the billing service knows no cycle. */
-  usage: OrgUsageSummary | null;
-};
+export type {
+  CommercePlan,
+  OrgCommerceMember,
+  OrgUsageSummary,
+  OrgBillingOverview,
+} from "./commerce.js";
 
 // ---------------------------------------------------------------------------
 // Context Library — pluggable separate worker (packages/gatekeeper-context)
@@ -1602,7 +1374,7 @@ export type DeploymentUpdateStatus = {
  * provides — NOT authentication config (that's env-var driven). Each setter throws on invalid
  * input.
  */
-export interface AdminApi {
+export interface AdminApi extends DeploymentBotAdminMethods {
   /** Read all admin-managed settings for the admin UI in one call. */
   getSettings(): Promise<AdminSettingsView>;
 
@@ -1628,24 +1400,6 @@ export interface AdminApi {
 
   /** Replace the agent system-prompt instructions. Pass "" to clear. Rejects over MAX_INSTANCE_INSTRUCTIONS_LENGTH. */
   setInstanceInstructions(text: string): Promise<void>;
-
-  /**
-   * List the deployment's bots, offered to every user alongside their own (see
-   * AuthenticatedApi.listBots).
-   */
-  listDeploymentBots(): Promise<(BotDefinition & {id: string})[]>;
-
-  /**
-   * Add a deployment-wide bot. `id` is a lowercase slug naming it in BotSelections; it must be a
-   * valid unique identifier. The definition is validated like a user bot's.
-   */
-  addDeploymentBot(id: string, def: BotDefinition): Promise<void>;
-
-  /** Replace a deployment-wide bot's definition. The `id` names it; the definition has no id. */
-  updateDeploymentBot(id: string, def: BotDefinition): Promise<void>;
-
-  /** Remove a deployment-wide bot. Chats that used it keep their frozen snapshot. */
-  removeDeploymentBot(id: string): Promise<void>;
 
   /**
    * Enable or disable a single gatekeeper resource type, keyed by vendor id + resource urlPattern.
@@ -5066,93 +4820,23 @@ export type CapsuleSpecifier = {
 };
 
 // --- Bots ---
+// The bot grammar and both bot method faces (user bots on AuthenticatedApi, deployment bots on
+// AdminApi) live in ./bots.ts; re-exported here so this file stays the one import surface.
 
-/**
- * A declared bot: a named agent with pre-set instructions, a model, and skills, picked instead
- * of a model when starting or steering a chat. Bots exist in two scopes, merged everywhere they
- * are listed: each user's own (AuthenticatedApi) and the deployment's (AdminApi). A chat running
- * as a bot can delegate to other bots as subagents and exchange direct messages with them.
- */
+export type {
+  BotSkillRef,
+  BotDefinition,
+  BotSelection,
+  BotInfo,
+  BotSkillChoice,
+} from "./bots.js";
+export {
+  MAX_BOT_NAME_LENGTH,
+  MAX_BOT_DESCRIPTION_LENGTH,
+  MAX_BOT_INSTRUCTIONS_LENGTH,
+  MAX_BOT_SKILLS,
+} from "./bots.js";
 
-/**
- * A skill a bot declares, identified like a slash command (`vendorId` + `commandId`), which is
- * stable across workspaces. `name` is display-only, captured at declaration time; the reference
- * is resolved against a workspace's gatekeepers when a bot chat starts.
- */
-export type BotSkillRef = {
-  /** Vendor whose gatekeeper offers the skill. */
-  vendorId: string;
-  /** The command to activate, as that vendor names it. */
-  commandId: string;
-  /** Display name captured when the skill was declared; never used for resolution. */
-  name: string;
-};
-
-/** Maximum length (characters) of a bot's name. */
-export const MAX_BOT_NAME_LENGTH = 64;
-
-/** Maximum length (characters) of a bot's description. */
-export const MAX_BOT_DESCRIPTION_LENGTH = 200;
-
-/** Maximum length (characters) of a bot's instructions. */
-export const MAX_BOT_INSTRUCTIONS_LENGTH = 8000;
-
-/** Maximum number of skills a bot may declare. */
-export const MAX_BOT_SKILLS = 50;
-
-/**
- * A bot's declaration. `modelId` names a model as it resolved for the declaring user; a chat
- * started as the bot refuses visibly if that model no longer resolves for the user starting it.
- */
-export type BotDefinition = {
-  /** Unique within the bot's scope. */
-  name: string;
-  /** One-line summary shown in pickers and bot lists. */
-  description?: string;
-  /** Standing instructions added to the bot's system prompt. */
-  instructions: string;
-  /** The model the bot runs on. */
-  modelId: string;
-  /** Skills the bot may activate on demand (see the activateSkill tool). */
-  skills: BotSkillRef[];
-};
-
-/** Identifies a bot by scope, for passing into chat APIs. */
-export type BotSelection = {
-  scope: "user" | "deployment";
-  id: string;
-};
-
-/** One bot as listed for pickers: its identity plus whether it can start a chat right now. */
-export type BotInfo = {
-  selection: BotSelection;
-  name: string;
-  description?: string;
-  modelId: string;
-  /** Display name of the bot's model, when it resolves. */
-  modelName?: string;
-  /**
-   * Whether a chat can start with this bot now. False means the bot's model no longer resolves
-   * for this user; such a bot stays listed (disabled, with `unavailableReason`) rather than
-   * disappearing from underneath chats that picked it.
-   */
-  available: boolean;
-  unavailableReason?: string;
-};
-
-/** One skill a bot can declare, as offered by the user's connected accounts. */
-export type BotSkillChoice = {
-  /** With `commandId`, the stable reference to store in a BotSkillRef. */
-  vendorId: string;
-  /** With `vendorId`, the stable reference to store in a BotSkillRef. */
-  commandId: string;
-  /** Display name captured into the declaration. */
-  name: string;
-  /** What the skill does, shown in the picker. */
-  description: string;
-  /** Name of the account or gatekeeper offering the skill. */
-  providerLabel: string;
-};
 /** Identifies a Gatekeeper slash command or the built-in `/compact` command. */
 export type SlashCommandId = {
   gatekeeperId: WorkpieceId;

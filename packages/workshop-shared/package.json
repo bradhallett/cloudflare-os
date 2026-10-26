@@ -46,6 +46,18 @@
     "./theme": {
       "types": "./src/theme.ts",
       "import": "./src/theme.ts"
+    },
+    "./orgs": {
+      "types": "./src/orgs.ts",
+      "import": "./src/orgs.ts"
+    },
+    "./bots": {
+      "types": "./src/bots.ts",
+      "import": "./src/bots.ts"
+    },
+    "./errors": {
+      "types": "./src/errors.ts",
+      "import": "./src/errors.ts"
     }
   },
   "scripts": {
