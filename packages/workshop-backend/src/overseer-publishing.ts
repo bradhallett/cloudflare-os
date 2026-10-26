@@ -7,7 +7,7 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { AiGatewayLogRetryableError, getAiGatewayLogCost } from "./ai-gateway";
 import type { BindingRecord } from "./storage-schema/overseer-storage";
 import type { AiGatewayLogRoute } from "./ai-gateway";
-import type { AiChatMessageBodyWithModelData, WorktreeTurnAccess } from "./agent";
+import type { AiChatMessageBodyWithModelData, WorktreeTurnAccess } from "./agent-hooks";
 import {
   blueprintContentKey, deleteBlueprintContent, readBlueprintRelease,
 } from "./blueprint-archive";

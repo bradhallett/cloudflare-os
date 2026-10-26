@@ -7,7 +7,7 @@ import { applyCodeChange, requireTextContent, type CodeChange, type CodeContent,
 import type { GitOid, GitPullHints } from "@gadgets/workshop-shared/gatekeeper";
 import type { OverseerDurableObject } from "../src/overseer.js";
 import { WorktreeSessionImpl, type WorktreeSessionHost } from "../src/worktree-session";
-import type { WorktreeTurnAccess } from "../src/agent";
+import type { WorktreeTurnAccess } from "../src/agent-hooks";
 import { formatUnifiedDiff } from "../src/agent";
 import { WorkspaceGitCache } from "../src/git-cache";
 import { MAX_GIT_OBJECT_SIZE } from "../src/git-walker";

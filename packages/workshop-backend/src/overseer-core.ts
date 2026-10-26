@@ -6,7 +6,7 @@ import { chatKeyPrefix, makeOverseerStorage } from "./storage-schema/overseer-st
 import type { BindingRecord, ChatChangeRecord, ExternalMessageRecord, GadgetRecord, OverseerStorage, WorkpieceRecord, WorktreeRecord, WorkspaceOwnerSubject } from "./storage-schema/overseer-storage";
 import { GitStore } from "./git-store";
 import { WorkspaceGitCache } from "./git-cache";
-import type { WorktreeTurnAccess } from "./agent";
+import type { WorktreeTurnAccess } from "./agent-hooks";
 import { scanWorkpieceForGrep } from "./grep";
 import type { GrepScan } from "./grep";
 import { isTurnPrompt } from "./agent-compaction";

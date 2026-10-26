@@ -9,8 +9,9 @@ import type { AiChatAgentContext, BindingRecord, ChatChangeRecord, CompactionChe
 import type { BindingHolder } from "./overseer-support";
 import { getModel } from "./ai-models";
 import { completeText } from "./ai-invoke";
-import { AgentGadgetInfo, GIT_BINDING_NAME } from "./agent";
-import type { ChatHistory } from "./agent";
+import { GIT_BINDING_NAME } from "./agent";
+import type { AgentGadgetInfo } from "./agent-hooks";
+import type { ChatHistory } from "./agent-hooks";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
 import { UserDurableObject } from "./user";
 import { checkOwnerUsage } from "./ai-gateway-billing/limits/usage-checker";

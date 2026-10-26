@@ -2,7 +2,8 @@ import { WorkpieceId, AiChatMetadata, AiChatAuthorInfo, AiToolCall, CapsuleSpeci
 import { Gatekeeper, GitPullHints } from "@gadgets/workshop-shared/gatekeeper";
 import { WorkspaceGitCache } from "./git-cache";
 import { migrateToActionIndexes, migrateToBlueprintUpstreams, migrateToGitStorage, migrateToMultiGadget, migrateToWorkpieceTypes, migrateToSpawnerBindings, migrateToDeclaredBots } from "./storage-schema/overseer-migrations";
-import { AgentHooks, summarizeArgs } from "./agent";
+import { summarizeArgs } from "./agent";
+import type { AgentHooks } from "./agent-hooks";
 import { ChatCacheWarmer } from "./chat-cache-warming";
 import { UserDurableObject } from "./user";
 import type { UserChatContext } from "./user";

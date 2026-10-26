@@ -16,7 +16,8 @@ import type {
 } from "@gadgets/workshop-shared/api";
 import type { OverseerDurableObject } from "../src/overseer.js";
 import type { GadgetRecord } from "../src/storage-schema/overseer-storage.js";
-import { runAgent, type AgentHooks } from "../src/agent";
+import { runAgent } from "../src/agent";
+import type { AgentHooks } from "../src/agent-hooks";
 import type { CachedRequest, ModelHandle } from "../src/ai-models.js";
 
 declare module "cloudflare:workers" {

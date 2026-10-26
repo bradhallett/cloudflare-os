@@ -21,7 +21,7 @@ import type { CommitObject } from "isomorphic-git";
 
 import type { WorkspaceGitCache } from "./git-cache";
 import type { GitStore } from "./git-store";
-import type { WorktreeTurnAccess } from "./agent";
+import type { WorktreeTurnAccess } from "./agent-hooks";
 import { WorktreeSessionImpl, type WorktreeRecordView, type WorktreeSessionHost }
   from "./worktree-session";
 
