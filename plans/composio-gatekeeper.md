@@ -2,7 +2,8 @@
 
 **Status: implemented and merged** (PRs #83–#87; two post-merge integration reviews closed).
 Scope decisions confirmed by the deployment owner on
-2026-10-26; build is deferred; this record fixes the design so the build can start from it.
+2026-10-26; this record fixed the design before the build, and the epic is now
+implemented on it (PRs #83–#87); it remains the binding design map.
 Composio facts are from docs.composio.dev and the Composio v3.1 REST surface as retrieved
 2026-10-26 — the fact base was audited line-by-line against live docs by a dedicated reviewer,
 and the whole design was stress-tested by eight parallel reviewers (contract, mcp-shared reuse,
