@@ -76,6 +76,8 @@ type PreparedRun = {
   /** Fences this delivery attempt: the retry reuses `runId` but never this token. */
   attempt: string;
   scheduledTime: number;
+  /** The lease deadline `#prepareRun` persisted for this run; the expiry race needs no re-read. */
+  leaseExpiresAt: number;
 };
 
 type PendingState = Extract<EnabledSchedule, { status: "pending" }>;
@@ -398,9 +400,7 @@ export class ScheduleDriver extends DurableObject {
    * pending-run compare-and-set so a late settlement can never double-settle the run.
    */
   async #enforceLeaseDeadline(prepared: PreparedRun, delivery: Promise<boolean>): Promise<boolean> {
-    const stored = this.#readSchedule(scheduleKey(prepared.workspaceId, prepared.scheduleId));
-    const deadline = stored?.state.status === "pending" ? stored.state.leaseExpiresAt : undefined;
-    if (deadline === undefined) return delivery;
+    const deadline = prepared.leaseExpiresAt;
     const expired = Promise.withResolvers<"expired">();
     const timer = setTimeout(() => expired.resolve("expired"), Math.max(deadline - Date.now(), 0));
     let outcome: boolean | "expired";
@@ -546,6 +546,7 @@ export class ScheduleDriver extends DurableObject {
         runId: state.runId,
         attempt: state.attempt,
         scheduledTime: state.scheduledTime,
+        leaseExpiresAt,
       };
     });
   }
