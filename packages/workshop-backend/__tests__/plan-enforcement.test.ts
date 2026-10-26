@@ -13,7 +13,7 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import type { Entitlements } from "@gadgets/workshop-shared/entitlements";
 import { DecisionModelGatekeeper, LanguageModelGatekeeper } from "../src/ai-models.js";
-import type { AiChatAuthorInfo } from "@gadgets/workshop-shared/api";
+import { getPlanRefusalCode, type AiChatAuthorInfo } from "@gadgets/workshop-shared/api";
 import { serializeAdminConfig } from "../src/admin-config.js";
 import { OrgDurableObject } from "../src/org.js";
 import type { OverseerDurableObject } from "../src/overseer.js";
@@ -125,18 +125,19 @@ async function attempt<T>(f: () => Promise<T>): Promise<T | { error: string }> {
     return { error: err instanceof Error ? err.message : String(err) };
   }
 }
-
-// A plan answer a test can swap between calls on the same Durable Object, so a downgrade lands
-// mid-test.
+// A plan answer the ambient downgrade test swaps between calls on the same Durable Object, each
+// swap served by a fresh port object: resolveEntitlements remembers a resolved answer per port
+// for a few seconds (see src/entitlements.ts), so swapping one port's answer mid-test would
+// serve the remembered pre-downgrade answer — the memo's bounded staleness, covered in
+// entitlements-policy.test.ts — instead of the dorm rule under test.
 function swappablePlan(initial: Entitlements) {
-  const state = { answer: initial as Entitlements | Error };
-  const port = {
-    getEntitlements: async () => {
-      if (state.answer instanceof Error) throw state.answer;
-      return state.answer;
-    },
-  } as unknown as NonNullable<Cloudflare.Env["SAAS_ENTITLEMENTS"]>;
-  return { state, port };
+  const state = { answer: initial as Entitlements };
+  return {
+    state,
+    port: () => ({
+      getEntitlements: async () => state.answer,
+    }) as unknown as NonNullable<Cloudflare.Env["SAAS_ENTITLEMENTS"]>,
+  };
 }
 
 // A workspace the user owns (`owner` unset), or one shared with them (set).
@@ -380,7 +381,9 @@ describe("plan-enforced ambient gatekeepers", () => {
     const { state, port } = swappablePlan(plan({ allowedGatekeepers: ["ambientkee"] }));
     const { inDo } = planUser(null, {}, state => ({
       GATEKEEPER_AMBIENTKEE: ambientVendor(state),
-      SAAS_ENTITLEMENTS: port,  // overrides the harness's; the answer changes mid-test
+      // Fresh port each invocation (see swappablePlan), so every call below consults the plan
+      // as it stands; the harness's own binding stays overridden.
+      SAAS_ENTITLEMENTS: port(),
     }));
     await inDo(user => user.provisionAmbientAccount("ambientkee"));
 
@@ -458,8 +461,13 @@ describe("plan-enforced model bindings", () => {
   });
 
   it("a plan downgrade refuses the binding's next session, both gatekeepers", async () => {
-    await expect(session(plan({ allowedModelTiers: ["standard"] }))).rejects.toThrow(
-        'The "Claude Opus 5.5" model isn\'t available on your plan.');  // premium-tier model
+    // The refusal carries its code, as a chat naming the model does, so the UI can offer the
+    // plan upgrade and the agent layer classifies it (PLAN_REFUSAL_CODES).
+    const refusal = await session(plan({ allowedModelTiers: ["standard"] })).then(
+        () => undefined, (error: unknown) => error);
+    expect(getPlanRefusalCode(refusal)).toBe("MODEL_NOT_ON_PLAN");
+    expect((refusal as Error).message)
+        .toBe('The "Claude Opus 5.5" model isn\'t available on your plan.');  // premium-tier model
     await expect(session(plan({ allowedModelTiers: ["premium"] }), DECISION_CONFIG, true))
         .rejects.toThrow(
             'The "Clef (Workers AI)" model isn\'t available on your plan.');  // standard-tier
@@ -620,6 +628,20 @@ describe("plan-enforced org workspace caps", () => {
         .toEqual({ error: "This organization has reached its plan's limit of 2 workspaces." });
     const room = await orgWithPlan(plan({ maxWorkspaces: 3 }), ["g1", "g2"]);
     expect(await room.inDo(org => transfer(org, "g3"))).toBeUndefined();
+  });
+
+  it("the cap refusal carries the WORKSPACE_CAP_REACHED code a plan upgrade reads", async () => {
+    const capped = await orgWithPlan(plan({ maxWorkspaces: 1 }), ["g1"]);
+    // The code is read inside the Durable Object: runInDurableObject serializes a thrown
+    // error to its message, which is what `attempt` above asserts.
+    const code = await capped.inDo(async org => {
+      try {
+        await org.addOwnedGadget(OWNER, "g2", "member-1");
+      } catch (err) {
+        return getPlanRefusalCode(err);
+      }
+    });
+    expect(code).toBe("WORKSPACE_CAP_REACHED");
   });
 
   it("a transfer its own crashed attempt left behind is not re-refused", async () => {

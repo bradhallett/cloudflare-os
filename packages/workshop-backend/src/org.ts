@@ -13,27 +13,20 @@ import { validateRpc } from "capnweb-validate";
 import { createWorkshopLogger, type WorkshopLogger } from "./observability";
 import {
   MAX_ORG_NAME_LENGTH, type OrgCommerceMember, type OrgMember, type OrgMemberStatus,
-  type OrgRole, type OrgSummary,
+  type OrgRole, type OrgSummary, createPlanRefusalError,
 } from "@gadgets/workshop-shared/api";
 import {
   canManageOrgAssets, canManageRoles, canRemoveMember, canUpdateSettings, canViewMembers,
   gadgetBaselineRole, isActiveMember, invitableView, wouldLoseLastOwner, type OrgAccess,
 } from "./org-access";
 import { makeOrgStorage, type OrgRecord, type OrgSettings } from "./storage-schema/org-storage";
-import { resolveEntitlements } from "./entitlements.js";
+import { resolveEntitlements, workspaceCapFrom } from "./entitlements.js";
 import { notifyOrgMembersChanged } from "./commerce.js";
 
 const logger = createWorkshopLogger("workshop.org");
 
 /** How long an invitation stays acceptable after it is issued or refreshed. */
 const INVITATION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-
-/** Mints the random id of a new org, which is also its Durable Object's name. */
-export function randomOrgId(): string {
-  let idBytes = new Uint8Array(16);
-  crypto.getRandomValues(idBytes);
-  return idBytes.toHex();
-}
 
 /**
  * The Org Durable Object. Reached by the authenticated API (server.ts) and, once org-scoped
@@ -432,22 +425,22 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
       throw new Error("Only an owner or admin of this organization may transfer workspaces into it.");
     }
     if (transferringUserId !== undefined) {
-      let answer = await resolveEntitlements(this.env, transferringUserId);
-      // "unavailable" — a bound plan service that failed — refuses the transfer: fail closed,
-      // as the personal-creation cap does (see UserDurableObject.newGadget).
-      if (answer.status === "unavailable") {
+      // The cap is folded from the answer once (see workspaceCapFrom): "unavailable" — a bound
+      // plan service that failed — refuses the transfer, as the personal-creation cap does (see
+      // UserDurableObject.newGadget); "unbound" is unlimited.
+      let gate = workspaceCapFrom(await resolveEntitlements(this.env, transferringUserId));
+      if (gate.status === "unavailable") {
         throw new Error(
             "Your plan couldn't be verified, so the workspace wasn't transferred. Please try again.");
       }
-      let cap = answer.status === "resolved" ? answer.entitlements.maxWorkspaces : undefined;
-      if (cap !== undefined) {
+      if (gate.status === "capped") {
         // Count the org's owned workspaces, excluding this one: a retried transfer must not be
         // refused by the index entry its own crashed attempt left behind.
         let owned = [...this.storage.ownedGadgets.list()]
             .filter(gadget => gadget.gadgetId !== gadgetId).length;
-        if (owned >= cap) {
-          throw new Error(
-              `This organization has reached its plan's limit of ${cap} workspaces.`);
+        if (owned >= gate.cap) {
+          throw createPlanRefusalError("WORKSPACE_CAP_REACHED",
+              `This organization has reached its plan's limit of ${gate.cap} workspaces.`);
         }
       }
     }
@@ -500,9 +493,6 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
     const org = this.#org();
     if (!canUpdateSettings(this.#accessFor(actorId))) {
       throw new Error("Only an owner may change this organization's settings.");
-    }
-    if (settings.invitePolicy !== "admin" && settings.invitePolicy !== "member") {
-      throw new Error("The invite policy must be \"admin\" or \"member\".");
     }
     const updated: OrgSettings = { invitePolicy: settings.invitePolicy };
     this.storage.settings.put(updated);

@@ -20,13 +20,14 @@ import { GatekeeperUiFrame, GatekeeperUserSelection } from "@gadgets/workshop-sh
 import { DecisionModelGatekeeper, LanguageModelGatekeeper } from "./ai-models";
 import { getGatewayModels } from "./ai-gateway.js";
 import { AdminSettings, AdminApiImpl } from "./admin-settings.js";
-import { blueprintContentKey, buildBlueprintArchiveStream, sanitizeBlueprintOutput, parseBlueprintArchive, randomBlueprintId } from "./blueprint-archive.js";
+import { blueprintContentKey, buildBlueprintArchiveStream, sanitizeBlueprintOutput, parseBlueprintArchive } from "./blueprint-archive.js";
+import { random128BitId } from "./ids.js";
 import { BlueprintKvRecord, blueprintKvKey, listFeaturedBlueprintsFromKv, readBlueprintKvRecord } from "./storage-schema/blueprints-kv.js";
 import { GatekeeperConnectCallbackImpl, GatekeeperUserSelectionExchangeImpl, normalizeUsername, UserDurableObject, CLOUDFLARE_VENDOR_ID } from "./user";
 import { resolveBlueprintForUser } from "./blueprint-access.js";
 import { OverseerDurableObject, GatekeeperLoopback, CodeModeTailLoopback, AgentSpawnerGatekeeper, GatekeeperHookLoopback, GadgetTailLoopback, AgentSelfLoopback } from "./overseer";
 import { UserDirectoryDurableObject } from "./user-directory.js";
-import { OrgDurableObject, randomOrgId } from "./org.js";
+import { OrgDurableObject } from "./org.js";
 import { ExternalMessageGateway } from "./external-message-gateway";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { recordAnalytics } from "./analytics";
@@ -243,7 +244,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
   // Writes never retry across an org-DO reset (see whoami for the user DO's version of this).
   createOrg(name: string): Promise<OrgSummary> {
-    return this.#org(randomOrgId()).initializeOrg(name, this.#ownId);
+    return this.#org(random128BitId()).initializeOrg(name, this.#ownId);
   }
   async listMyOrgs(): Promise<OrgSummary[]> {
     // The user DO's index is discovery only; each org re-checks the membership live, which also
@@ -630,7 +631,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   async importBlueprint(archive: ReadableStream<Uint8Array>): Promise<string> {
     let { metadata, contentLength, content } = await parseBlueprintArchive(archive);
     delete metadata.screenshot;
-    let blueprintId = randomBlueprintId();
+    let blueprintId = random128BitId();
     // An imported blueprint belongs to the importing user, as a workspace-published one belongs
     // to the workspace's owner.
     let owner = {type: "user", id: this.#userId.toString()} as const;

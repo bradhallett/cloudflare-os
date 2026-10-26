@@ -6,9 +6,11 @@
 // allowance (the SaaS meters the spend), and a failing port falls back to env config / no gate
 // rather than blocking or crashing model calls (see src/entitlements.ts).
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { Entitlements, UsagePolicy } from "@gadgets/workshop-shared/entitlements";
-import { resolveEntitlements, resolveUsagePolicy } from "../src/entitlements.js";
+import {
+  allowedSetFrom, overageAllowedFrom, resolveEntitlements, resolveUsagePolicy, workspaceCapFrom,
+} from "../src/entitlements.js";
 import { checkUsageAndBalance } from "../src/ai-gateway-billing/limits/usage-checker.js";
 import type { UserDurableObject } from "../src/user.js";
 
@@ -234,5 +236,82 @@ describe("resolveEntitlements (SaaS entitlements adapter)", () => {
         { dailyLlmCallLimit: 3, minimumBalance: 9 }, new Error("entitlements down"));
     expect(await resolveEntitlements(env({ SAAS_ENTITLEMENTS: port }), USER_ID))
         .toEqual({ status: "unavailable" });
+  });
+});
+
+describe("EntitlementsAnswer folds (the plan gates' one fail-open/fail-closed policy)", () => {
+  it("allowedSetFrom: unbound is no gate, unavailable the empty set, resolved the picked values", () => {
+    expect(allowedSetFrom({ status: "unbound" }, e => e.allowedModelTiers)).toBeNull();
+    expect(allowedSetFrom({ status: "unavailable" }, e => e.allowedModelTiers)).toEqual(new Set());
+    expect(allowedSetFrom(
+        { status: "resolved", entitlements: planEntitlements(true) },
+        e => e.allowedModelTiers))
+        .toEqual(new Set(["standard"]));
+    // The pick also normalizes, as the connector gate does (vendor ids compare lowercased).
+    expect(allowedSetFrom(
+        {
+          status: "resolved",
+          entitlements: { ...planEntitlements(true), allowedGatekeepers: ["Notion", "Slack"] },
+        },
+        e => e.allowedGatekeepers.map(id => id.toLowerCase())))
+        .toEqual(new Set(["notion", "slack"]));
+  });
+
+  it("workspaceCapFrom: unavailable refuses, a stated cap caps, everything else is uncapped", () => {
+    expect(workspaceCapFrom({ status: "unavailable" })).toEqual({ status: "unavailable" });
+    expect(workspaceCapFrom({ status: "unbound" })).toEqual({ status: "uncapped" });
+    expect(workspaceCapFrom({ status: "resolved", entitlements: planEntitlements(true) }))
+        .toEqual({ status: "uncapped" });
+    expect(workspaceCapFrom({
+      status: "resolved",
+      entitlements: { ...planEntitlements(true), maxWorkspaces: 3 },
+    })).toEqual({ status: "capped", cap: 3 });
+  });
+
+  it("overageAllowedFrom: only a resolved plan that allows overage does", () => {
+    expect(overageAllowedFrom({ status: "unbound" })).toBe(false);
+    expect(overageAllowedFrom({ status: "unavailable" })).toBe(false);
+    expect(overageAllowedFrom({ status: "resolved", entitlements: planEntitlements(false) }))
+        .toBe(false);
+    expect(overageAllowedFrom({ status: "resolved", entitlements: planEntitlements(true) }))
+        .toBe(true);
+  });
+});
+
+describe("resolveEntitlements remembers a resolved answer for a few seconds", () => {
+  it("serves a remembered answer without a second consult, then re-asks once it expires", async () => {
+    vi.useFakeTimers();
+    try {
+      const { queriedEntitlements, port } = fakePort(
+          { dailyLlmCallLimit: 3, minimumBalance: 9 }, planEntitlements(true));
+      const bound = env({ SAAS_ENTITLEMENTS: port });
+      const expected = { status: "resolved", entitlements: planEntitlements(true) };
+      expect(await resolveEntitlements(bound, USER_ID)).toEqual(expected);
+      expect(await resolveEntitlements(bound, USER_ID)).toEqual(expected);
+      expect(queriedEntitlements).toEqual([USER_ID]);
+      vi.advanceTimersByTime(5_001);
+      expect(await resolveEntitlements(bound, USER_ID)).toEqual(expected);
+      expect(queriedEntitlements).toEqual([USER_ID, USER_ID]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never remembers an outage: each failed consult reaches the port again", async () => {
+    const { queriedEntitlements, port } = fakePort(
+        { dailyLlmCallLimit: 3, minimumBalance: 9 }, new Error("entitlements down"));
+    const bound = env({ SAAS_ENTITLEMENTS: port });
+    expect(await resolveEntitlements(bound, USER_ID)).toEqual({ status: "unavailable" });
+    expect(await resolveEntitlements(bound, USER_ID)).toEqual({ status: "unavailable" });
+    expect(queriedEntitlements).toEqual([USER_ID, USER_ID]);
+  });
+
+  it("remembers per port, so one binding's answer never serves another's consult", async () => {
+    const first = fakePort({ dailyLlmCallLimit: 3, minimumBalance: 9 }, planEntitlements(true));
+    const second = fakePort({ dailyLlmCallLimit: 3, minimumBalance: 9 }, planEntitlements(false));
+    await resolveEntitlements(env({ SAAS_ENTITLEMENTS: first.port }), USER_ID);
+    expect(await resolveEntitlements(env({ SAAS_ENTITLEMENTS: second.port }), USER_ID))
+        .toEqual({ status: "resolved", entitlements: planEntitlements(false) });
+    expect(second.queriedEntitlements).toEqual([USER_ID]);
   });
 });

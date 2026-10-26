@@ -28,17 +28,17 @@ import AI_MODEL_BINDING_TYPES from "./ai-model-binding.txt";
 import { DecisionAnswer, DecisionModelBinding, DecisionRequest } from "./decision-model-binding";
 import DECISION_MODEL_BINDING_TYPES from "./decision-model-binding.txt";
 import {
-  AiChatAuthorInfo, AiModelConfig, AiModelProvider, BuiltInReasoning, GatewayModelCapabilities,
-  REASONING_LEVELS, ReasoningLevel, SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT,
+  AiChatAuthorInfo, AiModelConfig, AiModelProvider, BuiltInReasoning, createPlanRefusalError,
+  GatewayModelCapabilities, REASONING_LEVELS, ReasoningLevel, SUGGESTED_MODELS,
+  WORKERS_AI_OUTPUT_LIMIT,
 } from "@gadgets/workshop-shared/api";
 import { traceChat } from "./agent-tracing.js";
 import {
   AiGatewayConfig, getAiGatewayConfig, getGatewayModels, type AiGatewayLogRoute,
 } from "./ai-gateway.js";
 import { completeText } from "./ai-invoke.js";
-import { bindingUsageGate } from "./ai-model-usage-gate.js";
-import { emitUsageEvent, usageTokens } from "./usage-events.js";
-import { resolveEntitlements } from "./entitlements.js";
+import { bindingMetering } from "./ai-model-usage-gate.js";
+import { allowedSetFrom, resolveEntitlements } from "./entitlements.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
 import {
   estimateSharedHeadTokens, hasGpt56PromptCaching, splitSystemPrompt,
@@ -1115,7 +1115,7 @@ export type AiModelGatekeeperProps = {
    * The workspace owner whose LLM allowance the binding's calls count against, set at mint.
    * Also the user whose plan re-approves the binding's model tier on every session (see
    * refuseRevokedModel). Undefined only on bindings minted before spend gating existed (see
-   * bindingUsageGate).
+   * bindingMetering).
    */
   ownerUserId?: string,
 };
@@ -1126,31 +1126,29 @@ export type AiModelGatekeeperProps = {
  * at its next call. While users may not add their own models, so does a binding for any other
  * model: one a user added, or one the admin added and removed. A durable binding also outlives the
  * plan it was minted under, so when it names a workspace owner (ownerUserId) its model's catalog
- * tier is re-checked against that owner's plan on every session — mirroring the #requireModel
- * refusal a chat naming the model gets (see UserDurableObject) — and a downgrade stops the binding
- * at its next call rather than running a premium tier forever.
+ * tier is re-checked against that owner's plan on every session — refusing with the same coded
+ * MODEL_NOT_ON_PLAN refusal a chat naming the model gets (see UserDurableObject) — and a downgrade
+ * stops the binding at its next call rather than running a premium tier forever.
  */
 async function refuseRevokedModel(env: Cloudflare.Env, props: AiModelGatekeeperProps) {
   let models = await getGatewayModels(env);
-  let entry = models?.get(props.config.model);
-  if (entry?.provider === props.config.provider) {
-    models!.refuseDisabled(props.config.model);
-    if (props.ownerUserId !== undefined) {
-      let answer = await resolveEntitlements(env, props.ownerUserId);
-      if (answer.status === "resolved") {
-        if (entry.tier !== undefined &&
-            !answer.entitlements.allowedModelTiers.includes(entry.tier)) {
-          throw new Error(`The "${entry.name}" model isn't available on your plan.`);
-        }
-      } else if (answer.status === "unavailable" && entry.tier !== undefined) {
-        // A bound plan service that failed reads as the empty tier set, as it does for the
-        // chat-side gate (see #allowedModelTiers); "unbound" is an OSS deployment, where no
-        // gate applies at all.
-        throw new Error(`The "${entry.name}" model isn't available on your plan.`);
-      }
-    }
-  } else {
-    models?.refuseUserModel(props.displayName);
+  // No gateway catalog: AI Gateway mode is off, so nothing below can name the binding's model.
+  if (models === null) return;
+  let entry = models.get(props.config.model);
+  if (entry?.provider !== props.config.provider) {
+    models.refuseUserModel(props.displayName);
+    return;
+  }
+  models.refuseDisabled(props.config.model);
+  if (props.ownerUserId === undefined || entry.tier === undefined) return;
+  // The fold reads unbound as "no gate" (every OSS deployment) and unavailable as the empty set,
+  // as every plan gate does (see entitlements.ts).
+  let tiers = allowedSetFrom(
+      await resolveEntitlements(env, props.ownerUserId),
+      entitlements => entitlements.allowedModelTiers);
+  if (tiers !== null && !tiers.has(entry.tier)) {
+    throw createPlanRefusalError("MODEL_NOT_ON_PLAN",
+        `The "${entry.name}" model isn't available on your plan.`);
   }
 }
 
@@ -1191,18 +1189,8 @@ export class LanguageModelGatekeeper
     let model = getModel(this.env, config, this.ctx.props.initiator, {
       metadata: this.ctx.props.metadata,
     });
-    let usageGate = bindingUsageGate(
-        this.env, this.ctx.props.ownerUserId, this.ctx.exports.UserDurableObject);
-    // Meter the binding's one-shot calls (#17's seam): the owner is in scope here, and the
-    // hook fires only on completions (never errors), fire-and-forget at the port (OSS unbound:
-    // no-op). pi reports usage per request; completeText would otherwise discard it.
-    let onUsage = this.ctx.props.ownerUserId === undefined ? undefined
-        : (usage: Usage) => emitUsageEvent(this.ctx, this.env, {
-              modelId: model.model.id,
-              tokens: usageTokens(usage),
-              userId: this.ctx.props.ownerUserId!,
-              surface: "binding",
-            });
+    let { usageGate, onUsage } = bindingMetering(
+        this.env, this.ctx, this.ctx.props.ownerUserId, model.model.id);
     return new LanguageModelBindingImpl(model, usageGate, onUsage);
   }
 
@@ -1274,19 +1262,8 @@ export class DecisionModelGatekeeper
       : Promise<DecisionModelBinding> {
     let { config, initiator, metadata } = this.ctx.props;
     await refuseRevokedModel(this.env, this.ctx.props);
-    let usageGate = bindingUsageGate(
-        this.env, this.ctx.props.ownerUserId, this.ctx.exports.UserDurableObject);
-    // Meter the binding's classifier calls as the LLM binding meters run() (#17's seam): the
-    // owner is in scope here, and decide() would otherwise discard the usage pi reports on the
-    // result. Fire-and-forget at the port (OSS unbound: no-op); config.model is the catalog id
-    // the classifier catalog is keyed by, so it is the id a price table resolves.
-    let onUsage = this.ctx.props.ownerUserId === undefined ? undefined
-        : (usage: Usage) => emitUsageEvent(this.ctx, this.env, {
-              modelId: config.model,
-              tokens: usageTokens(usage),
-              userId: this.ctx.props.ownerUserId!,
-              surface: "binding",
-            });
+    let { usageGate, onUsage } = bindingMetering(
+        this.env, this.ctx, this.ctx.props.ownerUserId, config.model);
     return new DecisionModelBindingImpl(
         getDecisionModel(this.env, config, initiator, metadata), usageGate, onUsage);
   }
