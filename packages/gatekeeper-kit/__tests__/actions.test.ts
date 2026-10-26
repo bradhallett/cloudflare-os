@@ -327,6 +327,89 @@ describe("ActionJournal", () => {
     expect(journal.get(id)).toBeDefined();
   });
 
+  it("splits reservation from staging for an id the payload embeds, and skips a reservation nothing stages", () => {
+    const journal = new ActionJournal<Sql>(makeKv(), { namespace: "pending" });
+
+    const first = journal.reserveId();
+    expect(first).toBe(1);
+    journal.stage(first, { sql: "one" });
+    journal.markSubmitted(first);
+    expect(journal.listPending().map(({ id }) => id)).toEqual([1]);
+
+    // A crash between reservation and staging must not reissue the id.
+    journal.reserveId();
+    expect(journal.reserveId()).toBe(3);
+  });
+
+  it("refuses to stage an id the journal never reserved", () => {
+    const journal = new ActionJournal<Sql>(makeKv(), { namespace: "pending" });
+    journal.reserveId();
+
+    expect(() => journal.stage(1, { sql: "one" })).not.toThrow();
+    expect(() => journal.stage(2, { sql: "two" })).toThrow(/was not reserved/);
+    expect(() => journal.stage(0, { sql: "zero" })).toThrow(/was not reserved/);
+  });
+
+  it("adopts a previous store's records verbatim, routing applied to the retained tier", () => {
+    const journal = new ActionJournal<Sql>(makeKv(), { namespace: "pending" });
+
+    journal.adopt(4, { state: "applied", action: { sql: "done" } });
+    journal.adopt(5, { state: "pending", action: { sql: "queued" } });
+    journal.adopt(6, {
+      state: "failed", action: { sql: "discarded" },
+      error: "action 6 was discarded", undispatched: true,
+    });
+    expect(journal.get(4)).toEqual({ state: "applied", action: { sql: "done" } });
+    expect(journal.listPending()).toEqual([{ id: 5, action: { sql: "queued" } }]);
+    expect(journal.listFailed().map(({ id }) => id)).toEqual([6]);
+    journal.retire(4);
+    expect(journal.wasApplied(4)).toBe(true);
+  });
+
+  it("adopts without holding a capacity slot, but still refuses an issued id", () => {
+    const kv = makeKv();
+    const journal = new ActionJournal<Sql>(kv, { namespace: "pending", maxPending: 1 });
+
+    journal.adopt(1, { state: "pending", action: { sql: "one" } });
+    journal.adopt(2, { state: "pending", action: { sql: "two" } });
+    expect(() => journal.adopt(2, { state: "pending", action: { sql: "again" } }))
+      .toThrow(/already issued/);
+
+    // The adopted records keep their slots; only new staging obeys the bound.
+    expect(() => journal.allocate({ sql: "three" })).toThrow(/Too many pending/);
+  });
+
+  it("updates a pending-tier payload in place, keeping state and failure reason", () => {
+    const journal = new ActionJournal<Sql>(makeKv(), { namespace: "pending" });
+    const id = journal.allocate({ sql: "one" });
+    journal.markSubmitted(id);
+    journal.markFailed(id, "midway", { outcome: "unknown" });
+
+    journal.update(id, { sql: "one", rows: 3 });
+    expect(journal.get(id)).toEqual({
+      state: "failed", action: { sql: "one", rows: 3 },
+      error: "midway", outcome: "unknown",
+    });
+
+    // No pending-tier record, no write: a promoted record's payload moves through retain.
+    const settled = journal.allocate({ sql: "two" });
+    journal.markSubmitted(settled);
+    journal.retain(settled, { sql: "two", rows: 2 });
+    journal.update(settled, { sql: "moved on" });
+    expect(journal.get(settled)).toEqual({ state: "applied", action: { sql: "two", rows: 2 } });
+  });
+
+  it("lists failed records alongside the other pending-tier scans", () => {
+    const journal = new ActionJournal<Sql>(makeKv(), { namespace: "pending" });
+    const id = journal.allocate({ sql: "one" });
+    journal.markSubmitted(id);
+
+    expect(journal.listFailed()).toEqual([]);
+    journal.markFailed(id, "provider said no");
+    expect(journal.listFailed()).toEqual([{ id, action: { sql: "one" } }]);
+    expect(journal.listPending()).toEqual([]);
+  });
+
   it("refuses overlapping keyspaces a port could pass by hand", () => {
     const legacy = (nextIdKey: string, recordPrefix: string) =>
       () => new ActionJournal(makeKv(), { legacyKeys: { nextIdKey, recordPrefix } });
