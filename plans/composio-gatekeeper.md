@@ -1,6 +1,7 @@
 # Plan: Composio gatekeeper — the long tail of apps through one brokered connector
 
-**Status: planned** (not implemented). Scope decisions confirmed by the deployment owner on
+**Status: implemented and merged** (PRs #83–#87; two post-merge integration reviews closed).
+Scope decisions confirmed by the deployment owner on
 2026-10-26; build is deferred; this record fixes the design so the build can start from it.
 Composio facts are from docs.composio.dev and the Composio v3.1 REST surface as retrieved
 2026-10-26 — the fact base was audited line-by-line against live docs by a dedicated reviewer,
@@ -305,9 +306,10 @@ behind a generic card.
   Hobby pool so a handful of active users cannot drain it) using the X gatekeeper's
   reserve-then-settle pattern across all the user's bindings. **Own-key calls spend the user's
   project, not the deployment's**: they are counted in a separate counter, never refused at the
-  deployment-funded limit, and never rolled into the deployment total. Deployment totals are
-  emitted as usage metrics through `@gadgets/observability/metrics` (the admin panel reads the
-  metrics side, per-user numbers live in the app UI). Quota exhaustion degrades to a clear
+  deployment-funded limit, and never rolled into the deployment total. Per-user usage numbers
+  live in the app UI from the account DO's counters; the metrics-dataset emission this
+  sentence once promised was dropped from scope (no `@gadgets/observability/metrics`
+  emission ships). Quota exhaustion degrades to a clear
   refusal, never a silent failure.
 
 ### Triggers
@@ -362,8 +364,8 @@ behind a generic card.
   (`suggestedBindingName`), read through `getSession()`/`getAgentCatalog()` in `executeCode`
   with each read an observation. `getAgentCatalog()` returns bounded toolkit entries (connected
   first, then top-of-catalog) with `catalogChange` on connect/disconnect. "Zero backend
-  changes" was false and is withdrawn — the kernel touches are exactly: the mcp-shared
-  auth-scheme option, the backend props pass-through for both toolkit lists, the two
+  changes" was false and is withdrawn — the kernel touches are exactly: the backend
+  props pass-through for both toolkit lists, the two
   `AdminConfig` fields, the SINGLETON manifest registration, the dev-server var
   registrations, and (owner-approved 2026-10-25, PR-3 review finding F1/M1) an additive
   **optional policy argument on `getSingletonGatekeeperClass`** so the live toolkit policy
@@ -405,16 +407,17 @@ chat agent ──composio binding──▶ gatekeeper-composio
                                    ├─ app UI       catalog browser, connect, key mode, quotas
                                    ▼
                  Composio Platform (backend.composio.dev, v3.1 — REST for catalog/session/
-                 triggers, session MCP (POST-only, x-api-key) for execution)
+                 triggers/execution; x-api-key, no MCP transport)
                                    ▼
                      upstream apps (tokens stay at Composio)
 ```
 
 File layout mirrors `gatekeeper-websearch` for the vendor/account skeleton and `gatekeeper-mcp`
 for client/action reuse: `src/worker.ts` (vendor + routes incl. the webhook handler),
-`src/account.ts` (the DO; implements mcp-shared's `ConnectionAccount` structurally — it does
-not extend `McpAccountBase`), `src/facet.ts` (per-toolkit RpcTargets subclassing
-`McpFacetBase` where it fits, connector-custom catalog/scope), `src/session.ts`,
+`src/account.ts` (the DO; with no MCP transport there is no `ConnectionAccount` session state
+to guard — it owns keys, catalog cache, policy, quotas, consent, triggers), `src/facet.ts`
+(connector-owned per-toolkit RpcTargets reusing mcp-shared's `ActionStore` via the approved
+`./action-store` export — the design bypasses `McpFacetBase`), `src/session.ts`,
 `src/catalog.ts` (REST assembly + cache), `src/triggers.ts`, `src/composio-api.ts` (the only
 module talking HTTP to Composio; response validation, no blind casts — the
 `gatekeeper-cloudflare` layering rule; the only reader of `ownApiKey`; redacts provider-echoed
@@ -425,12 +428,15 @@ the app UI.
 
 Worker registration is part of the design, not an afterthought: `cloudflare.config.ts` via
 `defineGadgetsWorker` + `DEFAULT_GATEKEEPER_WRANGLER` with a `migrations` export tagging
-`ComposioAccountDurableObject` as `new_sqlite_classes`; the committed `wrangler.jsonc` is
+`ComposioAccount`, `ComposioSingletonGatekeeper`, and `ComposioToolkitGatekeeper` as
+`new_sqlite_classes`; the committed `wrangler.jsonc` is
 generated (`pnpm configs:generate`) and `worker-configuration.d.ts` via `pnpm types:generate`.
 The compat flags include `allow_irrevocable_stub_storage` (hook initiators) and
-`global_fetch_strictly_public` — the latter is **required**, not hygiene: `session.mcp.url` is
-third-party response data that never passes user-pasted validation, and mcp-shared's own
-hostname list is explicitly not the SSRF boundary. Dev-server vars register under
+`global_fetch_strictly_public` — the latter is **required**, not hygiene: every Composio
+fetch must land on the fixed config base URLs, never a host from third-party response data
+(post-pivot nothing fetches `session.mcp.url` — the flag is the standing fence that keeps it
+that way; mcp-shared's own hostname list is explicitly not the SSRF boundary).
+Dev-server vars register under
 `PASSTHROUGH_GATEKEEPER_VARS`: `COMPOSIO_API_KEY`, `COMPOSIO_DAILY_CALL_LIMIT` (core),
 `WEBHOOK_ORIGIN` (triggers PR). Tests are two vitest projects (node: classification, scoping,
 settlement map, quotas, slug registry; workerd via the `TestHooks` DO pattern for facets,
@@ -448,7 +454,8 @@ codes and bounded fields are logged.
 
 Kernel lines stay minimal and land apart from the connector, per the review bar:
 
-1. **PR 1 — mcp-shared auth scheme** (`packages/mcp-shared` only): auth-scheme/extra-headers
+1. **PR 1 — mcp-shared auth scheme** (`packages/mcp-shared` only) — **withdrawn by the
+   transport pivot and reverted in #87**; kept for sequence history: auth-scheme/extra-headers
    option on `McpClient`/`withClient`/the connection shape, cross-origin redirect hygiene
    extended to the configured header. Both vitest suites; no behavior change for Bearer
    connectors.
@@ -484,9 +491,8 @@ Kernel lines stay minimal and land apart from the connector, per the review bar:
   see the ambient-singleton decision); no per-workspace consent (the contract carries no
   workspace context to key it on).
 - No token custody: upstream OAuth tokens live at Composio, by design and disclosure.
-- No mcp-shared changes beyond PR 1's auth-scheme option and redirect hygiene — with one
-  owner-approved exception (2026-10-25): PR 3 adds a single additive line to the
-  `@gadgets/mcp-shared` exports map (`./action-store`) so the connector's REST-catalog facets can
+- No mcp-shared changes survive except the owner-approved exception (2026-10-25): PR 3 adds a
+  single additive line to the `@gadgets/mcp-shared` exports map (`./action-store`) so the connector's REST-catalog facets can
   reuse the queued-action store directly; `McpFacetBase` is hard-wired to MCP discovery this
   design bypasses, and duplicating the store would create a parallel mechanism. No other
   mcp-shared change of any kind.
@@ -527,8 +533,8 @@ coordinator; reports at `/tmp/composio-research-{a,b}.md` (session artifacts).
   request payload and response body) — sufficient as the outcome-unknown reconciliation handle;
   endpoint is auth-gated (401 envelope verified live).
 - **`execute_meta` — settled: not a general fallback.** It executes `COMPOSIO_*` meta tools
-  within a session only, gated by Session tool execution: Write. Session-MCP execution remains
-  the only ordinary route; this item closes.
+  within a session only, gated by Session tool execution: Write. REST execution is the only
+  ordinary route post-pivot; this item closes.
 
 ## Relationship to prior art
 

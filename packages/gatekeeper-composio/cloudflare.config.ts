@@ -8,8 +8,8 @@ export default defineGadgetsWorker({
   entrypoint: ".wrangler/validate/src/worker.ts",
   // `allow_irrevocable_stub_storage`: trigger hook initiator stubs are stored durably, and the
   // flag ships with the worker so the migration never changes. `global_fetch_strictly_public` is
-  // required, not hygiene: `session.mcp.url` is third-party response data that never passes
-  // user-pasted validation. `nodejs_als` backs the observability context.
+  // required, not hygiene: every Composio fetch must land on the fixed config base URLs, never
+  // a host from third-party response data. `nodejs_als` backs the observability context.
   compatibilityFlags: ["allow_irrevocable_stub_storage", "global_fetch_strictly_public", "nodejs_als"],
   observability: OBSERVABILITY,
 });

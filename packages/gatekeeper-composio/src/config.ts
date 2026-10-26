@@ -29,14 +29,13 @@ export function isMetaTool(slug: string): boolean {
 }
 /**
  * The webhook route this worker serves relative to its public origin: `${basePath}/webhook` on
- * the gatekeeper's BASE_URL (see webhooks.ts). PR 3 reserved the connect-callback suffix here;
- * PR 4 adds its sibling.
+ * the gatekeeper's BASE_URL (see webhooks.ts), alongside the connect-callback sibling below.
  */
 export const WEBHOOK_ROUTE_SUFFIX = "/webhook";
 
 /**
- * Placeholder callback route for Connect Link flows; PR 4 may replace it. Declared here so the
- * constant has a single home if the webhook route lands.
+ * Placeholder callback route for Connect Link flows; the webhook route landed beside it.
+ * Declared here so the constant has a single home.
  */
 export const CONNECT_LINK_CALLBACK_PATH = "/gatekeeper/composio/connect-callback";
 

@@ -416,6 +416,9 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
     return null;
   }
 
+  /**
+   * Skipped like its siblings in worker.ts/facet.ts: returns a raw DO stub for capnweb to mint.
+   */
   @skipRpcValidation()
   async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
     return this.ctx.exports.ComposioVerifier({});
@@ -1631,7 +1634,7 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
   /**
    * Mints a Connect Link for one toolkit inside the account's active session. The redirect URL
    * is a bearer capability and is returned to the app only, never logged. The callback URL
-   * names this worker's connect-callback route — a placeholder in PR 3 (see README, "PR 4").
+   * names this worker's connect-callback route (see config.ts CONNECT_LINK_CALLBACK_PATH).
    */
   async connectToolkit(toolkitSlug: string, alias?: string): Promise<{
     redirectUrl: string;
