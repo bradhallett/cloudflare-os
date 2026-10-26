@@ -395,4 +395,17 @@ describe("org grants", () => {
     await collection(id).deleteSelf("dana", false);
     expect((await resolved(id, "alice")).exists).toBe(false);
   });
+
+  it("report the actor's recorded orgs to the management UI, following resyncs", async () => {
+    await recordMemberships("alice", [{ orgId: "org-1", role: "admin" }, { orgId: "org-2", role: "member" }]);
+    expect((await api("alice").getViewerInfo()).orgs).toEqual([
+      { orgId: "org-1", role: "admin" },
+      { orgId: "org-2", role: "member" },
+    ]);
+
+    // The picker offers exactly what the recordings say, so a resync is all it takes to change
+    // the orgs the UI may spend.
+    await recordMemberships("alice", [{ orgId: "org-2", role: "member" }]);
+    expect((await api("alice").getViewerInfo()).orgs).toEqual([{ orgId: "org-2", role: "member" }]);
+  });
 });

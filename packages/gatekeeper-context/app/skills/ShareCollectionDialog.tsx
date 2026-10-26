@@ -10,12 +10,13 @@ import { Buildings, CaretDown, User, Warning, WarningCircle, X } from "@phosphor
 import { RpcTarget } from "capnweb";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
-  ContextApi,
-  ContextCollectionMember,
-  ContextCollectionPermissions,
-  ContextCollectionRole,
-  ContextCollectionSharing,
-} from "../../src/context-types";
+   ContextApi,
+   ContextCollectionMember,
+   ContextCollectionPermissions,
+   ContextCollectionRole,
+   ContextCollectionSharing,
+  ContextViewerOrg,
+ } from "../../src/context-types";
 import {
   useContextApi,
   useSelectUsers,
@@ -38,6 +39,8 @@ type ShareCollectionDialogProps = {
 type ShareState = {
   sharing: ContextCollectionSharing;
   permissions: ContextCollectionPermissions;
+  /** The viewer's recorded orgs; the only orgs the backend accepts a share for. */
+  orgs: ContextViewerOrg[];
 };
 
 const MEMBER_ROLE_LABELS: Record<ContextCollectionRole, string> = {
@@ -45,6 +48,10 @@ const MEMBER_ROLE_LABELS: Record<ContextCollectionRole, string> = {
   editor: "Can edit",
   owner: "Owner",
 };
+
+// The Workshop knows org names; the gatekeeper only ever sees the opaque org ids its grants are
+// keyed by, so rows and the picker can only name the id.
+const orgLabel = (orgId: string) => `Organization ${orgId}`;
 
 const errorMessage = (error: unknown, fallback: string) =>
   error instanceof Error && error.message ? error.message : fallback;
@@ -118,12 +125,13 @@ export const ShareCollectionDialog = ({
     const isCurrent = () => sequence === loadSequence.current;
     setLoading(true);
     try {
-      const [sharing, permissions] = await Promise.all([
+      const [sharing, permissions, viewer] = await Promise.all([
         context.getContextCollectionSharing(collection.id),
         context.getContextCollectionPermissions(collection.id),
+        context.getViewerInfo(),
       ]);
       if (!isCurrent()) return;
-      setState({ sharing, permissions });
+      setState({ sharing, permissions, orgs: viewer.orgs });
       setLoadError(null);
     } catch (loadFailure) {
       if (isCurrent()) setLoadError(errorMessage(loadFailure, "Sharing settings could not be loaded."));
@@ -207,6 +215,15 @@ export const ShareCollectionDialog = ({
     );
   };
 
+  const shareWithOrg = async (orgId: string) => {
+    await mutate(
+      orgId,
+      () => context.shareContextCollectionWithOrg(collection.id, orgId, newRole),
+      "The organization could not be given access.",
+    );
+  };
+
+
   const permissions = state?.permissions;
   const sharing = state?.sharing;
   const roleOptions: ContextCollectionRole[] = permissions?.canManageOwners
@@ -216,9 +233,17 @@ export const ShareCollectionDialog = ({
   const newRole = roleOptions.includes(selectedRole) ? selectedRole : "editor";
   const ownerCount = sharing?.members.filter((member) => member.role === "owner").length ?? 0;
   const otherMembers = sharing?.members.filter((member) => !member.isViewer) ?? [];
+  // Orgs the viewer belongs to that don't already hold a grant; granted orgs appear as member
+  // rows below, where their role changes like anyone else's.
+  const grantedOrgIds = new Set(
+    sharing?.members.flatMap((member) => member.subject === "org" ? [member.memberId] : []),
+  );
+  const addableOrgs = state?.orgs.filter((org) => !grantedOrgIds.has(org.orgId)) ?? [];
 
   const renderMember = (member: ContextCollectionMember) => {
-    const name = member.isViewer ? "You" : member.displayName ?? "Collection creator";
+    const isOrg = member.subject === "org";
+    const name = isOrg ? orgLabel(member.memberId)
+      : member.isViewer ? "You" : member.displayName ?? "Collection creator";
     const isOwner = member.role === "owner";
     const soleOwner = isOwner && ownerCount === 1;
     const canChangeRole = permissions?.canShare
@@ -231,7 +256,8 @@ export const ShareCollectionDialog = ({
           aria-hidden="true"
           className="flex size-[26px] shrink-0 items-center justify-center rounded-full bg-kumo-tint text-xs font-medium text-kumo-default"
         >
-          {member.isViewer ? <User size={16} /> : name.trim().charAt(0).toUpperCase() || "?"}
+          {member.isViewer ? <User size={16} /> : isOrg ? <Buildings size={14} />
+            : name.trim().charAt(0).toUpperCase() || "?"}
         </span>
         <span className="min-w-0 flex-1 truncate text-sm text-kumo-default">
           {name}
@@ -389,15 +415,45 @@ export const ShareCollectionDialog = ({
                     ))}
                   </DropdownMenu.Content>
                 </DropdownMenu>
-                <Button
-                  variant="primary"
-                  className="ml-auto shrink-0"
-                  loading={pending === "picker"}
-                  disabled={!permissions.canShare || controlsDisabled}
-                  onClick={() => void addPeople()}
-                >
-                  Select users
-                </Button>
+                <div className="ml-auto flex shrink-0 items-center gap-2">
+                  {addableOrgs.length > 0 && (
+                    <DropdownMenu>
+                      <DropdownMenu.Trigger
+                        disabled={!permissions.canShare || controlsDisabled}
+                        render={(
+                          <Button
+                            variant="secondary"
+                            className="group gap-1.5"
+                            aria-label="Add organization"
+                          >
+                            <Buildings size={13} />
+                            Add organization
+                            <CaretDown size={10} weight="bold" className="group-data-[popup-open]:rotate-180" />
+                          </Button>
+                        )}
+                      />
+                      <DropdownMenu.Content align="end" sideOffset={6}>
+                        {addableOrgs.map((org) => (
+                          <DropdownMenu.Item
+                            key={org.orgId}
+                            className="text-sm"
+                            onClick={() => void shareWithOrg(org.orgId)}
+                          >
+                            <span className="min-w-0 flex-1 pr-4">{orgLabel(org.orgId)}</span>
+                          </DropdownMenu.Item>
+                        ))}
+                      </DropdownMenu.Content>
+                    </DropdownMenu>
+                  )}
+                  <Button
+                    variant="primary"
+                    loading={pending === "picker"}
+                    disabled={!permissions.canShare || controlsDisabled}
+                    onClick={() => void addPeople()}
+                  >
+                    Select users
+                  </Button>
+                </div>
               </div>
 
               <ul aria-label="People with access" className="flex flex-col">

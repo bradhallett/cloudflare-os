@@ -90,7 +90,7 @@ describe("collection dialogs", () => {
     } as unknown as ContextApi;
     render(
       <CreateCollectionDialog
-        viewerInfo={{ isAdmin: true, supportsGitCollections: true }}
+        viewerInfo={{ isAdmin: true, supportsGitCollections: true, orgs: [] }}
         onCreated={() => {}}
         onClose={() => {}}
       />,
@@ -114,10 +114,66 @@ describe("collection dialogs", () => {
       "public",
       DEFAULT_COLLECTION_ICON,
       "git",
+      undefined,
     );
     expect(createContextCollectionGitToken).toHaveBeenCalledWith("created");
     expect(document.body.textContent).toContain("Set up the mirror");
     expect(document.body.textContent).toContain("you do not enter a source repository URL here");
+  });
+
+  it("creates collections owned by an org the viewer administers", async () => {
+    const createdCollection: ContextCollectionMetadata = {
+      id: "team-library",
+      title: "Team library",
+      description: "",
+      visibility: "private",
+      created: new Date(),
+      lastUpdated: new Date(),
+      documentCount: 0,
+      content: { source: "web" },
+    };
+    const createContextCollection = vi.fn<ContextApi["createContextCollection"]>(
+      async () => createdCollection,
+    );
+    mocks.api = {
+      createContextCollection,
+    } as unknown as ContextApi;
+    render(
+      <CreateCollectionDialog
+        viewerInfo={{
+          isAdmin: false,
+          supportsGitCollections: false,
+          orgs: [
+            { orgId: "org-administered", role: "admin" },
+            { orgId: "org-plain", role: "member" },
+          ],
+        }}
+        onCreated={() => {}}
+        onClose={() => {}}
+      />,
+    );
+
+    act(() => {
+      setInputValue(document.querySelector<HTMLInputElement>(
+        'input[placeholder^="A short name"]',
+      )!, "Team library");
+    });
+    // Only orgs the viewer owns or administers may own a collection.
+    expect(radio("org-plain")).toBeUndefined();
+    act(() => radio("Organization org-administered")?.click());
+    await act(async () => {
+      button("Add collection")?.click();
+      await Promise.resolve();
+    });
+
+    expect(createContextCollection).toHaveBeenCalledWith(
+      "Team library",
+      "",
+      "private",
+      DEFAULT_COLLECTION_ICON,
+      "web",
+      "org-administered",
+    );
   });
 
   it("updates a Git branch and exposes token management", async () => {
