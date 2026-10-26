@@ -5,7 +5,7 @@ import { act, type ComponentProps } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { GadgetSummary } from '@gadgets/workshop-shared/api'
-import type { ChatCodeChanges } from '../../ChatInterface'
+import type { ChatCodeChanges } from '../chat/ChatInterface'
 import type { ChatContentReader } from './otClient'
 
 // Covers the code view lending out the selected chat's content (see ChatContentReader), which

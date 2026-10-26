@@ -11,9 +11,7 @@ import { AuthenticatedApi, CommercePlan } from '@gadgets/workshop-shared/api'
 import { Button } from '@cloudflare/kumo'
 import { useRpcStub } from '../../RpcContext'
 import { hashPassword } from '../../passwordHash'
-
-const INPUT =
-  'h-10 w-full rounded-lg border border-kumo-line bg-kumo-base px-3 text-[16px] text-kumo-default placeholder:text-kumo-inactive transition-colors focus:border-kumo-ring focus:outline-none focus:ring-[3px] focus:ring-kumo-ring/15'
+import { INPUT_LG } from '../../components/inputStyles'
 
 /** One step of the funnel; the card keeps its height between steps so the page doesn't jump. */
 function Step({ title, children, footer }: {
@@ -142,14 +140,14 @@ export default function SaasStart() {
           }
         >
           <input
-            className={INPUT}
+            className={INPUT_LG}
             placeholder="Username"
             autoComplete="username"
             value={username}
             onChange={(e) => setUsername(e.target.value)}
           />
           <input
-            className={INPUT}
+            className={INPUT_LG}
             type="password"
             placeholder="Password (8+ characters)"
             autoComplete={mode === 'create' ? 'new-password' : 'current-password'}
@@ -174,7 +172,7 @@ export default function SaasStart() {
             Your organization owns the subscription; everyone you invite works under it.
           </p>
           <input
-            className={INPUT}
+            className={INPUT_LG}
             placeholder="Organization name"
             value={orgName}
             onChange={(e) => setOrgName(e.target.value)}

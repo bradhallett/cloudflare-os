@@ -14,9 +14,8 @@ import {
 } from '@gadgets/workshop-shared/api'
 import { useAuthenticatedApi } from '../../AuthContext'
 import { useSaasEnabled } from '../../ServerConfigContext'
-
-const INPUT =
-  'h-9 w-full rounded-lg border border-kumo-line bg-kumo-base px-3 text-[14px] text-kumo-default placeholder:text-kumo-inactive transition-colors focus:border-kumo-ring focus:outline-none focus:ring-[3px] focus:ring-kumo-ring/15'
+import { canAdministerOrg } from './orgAccess'
+import { INPUT_SM } from '../../components/inputStyles'
 
 /**
  * One org's billing panel. The `org` entry carries the caller's own role and status — the admin
@@ -36,7 +35,7 @@ function OrgBillingPanel({ org, onCheckoutStart }: {
   const [busy, setBusy] = useState(false)
   const refreshVersion = useRef(0)
 
-  const isAdmin = org.status === 'active' && (org.role === 'owner' || org.role === 'admin')
+  const isAdmin = canAdministerOrg(org)
 
   // Billing is admin-only on the server (getOrgBilling re-checks live), so a member is never
   // asked for it — a refusal would otherwise render as the misleading "free plan" fallback.
@@ -167,7 +166,7 @@ function OrgBillingPanel({ org, onCheckoutStart }: {
         {isAdmin && (
           <div className="mt-2 flex gap-2">
             <input
-              className={INPUT}
+              className={INPUT_SM}
               placeholder="Email or username to invite"
               value={inviteId}
               onChange={(e) => setInviteId(e.target.value)}
@@ -270,13 +269,11 @@ export default function OrgBillingSettings({ org: requestedOrg }: { org?: string
       </h2>
 
       {orgs.length > 1 && (
-        <div role="tablist" className="flex gap-1 px-1">
+        <div className="flex gap-1 px-1">
           {orgs.map((entry) => (
             <button
               key={entry.id}
-              role="tab"
               type="button"
-              aria-selected={entry.id === org.id}
               onClick={() => navigate({ to: '/profile', search: { org: entry.id } })}
               className={`cursor-pointer rounded-lg px-3 py-1.5 text-[13px] font-medium transition-colors ${
                 entry.id === org.id

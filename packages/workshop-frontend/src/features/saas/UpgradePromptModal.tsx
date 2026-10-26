@@ -10,6 +10,7 @@ import { Lightning } from '@phosphor-icons/react'
 import { PLAN_REFUSAL_CODES, type PlanRefusalCode } from '@gadgets/workshop-shared/api'
 import { useAuthenticatedApi } from '../../AuthContext'
 import { SAAS_ROUTE_BASE } from './saasRoute'
+import { canAdministerOrg } from './orgAccess'
 
 export type UpgradePromptReason = 'usage_limit' | PlanRefusalCode
 
@@ -52,8 +53,7 @@ export default function UpgradePromptModal({ open, onClose, reason }: UpgradePro
     authenticatedApi.whoami()
       .then((info) => {
         if (cancelled) return
-        const adminnable = info.orgs.find(
-          (org) => org.status === 'active' && (org.role === 'owner' || org.role === 'admin'))
+        const adminnable = info.orgs.find((org) => canAdministerOrg(org))
         setAdminOrg(adminnable?.orgId ?? null)
       })
       .catch(() => { if (!cancelled) setAdminOrg(null) })

@@ -1,12 +1,12 @@
 // @vitest-environment jsdom
 /* eslint-disable react/react-in-jsx-scope */
 
-// The org billing tabs against a real TanStack router (a memory history), through the real
-// /profile route: switching the ?org= search parameter — what a tab click, the org switcher,
-// and the upgrade prompt all do — must switch the panel and aria-selected to that org. A
-// search-only navigation re-renders without remounting the route, which is exactly the
-// condition that once left the panel stuck on the first org: selection is derived from the
-// live search, never seeded at mount.
+// The org billing switcher against a real TanStack router (a memory history), through the real
+// /profile route: switching the ?org= search parameter — what an org button, the org switcher,
+// and the upgrade prompt all do — must switch the panel to that org. A search-only navigation
+// re-renders without remounting the route, which is exactly the condition that once left the
+// panel stuck on the first org: selection is derived from the live search, never seeded at
+// mount.
 
 import { act, type ComponentProps } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
@@ -123,32 +123,27 @@ describe('the org billing tabs follow the ?org= search parameter', () => {
     } as unknown as RpcStub<AuthenticatedApi>
   })
 
-  it('clicking the second tab fetches and shows that org, and moves aria-selected', async () => {
+  it('clicking the second org fetches and shows that org', async () => {
     const page = await renderAt('/profile')
     await until(() => expect(page.textContent).toContain('Pro plan'))
 
-    const tabs = page.querySelectorAll('button[role="tab"]')
-    expect(tabs).toHaveLength(2)
-    expect(tabs[0]!.getAttribute('aria-selected')).toBe('true')
-    expect(tabs[1]!.getAttribute('aria-selected')).toBe('false')
+    const orgButton = (name: string) =>
+      [...page.querySelectorAll('button')].find((b) => b.textContent === name)!
+    expect(orgButton('Acme')).toBeDefined()
+    expect(orgButton('Globex')).toBeDefined()
 
-    await act(async () => (tabs[1] as HTMLButtonElement).click())
+    await act(async () => orgButton('Globex').click())
 
-    // The panel follows the search parameter: org-2's billing is fetched and shown, and the
-    // tab truthfully reports the selection.
+    // The panel follows the search parameter: org-2's billing is fetched and shown.
     await until(() => expect(page.textContent).toContain('Team plan'))
     expect(authState.api.getOrgBilling).toHaveBeenLastCalledWith('org-2')
-    const after = page.querySelectorAll('button[role="tab"]')
-    expect(after[0]!.getAttribute('aria-selected')).toBe('false')
-    expect(after[1]!.getAttribute('aria-selected')).toBe('true')
   })
 
   it('a deep link with ?org= opens straight on that org', async () => {
     const page = await renderAt('/profile?org=org-2')
     await until(() => expect(page.textContent).toContain('Team plan'))
     expect(authState.api.getOrgBilling).toHaveBeenCalledWith('org-2')
-    const tabs = page.querySelectorAll('button[role="tab"]')
-    expect(tabs[1]!.getAttribute('aria-selected')).toBe('true')
+    expect([...page.querySelectorAll('button')].filter((b) => b.textContent === 'Globex')).toHaveLength(1)
   })
 
   it('an upgrade opened on one org does not bill that org after switching tabs', async () => {
@@ -177,8 +172,8 @@ describe('the org billing tabs follow the ?org= search parameter', () => {
 
     // Switching tabs must hide the upgrade block entirely: it belongs to the org it
     // upgrades, so it can never offer org-1's checkout under org-2's name.
-    const tabs = page.querySelectorAll('button[role="tab"]')
-    await act(async () => (tabs[1] as HTMLButtonElement).click())
+    const globex = [...page.querySelectorAll('button')].find((b) => b.textContent === 'Globex')!
+    await act(async () => globex.click())
     await until(() => expect(page.textContent).toContain('Team plan'))
     expect(page.textContent).not.toContain('Upgrade Acme')
     expect(page.textContent).not.toContain('Upgrade Globex')

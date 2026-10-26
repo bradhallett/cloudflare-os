@@ -1,6 +1,6 @@
 import { Tooltip } from "@cloudflare/kumo";
 import { ArrowsClockwiseIcon, WarningCircleIcon, XIcon } from "@phosphor-icons/react";
-import styles from "../../../ChatInterface.module.css";
+import styles from "../ChatInterface.module.css";
 import type { OverseerSource } from "../../../components/chat/slash-command-catalog";
 import { formatFullTimestamp } from "../../../utils/formatTimestamp";
 import { MarkdownMessage } from "../markdown/MarkdownMessage";

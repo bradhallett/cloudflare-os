@@ -21,7 +21,7 @@ import {
   ChatAttachmentRef,
   WorkpieceId,
 } from "@gadgets/workshop-shared/api";
-import styles from "../../ChatInterface.module.css";
+import styles from "./ChatInterface.module.css";
 import { formatFullTimestamp } from "../../utils/formatTimestamp";
 import { BlueprintProposalNotice } from "../blueprint-updates/BlueprintProposalNotice";
 import { ChatAttachmentGrid } from "./attachments/ChatAttachmentGrid";

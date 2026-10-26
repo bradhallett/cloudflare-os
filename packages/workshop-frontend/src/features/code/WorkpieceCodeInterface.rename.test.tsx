@@ -5,7 +5,7 @@ import { act, type ComponentProps } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { FileAtCommit, GadgetSummary, Overseer } from '@gadgets/workshop-shared/api'
-import type { ChatCodeChanges, ChatLiveChangeRows } from '../../ChatInterface'
+import type { ChatCodeChanges, ChatLiveChangeRows } from '../chat/ChatInterface'
 import type { ChatChangeRow } from './otClient'
 
 const testGlobal = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }

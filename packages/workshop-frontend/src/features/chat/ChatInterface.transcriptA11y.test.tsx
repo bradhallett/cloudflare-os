@@ -40,7 +40,7 @@ vi.mock('@cloudflare/kumo', async (importOriginal) => {
   }
 })
 
-vi.mock('./AuthContext', () => {
+vi.mock('../../AuthContext', () => {
   const context = {
     authenticatedApi: { listGatekeeperVendors: async () => [], listBots: async () => [] },
     currentUser: null,
@@ -51,7 +51,7 @@ vi.mock('./AuthContext', () => {
   }
 })
 
-import { makeOverseer, makeTestRoot } from './action-test-harness'
+import { makeOverseer, makeTestRoot } from '../../action-test-harness'
 import ChatInterface from './ChatInterface'
 
 const testRoot = makeTestRoot()

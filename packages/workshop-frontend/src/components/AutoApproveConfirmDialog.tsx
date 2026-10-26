@@ -77,13 +77,7 @@ export default function AutoApproveConfirmDialog({
           <WorkshopButton
             tone="primary"
             {...holdProps}
-            onClick={() =>
-              feedback.track(
-                Promise.resolve(onConfirm()).then((enabled) => {
-                  if (!enabled) throw undefined
-                }),
-              )
-            }
+            onClick={() => feedback.trackBoolean(onConfirm())}
             disabled={isProcessing}
             data-feedback={status}
             aria-busy={status === 'loading' || undefined}

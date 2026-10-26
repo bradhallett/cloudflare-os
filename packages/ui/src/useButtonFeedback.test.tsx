@@ -156,3 +156,62 @@ describe("useButtonFeedback", () => {
     hook.unmount();
   });
 });
+
+describe("useButtonFeedback.trackBoolean", () => {
+  beforeEach(() => vi.useFakeTimers());
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function advance(ms: number) {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+  }
+
+  it("maps a resolved false to the error state with an undefined reason", async () => {
+    const errors: unknown[] = [];
+    const hook = mountHook(use, { onError: (e) => errors.push(e) });
+
+    hook.value.trackBoolean(wait(80).then(() => false));
+    await advance(100);
+    expect(hook.value.status).toBe("error");
+    expect(hook.value.error).toBeUndefined();
+    expect(errors).toEqual([undefined]);
+    hook.unmount();
+  });
+
+  it("tracks a sync false and a sync true; a void result tracks nothing", async () => {
+    const hook = mountHook(use, {});
+
+    hook.value.trackBoolean(false);
+    expect(hook.value.isPending()).toBe(true);
+    await advance(100);
+    expect(hook.value.status).toBe("error");
+    await advance(4000);
+    expect(hook.value.status).toBe("idle");
+
+    hook.value.trackBoolean(true);
+    await advance(100);
+    expect(hook.value.status).toBe("success");
+    await advance(2000);
+
+    const statuses: string[] = [];
+    const watching = mountHook(use, { onStatusChange: (s) => statuses.push(s) });
+    watching.value.trackBoolean(undefined);
+    await advance(100);
+    expect(statuses).toEqual([]);
+    hook.unmount();
+    watching.unmount();
+  });
+
+  it("tracks a resolved non-false result as success", async () => {
+    const hook = mountHook(use, {});
+    hook.value.trackBoolean(new Promise<void>((resolve) => setTimeout(resolve, 80)));
+
+    await advance(100);
+    expect(hook.value.status).toBe("success");
+    hook.unmount();
+  });
+});

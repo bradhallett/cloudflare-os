@@ -178,6 +178,36 @@ function useButtonFeedback(options: ButtonFeedbackOptions = {}) {
     [clearTimers, isHeld, later, update],
   );
 
+  /**
+   * Tracks an action whose resolved `false` means failure: the control shows its error
+   * state with reason `undefined`, on the contract that the failure has already been
+   * reported where the action ran (a toast, an inline notice). A sync `false` maps the
+   * same way; any other sync result starts nothing async, so nothing is tracked.
+   */
+  const trackBoolean = React.useCallback(
+    (action: boolean | PromiseLike<boolean | void> | void) => {
+      if (typeof action === "boolean") {
+        if (action === false) {
+          track(Promise.reject(undefined));
+        } else {
+          track(Promise.resolve());
+        }
+        return;
+      }
+      if (action != null) {
+        track(
+          Promise.resolve(action).then((value) => {
+            if (value === false) {
+              throw undefined;
+            }
+          }),
+        );
+      }
+    },
+    [track],
+  );
+
+
   /** Cancels timers, clears a reported error, and returns to idle immediately. */
   const reset = React.useCallback(() => {
     runRef.current += 1;
@@ -215,6 +245,7 @@ function useButtonFeedback(options: ButtonFeedbackOptions = {}) {
     status,
     error,
     track,
+    trackBoolean,
     reset,
     isPending: () => inFlightRef.current,
     buttonProps: { status, ...handlers },
