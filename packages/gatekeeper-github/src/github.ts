@@ -74,7 +74,7 @@ import {
   parseUnifiedPatch,
   type TreeDiffSource,
 } from "@gadgets/gatekeeper-kit/git-diff";
-import { SessionGitCache } from "@gadgets/gatekeeper-kit/cursors";
+import { ArrayCursor, SessionGitCache } from "@gadgets/gatekeeper-kit/cursors";
 import {
   commitIdsOfSummary,
   isCommitOid,
@@ -1100,29 +1100,6 @@ function eventReview(review: GitHubPullRequestReviewResponse): GitHubEventReview
     ...review.submitted_at ? { submittedAt: new Date(review.submitted_at) } : {},
     url: review.html_url,
   };
-}
-
-@validateRpc()
-class ArrayCursor<T> extends RpcTarget implements Cursor<T> {
-  #items: T[];
-  #pageSize: number;
-  #index = 0;
-
-  constructor(items: T[], pageSize: number) {
-    super();
-    this.#items = items;
-    this.#pageSize = pageSize;
-  }
-
-  async next(): Promise<T[] | null> {
-    if (this.#index >= this.#items.length) {
-      return null;
-    }
-
-    const next = this.#items.slice(this.#index, this.#index + this.#pageSize);
-    this.#index += this.#pageSize;
-    return next;
-  }
 }
 
 /** Upstream page size for StreamingCursor walks: GitHub's maximum `per_page`. */

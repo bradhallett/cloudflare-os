@@ -1,13 +1,10 @@
-// The cursor every listing returns. It keeps the kit cursors' contract -- each page is authorized
-// before it leaves, a refused page is held and re-offered exactly, a walk ends at `null` -- but
-// makes exactly one X request per `next()`. The kit's `TokenCursor` fills a whole local page,
-// fetching again whenever X returns fewer rows than asked (twice per call by default, and a
-// constructor may opt in to more); on X every row fetched is billed, so a cursor must never read
-// rows the caller did not ask for.
+// X's listings ride the kit's `TokenCursor`, shaped to X's billing: a provider page is the unit
+// the caller asked for, so the cursor makes exactly one X request per `next()` (`fillPage: false`
+// with a fetch bound of 1) and serves that page whole — short pages included, never topped up
+// from a second request. On X every row fetched is billed, so a cursor must never read rows the
+// caller did not ask for.
 
-import { RpcTarget } from "cloudflare:workers";
-import { validateRpc } from "capnweb-validate";
-import { SerialTaskQueue } from "@gadgets/gatekeeper-kit/serial-queue";
+import { TokenCursor } from "@gadgets/gatekeeper-kit/cursors";
 import type { ObservationInput, ObservationScope } from "@gadgets/gatekeeper-kit/observers";
 import type { Cursor } from "./types";
 
@@ -30,48 +27,35 @@ export type XCursorOptions<T> = {
   dispose?(): void;
 };
 
-@validateRpc<XCursor<unknown>>()
-export class XCursor<T> extends RpcTarget implements Cursor<T>, Disposable {
-  readonly #options: XCursorOptions<T>;
-  readonly #queue = new SerialTaskQueue();
-  #token?: string;
-  #done = false;
-  #held?: XPage<T>;
-  #disposed = false;
-
-  constructor(options: XCursorOptions<T>) {
-    super();
-    this.#options = options;
-  }
-
-  /** @returns The next page, or `null` once the walk is over. Concurrent calls are serialized. */
-  next(): Promise<T[] | null> {
-    return this.#queue.run(() => this.#next());
-  }
-
-  async #next(): Promise<T[] | null> {
-    if (this.#held === undefined) {
-      if (this.#done) return null;
-      const asked = this.#token;
-      const page = await this.#options.fetchPage(asked);
-      if (page.nextToken !== undefined && page.nextToken === asked) {
-        throw new Error("X returned the same page it was asked to continue from.");
+/**
+ * Makes the cursor for an X listing, on the kit's `TokenCursor`.
+ * @param options The listing's fetch, authorization, and release hooks.
+ * @returns The cursor to return to the caller.
+ */
+export function xCursor<T>(options: XCursorOptions<T>): Cursor<T> {
+  // The local page is the provider page, overlays included, so a `next()` never splits one: the
+  // kit's page size is unbounded and the fetch bound holds the walk to a single X request.
+  let fetched: XPage<T> | undefined;
+  return new TokenCursor<T>({
+    pageSize: Number.MAX_SAFE_INTEGER,
+    fillPage: false,
+    maxProviderPagesPerCall: 1,
+    fetchPage: async token => {
+      fetched = await options.fetchPage(token);
+      return { items: fetched.items, nextToken: fetched.nextToken };
+    },
+    authorizePage: async (_items, { terminal }) => {
+      if (fetched === undefined) {
+        throw new Error("The X cursor authorized a page before it fetched one.");
       }
-      this.#token = page.nextToken;
-      this.#done = page.nextToken === undefined;
-      this.#held = page;
-    }
-    const page = this.#held;
-    await this.#options.authorize(page);
-    this.#held = undefined;
-    return page.items;
-  }
-
-  [Symbol.dispose](): void {
-    if (this.#disposed) return;
-    this.#disposed = true;
-    this.#options.dispose?.();
-  }
+      // A walk that disclosed rows ends without an X page of its own to authorize: the last page's
+      // authorization already happened when it was served. An empty walk authorized nothing yet, so
+      // the final empty page — the "no such thing" answer — is authorized here, as X served it.
+      if (terminal && fetched.items.length > 0) return;
+      await options.authorize(fetched);
+    },
+    dispose: () => options.dispose?.(),
+  });
 }
 
 /** A cursor over rows already in hand, such as posts that exist only while pending. */

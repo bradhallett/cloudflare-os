@@ -21,7 +21,7 @@ import {
 } from "./x-api";
 import { MAX_THREAD_POSTS, validateDraft, validateReplyParent, type StoredDraft, type XActions } from "./x-actions";
 import type { StoredIdentity } from "./x-credentials";
-import { XCursor, type XPage } from "./x-cursor";
+import { xCursor, type XPage } from "./x-cursor";
 import {
   authorsUnverified, indexIncludes, isMutedStatus, mentionsProtectedAuthor, toListInfo, toPostInfo, toUserInfo,
   type WireList, type WirePost, type WireUser,
@@ -227,7 +227,7 @@ type PostListing = {
 function postsCursor(ctx: SessionContext, size: number, listing: PostListing): Cursor<XPostInfo> {
   const gate = ctx.gate.lease();
   const { host } = ctx;
-  return new XCursor<XPostInfo>({
+  return xCursor<XPostInfo>({
     fetchPage: async token => {
       const me = await host.me();
       // Checked before it is cached, so a failed read is asked again rather than replayed.
@@ -260,7 +260,7 @@ function postsCursor(ctx: SessionContext, size: number, listing: PostListing): C
 
 /** A walk over posts that exist only while pending: there is nothing on X to read yet. */
 function pendingCursor(items: XPostInfo[]): Cursor<XPostInfo> {
-  return new XCursor<XPostInfo>({
+  return xCursor<XPostInfo>({
     fetchPage: async () => ({ items, observation: { title: "", description: "" }, scope: BASELINE }),
     // The pending posts are the session's own drafts; nothing from X is disclosed.
     authorize: async () => {},
@@ -284,7 +284,7 @@ type UserListing = {
 function usersCursor(ctx: SessionContext, size: number, listing: UserListing): Cursor<XUserInfo> {
   const gate = ctx.gate.lease();
   const { host } = ctx;
-  return new XCursor<XUserInfo>({
+  return xCursor<XUserInfo>({
     fetchPage: async token => {
       const me = await host.me();
       const envelope = await host.read<WireUser[]>(size, (api, current) => listing.request(api, current, token, size))
@@ -846,7 +846,7 @@ export class XListImpl extends RpcTarget implements XList {
       // The List isn't on X yet, but the profiles of the members pending actions add were read from it.
       const added = overlayMembers([], host.pending(), id, ref => host.resolve(ref), true);
       const gate = this.#ctx.gate.lease();
-      return new XCursor<XUserInfo>({
+      return xCursor<XUserInfo>({
         fetchPage: async () => ({
           items: added,
           observation: { title: "Read an X List's members", description: `Read ${countOf(added.length, "member")} of the List "${name}".` },
@@ -1060,7 +1060,7 @@ export class XAccountSessionImpl extends RpcTarget implements XAccountSession {
     const size = pageSize(options);
     const { host } = this.#ctx;
     const gate = this.#ctx.gate.lease();
-    return new XCursor<XListInfo>({
+    return xCursor<XListInfo>({
       fetchPage: async token => {
         const envelope = await host.read<WireList[]>(size, (api, me) => api.get<WireList[]>(`/2/users/${me.id}/owned_lists`, {
           ...LIST_FIELDS, ...pageQuery(size, token, { min: 1, max: 100 }),
