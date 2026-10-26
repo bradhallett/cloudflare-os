@@ -56,6 +56,10 @@ const EXPECTED: Record<string, ExpectedArea> = {
     forwarded: ["VITE_FRONTEND_ERROR_REPORTING"],
     injected: ["GATEKEEPER_APP_UNMINIFIED"],
   },
+  "packages/gatekeeper-composio": {
+    forwarded: ["VITE_FRONTEND_ERROR_REPORTING"],
+    injected: ["GATEKEEPER_APP_UNMINIFIED"],
+  },
   // `build/runtime.ts` defines `process.env.NODE_ENV` as "production" for the libraries it bundles
   // into the configurator runtime; the ambient value is never read.
   "packages/configurator-ui": {
