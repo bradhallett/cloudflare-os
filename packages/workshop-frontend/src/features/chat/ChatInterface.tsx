@@ -62,6 +62,7 @@ import {
   rhythmTopClass,
 } from "./transcript/chatDisplayEntries";
 import { usePendingTurnChanges } from "./transcript/usePendingTurnChanges";
+import { useExpansionSet } from "./transcript/useExpansionSet";
 import { useMessageScroller } from "./transcript/useMessageScroller";
 import { JumpToLatestPill } from "./transcript/JumpToLatestPill";
 import { MissedMessagesStatus } from "./transcript/MissedMessagesStatus";
@@ -223,17 +224,13 @@ function ChatInterface({
   const [isLoadingEarlier, setIsLoadingEarlier] = useState(false);
   // List, changes, and connection-request flow state lives in its hooks below
   // (useChatListActions, useChatChanges, useConnectionRequests).
-  const [expandedToolCalls, setExpandedToolCalls] = useState<Set<string>>(
-    new Set(),
-  );
+  const toolCallExpansion = useExpansionSet<string>();
   const [showThinkingTraces, setShowThinkingTraces] = useState(
     () => getStoredShowThinkingTraces(),
   );
-  const [expandedActions, setExpandedActions] = useState<Set<number>>(
-    new Set(),
-  );
-  const [expandedErrors, setExpandedErrors] = useState<Set<string>>(new Set());
-  const [expandedCompactions, setExpandedCompactions] = useState<Set<number>>(new Set());
+  const actionExpansion = useExpansionSet<number>();
+  const errorExpansion = useExpansionSet<string>();
+  const compactionExpansion = useExpansionSet<number>();
   const [sidebarActiveTab, setSidebarActiveTab] = useState<
     "chat" | "connections"
   >("chat");
@@ -720,15 +717,23 @@ function ChatInterface({
     };
   }, [authenticatedApi]);
 
-  // Reset per-chat UI state when selectedChatId changes
+  // Reset per-chat UI state when selectedChatId changes. Compaction summaries keep their
+  // expansion: their keys are boundary sequences, which are stable across views. The reset
+  // functions are stable (see useExpansionSet), so this runs on chat switches only — not on
+  // every expansion toggle.
   useEffect(() => {
-    setExpandedToolCalls(new Set());
-    setExpandedActions(new Set());
-    setExpandedErrors(new Set());
+    toolCallExpansion.reset();
+    actionExpansion.reset();
+    errorExpansion.reset();
     setIsLoadingEarlier(false);
     setIsEditingTitle(false);
     setSidebarActiveTab("chat");
-  }, [selectedChatId]);
+  }, [
+    selectedChatId,
+    toolCallExpansion.reset,
+    actionExpansion.reset,
+    errorExpansion.reset,
+  ]);
 
   // While the chat is shown, the workspace keeps the model provider's cache of it warm. Disposing
   // the call's promise disposes the lease it resolves to, even if it hasn't resolved yet.
@@ -783,18 +788,6 @@ function ChatInterface({
     });
 
 
-  const toggleToolCallExpansion = useCallback((expansionKey: string) => {
-    setExpandedToolCalls((prev) => {
-      const next = new Set(prev);
-      if (next.has(expansionKey)) {
-        next.delete(expansionKey);
-      } else {
-        next.add(expansionKey);
-      }
-      return next;
-    });
-  }, []);
-
   const toggleShowThinkingTraces = useCallback(() => {
     setShowThinkingTraces((prev) => {
       const next = !prev;
@@ -802,42 +795,6 @@ function ChatInterface({
       return next;
     });
   }, []);
-
-  // Toggle action description expansion
-  const toggleActionExpansion = (actionId: number) => {
-    setExpandedActions((prev) => {
-      const next = new Set(prev);
-      if (next.has(actionId)) {
-        next.delete(actionId);
-      } else {
-        next.add(actionId);
-      }
-      return next;
-    });
-  };
-
-  // Compaction summaries are collapsed by default: the marker answers where the cut fell, and the
-  // summary is there for anyone who wants to see what the model was left with.
-  const toggleCompactionSummary = (to: number) => {
-    setExpandedCompactions((prev) => {
-      const next = new Set(prev);
-      if (next.has(to)) next.delete(to); else next.add(to);
-      return next;
-    });
-  };
-
-  // Toggle error message expansion
-  const toggleErrorExpansion = (messageKey: string) => {
-    setExpandedErrors((prev) => {
-      const next = new Set(prev);
-      if (next.has(messageKey)) {
-        next.delete(messageKey);
-      } else {
-        next.add(messageKey);
-      }
-      return next;
-    });
-  };
 
 
   // The current epoch's opening sequence (see ChatCodeBase.epoch), zero when the epoch spans the
@@ -999,47 +956,59 @@ function ChatInterface({
                     useConstrainedChatWidth={useConstrainedChatWidth}
                     displayEntries={displayEntries}
                     entryTopClasses={entryTopClasses}
-                    expandedCompactions={expandedCompactions}
-                    toggleCompactionSummary={toggleCompactionSummary}
                     currentUser={currentUser}
                     chatEpoch={chatEpoch}
                     onRetryFailedSend={retryFailedSend}
                     onDismissFailedSend={dismissFailedSend}
                     isAgentActive={isAgentActive}
                     activeAgent={activeAgent}
-                    lastDurablePendingChange={lastDurablePendingChange}
-                    pendingChangeByTurnItemSeq={pendingChangeByTurnItemSeq}
-                    createdWorkpiecesByTurnItemSeq={createdWorkpiecesByTurnItemSeq}
-                    completedAgentTurnMessageSeqs={completedAgentTurnMessageSeqs}
-                    latestCompletedAgentTurnMessageSeq={latestCompletedAgentTurnMessageSeq}
-                    resolveToolOutput={resolveToolOutput}
-                    expandedToolCalls={expandedToolCalls}
-                    toggleToolCallExpansion={toggleToolCallExpansion}
-                    onOpenGadget={onOpenGadget}
-                    getOverseer={getOverseer}
                     hideOwnUserName={hideOwnUserName}
-                    downloadChatAttachment={downloadChatAttachment}
                     showThinkingTraces={showThinkingTraces}
-                    handleCopyMessage={handleCopyMessage}
-                    handleRevertChanges={handleRevertChanges}
-                    messageStates={messageStates}
                     restricted={restricted}
-                    expandedActions={expandedActions}
-                    processingActions={processingActions}
-                    toggleActionExpansion={toggleActionExpansion}
-                    resolveAction={resolveAction}
-                    setAutoApproveConfirm={setAutoApproveConfirm}
-                    isTagAutoApproved={isTagAutoApproved}
-                    handleToggleHook={handleToggleHook}
-                    processingConnections={processingConnections}
-                    handleAcceptConnection={handleAcceptConnection}
-                    handleDenyConnection={handleDenyConnection}
-                    expandedErrors={expandedErrors}
-                    toggleErrorExpansion={toggleErrorExpansion}
-                    setUsageModalOpen={setUsageModalOpen}
-                    handleRetry={handleRetry}
-                    retryModelId={retryModelId}
                     lastMessageSequence={lastMessageSequence}
+                    currentMessages={currentMessages}
+                    queuedSteers={queuedSteers}
+                    turnChanges={{
+                      lastDurablePendingChange,
+                      pendingChangeByTurnItemSeq,
+                      createdWorkpiecesByTurnItemSeq,
+                      completedAgentTurnMessageSeqs,
+                      latestCompletedAgentTurnMessageSeq,
+                      handleRevertChanges,
+                    }}
+                    expansion={{
+                      toolCalls: toolCallExpansion,
+                      actions: actionExpansion,
+                      errors: errorExpansion,
+                      compactions: compactionExpansion,
+                    }}
+                    tools={{
+                      resolveToolOutput,
+                      onOpenGadget,
+                      getOverseer,
+                    }}
+                    actionCards={{
+                      processingActions,
+                      resolveAction,
+                      setAutoApproveConfirm,
+                      isTagAutoApproved,
+                      handleToggleHook,
+                    }}
+                    connections={{
+                      processingConnections,
+                      handleAcceptConnection,
+                      handleDenyConnection,
+                    }}
+                    errorHandling={{
+                      setUsageModalOpen,
+                      handleRetry,
+                      retryModelId,
+                    }}
+                    messages={{
+                      messageStates,
+                      handleCopyMessage,
+                      downloadChatAttachment,
+                    }}
                     currentRowBuffer={currentRowBuffer}
                     currentHasUserDraftRows={currentHasUserDraftRows}
                     handleDiscardDraftChanges={handleDiscardDraftChanges}
@@ -1048,8 +1017,6 @@ function ChatInterface({
                     provisionalToolCalls={provisionalToolCalls}
                     isCompacting={isCompacting}
                     provisionalTick={provisionalTick}
-                    currentMessages={currentMessages}
-                    queuedSteers={queuedSteers}
                   />
                 </div>
                 <MissedMessagesStatus

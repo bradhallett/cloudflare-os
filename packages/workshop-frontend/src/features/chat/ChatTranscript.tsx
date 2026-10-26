@@ -47,6 +47,7 @@ import {
 } from "./transcript/ActionCard";
 import { ConnectionRequestCard } from "./transcript/ConnectionRequestCard";
 import type { OverseerSource } from "../../components/chat/slash-command-catalog";
+import type { ExpansionSet } from "./transcript/useExpansionSet";
 import type { ChatChangeRowBuffer } from "./liveCodeStreams";
 import type {
   ProvisionalChatState,
@@ -58,7 +59,78 @@ import { CONSTRAINED_CHAT_COLUMN_CLASS } from "./chatColumn";
 type ActionCardResolve = ComponentProps<typeof ActionCard>["onResolve"];
 type ConnectionAccept = ComponentProps<typeof ConnectionRequestCard>["onAccept"];
 
-/** Props for {@link ChatTranscript}: everything the messages pane renders or calls. */
+/**
+ * Turn-scoped change bookkeeping shared by the saved-changes, work-run and message rows:
+ * what the running or last turn changed, and how a row asks to revert it.
+ */
+export interface TranscriptTurnChanges {
+  readonly lastDurablePendingChange: ChangeChatMessage | null;
+  readonly pendingChangeByTurnItemSeq: Map<number, PendingTurnChanges>;
+  readonly createdWorkpiecesByTurnItemSeq: Map<number, CreatedWorkpieceCardInfo[]>;
+  readonly completedAgentTurnMessageSeqs: Set<number>;
+  readonly latestCompletedAgentTurnMessageSeq: number | null;
+  readonly handleRevertChanges: (revertFrom: number) => Promise<void>;
+}
+
+/** The expansion controller for every kind of expandable row, keyed by kind. */
+export interface TranscriptExpansion {
+  readonly toolCalls: ExpansionSet<string>;
+  readonly actions: ExpansionSet<number>;
+  readonly errors: ExpansionSet<string>;
+  readonly compactions: ExpansionSet<number>;
+}
+
+/** Tool-call affordances the work-run and agent-message rows share. */
+export interface TranscriptTools {
+  readonly resolveToolOutput: ToolOutputResolver;
+  readonly onOpenGadget: (workpieceId: WorkpieceId) => void;
+  readonly getOverseer: OverseerSource;
+}
+
+/** Pending-action card affordances. */
+export interface TranscriptActionCards {
+  readonly processingActions: ReadonlySet<number>;
+  readonly resolveAction: ActionCardResolve;
+  readonly setAutoApproveConfirm: (target: AutoApproveTarget | null) => void;
+  readonly isTagAutoApproved: (gatekeeperId: number, tag: string) => boolean;
+  readonly handleToggleHook: (
+    actionId: number,
+    hookId: number,
+    enabled: boolean,
+  ) => Promise<void>;
+}
+
+/** Connection-request card affordances. */
+export interface TranscriptConnections {
+  readonly processingConnections: ReadonlySet<string>;
+  readonly handleAcceptConnection: ConnectionAccept;
+  readonly handleDenyConnection: (requestId: string) => Promise<void>;
+}
+
+/** Error-row retry affordances (expansion lives in {@link TranscriptExpansion}). */
+export interface TranscriptErrorHandling {
+  readonly setUsageModalOpen: (open: boolean) => void;
+  readonly handleRetry: () => Promise<void>;
+  /** The model a retry runs on — a bot chat retries on its bot's declared model, not the
+   * composer's current pick (null disables the retry button). */
+  readonly retryModelId: string | null;
+}
+
+/** Message affordances that are neither change- nor tool-scoped. */
+export interface TranscriptMessages {
+  readonly messageStates: MessageState;
+  readonly handleCopyMessage: (message: string) => Promise<void>;
+  readonly downloadChatAttachment: (
+    chatId: number,
+    attachment: ChatAttachmentRef,
+  ) => Promise<void>;
+}
+
+/**
+ * Props for {@link ChatTranscript}: the pane's own layout values plus one grouped object
+ * per row family. A new row affordance is added to its group's interface and the group's
+ * construction in ChatInterface — no per-row prop drilling through this file.
+ */
 export interface ChatTranscriptProps {
   isLoading: boolean;
   isLoadingEarlier: boolean;
@@ -66,54 +138,27 @@ export interface ChatTranscriptProps {
   useConstrainedChatWidth: boolean | undefined;
   displayEntries: ChatDisplayEntry[];
   entryTopClasses: string[];
-  expandedCompactions: Set<number>;
-  toggleCompactionSummary: (to: number) => void;
   currentUser: AiChatAuthorInfo | null;
   chatEpoch: number;
   isAgentActive: boolean;
   activeAgent: AiChatAuthorInfo | undefined;
-  lastDurablePendingChange: ChangeChatMessage | null;
-  pendingChangeByTurnItemSeq: Map<number, PendingTurnChanges>;
-  createdWorkpiecesByTurnItemSeq: Map<number, CreatedWorkpieceCardInfo[]>;
-  completedAgentTurnMessageSeqs: Set<number>;
-  latestCompletedAgentTurnMessageSeq: number | null;
-  resolveToolOutput: ToolOutputResolver;
-  expandedToolCalls: Set<string>;
-  toggleToolCallExpansion: (expansionKey: string) => void;
-  onOpenGadget: (workpieceId: WorkpieceId) => void;
-  getOverseer: OverseerSource;
   hideOwnUserName: boolean;
-  downloadChatAttachment: (
-    chatId: number,
-    attachment: ChatAttachmentRef,
-  ) => Promise<void>;
   showThinkingTraces: boolean;
-  handleCopyMessage: (message: string) => Promise<void>;
-  handleRevertChanges: (revertFrom: number) => Promise<void>;
-  messageStates: MessageState;
   restricted: boolean | undefined;
-  expandedActions: Set<number>;
-  processingActions: Set<number>;
-  toggleActionExpansion: (actionId: number) => void;
-  resolveAction: ActionCardResolve;
-  setAutoApproveConfirm: (target: AutoApproveTarget | null) => void;
-  isTagAutoApproved: (gatekeeperId: number, tag: string) => boolean;
-  handleToggleHook: (
-    actionId: number,
-    hookId: number,
-    enabled: boolean,
-  ) => Promise<void>;
-  processingConnections: Set<string>;
-  handleAcceptConnection: ConnectionAccept;
-  handleDenyConnection: (requestId: string) => Promise<void>;
-  expandedErrors: Set<string>;
-  toggleErrorExpansion: (messageKey: string) => void;
-  setUsageModalOpen: (open: boolean) => void;
-  handleRetry: () => Promise<void>;
-  /** The model a retry runs on — a bot chat retries on its bot's declared model, not the
-   * composer's current pick (null disables the retry button). */
-  retryModelId: string | null;
   lastMessageSequence: number | undefined;
+  currentMessages: AiChatMessage[];
+  queuedSteers: { text: string; author: AiChatAuthorInfo }[] | undefined;
+  turnChanges: TranscriptTurnChanges;
+  expansion: TranscriptExpansion;
+  tools: TranscriptTools;
+  actionCards: TranscriptActionCards;
+  connections: TranscriptConnections;
+  errorHandling: TranscriptErrorHandling;
+  messages: TranscriptMessages;
+  /** Re-sends a failed user send's exact payload (the row's owner drops it on success). */
+  onRetryFailedSend: (send: FailedChatSend) => void;
+  /** Drops a failed user send's message for good. */
+  onDismissFailedSend: (send: FailedChatSend) => void;
   currentRowBuffer: ChatChangeRowBuffer | null;
   currentHasUserDraftRows: boolean;
   handleDiscardDraftChanges: () => Promise<void>;
@@ -127,12 +172,6 @@ export interface ChatTranscriptProps {
    * response streams. Every other prop holds steady across ticks.
    */
   provisionalTick: number;
-  /** Re-sends a failed user send's exact payload (the row's owner drops it on success). */
-  onRetryFailedSend: (send: FailedChatSend) => void;
-  /** Drops a failed user send's message for good. */
-  onDismissFailedSend: (send: FailedChatSend) => void;
-  currentMessages: AiChatMessage[];
-  queuedSteers: { text: string; author: AiChatAuthorInfo }[] | undefined;
 }
 
 /**
@@ -149,45 +188,25 @@ export function ChatTranscript({
   useConstrainedChatWidth,
   displayEntries,
   entryTopClasses,
-  expandedCompactions,
-  toggleCompactionSummary,
   currentUser,
   chatEpoch,
   isAgentActive,
   activeAgent,
-  lastDurablePendingChange,
-  pendingChangeByTurnItemSeq,
-  createdWorkpiecesByTurnItemSeq,
-  completedAgentTurnMessageSeqs,
-  latestCompletedAgentTurnMessageSeq,
-  resolveToolOutput,
-  expandedToolCalls,
-  toggleToolCallExpansion,
-  onOpenGadget,
-  getOverseer,
   hideOwnUserName,
-  downloadChatAttachment,
   showThinkingTraces,
-  handleCopyMessage,
-  handleRevertChanges,
-  messageStates,
   restricted,
-  expandedActions,
-  processingActions,
-  toggleActionExpansion,
-  resolveAction,
-  setAutoApproveConfirm,
-  isTagAutoApproved,
-  handleToggleHook,
-  processingConnections,
-  handleAcceptConnection,
-  handleDenyConnection,
-  expandedErrors,
-  toggleErrorExpansion,
-  setUsageModalOpen,
-  handleRetry,
-  retryModelId,
   lastMessageSequence,
+  currentMessages,
+  queuedSteers,
+  turnChanges,
+  expansion,
+  tools,
+  actionCards,
+  connections,
+  errorHandling,
+  messages,
+  onRetryFailedSend,
+  onDismissFailedSend,
   currentRowBuffer,
   currentHasUserDraftRows,
   handleDiscardDraftChanges,
@@ -196,10 +215,6 @@ export function ChatTranscript({
   provisionalToolCalls,
   isCompacting,
   provisionalTick,
-  currentMessages,
-  onRetryFailedSend,
-  onDismissFailedSend,
-  queuedSteers,
 }: ChatTranscriptProps) {
   // Consecutive messages from one user read as one group, so their bubbles are rendered
   // without per-message meta; the row that ends the group carries name and time.
@@ -215,7 +230,7 @@ export function ChatTranscript({
       case "compactionCut":
         // Only meaningful alongside the summary it belongs to; on its own it would be a line
         // with nothing to explain it.
-        return expandedCompactions.has(entry.boundary.to) ? (
+        return expansion.compactions.keys.has(entry.boundary.to) ? (
           <CompactionCutRow key={entry.key} className={entryTopClass} />
         ) : null;
       case "compactionBoundary":
@@ -223,8 +238,8 @@ export function ChatTranscript({
           <CompactionBoundaryRow
             key={entry.key}
             entry={entry}
-            expanded={expandedCompactions.has(entry.boundary.to)}
-            onToggle={toggleCompactionSummary}
+            expanded={expansion.compactions.keys.has(entry.boundary.to)}
+            onToggle={expansion.compactions.toggle}
             className={entryTopClass}
           />
         );
@@ -238,8 +253,8 @@ export function ChatTranscript({
             currentUser={currentUser}
             chatEpoch={chatEpoch}
             isAgentActive={isAgentActive}
-            lastDurablePendingChange={lastDurablePendingChange}
-            onRevertChanges={handleRevertChanges}
+            lastDurablePendingChange={turnChanges.lastDurablePendingChange}
+            onRevertChanges={turnChanges.handleRevertChanges}
             className={entryTopClass}
           />
         );
@@ -262,14 +277,14 @@ export function ChatTranscript({
             key={entry.key}
             entry={entry}
             isAgentActive={isAgentActive}
-            lastDurablePendingChange={lastDurablePendingChange}
-            pendingChangeByTurnItemSeq={pendingChangeByTurnItemSeq}
-            createdWorkpiecesByTurnItemSeq={createdWorkpiecesByTurnItemSeq}
-            expandedToolCalls={expandedToolCalls}
-            toggleToolCallExpansion={toggleToolCallExpansion}
-            resolveToolOutput={resolveToolOutput}
-            onOpenGadget={onOpenGadget}
-            onRevertChanges={handleRevertChanges}
+            lastDurablePendingChange={turnChanges.lastDurablePendingChange}
+            pendingChangeByTurnItemSeq={turnChanges.pendingChangeByTurnItemSeq}
+            createdWorkpiecesByTurnItemSeq={turnChanges.createdWorkpiecesByTurnItemSeq}
+            expandedToolCalls={expansion.toolCalls.keys}
+            toggleToolCallExpansion={expansion.toolCalls.toggle}
+            resolveToolOutput={tools.resolveToolOutput}
+            onOpenGadget={tools.onOpenGadget}
+            onRevertChanges={turnChanges.handleRevertChanges}
             className={entryTopClass}
           />
         );
@@ -278,7 +293,7 @@ export function ChatTranscript({
           <div key={entry.key} className={entryTopClass}>
             <FailedSendRow
               send={entry.send}
-              getOverseer={getOverseer}
+              getOverseer={tools.getOverseer}
               onRetry={onRetryFailedSend}
               onDismiss={onDismissFailedSend}
             />
@@ -294,40 +309,17 @@ export function ChatTranscript({
               !continuesUserGroup(entry, displayEntries[entryIndex + 1])
             }
             showsOwnUserName={showsOwnUserName}
-            currentUser={currentUser}
             isAgentActive={isAgentActive}
-            lastDurablePendingChange={lastDurablePendingChange}
-            pendingChangeByTurnItemSeq={pendingChangeByTurnItemSeq}
-            createdWorkpiecesByTurnItemSeq={createdWorkpiecesByTurnItemSeq}
-            completedAgentTurnMessageSeqs={completedAgentTurnMessageSeqs}
-            latestCompletedAgentTurnMessageSeq={latestCompletedAgentTurnMessageSeq}
-            resolveToolOutput={resolveToolOutput}
-            expandedToolCalls={expandedToolCalls}
-            toggleToolCallExpansion={toggleToolCallExpansion}
-            onOpenGadget={onOpenGadget}
-            getOverseer={getOverseer}
-            downloadChatAttachment={downloadChatAttachment}
             showThinkingTraces={showThinkingTraces}
-            handleCopyMessage={handleCopyMessage}
-            handleRevertChanges={handleRevertChanges}
-            messageStates={messageStates}
             restricted={restricted}
-            expandedActions={expandedActions}
-            processingActions={processingActions}
-            toggleActionExpansion={toggleActionExpansion}
-            resolveAction={resolveAction}
-            setAutoApproveConfirm={setAutoApproveConfirm}
-            isTagAutoApproved={isTagAutoApproved}
-            handleToggleHook={handleToggleHook}
-            processingConnections={processingConnections}
-            handleAcceptConnection={handleAcceptConnection}
-            handleDenyConnection={handleDenyConnection}
-            expandedErrors={expandedErrors}
-            toggleErrorExpansion={toggleErrorExpansion}
-            setUsageModalOpen={setUsageModalOpen}
-            handleRetry={handleRetry}
-            retryModelId={retryModelId}
             lastMessageSequence={lastMessageSequence}
+            turnChanges={turnChanges}
+            expansion={expansion}
+            tools={tools}
+            actionCards={actionCards}
+            connections={connections}
+            errorHandling={errorHandling}
+            messages={messages}
           />
         );
     }
@@ -379,8 +371,8 @@ export function ChatTranscript({
               showThinkingTraces={showThinkingTraces}
               currentMessages={currentMessages}
               previousEntry={lastEntry}
-              expandedToolCalls={expandedToolCalls}
-              toggleToolCallExpansion={toggleToolCallExpansion}
+              expandedToolCalls={expansion.toolCalls.keys}
+              toggleToolCallExpansion={expansion.toolCalls.toggle}
             />
           )}
 
@@ -408,45 +400,22 @@ export function ChatTranscript({
 /**
  * The per-message dispatch: every message-shaped entry keeps one wrapper row (its
  * data-entry-key is what the scroller anchors and counts), with the message's own type
- * choosing the row that renders inside it. Everything else is passed through from
- * {@link ChatTranscript} unchanged, so the rows see the same values the shell does.
+ * choosing the row that renders inside it. Everything else arrives as the same grouped
+ * objects {@link ChatTranscript} takes, mapped onto each row's own props here.
  */
 type MessageEntryRowProps = Pick<
   ChatTranscriptProps,
-  | "currentUser"
   | "isAgentActive"
-  | "lastDurablePendingChange"
-  | "pendingChangeByTurnItemSeq"
-  | "createdWorkpiecesByTurnItemSeq"
-  | "completedAgentTurnMessageSeqs"
-  | "latestCompletedAgentTurnMessageSeq"
-  | "resolveToolOutput"
-  | "expandedToolCalls"
-  | "toggleToolCallExpansion"
-  | "onOpenGadget"
-  | "getOverseer"
-  | "downloadChatAttachment"
   | "showThinkingTraces"
-  | "handleCopyMessage"
-  | "handleRevertChanges"
-  | "messageStates"
   | "restricted"
-  | "expandedActions"
-  | "processingActions"
-  | "toggleActionExpansion"
-  | "resolveAction"
-  | "setAutoApproveConfirm"
-  | "isTagAutoApproved"
-  | "handleToggleHook"
-  | "processingConnections"
-  | "handleAcceptConnection"
-  | "handleDenyConnection"
-  | "expandedErrors"
-  | "toggleErrorExpansion"
-  | "setUsageModalOpen"
-  | "handleRetry"
-  | "retryModelId"
   | "lastMessageSequence"
+  | "turnChanges"
+  | "expansion"
+  | "tools"
+  | "actionCards"
+  | "connections"
+  | "errorHandling"
+  | "messages"
 > & {
   entry: Extract<ChatDisplayEntry, { type: "message" }>;
   entryTopClass: string;
@@ -459,7 +428,17 @@ function MessageEntryRow({
   entryTopClass,
   endsUserGroup,
   showsOwnUserName,
-  ...rest
+  isAgentActive,
+  showThinkingTraces,
+  restricted,
+  lastMessageSequence,
+  turnChanges,
+  expansion,
+  tools,
+  actionCards,
+  connections,
+  errorHandling,
+  messages,
 }: MessageEntryRowProps) {
   const msg = entry.message;
   switch (msg.type) {
@@ -472,19 +451,19 @@ function MessageEntryRow({
               msg={msg}
               workGroup={entry.workGroup}
               lastMessageSequence={entry.lastMessageSequence}
-              showThinkingTraces={rest.showThinkingTraces}
-              isAgentActive={rest.isAgentActive}
-              lastDurablePendingChange={rest.lastDurablePendingChange}
-              pendingChangeByTurnItemSeq={rest.pendingChangeByTurnItemSeq}
-              createdWorkpiecesByTurnItemSeq={rest.createdWorkpiecesByTurnItemSeq}
-              completedAgentTurnMessageSeqs={rest.completedAgentTurnMessageSeqs}
-              latestCompletedAgentTurnMessageSeq={rest.latestCompletedAgentTurnMessageSeq}
-              expandedToolCalls={rest.expandedToolCalls}
-              toggleToolCallExpansion={rest.toggleToolCallExpansion}
-              resolveToolOutput={rest.resolveToolOutput}
-              onOpenGadget={rest.onOpenGadget}
-              onCopyMessage={rest.handleCopyMessage}
-              onRevertChanges={rest.handleRevertChanges}
+              showThinkingTraces={showThinkingTraces}
+              isAgentActive={isAgentActive}
+              lastDurablePendingChange={turnChanges.lastDurablePendingChange}
+              pendingChangeByTurnItemSeq={turnChanges.pendingChangeByTurnItemSeq}
+              createdWorkpiecesByTurnItemSeq={turnChanges.createdWorkpiecesByTurnItemSeq}
+              completedAgentTurnMessageSeqs={turnChanges.completedAgentTurnMessageSeqs}
+              latestCompletedAgentTurnMessageSeq={turnChanges.latestCompletedAgentTurnMessageSeq}
+              expandedToolCalls={expansion.toolCalls.keys}
+              toggleToolCallExpansion={expansion.toolCalls.toggle}
+              resolveToolOutput={tools.resolveToolOutput}
+              onOpenGadget={tools.onOpenGadget}
+              onCopyMessage={messages.handleCopyMessage}
+              onRevertChanges={turnChanges.handleRevertChanges}
             />
           </div>
         );
@@ -496,9 +475,9 @@ function MessageEntryRow({
             slashCommand={entry.slashCommand}
             endsUserGroup={endsUserGroup}
             showName={showsOwnUserName(msg.author.id)}
-            getOverseer={rest.getOverseer}
+            getOverseer={tools.getOverseer}
             onDownloadAttachment={(chatId, attachment) => {
-              void rest.downloadChatAttachment(chatId, attachment);
+              void messages.downloadChatAttachment(chatId, attachment);
             }}
           />
         </div>
@@ -511,8 +490,8 @@ function MessageEntryRow({
             msg={msg}
             timestamp={
               msg.type === "merge"
-                ? rest.messageStates.mergeTimestamps.get(msg.sequence)
-                : rest.messageStates.revertTimestamps.get(msg.sequence)
+                ? messages.messageStates.mergeTimestamps.get(msg.sequence)
+                : messages.messageStates.revertTimestamps.get(msg.sequence)
             }
           />
         </div>
@@ -522,14 +501,14 @@ function MessageEntryRow({
         <div data-entry-key={entry.key} className={entryTopClass}>
           <ActionCard
             msg={msg}
-            restricted={!!rest.restricted}
-            open={rest.expandedActions.has(msg.actionId)}
-            isProcessing={rest.processingActions.has(msg.actionId)}
-            onToggleExpansion={rest.toggleActionExpansion}
-            onResolve={rest.resolveAction}
-            onAlwaysApprove={rest.setAutoApproveConfirm}
-            isTagAutoApproved={rest.isTagAutoApproved}
-            onToggleHook={rest.handleToggleHook}
+            restricted={!!restricted}
+            open={expansion.actions.keys.has(msg.actionId)}
+            isProcessing={actionCards.processingActions.has(msg.actionId)}
+            onToggleExpansion={expansion.actions.toggle}
+            onResolve={actionCards.resolveAction}
+            onAlwaysApprove={actionCards.setAutoApproveConfirm}
+            isTagAutoApproved={actionCards.isTagAutoApproved}
+            onToggleHook={actionCards.handleToggleHook}
           />
         </div>
       );
@@ -538,9 +517,9 @@ function MessageEntryRow({
         <div data-entry-key={entry.key} className={entryTopClass}>
           <ConnectionRequestCard
             msg={msg}
-            isProcessing={rest.processingConnections.has(msg.requestId)}
-            onAccept={rest.handleAcceptConnection}
-            onDeny={rest.handleDenyConnection}
+            isProcessing={connections.processingConnections.has(msg.requestId)}
+            onAccept={connections.handleAcceptConnection}
+            onDeny={connections.handleDenyConnection}
           />
         </div>
       );
@@ -565,12 +544,12 @@ function MessageEntryRow({
         <div data-entry-key={entry.key} className={entryTopClass}>
           <ErrorRow
             msg={msg}
-            isLast={msg.sequence === rest.lastMessageSequence && !rest.isAgentActive}
-            isExpanded={rest.expandedErrors.has(key)}
-            onToggle={() => rest.toggleErrorExpansion(key)}
-            onOpenUsageModal={() => rest.setUsageModalOpen(true)}
-            onRetry={() => void rest.handleRetry()}
-            retryModelId={rest.retryModelId}
+            isLast={msg.sequence === lastMessageSequence && !isAgentActive}
+            isExpanded={expansion.errors.keys.has(key)}
+            onToggle={() => expansion.errors.toggle(key)}
+            onOpenUsageModal={() => errorHandling.setUsageModalOpen(true)}
+            onRetry={() => void errorHandling.handleRetry()}
+            retryModelId={errorHandling.retryModelId}
           />
         </div>
       );
