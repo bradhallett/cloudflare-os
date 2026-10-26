@@ -94,6 +94,7 @@ import type {
   NotionWorkspace as NotionWorkspaceSession,
   NotionWorkspaceMetadata,
 } from "./types";
+import { notionCursor } from "./notion-cursor";
 import { NotionItemConfiguratorUI, NotionWorkspaceConfiguratorUI } from "./notion-configurators";
 import NOTION_LOGO_SVG from "./notion-logo.svg";
 import TYPES_CODE from "./types.txt";
@@ -1022,35 +1023,6 @@ export class NotionWorkspaceGatekeeperImpl
   }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Cursor
-
-@validateRpc()
-class PagedCursor<T> extends RpcTarget implements Cursor<T> {
-  #fetchPage: (cursor: string | undefined, firstPage: boolean) =>
-    Promise<{ items: T[]; nextCursor: string | undefined }>;
-  #cursor: string | undefined = undefined;
-  #first = true;
-  #done = false;
-
-  constructor(
-    fetchPage: (cursor: string | undefined, firstPage: boolean) =>
-      Promise<{ items: T[]; nextCursor: string | undefined }>,
-  ) {
-    super();
-    this.#fetchPage = fetchPage;
-  }
-
-  async next(): Promise<T[] | null> {
-    if (this.#done) return null;
-    const { items, nextCursor } = await this.#fetchPage(this.#cursor, this.#first);
-    this.#first = false;
-    if (nextCursor) this.#cursor = nextCursor;
-    else this.#done = true;
-    return items;
-  }
-}
-
 // Recursively collect child_page / child_database blocks from a fetched block tree, so sub-pages
 // nested inside columns/toggles are surfaced by listChildPages.
 function collectChildPages(
@@ -1199,7 +1171,13 @@ class NotionPageSessionImpl extends RpcTarget implements NotionPageSession {
     // in `pageSize` chunks through the cursor.
     let all: NotionItemSummary[] | null = null;
     let offset = 0;
-    return new PagedCursor<NotionItemSummary>(async () => {
+    // The listing reveals each (real) child item's existence/title, so attribute it to the parent
+    // page plus the child pages/databases themselves. One observation covers the whole listing:
+    // taken with the first slice, before anything is disclosed, and a refusal leaves it untaken so
+    // the retry re-authorizes.
+    let itemIds: string[] = [];
+    let observed = false;
+    return notionCursor<NotionItemSummary>(async () => {
       if (all === null) {
         const collected: NotionItemSummary[] = [];
         if (!provisional) {
@@ -1207,18 +1185,23 @@ class NotionPageSessionImpl extends RpcTarget implements NotionPageSession {
           collectChildPages(tree, collected);
         }
         all = overlayChildPages(collected, pageId, store, true);
-        // The listing reveals each (real) child item's existence/title, so attribute it to the parent
-        // page plus the child pages/databases themselves.
-        const itemIds = provisional ? [] : [
+        itemIds = provisional ? [] : [
           store.resolveId(pageId),
           ...all.filter(c => !NotionStore.isProvisional(c.id)).map(c => c.id),
         ];
-        await authorizeItemObservation(approvalQueue, observe, itemIds,
-          observation("List Notion child pages", `List the sub-pages of Notion page ${store.resolveId(pageId)}.`));
       }
       const slice = all.slice(offset, offset + pageSize);
       offset += slice.length;
-      return { items: slice, nextCursor: offset < all.length ? String(offset) : undefined };
+      return {
+        items: slice,
+        nextCursor: offset < all.length ? String(offset) : undefined,
+        authorize: async () => {
+          if (observed) return;
+          await authorizeItemObservation(approvalQueue, observe, itemIds,
+            observation("List Notion child pages", `List the sub-pages of Notion page ${store.resolveId(pageId)}.`));
+          observed = true;
+        },
+      };
     });
   }
 
@@ -1313,7 +1296,7 @@ class NotionPageSessionImpl extends RpcTarget implements NotionPageSession {
     const pageId = this.#pageId;
     const provisional = this.#isProvisional();
     const itemIds = provisional ? [] : [store.resolveId(pageId)];
-    return new PagedCursor<NotionComment>(async (cursor, firstPage) => {
+    return notionCursor<NotionComment>(async (cursor, firstPage) => {
       let items: NotionComment[] = [];
       let nextCursor: string | undefined;
       if (!provisional) {
@@ -1335,9 +1318,12 @@ class NotionPageSessionImpl extends RpcTarget implements NotionPageSession {
       }
       // Pending comments are only surfaced on the first batch to avoid duplication.
       if (firstPage) items = simulateComments(items, store.pendingForPage(pageId));
-      await authorizeItemObservation(approvalQueue, observe, itemIds,
-        observation("Read Notion page comments", `Read the comment thread on Notion page ${store.resolveId(pageId)}.`));
-      return { items, nextCursor };
+      return {
+        items,
+        nextCursor,
+        authorize: () => authorizeItemObservation(approvalQueue, observe, itemIds,
+          observation("Read Notion page comments", `Read the comment thread on Notion page ${store.resolveId(pageId)}.`)),
+      };
     });
   }
 
@@ -1409,7 +1395,7 @@ class NotionDatabaseSessionImpl extends RpcTarget implements NotionDatabaseSessi
     const filter = options?.filter ? filterToNotion(options.filter, typeOf) : undefined;
     const sorts = options?.sorts?.map(sortToNotion);
     const seed = defaultPropertiesFromSchema(schema);
-    return new PagedCursor<NotionPageSummary>(async (cursor, firstPage) => {
+    return notionCursor<NotionPageSummary>(async (cursor, firstPage) => {
       const result = await store.api.queryDataSource(dataSourceId, {
         filter,
         sorts,
@@ -1419,9 +1405,12 @@ class NotionDatabaseSessionImpl extends RpcTarget implements NotionDatabaseSessi
       const rows = overlayDatabaseRows(result.results.map(pageToSummary), databaseId, store, firstPage, seed);
       // A query reveals row data, which is gated by access to the database (rows inherit it), so the
       // database is the data set.
-      await authorizeItemObservation(approvalQueue, observe, [databaseId],
-        observation("Query Notion database", `Query rows from Notion database ${store.resolveId(databaseId)}.`));
-      return { items: rows, nextCursor: result.has_more ? result.next_cursor ?? undefined : undefined };
+      return {
+        items: rows,
+        nextCursor: result.has_more ? result.next_cursor ?? undefined : undefined,
+        authorize: () => authorizeItemObservation(approvalQueue, observe, [databaseId],
+          observation("Query Notion database", `Query rows from Notion database ${store.resolveId(databaseId)}.`)),
+      };
     });
   }
 
@@ -1542,7 +1531,7 @@ class NotionWorkspaceSessionImpl extends RpcTarget implements NotionWorkspaceSes
     const filter = options?.filter
       ? { property: "object" as const, value: options.filter }
       : undefined;
-    return new PagedCursor<NotionItemSummary>(async (cursor, firstPage) => {
+    return notionCursor<NotionItemSummary>(async (cursor, firstPage) => {
       const result = await store.api.search({
         query: options?.query,
         filter,
@@ -1557,9 +1546,12 @@ class NotionWorkspaceSessionImpl extends RpcTarget implements NotionWorkspaceSes
       const itemIds = result.results
         .map(r => r.id)
         .filter(id => !NotionStore.isProvisional(id));
-      await authorizeItemObservation(approvalQueue, observe, itemIds,
-        observation("Search Notion", `Search Notion for “${options?.query ?? ""}”.`));
-      return { items, nextCursor: result.has_more ? result.next_cursor ?? undefined : undefined };
+      return {
+        items,
+        nextCursor: result.has_more ? result.next_cursor ?? undefined : undefined,
+        authorize: () => authorizeItemObservation(approvalQueue, observe, itemIds,
+          observation("Search Notion", `Search Notion for “${options?.query ?? ""}”.`)),
+      };
     });
   }
 
@@ -1618,15 +1610,15 @@ class NotionWorkspaceSessionImpl extends RpcTarget implements NotionWorkspaceSes
     const store = this.#store;
     const approvalQueue = this.#approvalQueue;
     const observe = this.#observe;
-    return new PagedCursor<NotionUser>(async cursor => {
+    return notionCursor<NotionUser>(async cursor => {
       const result = await store.api.listUsers(cursor, pageSize);
       // The member directory is visible to any workspace member, so no item attribution (the baseline
       // workspace-membership check in addObserver covers it).
-      await authorizeItemObservation(approvalQueue, observe, [],
-        observation("List Notion users", "List the members of the Notion workspace."));
       return {
         items: result.results.map(userResponseToUser),
         nextCursor: result.has_more ? result.next_cursor ?? undefined : undefined,
+        authorize: () => authorizeItemObservation(approvalQueue, observe, [],
+          observation("List Notion users", "List the members of the Notion workspace.")),
       };
     });
   }

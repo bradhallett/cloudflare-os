@@ -113,6 +113,7 @@ import type {
   SpaceSummary,
   UploadAttachmentOptions,
 } from "./types";
+import { confluenceCursor } from "./confluence-cursor";
 import CONFLUENCE_LOGO_SVG from "./confluence-logo.svg";
 import TYPES_CODE from "./types.txt";
 import SITE_CONFIGURATOR_HTML from "./generated/confluence-site-configurator-ui.txt";
@@ -793,31 +794,6 @@ function accountFor(ctx: { exports: Cloudflare.Env }, userObjectId: string) {
   return (ctx.exports as any).UserAccount.get((ctx.exports as any).UserAccount.idFromString(userObjectId));
 }
 
-// ---------------------------------------------------------------------------------------------
-// Cursor
-
-@validateRpc()
-class PagedCursor<T> extends RpcTarget implements Cursor<T> {
-  // `fetchPage` receives the current opaque cursor (undefined for the first page) and returns the
-  // items plus the next cursor (undefined when exhausted).
-  #fetchPage: (cursor: string | undefined) => Promise<{ items: T[]; nextCursor?: string }>;
-  #cursor: string | undefined = undefined;
-  #done = false;
-
-  constructor(fetchPage: (cursor: string | undefined) => Promise<{ items: T[]; nextCursor?: string }>) {
-    super();
-    this.#fetchPage = fetchPage;
-  }
-
-  async next(): Promise<T[] | null> {
-    if (this.#done) return null;
-    const { items, nextCursor } = await this.#fetchPage(this.#cursor);
-    if (nextCursor) this.#cursor = nextCursor;
-    else this.#done = true;
-    return items;
-  }
-}
-
 const clampPageSize = (pageSize: number | undefined): number =>
   pageSize === undefined ? 25 : Math.max(1, Math.min(100, Math.floor(pageSize)));
 
@@ -877,12 +853,15 @@ class SiteSessionImpl extends RpcTarget implements ConfluenceSiteSession {
 
   listSpaces(options?: ListSpacesOptions): Promise<Cursor<SpaceSummary>> {
     const limit = clampPageSize(options?.pageSize);
-    return Promise.resolve(new PagedCursor<SpaceSummary>(async cursor => {
+    return Promise.resolve(confluenceCursor<SpaceSummary>(async cursor => {
       const { results, nextCursor } = await this.#store.api.listSpaces({ type: options?.type, cursor, limit });
-      await authorizeConfluenceObservation(
-        this.#approvalQueue, this.#observe, spaceSets(results.map(s => s.id)),
-        observation("List Confluence spaces", "List the spaces on the Confluence site."));
-      return { items: results.map(s => spaceToMetadata(s, this.#webBase)), nextCursor };
+      return {
+        items: results.map(s => spaceToMetadata(s, this.#webBase)),
+        nextCursor,
+        authorize: () => authorizeConfluenceObservation(
+          this.#approvalQueue, this.#observe, spaceSets(results.map(s => s.id)),
+          observation("List Confluence spaces", "List the spaces on the Confluence site.")),
+      };
     }));
   }
 
@@ -963,18 +942,21 @@ class SpaceSessionImpl extends RpcTarget implements ConfluenceSpaceSession {
 
   #listContent(type: "page" | "blogpost", depth: "root" | "all" | undefined, pageSize?: number): Cursor<ContentSummary> {
     const limit = clampPageSize(pageSize);
-    return new PagedCursor<ContentSummary>(async cursor => {
+    return confluenceCursor<ContentSummary>(async cursor => {
       const spaceId = await this.#store.getSpaceId(this.#spaceKey);
       const { results, nextCursor } = type === "blogpost"
         ? await this.#store.api.listBlogPostsInSpace({ spaceId, cursor, limit })
         : await this.#store.api.listPagesInSpace({ spaceId, depth: depth ?? "root", cursor, limit });
       const items = overlaySpaceContent(
         results.map(c => contentToSummary(c, this.#webBase)), this.#store, this.#spaceKey, type, !cursor);
-      await authorizeConfluenceObservation(
-        this.#approvalQueue, this.#observe, contentSets(items.map(item => item.id)), observation(
-          `List Confluence ${type === "blogpost" ? "blog posts" : "pages"}`,
-          `List the ${type === "blogpost" ? "blog posts" : "pages"} in space ${this.#spaceKey}.`));
-      return { items, nextCursor };
+      return {
+        items,
+        nextCursor,
+        authorize: () => authorizeConfluenceObservation(
+          this.#approvalQueue, this.#observe, contentSets(items.map(item => item.id)), observation(
+            `List Confluence ${type === "blogpost" ? "blog posts" : "pages"}`,
+            `List the ${type === "blogpost" ? "blog posts" : "pages"} in space ${this.#spaceKey}.`)),
+      };
     });
   }
 
@@ -1108,7 +1090,7 @@ class ContentSessionImpl extends RpcTarget implements ConfluenceContentSession {
 
   listChildPages(options?: ListOptions): Promise<Cursor<ContentSummary>> {
     const limit = clampPageSize(options?.pageSize);
-    return Promise.resolve(new PagedCursor<ContentSummary>(async cursor => {
+    return Promise.resolve(confluenceCursor<ContentSummary>(async cursor => {
       let items: ContentSummary[] = [];
       let nextCursor: string | undefined;
       // Only pages have children; a provisional or blog-post target just yields pending creations.
@@ -1119,11 +1101,14 @@ class ContentSessionImpl extends RpcTarget implements ConfluenceContentSession {
         nextCursor = res.nextCursor;
       }
       items = overlayChildPages(items, this.#store, this.#contentId, !cursor);
-      await authorizeConfluenceObservation(
-        this.#approvalQueue, this.#observe,
-        [...this.#sets(), ...contentSets(items.map(item => item.id))],
-        observation("List Confluence child pages", `List the child pages of Confluence content ${this.#ref()}.`));
-      return { items, nextCursor };
+      return {
+        items,
+        nextCursor,
+        authorize: () => authorizeConfluenceObservation(
+          this.#approvalQueue, this.#observe,
+          [...this.#sets(), ...contentSets(items.map(item => item.id))],
+          observation("List Confluence child pages", `List the child pages of Confluence content ${this.#ref()}.`)),
+      };
     }));
   }
 
@@ -1164,7 +1149,7 @@ class ContentSessionImpl extends RpcTarget implements ConfluenceContentSession {
 
   listComments(options?: ListOptions): Promise<Cursor<Comment>> {
     const limit = clampPageSize(options?.pageSize);
-    return Promise.resolve(new PagedCursor<Comment>(async cursor => {
+    return Promise.resolve(confluenceCursor<Comment>(async cursor => {
       let items: Comment[] = [];
       let nextCursor: string | undefined;
       if (!this.#isProvisional()) {
@@ -1173,9 +1158,12 @@ class ContentSessionImpl extends RpcTarget implements ConfluenceContentSession {
         nextCursor = res.nextCursor;
       }
       if (!cursor) items = simulateComments(items, this.#pending());
-      await authorizeConfluenceObservation(this.#approvalQueue, this.#observe, this.#sets(),
-        observation("Read Confluence comments", `Read the comments on Confluence content ${this.#ref()}.`));
-      return { items, nextCursor };
+      return {
+        items,
+        nextCursor,
+        authorize: () => authorizeConfluenceObservation(this.#approvalQueue, this.#observe, this.#sets(),
+          observation("Read Confluence comments", `Read the comments on Confluence content ${this.#ref()}.`)),
+      };
     }));
   }
 
@@ -1185,13 +1173,16 @@ class ContentSessionImpl extends RpcTarget implements ConfluenceContentSession {
 
   listAttachments(options?: ListOptions): Promise<Cursor<Attachment>> {
     const limit = clampPageSize(options?.pageSize);
-    return Promise.resolve(new PagedCursor<Attachment>(async cursor => {
+    return Promise.resolve(confluenceCursor<Attachment>(async cursor => {
       const res = this.#isProvisional()
         ? { results: [], nextCursor: undefined }
         : await this.#store.api.listAttachments(this.#ref(), await this.#kind(), { cursor, limit });
-      await authorizeConfluenceObservation(this.#approvalQueue, this.#observe, this.#sets(),
-        observation("List Confluence attachments", `List the attachments on Confluence content ${this.#ref()}.`));
-      return { items: res.results.map(attachmentToAttachment), nextCursor: res.nextCursor };
+      return {
+        items: res.results.map(attachmentToAttachment),
+        nextCursor: res.nextCursor,
+        authorize: () => authorizeConfluenceObservation(this.#approvalQueue, this.#observe, this.#sets(),
+          observation("List Confluence attachments", `List the attachments on Confluence content ${this.#ref()}.`)),
+      };
     }));
   }
 
@@ -1272,12 +1263,15 @@ function searchCursor(
 ): Cursor<ContentSummary> {
   const limit = clampPageSize(options?.pageSize);
   const cql = buildCql({ text: options?.text, cql: options?.cql, type: options?.type, spaceKey });
-  return new PagedCursor<ContentSummary>(async cursor => {
+  return confluenceCursor<ContentSummary>(async cursor => {
     const { results, nextCursor } = await store.api.search(cql, { cursor, limit });
     const items = overlaySearch(results, store, !cursor, options?.type);
-    await authorizeConfluenceObservation(
-      approvalQueue, observe, contentSets(items.map(item => item.id)),
-      observation("Search Confluence", `Search Confluence for “${options?.cql ?? options?.text ?? ""}”.`));
-    return { items, nextCursor };
+    return {
+      items,
+      nextCursor,
+      authorize: () => authorizeConfluenceObservation(
+        approvalQueue, observe, contentSets(items.map(item => item.id)),
+        observation("Search Confluence", `Search Confluence for “${options?.cql ?? options?.text ?? ""}”.`)),
+    };
   });
 }
