@@ -145,6 +145,10 @@ export class ActionJournal<A> {
   readonly #appliedIdsKey: string;
   readonly #upgradeRecord?: (raw: unknown) => A | undefined;
   readonly #maxPending: number;
+  // Pending projections, cached per states-view (the module's PROJECTED/UNDECIDED constants key
+  // it, so it holds at most two entries) until the next record mutation clears it: one activation
+  // may project the same set several times, and every projection is otherwise a full storage walk.
+  readonly #pendingCache = new Map<readonly JournalState[], readonly JournalEntry<A>[]>();
 
   /**
    * Creates an action journal.
@@ -307,6 +311,7 @@ export class ActionJournal<A> {
    * @param id Action ID to remove.
    */
   remove(id: number): void {
+    this.#pendingCache.clear();
     this.#kv.delete(this.#pendingKey(id));
     this.#kv.delete(this.#retainedKey(id));
   }
@@ -402,22 +407,32 @@ export class ActionJournal<A> {
     };
   }
 
-  /** @returns Actions visible to simulation, ordered by ID. */
+  /**
+   * Lists actions visible to simulation, ordered by ID. Cached until the journal's next mutation;
+   * each call still returns a fresh array.
+   * @returns Pending and claimed actions.
+   */
   listPending(): JournalEntry<A>[] {
     return this.#scan(PROJECTED);
   }
 
-  /** @returns Actions still eligible for a decision, ordered by ID. */
+  /**
+   * Lists actions still eligible for a decision, ordered by ID. Cached until the journal's next
+   * mutation; each call still returns a fresh array.
+   * @returns Pending actions.
+   */
   listUndecided(): JournalEntry<A>[] {
     return this.#scan(UNDECIDED);
   }
 
   /**
-   * Scans the pending tier for selected states.
+   * Scans the pending tier for selected states, serving repeat projections of one view from cache.
    * @param states States to include.
-   * @returns Matching actions ordered by ID.
+   * @returns Matching actions ordered by ID, as a fresh array.
    */
   #scan(states: readonly JournalState[]): JournalEntry<A>[] {
+    const cached = this.#pendingCache.get(states);
+    if (cached !== undefined) return [...cached];
     const found: JournalEntry<A>[] = [];
     const applied = this.#appliedSet();
     for (const [key, raw] of this.#kv.list<unknown>({ prefix: this.#prefix })) {
@@ -429,7 +444,9 @@ export class ActionJournal<A> {
       if (id === undefined || applied.has(id) || this.isRetained(id)) continue;
       found.push({ id, action: record.action });
     }
-    return found.toSorted((a, b) => a.id - b.id);
+    const sorted = found.toSorted((a, b) => a.id - b.id);
+    this.#pendingCache.set(states, sorted);
+    return [...sorted];
   }
 
   /** Enforces capacity and prunes excess staged or failed records. */
@@ -544,6 +561,7 @@ export class ActionJournal<A> {
    * @param record Record to store.
    */
   #write(key: string, record: JournalRecord<A>): void {
+    this.#pendingCache.clear();
     this.#kv.put<StoredJournalRecord<A>>(key, { ...record, v: JOURNAL_VERSION });
   }
 
