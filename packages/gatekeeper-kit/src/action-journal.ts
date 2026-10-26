@@ -222,6 +222,17 @@ export class ActionJournal<A> {
   }
 
   /**
+   * Issues every action ID up to and including `id`, for a connector whose caller numbered the
+   * action itself (a hand-built payload) instead of reserving first. Ids already issued are a
+   * no-op; `stage` still refuses one a record occupies.
+   * @param id The action ID the caller carried.
+   */
+  reserveThrough(id: number): void {
+    const next = this.#kv.get<number>(this.#nextIdKey) ?? 1;
+    if (id >= next) this.#kv.put(this.#nextIdKey, id + 1);
+  }
+
+  /**
    * Stages an action at an ID `reserveId` returned. The reservation and the record stay paired:
    * an ID this journal never reserved, or one a record already occupies, is refused.
    * @param id Reserved action ID.
