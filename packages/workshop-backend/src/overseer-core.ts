@@ -623,7 +623,7 @@ export abstract class OverseerCore {
     if (!title) {
       throw new Error("A worktree requires a non-empty title.");
     }
-    let baseCommit = await this.gitCache.fetchCommit(commitId);
+    let baseCommit = await this.gitCache.walker.fetchCommit(commitId);
 
     // The awaits above could have outlived the chat; a pending record for a deleted chat would
     // never be reaped.
@@ -871,7 +871,7 @@ export abstract class OverseerCore {
    * sorted.
    */
   async listChangedPaths(fromCommit: string, toCommit: string): Promise<string[]> {
-    return [...await this.gitCache.changedFilePathsBetween(fromCommit, toCommit)].toSorted();
+    return [...await this.gitCache.walker.changedFilePathsBetween(fromCommit, toCommit)].toSorted();
   }
 
   /**
@@ -880,13 +880,13 @@ export abstract class OverseerCore {
    * the way unpinned gadget reads are served too.
    */
   readFileAtCommit(commit: string, path: string): Promise<string | undefined> {
-    return this.gitCache.readFileAtCommitIfExists(commit, path);
+    return this.gitCache.walker.readFileAtCommitIfExists(commit, path);
   }
 
   /** AgentHooks implementation: the same read, plus the blob's oid for the read's stamp. */
   readFileAtCommitWithOid(commit: string, path: string)
       : Promise<{text: string, oid: string} | undefined> {
-    return this.gitCache.readFileAtCommitWithOid(commit, path);
+    return this.gitCache.walker.readFileAtCommitWithOid(commit, path);
   }
 
   /**
@@ -894,7 +894,7 @@ export abstract class OverseerCore {
    * WorkspaceGitCache.fileOidAtCommit), for the agent's read-freshness comparisons.
    */
   fileOidAtCommit(commit: string, path: string): Promise<string | undefined> {
-    return this.gitCache.fileOidAtCommit(commit, path);
+    return this.gitCache.walker.fileOidAtCommit(commit, path);
   }
 
   /**
@@ -902,7 +902,7 @@ export abstract class OverseerCore {
    * stamped read's blob was pulled by the read itself, so this is a local read.
    */
   readBlobText(oid: string, path: string): Promise<string> {
-    return this.gitCache.readTextBlob(oid, undefined, path);
+    return this.gitCache.walker.readTextBlob(oid, undefined, path);
   }
 
   /**
@@ -910,13 +910,13 @@ export abstract class OverseerCore {
    * WorkspaceGitCache.assertWorktreePathWritable).
    */
   assertWorktreePathWritable(commit: string, path: string): Promise<void> {
-    return this.gitCache.assertWorktreePathWritable(commit, path);
+    return this.gitCache.walker.assertWorktreePathWritable(commit, path);
   }
 
   /** AgentHooks implementation: the grep tool's scan (see scanWorkpieceForGrep). */
   grepWorkpiece(turn: WorktreeTurnAccess, workpieceId: WorkpieceId, base: string | undefined,
                 path?: string): Promise<GrepScan> {
-    return scanWorkpieceForGrep(this.gitCache, turn, workpieceId, base, path);
+    return scanWorkpieceForGrep(this.gitCache.walker, turn, workpieceId, base, path);
   }
 
   /**
@@ -941,7 +941,7 @@ export abstract class OverseerCore {
       if (base === undefined) continue;
       for (let [path, fileChange] of entries) {
         if (!("edit" in fileChange) || result.get(worktreeId)?.has(path)) continue;
-        let text = await this.gitCache.readFileAtCommitIfExists(base, path);
+        let text = await this.gitCache.walker.readFileAtCommitIfExists(base, path);
         if (text === undefined) continue;
         if (result === content) result = new Map(content);
         let files = new Map(result.get(worktreeId));
@@ -996,7 +996,7 @@ export abstract class OverseerCore {
         let key = `${worktreeId}:${path}`;
         let text = seeds.get(key);
         if (text === undefined) {
-          text = await this.gitCache.readFileAtCommitIfExists(base, path) ?? null;
+          text = await this.gitCache.walker.readFileAtCommitIfExists(base, path) ?? null;
           seeds.set(key, text);
         }
         if (text === null) continue;

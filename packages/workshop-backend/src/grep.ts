@@ -6,7 +6,7 @@
 import type { GrepFileError } from "./worktree-binding";
 import type { WorkpieceId } from "@gadgets/workshop-shared/api";
 import type { GitOid } from "@gadgets/workshop-shared/gatekeeper";
-import { UnreadableContentError, type WorkspaceGitCache } from "./git-cache";
+import { UnreadableContentError, type GitObjectWalker } from "./git-walker";
 import type { WorktreeTurnAccess } from "./agent";
 
 /** A searchable file: its path within the workpiece and full text. */
@@ -36,7 +36,7 @@ type GrepCandidate = { path: string } | { path: string, oid: GitOid, base: strin
  * error entry rather than failing it.
  */
 export async function scanWorkpieceForGrep(
-    gitCache: Pick<WorkspaceGitCache,
+    gitCache: Pick<GitObjectWalker,
         "pathEntryAtCommit" | "listCommitTreePaths" | "ensureBlobs" | "readTextBlob">,
     turn: Pick<WorktreeTurnAccess, "getOverlayFiles" | "getRemovedPaths">,
     workpieceId: WorkpieceId, base: string | undefined,

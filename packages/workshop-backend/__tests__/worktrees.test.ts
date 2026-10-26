@@ -933,7 +933,7 @@ describe("worktree commit head advancements", () => {
     expect(impl.storage.gadgets.get(id)!.headCommit).toBe(c1);
     expect(codeBaseOf(impl, 1).pins).toEqual([]);
     // The commit objects remain (dangling, like auto-commits).
-    expect(impl.gitCache.hasLocalObject(c3)).toBe(true);
+    expect(impl.gitCache.walker.hasLocalObject(c3)).toBe(true);
   }));
 
   it("a discard restores the head to the epoch's start across edits and several commit()s",

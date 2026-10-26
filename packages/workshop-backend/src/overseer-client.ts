@@ -393,7 +393,7 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
    * nothing an agent couldn't already trigger.
    */
   async listTree(commitId: string): Promise<TreeNode[]> {
-    return await this.impl.gitCache.readCommitTree(validateOid(commitId));
+    return await this.impl.gitCache.walker.readCommitTree(validateOid(commitId));
   }
 
   async readFilesAtCommit(commitId: string, paths: string[])
@@ -401,7 +401,7 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
     if (paths.length > MAX_READ_FILES_PER_CALL) {
       throw new Error(`Too many paths: at most ${MAX_READ_FILES_PER_CALL} per call.`);
     }
-    return await this.impl.gitCache.readFilesAtCommit(validateOid(commitId), paths);
+    return await this.impl.gitCache.walker.readFilesAtCommit(validateOid(commitId), paths);
   }
 
   async listChangedPaths(fromCommit: string, toCommit: string): Promise<string[]> {

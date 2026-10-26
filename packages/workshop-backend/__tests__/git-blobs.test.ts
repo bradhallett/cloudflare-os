@@ -3,7 +3,8 @@ import {expect, it, vi} from "vitest";
 import {makeMockStorage} from "./mock-storage";
 import {makeOverseerStorage} from "../src/storage-schema/overseer-storage";
 import {GitStore} from "../src/git-store";
-import {MAX_GIT_OBJECT_SIZE, WorkspaceGitCache} from "../src/git-cache";
+import {WorkspaceGitCache} from "../src/git-cache";
+import {MAX_GIT_OBJECT_SIZE} from "../src/git-walker";
 import {buildPackStream, decodeLooseObject, decodePackStream} from "../src/git-codec";
 
 function fixture() {
@@ -25,7 +26,7 @@ it("stores raw bytes and remote blobs in the same ordinary Git object collection
   expect(await cache.putFromGatekeeper(7, "blob", bytes)).toBe(oid);
   expect(await git.writeBlob(bytes)).toEqual(ref);
   expect([...storage.gitObjects.list()]).toHaveLength(1);
-  expect(cache.readLocalObject(oid)).toEqual({type: "blob", payload: bytes});
+  expect(cache.walker.readLocalObject(oid)).toEqual({type: "blob", payload: bytes});
   expect(git.readBlob(oid, ref.byteLength)).toEqual(bytes);
 });
 
@@ -73,11 +74,11 @@ it("commits binary and empty files as ordinary blobs and exports a byte-exact pa
   const bytes = Uint8Array.of(0, 255, 42), ref = await git.writeBlob(bytes);
   const empty = await git.writeBlob(new Uint8Array());
   const commit = await git.writeFilesAsCommit(new Map([["image.bin", ref], ["empty.bin", empty]]), options);
-  expect(await cache.fileBytesAtCommit(commit, "image.bin")).toEqual(ref);
-  expect(await cache.fileBytesAtCommit(commit, "empty.bin")).toEqual(empty);
+  expect(await cache.walker.fileBytesAtCommit(commit, "image.bin")).toEqual(ref);
+  expect(await cache.walker.fileBytesAtCommit(commit, "empty.bin")).toEqual(empty);
   const pack = buildPackStream(2, (async function* () {
-    yield await cache.ensureObject(ref.oid, {type: "blob"});
-    yield await cache.ensureObject(empty.oid, {type: "blob"});
+    yield await cache.walker.ensureObject(ref.oid, {type: "blob"});
+    yield await cache.walker.ensureObject(empty.oid, {type: "blob"});
   })());
   const received = [];
   for await (const object of decodePackStream(pack, {
@@ -93,11 +94,11 @@ it("decodes UTF-8 blobs by content and preserves old blob contents across replac
   const ref = await git.writeBlob(bytes);
   const commit = await git.writeFilesAsCommit(new Map([["a.txt", ref]]), options);
   expect(await git.readCommitFiles(commit)).toEqual(new Map([["a.txt", text]]));
-  expect(await cache.readFileAtCommit(commit, "a.txt")).toBe(text);
+  expect(await cache.walker.readFileAtCommit(commit, "a.txt")).toBe(text);
   const replacement = await git.writeBlob(Uint8Array.of(0, 255));
   const next = await git.writeChangedFilesAsCommit(new Map([["a.txt", replacement]]),
     {...options, treeBase: commit, parents: [commit]});
   await expect(git.readCommitFiles(next)).rejects.toThrow("not a text file");
   expect(git.readBlob(ref.oid)).toEqual(bytes);
-  expect(await cache.fileBytesAtCommit(commit, "a.txt")).toEqual(ref);
+  expect(await cache.walker.fileBytesAtCommit(commit, "a.txt")).toEqual(ref);
 });
