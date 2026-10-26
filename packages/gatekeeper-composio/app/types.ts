@@ -46,6 +46,44 @@ export interface Usage {
   deployment: QuotaCounters;
   own: QuotaCounters;
   limit: number;
+  events: EventUsage;
+}
+
+/** Trigger deliveries today (UTC), across every workspace on this account. */
+export interface EventUsage {
+  delivered: number;
+  dropped: number;
+  limit: number;
+}
+
+/** One armed trigger, as the Triggers section lists it. */
+export interface TriggerSummary {
+  triggerId: string;
+  workspaceId: string;
+  triggerSlug: string;
+  title: string;
+  createdAt: number;
+}
+
+/** Everything the Triggers section shows in one round trip. */
+export interface TriggersData {
+  triggers: TriggerSummary[];
+  notices: ExpiryNotice[];
+  webhooks: WebhookState;
+}
+
+/** A connected account upstream reported expired (no user_id to route by). */
+export interface ExpiryNotice {
+  toolkitSlug: string;
+  connectedAccountId: string;
+  statusReason?: string;
+  at: number;
+}
+
+/** The webhook subscription state this account's triggers depend on. */
+export interface WebhookState {
+  url: string | null;
+  subscribed: boolean;
 }
 
 /**
@@ -63,4 +101,8 @@ export type ComposioAppUiClient = {
   getSharing(): Promise<{ enabled: boolean }>;
   setSharing(on: boolean): Promise<void>;
   getUsage(): Promise<Usage>;
+  listTriggers(): Promise<TriggerSummary[]>;
+  expiryNotices(): Promise<ExpiryNotice[]>;
+  webhookState(): Promise<WebhookState>;
+  rotateWebhookSecret(): Promise<void>;
 };

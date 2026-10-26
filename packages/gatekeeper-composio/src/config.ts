@@ -27,12 +27,25 @@ const META_TOOL_SET: ReadonlySet<string> = new Set(META_TOOL_SLUGS);
 export function isMetaTool(slug: string): boolean {
   return META_TOOL_SET.has(slug);
 }
+/**
+ * The webhook route this worker serves relative to its public origin: `${basePath}/webhook` on
+ * the gatekeeper's BASE_URL (see webhooks.ts). PR 3 reserved the connect-callback suffix here;
+ * PR 4 adds its sibling.
+ */
+export const WEBHOOK_ROUTE_SUFFIX = "/webhook";
 
 /**
  * Placeholder callback route for Connect Link flows; PR 4 may replace it. Declared here so the
  * constant has a single home if the webhook route lands.
  */
 export const CONNECT_LINK_CALLBACK_PATH = "/gatekeeper/composio/connect-callback";
+
+/**
+ * Per-workspace, per-UTC-day cap on delivered trigger events. Composio redelivers on failure and
+ * the fan-out is per trigger, so a runaway upstream must not be able to spend unbounded delivery
+ * or callback attention; over-limit events are dropped and counted visibly in the app UI.
+ */
+export const EVENTS_PER_WORKSPACE_PER_DAY = 500;
 
 /**
  * The deployment project key. Throws a clear error when unset — the vendor fails closed rather
@@ -59,4 +72,41 @@ export function dailyCallLimit(env: { COMPOSIO_DAILY_CALL_LIMIT?: string }): num
     throw new Error(`COMPOSIO_DAILY_CALL_LIMIT must be a positive integer, got ${raw}.`);
   }
   return parsed;
+}
+
+/**
+ * The webhook origin for this deployment. Production reads the manifest-templated BASE_URL;
+ * WEBHOOK_ORIGIN (a tunnel's public origin, same var as the GitHub connector) overrides it for
+ * local development, where the dev server's origin is not publicly reachable. Returns `null`
+ * when neither yields an https origin — callers must refuse rather than register an unreachable
+ * or plain-http subscription URL.
+ */
+export function webhookOrigin(env: {
+  BASE_URL?: string;
+  WEBHOOK_ORIGIN?: string;
+}): string | null {
+  const raw = env.WEBHOOK_ORIGIN?.trim() || env.BASE_URL?.trim();
+  if (raw === undefined || raw === "") return null;
+  let origin: string;
+  try {
+    origin = new URL(raw).origin;
+  } catch {
+    return null;
+  }
+  return origin.startsWith("https://") ? origin : null;
+}
+
+/**
+ * The base path of the gatekeeper's route under the public origin, from BASE_URL (e.g.
+ * `https://host/gatekeeper/composio` → `/gatekeeper/composio`). Empty when BASE_URL is unset
+ * (production always sets it; tests may not).
+ */
+export function gatekeeperBasePath(env: { BASE_URL?: string }): string {
+  const raw = env.BASE_URL?.trim();
+  if (raw === undefined || raw === "") return "";
+  try {
+    return new URL(raw).pathname.replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
 }

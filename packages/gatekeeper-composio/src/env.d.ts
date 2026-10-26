@@ -11,8 +11,10 @@ declare namespace Cloudflare {
     /** Where browsers reach this worker; joins Connect Link callback URLs. */
     BASE_URL?: string;
     /**
-     * The public origin Composio delivers webhook events to. Placeholder for PR 4 (triggers and
-     * webhooks); nothing in PR 3 reads it.
+     * The public origin Composio delivers webhook events to — a dev tunnel's https origin,
+     * overriding BASE_URL when set (same var as the GitHub connector). Without an https origin
+     * from either source, trigger enablement refuses rather than registering a subscription
+     * Composio could never deliver to.
      */
     WEBHOOK_ORIGIN?: string;
   }

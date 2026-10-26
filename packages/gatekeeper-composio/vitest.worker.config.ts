@@ -21,6 +21,9 @@ export default defineConfig({
       miniflare: {
         compatibilityDate,
         compatibilityFlags,
+        // The https origin trigger deliveries target: without it, subscription creation (and so
+        // every trigger enable) refuses, exactly as production does without a public origin.
+        bindings: { WEBHOOK_ORIGIN: "https://composio.test" },
         durableObjects: {
           COMPOSIO_ACCOUNT: { className: "ComposioAccount", useSQLite: true },
           COMPOSIO_SINGLETON: { className: "ComposioSingletonGatekeeper", useSQLite: true },

@@ -38,14 +38,26 @@ import {
 import { ToolkitPolicy, resolveToolkitPolicy } from "./policy.js";
 import {
   CONNECT_LINK_CALLBACK_PATH,
+  EVENTS_PER_WORKSPACE_PER_DAY,
   dailyCallLimit,
   deploymentApiKey,
   isMetaTool,
 } from "./config.js";
+import { HookDeliveryQueue } from "@gadgets/gatekeeper-kit/hook-delivery-queue";
+import { buildDescription, quoteUntrusted } from "@gadgets/gatekeeper-kit/action-description";
+import { capUtf8 } from "./composio-api.js";
 import type { SingletonFacetProps, ToolkitFacetProps } from "./facet.js";
 import { QuotaTable, quotaDay, type QuotaCounters } from "./quota.js";
 import { startAppUi } from "./app-ui.js";
+import type { ComposioTriggerInitiator, ComposioTriggerMessage } from "./triggers.js";
 import { TOOLKIT_RESOURCE, composioFetch, logger } from "./worker.js";
+import {
+  WEBHOOK_EVENT_TYPES,
+  parseWebhookEnvelope,
+  verifyWebhookSignature,
+  webhookSubscriptionUrl,
+  type ParsedWebhook,
+} from "./webhooks.js";
 
 /** Which Composio project key this account spends: the deployment's, or the owner's own. */
 export type ComposioKeyMode = "deployment" | "own";
@@ -115,10 +127,84 @@ const SEARCH_RESULT_LIMIT = 50;
 const MAX_SLUG_LENGTH = 120;
 /** HTTP statuses Composio can only have answered before executing anything. */
 const PRE_EXECUTION_4XX: ReadonlySet<number> = new Set([400, 401, 403, 404, 422]);
+/** Reconciliation cadence while any trigger row exists. */
+const RECONCILE_INTERVAL_MS = 15 * 60 * 1000;
+/** One queued trigger event's payload cap (96 KiB, past which the payload truncates). */
+const MAX_TRIGGER_EVENT_BYTES = 96 * 1024;
+/** Expiry notices kept for the app's connection panel. */
+const EXPIRY_NOTICES_LIMIT = 50;
+/** How long envelope-id dedupe markers live (mirrors the delivery queue's retention). */
+const WEBHOOK_SEEN_TTL_MS = 24 * 60 * 60 * 1000;
+/** Minimum spacing between upstream subscription listings for the signature self-heal. */
+const WEBHOOK_SECRET_REFRESH_MIN_INTERVAL_MS = 60 * 1000;
+
+/** KV key of one trigger's stored initiator capability. */
+function triggerCapsKey(triggerId: string): string {
+  return `triggerCaps:${triggerId}`;
+}
+
+/** KV key of the stored webhook subscription for one key mode. */
+function subscriptionKey(mode: ComposioKeyMode): string {
+  return `webhookSubscription:${mode}`;
+}
+
+/** What the trigger controller forwards at enable time (triggers.ts mints the controller). */
+export type ComposioTriggerEnableSpec = {
+  triggerId: string;
+  triggerSlug: string;
+  filters: Record<string, unknown>;
+  title: string;
+  description: string;
+  workspaceId: string;
+  gadgetId?: number;
+};
+
+/** One composio_triggers row. */
+type StoredTriggerRow = {
+  trigger_id: string;
+  workspace_id: string;
+  gadget_id: string | null;
+  trigger_slug: string;
+  filters_json: string;
+  title: string;
+  description: string;
+  upstream_trigger_id: string | null;
+  created_at: number;
+};
+
+/** The app-panel projection of a trigger row. */
+export type ComposioTriggerRowPublic = {
+  triggerId: string;
+  workspaceId: string;
+  triggerSlug: string;
+  title: string;
+  createdAt: number;
+};
+
+/** The initiator capability stored per trigger (stub storage is enabled for this worker). */
+type StoredTriggerCaps = { initiator: ComposioTriggerInitiator };
+
+/** The stored webhook subscription of one key mode (`secret` empty when upstream hid it). */
+type StoredWebhookSubscription = { id: string; secret: string; url: string };
+
+/** One connected-account expiry notice, as the app's connection panel shows it. */
+export type ExpiryNotice = {
+  toolkitSlug: string;
+  connectedAccountId: string;
+  statusReason?: string;
+  at: number;
+};
+
+function disposeStub(value: unknown): void {
+  const disposable = value as { [Symbol.dispose]?: () => void } | undefined;
+  disposable?.[Symbol.dispose]?.();
+}
+
 
 @validateRpc()
 export class ComposioAccount extends DurableObject<Cloudflare.Env> {
   readonly #quota: QuotaTable;
+  readonly #triggerQueue: HookDeliveryQueue<ComposioTriggerMessage>;
   #mutex: Promise<unknown> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
@@ -144,6 +230,34 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
     } catch {
       // Column already present.
     }
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS composio_triggers (
+      trigger_id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      gadget_id TEXT,
+      trigger_slug TEXT NOT NULL,
+      filters_json TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL,
+      upstream_trigger_id TEXT,
+      created_at INTEGER NOT NULL
+    ) STRICT`);
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS composio_events (
+      workspace_id TEXT NOT NULL,
+      day TEXT NOT NULL,
+      delivered INTEGER NOT NULL DEFAULT 0,
+      dropped INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (workspace_id, day)
+    ) STRICT`);
+    this.#triggerQueue = new HookDeliveryQueue<ComposioTriggerMessage>(
+      ctx.storage.kv,
+      () => {
+        // Dropped-after-retries is visibility, not an error: the queue's retention already
+        // bounds the state, and the per-day event counters below keep the loss countable.
+        logger.warn("trigger delivery dropped after final attempt", {
+          event: "account.trigger.delivery.dropped",
+        });
+      },
+    );
   }
 
   /** The stable account id this DO was named with at mint (createAccount's random uuid). */
@@ -240,9 +354,10 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * Revokes the account: deletes every connected upstream account (best-effort), tears down the
-   * Composio sessions, then drops all state. PR 4 adds trigger-instance and webhook-subscription
-   * teardown here (see plans/composio-gatekeeper.md "Keys" — the subscription is per project).
+   * Revokes the account: deletes every connected upstream account and trigger instance
+   * (best-effort, the own-mode project's webhook subscription with them), tears down the
+   * Composio sessions, then drops all state. The deployment project's webhook subscription
+   * survives — it is shared by every account of this deployment.
    */
   async revoke(): Promise<void> {
     await this.#serialized(async () => {
@@ -256,6 +371,30 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
           event: "account.revoke.connected-accounts-failed", error: err,
         });
       }
+      try {
+        const api = await this.#api();
+        for (const row of this.#triggerRows()) {
+          if (row.upstream_trigger_id !== null) {
+            await api.deleteTriggerInstance(row.upstream_trigger_id).catch(() => {});
+          }
+        }
+        if ((await this.#keyState()).keyMode === "own") {
+          const stored = await this.#storedSubscription("own");
+          if (stored !== undefined) {
+            await api.deleteWebhookSubscription(stored.id).catch(() => {});
+          }
+        }
+      } catch (err) {
+        logger.warn("revocation could not clean up trigger instances", {
+          event: "account.revoke.triggers-failed", error: err,
+        });
+      }
+      for (const row of this.#triggerRows()) {
+        const caps = await this.ctx.storage.get<StoredTriggerCaps>(
+          triggerCapsKey(row.trigger_id));
+        disposeStub(caps?.initiator);
+      }
+      await this.ctx.storage.deleteAlarm();
       await this.#deleteSessions();
       logger.info("account revoked", { event: "account.revoke.completed" });
     });
@@ -357,6 +496,9 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
           "awaiting approval or input. Approve, reject, or let them expire first.");
       }
 
+      const previousMode = (await this.ctx.storage.get<ComposioKeyMode>("keyMode"))
+        ?? "deployment";
+      const previousOwnKey = await this.ctx.storage.get<string>("ownApiKey");
       await this.#deleteSessions();
       const generation = (await this.ctx.storage.get<number>("generation") ?? 1) + 1;
       await this.ctx.storage.put("generation", generation);
@@ -364,11 +506,102 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
       if (ownKey === undefined) await this.ctx.storage.delete("ownApiKey");
       else await this.ctx.storage.put("ownApiKey", ownKey);
       await this.ctx.storage.delete(CATALOG_CACHE_KEY);
+      await this.#migrateTriggersForKeySwitch(previousMode, previousOwnKey);
 
       logger.info("key mode switched", {
         event: "account.key.switched", keyMode: mode, count: generation,
       });
     });
+  }
+
+  /**
+   * Moves every trigger to the new key's project after a switch: the old project's instances
+   * are deleted (the old own project's webhook subscription with them — the deployment
+   * project's subscription is shared and stays), the instances are re-created under the new
+   * key, and the new mode's subscription is ensured. All best-effort with warns: the
+   * generation fence already stopped in-flight work, and reconciliation heals what it can see
+   * — but an old-project instance no new key can list may orphan, which is logged, not fatal.
+   */
+  async #migrateTriggersForKeySwitch(
+    previousMode: ComposioKeyMode,
+    previousOwnKey: string | undefined,
+  ): Promise<void> {
+    const rows = this.#triggerRows();
+    let previousApi: ComposioApi | undefined;
+    if (previousMode === "own") {
+      if (previousOwnKey !== undefined) {
+        previousApi = new ComposioApi(previousOwnKey, composioFetch());
+      }
+      const stored = await this.#storedSubscription("own");
+      if (stored !== undefined) {
+        if (previousApi !== undefined) {
+          try {
+            await previousApi.deleteWebhookSubscription(stored.id);
+          } catch (err) {
+            logger.warn("could not delete the previous own project's webhook subscription", {
+              event: "account.webhook.own-subscription-delete-failed", error: err,
+            });
+          }
+        }
+        await this.ctx.storage.delete(subscriptionKey("own"));
+      }
+    } else {
+      try {
+        previousApi = new ComposioApi(deploymentApiKey(this.env), composioFetch());
+      } catch {
+        // No deployment key was ever configured; nothing was created under it either.
+      }
+    }
+
+    if (rows.length === 0) return;
+    let nextApi: ComposioApi | undefined;
+    try {
+      const keyState = await this.#keyState();
+      nextApi = new ComposioApi(await this.#activeApiKey(keyState), composioFetch());
+    } catch {
+      // The new mode has no usable key (e.g. switching back to a keyless deployment): drop the
+      // upstream pointers so reconciliation recreates the instances once a key exists again.
+      this.ctx.storage.sql.exec("UPDATE composio_triggers SET upstream_trigger_id = NULL");
+      logger.warn("key switch left trigger instances uncreated: no usable key", {
+        event: "account.trigger.switch-no-key",
+      });
+      return;
+    }
+    for (const row of rows) {
+      if (previousApi !== undefined && row.upstream_trigger_id !== null) {
+        try {
+          await previousApi.deleteTriggerInstance(row.upstream_trigger_id);
+        } catch (err) {
+          logger.warn("could not delete an old-project trigger instance", {
+            event: "account.trigger.old-instance-delete-failed", error: err,
+          });
+        }
+      }
+      try {
+        const upstreamId = await nextApi.upsertTriggerInstance(row.trigger_slug, {
+          composioUserId: this.composioUserId,
+          triggerConfig: JSON.parse(row.filters_json) as Record<string, unknown>,
+        });
+        this.ctx.storage.sql.exec(
+          "UPDATE composio_triggers SET upstream_trigger_id = ? WHERE trigger_id = ?",
+          upstreamId, row.trigger_id,
+        );
+      } catch (err) {
+        logger.warn("could not recreate a trigger instance under the new key", {
+          event: "account.trigger.switch-recreate-failed",
+          triggerSlug: row.trigger_slug, error: err,
+        });
+      }
+    }
+    try {
+      const keyState = await this.#keyState();
+      await this.#ensureSubscription(keyState.keyMode, nextApi);
+    } catch (err) {
+      logger.warn("could not ensure the webhook subscription after a key switch", {
+        event: "account.webhook.subscription-switch-failed", error: err,
+      });
+    }
+    await this.#planAlarmAfterMutation();
   }
 
   /**
@@ -514,14 +747,623 @@ export class ComposioAccount extends DurableObject<Cloudflare.Env> {
     }
   }
 
-  /** Today's quota usage for the app's usage panel (per-mode counters, see quota.ts). */
-  async usage(): Promise<{ deployment: QuotaCounters; own: QuotaCounters; limit: number }> {
+  /**
+   * Today's quota usage for the app's usage panel: per-mode call counters (quota.ts) plus the
+   * per-workspace trigger-event counters, summed across workspaces for the day (UTC).
+   */
+  async usage(): Promise<{
+    deployment: QuotaCounters;
+    own: QuotaCounters;
+    limit: number;
+    events: { delivered: number; dropped: number; limit: number };
+  }> {
     const day = quotaDay();
+    const eventRows = this.ctx.storage.sql.exec<{ delivered: number; dropped: number }>(
+      "SELECT delivered, dropped FROM composio_events WHERE day = ?", day,
+    ).toArray();
     return {
       deployment: this.#quota.counts(`deployment:${day}`),
       own: this.#quota.counts(`own:${day}`),
       limit: dailyCallLimit(this.env),
+      events: {
+        delivered: eventRows.reduce((sum, row) => sum + row.delivered, 0),
+        dropped: eventRows.reduce((sum, row) => sum + row.dropped, 0),
+        limit: EVENTS_PER_WORKSPACE_PER_DAY,
+      },
     };
+  }
+
+  // -- Triggers and webhooks -------------------------------------------------
+
+  /**
+   * Arms one trigger: creates (or repairs) the project's webhook subscription, upserts the
+   * upstream instance, and only then records the row and stores the initiator — an upstream
+   * failure leaves no local state, so a failed enable can always be retried as a fresh enable.
+   * Serialized with every other trigger mutation and reconciliation.
+   */
+  async enableTrigger(
+    spec: ComposioTriggerEnableSpec,
+    initiator: ComposioTriggerInitiator,
+  ): Promise<void> {
+    await this.#serialized(async () => {
+      const keyState = await this.#keyState();
+      const api = new ComposioApi(await this.#activeApiKey(keyState), composioFetch());
+      await this.#ensureSubscription(keyState.keyMode, api);
+      let upstreamId: string;
+      try {
+        upstreamId = await api.upsertTriggerInstance(spec.triggerSlug, {
+          composioUserId: this.composioUserId,
+          triggerConfig: spec.filters,
+        });
+      } catch (err) {
+        // Only the numeric code is safe to surface: message text can quote request data.
+        const status = err instanceof ComposioApiError ? err.status : 502;
+        throw new Error(`Composio upstream unavailable (HTTP ${status}); trigger not armed.`, { cause: err });
+      }
+      this.ctx.storage.sql.exec(
+        `INSERT INTO composio_triggers
+           (trigger_id, workspace_id, gadget_id, trigger_slug, filters_json, title, description,
+            upstream_trigger_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(trigger_id) DO UPDATE SET
+           upstream_trigger_id = excluded.upstream_trigger_id`,
+      spec.triggerId, spec.workspaceId,
+      spec.gadgetId !== undefined ? String(spec.gadgetId) : null, spec.triggerSlug,
+        JSON.stringify(spec.filters), spec.title, spec.description, upstreamId, Date.now(),
+      );
+      await this.ctx.storage.put(triggerCapsKey(spec.triggerId), { initiator });
+      await this.#planAlarmAfterMutation();
+      logger.info("trigger enabled", {
+        event: "account.trigger.enabled",
+        triggerSlug: spec.triggerSlug, workspaceId: spec.workspaceId,
+      });
+    });
+  }
+
+  /**
+   * Disarms one trigger: the upstream instance is deleted first (a failure is logged and left
+   * to reconciliation), then the queued deliveries are cancelled, the initiator disposed, and
+   * the row and capability record dropped. Idempotent: an unknown id is a no-op. The
+   * `workspaceId` fence refuses a row armed by another workspace (the scheduler's rule).
+   */
+  async disableTrigger(triggerId: string, workspaceId: string): Promise<void> {
+    await this.#serialized(async () => {
+      const row = this.#triggerRow(triggerId);
+      this.#triggerQueue.cancel(triggerId);
+      if (row === undefined) {
+        await this.#planAlarmAfterMutation();
+        return;
+      }
+      if (row.workspace_id !== workspaceId) {
+        // The scheduler's fence: a session of one workspace cannot disarm another
+        // workspace's trigger by its bare id.
+        throw new Error(
+          `Trigger ${quoteUntrusted(triggerId, 80)} does not belong to this workspace.`);
+      }
+      if (row.upstream_trigger_id !== null) {
+        try {
+          await (await this.#api()).deleteTriggerInstance(row.upstream_trigger_id);
+        } catch (err) {
+          logger.warn("could not delete trigger instance upstream", {
+            event: "account.trigger.upstream-delete-failed", error: err,
+          });
+        }
+      }
+      await this.#dropTriggerState(triggerId);
+      await this.#planAlarmAfterMutation();
+      logger.info("trigger disabled", {
+        event: "account.trigger.disabled", triggerSlug: row.trigger_slug,
+      });
+    });
+  }
+
+  /** The account's triggers, for the app's trigger panel. */
+  async listTriggers(): Promise<ComposioTriggerRowPublic[]> {
+    return this.#triggerRows().map(row => ({
+      triggerId: row.trigger_id,
+      workspaceId: row.workspace_id,
+      triggerSlug: row.trigger_slug,
+      title: row.title,
+      createdAt: row.created_at,
+    }));
+  }
+
+  /**
+   * Ingests one webhook delivery. Signature first — everything else about the envelope is
+   * attacker-controllable — then parse, dedupe on the envelope id (upstream is at-least-once;
+   * the id is stable across retries), then the per-kind handling below. Returns the HTTP status
+   * the worker should answer with: 401 (bad signature), 400 (malformed), 200 (handled or
+   * intentionally dropped — dropping must ACK, or Composio would redeliver a dead letter
+   * forever).
+   */
+  async ingestWebhook(
+    rawBody: string,
+    webhookId: string,
+    timestamp: string,
+    signature: string,
+  ): Promise<number> {
+    const keyState = await this.#keyState();
+    const verified = await this.#verifyInboundWebhook(
+      keyState.keyMode, rawBody, webhookId, timestamp, signature);
+    if (!verified) return 401;
+    const parsed = parseWebhookEnvelope(rawBody);
+    if (!parsed.ok) {
+      logger.info("webhook envelope malformed", { event: "webhook.ingest.malformed" });
+      return 400;
+    }
+    const event = parsed.event;
+    if (event.kind === "unknown") {
+      logger.info("webhook event of unsubscribed type acknowledged", {
+        event: "webhook.ingest.unknown-type",
+      });
+      return 200;
+    }
+    let status = 200;
+    await this.#serialized(async () => {
+      const seenKey = `webhookSeen:${event.eventId}`;
+      if (await this.ctx.storage.get(seenKey) !== undefined) {
+        status = 200; // A redelivery of an already-ingested envelope: ACK and do nothing.
+        return;
+      }
+      // The marker goes down only after the ingest succeeded: a crash mid-ingest leaves it
+      // absent, so the redelivery retries instead of ACKing a lost event (the queue's own
+      // message-id dedupe still suppresses a double delivery).
+      if (event.kind === "trigger") {
+        await this.#ingestTriggerEvent(event);
+      } else {
+        await this.#recordExpiryNotice(event);
+      }
+      await this.ctx.storage.put(seenKey, Date.now());
+    });
+    return status;
+  }
+
+  /** Routes one verified trigger event to its row, quota, and delivery queue. */
+  async #ingestTriggerEvent(event: Extract<ParsedWebhook, { kind: "trigger" }>): Promise<void> {
+    const row = this.ctx.storage.sql.exec<StoredTriggerRow>(
+      "SELECT * FROM composio_triggers WHERE upstream_trigger_id = ?",
+      event.upstreamTriggerId,
+    ).toArray()[0];
+    if (row === undefined) {
+      // Unknown or already-disabled upstream instance (a redelivery racing disable): ACK so
+      // Composio stops retrying; nothing here is in a recoverable state.
+      logger.info("webhook trigger event for unknown instance acknowledged", {
+        event: "webhook.ingest.unknown-trigger",
+      });
+      return;
+    }
+    const day = quotaDay();
+    const counters = this.ctx.storage.sql.exec<{ delivered: number }>(
+      "SELECT delivered FROM composio_events WHERE workspace_id = ? AND day = ?",
+      row.workspace_id, day,
+    ).toArray()[0];
+    if ((counters?.delivered ?? 0) >= EVENTS_PER_WORKSPACE_PER_DAY) {
+      this.#countEvent(row.workspace_id, day, "dropped");
+      logger.warn("trigger event dropped: workspace daily event limit reached", {
+        event: "webhook.ingest.event-quota-dropped", workspaceId: row.workspace_id,
+      });
+      return;
+    }
+    this.#countEvent(row.workspace_id, day, "delivered");
+    const serializedData = JSON.stringify(event.data ?? null);
+    const dataJson = capUtf8(serializedData, MAX_TRIGGER_EVENT_BYTES);
+    this.#triggerQueue.enqueue(row.trigger_id, event.eventId, {
+      eventId: event.eventId,
+      triggerSlug: event.triggerSlug,
+      timestamp: event.timestamp === undefined
+        || !Number.isFinite(Date.parse(event.timestamp))
+        ? null
+        : Date.parse(event.timestamp),
+      dataJson,
+      truncated: dataJson.length < serializedData.length,
+    }, Date.now());
+    await this.#planAlarmAfterMutation();
+  }
+
+  /** Records one connected-account expiry notice (bounded, newest first). */
+  async #recordExpiryNotice(
+    event: Extract<ParsedWebhook, { kind: "connected_account_expired" }>,
+  ): Promise<void> {
+    const notices = await this.ctx.storage.get<ExpiryNotice[]>("expiryNotices") ?? [];
+    notices.unshift({
+      toolkitSlug: event.toolkitSlug,
+      connectedAccountId: event.connectedAccountId,
+      ...(event.statusReason === undefined ? {} : { statusReason: event.statusReason }),
+      at: Date.now(),
+    });
+    await this.ctx.storage.put("expiryNotices", notices.slice(0, EXPIRY_NOTICES_LIMIT));
+    logger.info("connected account expiry noticed", {
+      event: "webhook.ingest.account-expired", toolkitSlug: event.toolkitSlug,
+    });
+  }
+
+  /** The bounded expiry-notice list for the app's connection panel. */
+  async expiryNotices(): Promise<ExpiryNotice[]> {
+    return await this.ctx.storage.get<ExpiryNotice[]>("expiryNotices") ?? [];
+  }
+
+  /**
+   * Rotates the active mode's webhook signing secret upstream and stores the replacement. In
+   * deployment mode the subscription is project-wide, so every account's stored copy self-heals
+   * on its next ingest (see #verifyInboundWebhook).
+   */
+  async rotateWebhookSecret(): Promise<void> {
+    await this.#serialized(async () => {
+      const keyState = await this.#keyState();
+      const api = new ComposioApi(await this.#activeApiKey(keyState), composioFetch());
+      const stored = await this.#storedSubscription(keyState.keyMode);
+      if (stored === undefined) {
+        await this.#ensureSubscription(keyState.keyMode, api);
+        return;
+      }
+      const secret = await api.rotateWebhookSecret(stored.id);
+      await this.ctx.storage.put(subscriptionKey(keyState.keyMode), { ...stored, secret });
+      logger.info("webhook signing secret rotated", {
+        event: "account.webhook.secret-rotated", keyMode: keyState.keyMode,
+      });
+    });
+  }
+
+  /**
+   * The webhook surface for the app's panel: the URL Composio delivers to, and whether the
+   * subscription exists yet (it is created on the first trigger enable or rotation).
+   */
+  async webhookState(): Promise<{ url: string | null; subscribed: boolean }> {
+    let url: string | null = null;
+    try {
+      url = webhookSubscriptionUrl(this.env);
+    } catch {
+      url = null;
+    }
+    const keyState = await this.#keyState();
+    return {
+      url,
+      subscribed: await this.#storedSubscription(keyState.keyMode) !== undefined,
+    };
+  }
+
+  /** The DO's alarm: reconcile (15-minute cadence while triggers exist), deliver, replan. */
+  async alarm(): Promise<void> {
+    const now = Date.now();
+    await this.#serialized(async () => {
+      await this.#pruneWebhookSeen(now);
+      const hasTriggers = this.#triggerRows().length > 0;
+      const last = await this.ctx.storage.get<number>("lastReconcileAt") ?? 0;
+      if (hasTriggers && now - last >= RECONCILE_INTERVAL_MS) {
+        await this.#reconcile(now);
+      }
+    });
+    // Deliveries run outside the mutex: a callback that calls back into this account (a read,
+    // a trigger listing) must not deadlock against the delivery that invoked it.
+    await this.#triggerQueue.run(now, (triggerId, message) =>
+      this.#deliverTrigger(triggerId, message));
+    await this.#serialized(() => this.#planAlarm());
+  }
+
+  /**
+   * Delivers one queued event: startHook → authorizeObservation → onTrigger, each failure
+   * thrown for the queue's backoff. The initiator stub is disposed once per attempt; the
+   * stored capability record survives for the next one.
+   */
+  async #deliverTrigger(triggerId: string, message: ComposioTriggerMessage): Promise<void> {
+    const row = this.#triggerRow(triggerId);
+    if (row === undefined) return; // Disabled mid-queue; the message completes and drops.
+    const caps = await this.ctx.storage.get<StoredTriggerCaps>(triggerCapsKey(triggerId));
+    if (caps === undefined) return;
+    let hookResult: Awaited<ReturnType<ComposioTriggerInitiator["startHook"]>> | undefined;
+    try {
+      // @ts-expect-error Worker RPC promises are disposable even though the mapped type omits it.
+      using hookCall = caps.initiator.startHook();
+      hookResult = await hookCall;
+      if (hookResult === undefined || hookResult === null) {
+        throw new Error("The workspace refused the trigger delivery (startHook).");
+      }
+      const preview = capUtf8(message.dataJson, 512);
+      let previewValue: unknown = preview;
+      try {
+        previewValue = JSON.parse(preview);
+      } catch {
+        // The preview cut mid-JSON (any payload over the cap), or the payload itself was
+        // truncated at ingest: either way the raw capped text still describes it.
+      }
+      await hookResult.approvalQueue.authorizeObservation({
+        title: row.title,
+        description: buildDescription(
+          `Deliver Composio trigger ${quoteUntrusted(message.triggerSlug, 80)} event ` +
+            `${quoteUntrusted(message.eventId, 80)} to this workspace.` +
+            (message.truncated ? " The payload was truncated in transit." : ""),
+        ).json("Payload preview", previewValue).finish().description,
+      });
+      let data: unknown = null;
+      try {
+        data = JSON.parse(message.dataJson);
+      } catch {
+        // A truncated payload cannot parse; deliver the truncation marker instead.
+      }
+      await hookResult.callback.onTrigger({
+        triggerId,
+        eventId: message.eventId,
+        triggerSlug: message.triggerSlug,
+        ...(message.timestamp !== null && Number.isFinite(message.timestamp)
+          ? { timestamp: new Date(message.timestamp).toISOString() }
+          : {}),
+        data,
+      });
+    } finally {
+      disposeStub(caps.initiator);
+    }
+  }
+
+  /**
+   * Walks the upstream active-instance list against local rows and repairs drift both ways:
+   * a local row with no (or a disabled) upstream instance is re-upserted, and an upstream
+   * instance with no local row (a disable whose delete failed, or a pre-key-switch leftover
+   * in this project) is deleted. Client-filtered to this account's Composio user id.
+   */
+  async #reconcile(now: number): Promise<void> {
+    let api: ComposioApi;
+    try {
+      api = await this.#api();
+    } catch (err) {
+      logger.warn("trigger reconcile skipped: no usable key", {
+        event: "account.trigger.reconcile-no-key", error: err,
+      });
+      return;
+    }
+    const rows = this.#triggerRows();
+    const byUpstream = new Map(
+      rows.filter(row => row.upstream_trigger_id !== null)
+        .map(row => [row.upstream_trigger_id as string, row]));
+    const upstreamIds = new Set<string>();
+    const disabledUpstream: StoredTriggerRow[] = [];
+    try {
+      await api.forEachActiveTriggerInstance(batch => {
+        for (const instance of batch) {
+          if (instance.composioUserId !== this.composioUserId) continue;
+          upstreamIds.add(instance.id);
+          if (instance.disabledAt !== null) {
+            const row = byUpstream.get(instance.id);
+            if (row !== undefined) disabledUpstream.push(row);
+          }
+        }
+      });
+    } catch (err) {
+      logger.warn("trigger reconcile listing failed", {
+        event: "account.trigger.reconcile-list-failed", error: err,
+      });
+      return; // Retry at the next interval; nothing was mutated.
+    }
+    for (const instanceId of upstreamIds) {
+      if (byUpstream.has(instanceId)) continue;
+      try {
+        await api.deleteTriggerInstance(instanceId);
+        logger.info("reconcile deleted an orphaned trigger instance", {
+          event: "account.trigger.reconcile-deleted",
+        });
+      } catch (err) {
+        logger.warn("reconcile could not delete an orphaned trigger instance", {
+          event: "account.trigger.reconcile-delete-failed", error: err,
+        });
+      }
+    }
+    const repaired = new Set(disabledUpstream.map(row => row.trigger_id));
+    for (const row of [...disabledUpstream,
+      ...rows.filter(pending => pending.upstream_trigger_id === null
+        || !upstreamIds.has(pending.upstream_trigger_id))]) {
+      if (row.upstream_trigger_id !== null && upstreamIds.has(row.upstream_trigger_id)
+        && !repaired.has(row.trigger_id)) {
+        continue;
+      }
+      try {
+        const filters = JSON.parse(row.filters_json) as Record<string, unknown>;
+        const upstreamId = await api.upsertTriggerInstance(row.trigger_slug, {
+          composioUserId: this.composioUserId,
+          triggerConfig: filters,
+        });
+        this.ctx.storage.sql.exec(
+          "UPDATE composio_triggers SET upstream_trigger_id = ? WHERE trigger_id = ?",
+          upstreamId, row.trigger_id,
+        );
+      } catch (err) {
+        logger.warn("reconcile could not re-upsert a trigger instance", {
+          event: "account.trigger.reconcile-upsert-failed",
+          triggerSlug: row.trigger_slug, error: err,
+        });
+      }
+    }
+    await this.ctx.storage.put("lastReconcileAt", now);
+  }
+
+  /**
+   * Ensures the project-level webhook subscription exists and points here: create, or on 409
+   * adopt the existing row (PATCHing it when URL or events drifted). The signing secret is
+   * stored per key mode — deployment mode shares one project (and thus one subscription) across
+   * every account, own mode owns its project alone.
+   */
+  async #ensureSubscription(mode: ComposioKeyMode, api: ComposioApi): Promise<void> {
+    const url = webhookSubscriptionUrl(this.env);
+    const existing = await this.#storedSubscription(mode);
+    if (existing !== undefined && existing.url === url) return;
+    try {
+      const created = await api.createWebhookSubscription(url, [...WEBHOOK_EVENT_TYPES]);
+      await this.ctx.storage.put(subscriptionKey(mode), {
+        id: created.id,
+        secret: created.secret ?? "",
+        url,
+      });
+      logger.info("webhook subscription created", {
+        event: "account.webhook.subscription-created", keyMode: mode,
+      });
+      return;
+    } catch (err) {
+      if (!(err instanceof ComposioApiError) || err.status !== 409) throw err;
+    }
+    const subscriptions = await api.listWebhookSubscriptions();
+    const ours = subscriptions.find(sub => sub.webhookUrl === url) ?? subscriptions[0];
+    if (ours === undefined) {
+      throw new Error("Composio reports a conflicting webhook subscription but lists none.");
+    }
+    if (ours.webhookUrl !== url
+      || !WEBHOOK_EVENT_TYPES.every(type => ours.enabledEvents.includes(type))) {
+      await api.updateWebhookSubscription(ours.id, {
+        webhookUrl: url,
+        enabledEvents: [...WEBHOOK_EVENT_TYPES],
+      });
+    }
+    await this.ctx.storage.put(subscriptionKey(mode), {
+      id: ours.id,
+      secret: ours.secret ?? "",
+      url,
+    });
+    logger.info("webhook subscription adopted", {
+      event: "account.webhook.subscription-adopted", keyMode: mode,
+    });
+  }
+
+  /**
+   * Verifies one inbound delivery against the stored secret for `mode`, self-healing once
+   * through the subscription listing when the stored secret no longer matches (an upstream
+   * rotation, or another deployment-mode account rotating the shared project secret). The
+   * heal spends a billed upstream listing, so it never runs for an account holding nothing
+   * to verify against (no stored subscription and no trigger rows) and at most once per
+   * interval per mode: forged traffic on the unauthenticated route must not burn quota.
+   */
+  async #verifyInboundWebhook(
+    mode: ComposioKeyMode,
+    rawBody: string,
+    webhookId: string,
+    timestamp: string,
+    signature: string,
+  ): Promise<boolean> {
+    const stored = await this.#storedSubscription(mode);
+    if (stored !== undefined && stored.secret !== ""
+      && await verifyWebhookSignature({
+        webhookId, timestamp, signatureHeader: signature, rawBody, secret: stored.secret,
+      })) {
+      return true;
+    }
+    if (stored === undefined && this.#triggerRows().length === 0) {
+      // Nothing of this account's was ever armed or subscribed: the signature can only be
+      // verified by spending upstream quota, so refuse instead (the 401 stands).
+      return false;
+    }
+    const healed = await this.#refreshSubscriptionSecret(mode);
+    return healed !== null && healed.secret !== ""
+      && await verifyWebhookSignature({
+        webhookId, timestamp, signatureHeader: signature, rawBody, secret: healed.secret,
+      });
+  }
+
+  /** Re-reads the subscription secret from the listing, storing what it finds. */
+  async #refreshSubscriptionSecret(mode: ComposioKeyMode): Promise<StoredWebhookSubscription | null> {
+    const stored = await this.#storedSubscription(mode);
+    const refreshKey = `webhookSecretRefresh:${mode}`;
+    if (Date.now() - (await this.ctx.storage.get<number>(refreshKey) ?? 0)
+      < WEBHOOK_SECRET_REFRESH_MIN_INTERVAL_MS) {
+      return stored ?? null;
+    }
+    try {
+      const api = await this.#api();
+      const subscriptions = await api.listWebhookSubscriptions();
+      // The stamp goes down even on a miss, so a heal storm (forged or failing) stays throttled.
+      await this.ctx.storage.put(refreshKey, Date.now());
+      const ours = subscriptions.find(sub => stored !== undefined && sub.id === stored.id)
+        ?? subscriptions.find(sub => sub.webhookUrl === (stored?.url ?? ""))
+        ?? subscriptions[0];
+      if (ours === undefined || ours.secret === null) return null;
+      const updated: StoredWebhookSubscription = {
+        id: ours.id, secret: ours.secret,
+        url: stored?.url ?? ours.webhookUrl,
+      };
+      await this.ctx.storage.put(subscriptionKey(mode), updated);
+      return updated;
+    } catch (err) {
+      logger.warn("could not refresh the webhook subscription secret", {
+        event: "account.webhook.secret-refresh-failed", error: err,
+      });
+      return null;
+    }
+  }
+
+  async #storedSubscription(mode: ComposioKeyMode): Promise<StoredWebhookSubscription | undefined> {
+    return await this.ctx.storage.get<StoredWebhookSubscription>(subscriptionKey(mode));
+  }
+
+  /** Drops one trigger's row, capability record, and queued deliveries (initiator disposed). */
+  async #dropTriggerState(triggerId: string): Promise<void> {
+    const caps = await this.ctx.storage.get<StoredTriggerCaps>(triggerCapsKey(triggerId));
+    if (caps !== undefined) disposeStub(caps.initiator);
+    this.#triggerQueue.cancel(triggerId);
+    this.ctx.storage.sql.exec(
+      "DELETE FROM composio_triggers WHERE trigger_id = ?", triggerId);
+    await this.ctx.storage.delete(triggerCapsKey(triggerId));
+  }
+
+  #triggerRow(triggerId: string): StoredTriggerRow | undefined {
+    return this.ctx.storage.sql.exec<StoredTriggerRow>(
+      "SELECT * FROM composio_triggers WHERE trigger_id = ?", triggerId,
+    ).toArray()[0];
+  }
+
+  #triggerRows(): StoredTriggerRow[] {
+    return this.ctx.storage.sql.exec<StoredTriggerRow>(
+      "SELECT * FROM composio_triggers ORDER BY created_at DESC",
+    ).toArray();
+  }
+
+  #countEvent(workspaceId: string, day: string, kind: "delivered" | "dropped"): void {
+    this.ctx.storage.sql.exec(
+      `INSERT INTO composio_events (workspace_id, day, delivered, dropped)
+         VALUES (?, ?, ?, 0)
+       ON CONFLICT(workspace_id, day) DO UPDATE SET ${kind} = ${kind} + 1`,
+      workspaceId, day, kind === "delivered" ? 1 : 0,
+    );
+  }
+
+  /** Expires the 24h webhook-seen markers (the same window the delivery queue retains). */
+  async #pruneWebhookSeen(now: number): Promise<void> {
+    const cutoff = now - WEBHOOK_SEEN_TTL_MS;
+    const stale: string[] = [];
+    const seen = await this.ctx.storage.list<number>({ prefix: "webhookSeen:" });
+    for (const [key, at] of seen) {
+      if (typeof at === "number" && at < cutoff) stale.push(key);
+    }
+    if (stale.length > 0) await this.ctx.storage.delete(stale);
+  }
+
+  /** Replans the alarm from scratch (called from inside a firing alarm). */
+  async #planAlarm(): Promise<void> {
+    const now = Date.now();
+    const due = this.#triggerQueue.nextDue();
+    const hasTriggers = this.#triggerRows().length > 0;
+    let next: number | undefined = due;
+    if (hasTriggers) {
+      const last = await this.ctx.storage.get<number>("lastReconcileAt") ?? now;
+      const reconcileDue = last + RECONCILE_INTERVAL_MS;
+      next = next === undefined ? reconcileDue : Math.min(next, reconcileDue);
+    }
+    if (next === undefined) {
+      await this.ctx.storage.deleteAlarm();
+    } else {
+      await this.ctx.storage.setAlarm(Math.max(now + 1000, next));
+    }
+  }
+
+  /** After a mutation outside the alarm: pull the alarm in, never push it out. */
+  async #planAlarmAfterMutation(): Promise<void> {
+    const due = this.#triggerQueue.nextDue();
+    const hasTriggers = this.#triggerRows().length > 0;
+    let next: number | undefined = due;
+    if (hasTriggers) {
+      const reconcileDue = (await this.ctx.storage.get<number>("lastReconcileAt") ?? 0)
+        + RECONCILE_INTERVAL_MS;
+      next = next === undefined ? reconcileDue : Math.min(next, reconcileDue);
+    }
+    if (next === undefined) return;
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null || next < current) {
+      await this.ctx.storage.setAlarm(Math.max(Date.now() + 1000, next));
+    }
   }
 
   // -- Facet registration and the sharing fence ------------------------------

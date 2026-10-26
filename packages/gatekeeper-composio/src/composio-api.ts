@@ -199,6 +199,48 @@ function parseExecuteEnvelope(value: unknown): ExecuteEnvelope {
       throw new ComposioApiError(502, "Composio returned an invalid response (result_type).");
   }
 }
+/** A `GET /webhook_subscriptions` row: the project-level delivery contract this connector owns. */
+export interface WebhookSubscription {
+  id: string;
+  webhookUrl: string;
+  enabledEvents: string[];
+  /** Present when the create/list responses include it; null after PATCH (upstream omits it). */
+  secret: string | null;
+}
+
+/** One row of `GET /trigger_instances/active`, after hand-validation. */
+export interface TriggerInstanceSummary {
+  id: string;
+  triggerName: string;
+  composioUserId: string;
+  triggerConfig: unknown;
+  disabledAt: string | null;
+}
+
+function parseWebhookSubscription(value: unknown): WebhookSubscription {
+  if (!isRecord(value)) throw new ComposioApiError(502, "Composio returned an invalid response (webhook subscription).");
+  const events = value.enabled_events;
+  return {
+    id: requireString(value.id, "subscription.id"),
+    webhookUrl: requireString(value.webhook_url, "subscription.webhook_url"),
+    enabledEvents: Array.isArray(events)
+      ? events.filter((item): item is string => typeof item === "string")
+      : [],
+    secret: typeof value.secret === "string" && value.secret !== "" ? value.secret : null,
+  };
+}
+
+function parseTriggerInstance(value: unknown): TriggerInstanceSummary {
+  if (!isRecord(value)) throw new ComposioApiError(502, "Composio returned an invalid response (trigger instance).");
+  const disabledAt = value.disabled_at;
+  return {
+    id: requireString(value.id, "trigger.id"),
+    triggerName: requireString(value.trigger_name, "trigger.trigger_name"),
+    composioUserId: requireString(value.user_id, "trigger.user_id"),
+    triggerConfig: value.trigger_config,
+    disabledAt: typeof disabledAt === "string" && disabledAt !== "" ? disabledAt : null,
+  };
+}
 
 const PAGE_LIMIT = 500;
 const MAX_RETRIES = 3;
@@ -419,7 +461,9 @@ export class ComposioApi {
     });
   }
 
-  /** Mint a Connect Link inside a session; returns the redirect URL and the attempt's account id. */
+  /**
+   * Mint a Connect Link inside a session; returns the redirect URL and the attempt's account id.
+   */
   async createConnectLink(sessionId: string, opts: {
     toolkit: string; alias?: string; callbackUrl: string;
   }): Promise<{ redirectUrl: string; connectedAccountId: string }> {
@@ -441,4 +485,107 @@ export class ComposioApi {
       connectedAccountId: requireString(body.connected_account_id, "link.connected_account_id"),
     };
   }
-}
+
+  /**
+   * Create the project-level webhook subscription. A 409 (URL or events already subscribed)
+   * propagates as an error the caller resolves against `listWebhookSubscriptions()`.
+   */
+  async createWebhookSubscription(webhookUrl: string, enabledEvents: string[]):
+    Promise<WebhookSubscription> {
+    const body = await this.#request("/webhook_subscriptions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ webhook_url: webhookUrl, enabled_events: enabledEvents, version: "V3" }),
+    });
+    return parseWebhookSubscription(body);
+  }
+
+  /** Every webhook subscription in the project (Composio caps these at one per URL). */
+  async listWebhookSubscriptions(): Promise<WebhookSubscription[]> {
+    const parsed = parsePage(await this.#request("/webhook_subscriptions"));
+    return parsed.items.map(parseWebhookSubscription);
+  }
+
+  /** Update a subscription's URL or event list; the signing secret is left untouched. */
+  async updateWebhookSubscription(id: string, patch: {
+    webhookUrl?: string; enabledEvents?: string[];
+  }): Promise<void> {
+    await this.#request(`/webhook_subscriptions/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        ...(patch.webhookUrl === undefined ? {} : { webhook_url: patch.webhookUrl }),
+        ...(patch.enabledEvents === undefined ? {} : { enabled_events: patch.enabledEvents }),
+      }),
+    });
+  }
+
+  /** Rotate a subscription's signing secret; returns the replacement (never logged upstream of here). */
+  async rotateWebhookSecret(id: string): Promise<string> {
+    const body = await this.#request(
+      `/webhook_subscriptions/${encodeURIComponent(id)}/rotate_secret`, { method: "POST" });
+    if (!isRecord(body)) {
+      throw new ComposioApiError(502, "Composio returned an invalid response (secret rotation).");
+    }
+    return requireString(body.secret, "rotated.secret");
+  }
+
+  /** Delete a subscription; 404 (already gone) is success. */
+  async deleteWebhookSubscription(id: string): Promise<void> {
+    try {
+      await this.#request(`/webhook_subscriptions/${encodeURIComponent(id)}`, { method: "DELETE" });
+    } catch (err) {
+      if (!(err instanceof ComposioApiError) || err.status !== 404) throw err;
+    }
+  }
+
+  /**
+   * Create-or-replace the trigger instance for `slug` under `composioUserId`. Returns the
+   * upstream trigger id (upsert answers 200/201 with `{trigger_id}`; a 204 body means Composio
+   * accepted but named nothing, which the caller treats as failure — without an id the
+   * connector could neither deliver, reconcile, nor delete the instance).
+   */
+  async upsertTriggerInstance(slug: string, payload: {
+    composioUserId: string; triggerConfig: Record<string, unknown>;
+  }): Promise<string> {
+    const body = await this.#request(`/trigger_instances/${encodeURIComponent(slug)}/upsert`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        user_id: payload.composioUserId,
+        trigger_config: payload.triggerConfig,
+      }),
+    });
+    if (!isRecord(body)) {
+      throw new ComposioApiError(502, "Composio returned an invalid response (trigger upsert).");
+    }
+    return requireString(body.trigger_id, "trigger_upsert.trigger_id");
+  }
+
+  /** Delete a trigger instance; 404 (already gone) is success. */
+  async deleteTriggerInstance(triggerId: string): Promise<void> {
+    try {
+      await this.#request(`/trigger_instances/manage/${encodeURIComponent(triggerId)}`, {
+        method: "DELETE",
+      });
+    } catch (err) {
+      if (!(err instanceof ComposioApiError) || err.status !== 404) throw err;
+    }
+  }
+
+  /**
+   * Cursor-paginate `GET /trigger_instances/active` (limit 50, the upstream page cap), disabled
+   * rows included; `page` is called per batch. The caller client-filters by `user_id`.
+   */
+  async forEachActiveTriggerInstance(page: (batch: TriggerInstanceSummary[]) => void):
+    Promise<void> {
+    let cursor: string | null = null;
+    do {
+      const query = `/trigger_instances/active?show_disabled=true&limit=50` +
+        (cursor === null ? "" : `&cursor=${encodeURIComponent(cursor)}`);
+      const parsed = parsePage(await this.#request(query));
+      page(parsed.items.map(parseTriggerInstance));
+      cursor = parsed.nextCursor;
+    } while (cursor !== null);
+  }
+ }
