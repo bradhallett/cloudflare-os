@@ -485,7 +485,7 @@ describe('BlueprintLandingPage gatekeeper configuration', () => {
     expect(openConnectWindow).toHaveBeenCalledExactlyOnceWith({
       url: 'https://accounts.example.com/grant',
       nonce: 'g'.repeat(64),
-    }, testState.authenticatedApi)
+    }, testState.authenticatedApi, undefined)
 
     await act(async () => harness.updateGrants([GMAIL_PATTERN, CALENDAR_PATTERN]))
     await vi.waitFor(() => expect(harness.startResourceConfigurator)

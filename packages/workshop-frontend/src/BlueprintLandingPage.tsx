@@ -23,9 +23,8 @@ import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER } from './components/menuStyl
 import { useDocumentTitle } from './useDocumentTitle'
 import { AccountsSubscriberAdapter } from './accountsSubscriber'
 import { useDialogSelectPortalContainer } from './useDialogSelectPortalContainer'
-import { openConnectWindow } from './connectHandoff'
+import { mergeGrantedPatterns, useConnectAccountActions } from './useConnectAccountActions'
 import { requestAccountResources } from './requestAccountResources'
-import { AuthPopupCancelledError } from './features/native-app/authPopup'
 
 interface Props {
   rpcStub: RpcStub<PublicApi>
@@ -80,9 +79,8 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
   const [vendors, setVendors] = useState<{id: string, description: VendorDescription, supportedResources: SupportedResource[]}[]>([])
   const [accounts, setAccounts] = useState<AccountOption[]>([])
   const accountsRef = useRef<Map<number, AccountOption>>(new Map())
-  const [connectingVendor, setConnectingVendor] = useState<string | null>(null)
-  const [grantingAccountId, setGrantingAccountId] = useState<number | null>(null)
-  const [reconnectingAccountId, setReconnectingAccountId] = useState<number | null>(null)
+  const connectActions = useConnectAccountActions(isAuthenticated ? authenticatedApi : null)
+  const { connectingVendor, grantingAccountId, reconnectingAccountId } = connectActions
 
   // Per-binding readiness flags reported by configurator iframes. A gatekeeper binding can be
   // submitted only when the iframe reports `setSelectionReady(true)` and an account is chosen.
@@ -211,9 +209,7 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
           supportedResources, credentialsValid,
         })
         publish()
-        if (credentialsValid) {
-          setReconnectingAccountId(prev => prev === accountId ? null : prev)
-        }
+        if (credentialsValid) connectActions.clearReconnecting(accountId)
       },
       remove(accountId) {
         if (cancelled) return
@@ -240,72 +236,40 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
   }, [isAuthenticated, authenticatedApi])
 
   const handleConnectAccount = useCallback(async (vendorId: string, resourceUrlPatterns?: string[]) => {
-    if (!authenticatedApi) return
-    setConnectingVendor(vendorId)
-    try {
-      const outcome = await openConnectWindow(
-        await authenticatedApi.connectAccount(vendorId, resourceUrlPatterns), authenticatedApi)
+    const outcome = await connectActions.connect(vendorId, resourceUrlPatterns)
+    if (outcome) {
       toasts.add({ title: outcome === 'connected' ? 'Account connected.' : 'Complete the account connection in the pop-up window.', variant: 'success' })
-    } catch (err) {
-      if (err instanceof AuthPopupCancelledError) return
-      console.error('Failed to initiate connection:', err)
-      toasts.add({ title: err instanceof Error ? err.message : 'Could not complete connection flow', variant: 'error' })
-    } finally {
-      setConnectingVendor(null)
     }
-  }, [authenticatedApi, toasts])
+  }, [connectActions, toasts])
 
   const handleGrantAccountResources = useCallback(async (
     accountId: number,
     resourceUrlPatterns: string[],
   ) => {
-    if (!authenticatedApi || resourceUrlPatterns.length === 0) return
-    setGrantingAccountId(accountId)
-    try {
-      const flow = await authenticatedApi.ensureAccountResources(accountId, resourceUrlPatterns)
-      if (flow) {
-        const outcome = await openConnectWindow(flow, authenticatedApi)
-        toasts.add({ title: outcome === 'connected' ? 'Access granted.' : 'Grant the additional access in the pop-up window.', variant: 'success' })
-      } else {
-        const account = accountsRef.current.get(accountId)
-        if (account) {
-          accountsRef.current.set(accountId, {
-            ...account,
-            description: {
-              ...account.description,
-              grantedResourceUrlPatterns: [
-                ...new Set([
-                  ...(account.description.grantedResourceUrlPatterns ?? []),
-                  ...resourceUrlPatterns,
-                ]),
-              ],
-            },
-          })
-          setAccounts(Array.from(accountsRef.current.values()))
-        }
+    if (resourceUrlPatterns.length === 0) return
+    const outcome = await connectActions.grant(accountId, resourceUrlPatterns)
+    if (outcome === 'already-granted') {
+      const account = accountsRef.current.get(accountId)
+      if (account) {
+        accountsRef.current.set(accountId, {
+          ...account,
+          description: mergeGrantedPatterns(account.description, resourceUrlPatterns),
+        })
+        setAccounts(Array.from(accountsRef.current.values()))
       }
-    } catch (err) {
-      if (err instanceof AuthPopupCancelledError) return
-      console.error('Failed to request additional access:', err)
-      toasts.add({ title: err instanceof Error ? err.message : 'Failed to request additional access', variant: 'error' })
-    } finally {
-      setGrantingAccountId(null)
+    } else if (outcome) {
+      toasts.add({ title: outcome === 'connected' ? 'Access granted.' : 'Grant the additional access in the pop-up window.', variant: 'success' })
     }
-  }, [authenticatedApi, toasts])
+  }, [connectActions, toasts])
 
+  // Busy stays held until the accounts subscription reports the account back with valid
+  // credentials, so the button reflects the flow the pop-up is still running.
   const handleReconnectAccount = useCallback(async (accountId: number) => {
-    if (!authenticatedApi) return
-    setReconnectingAccountId(accountId)
-    try {
-      const outcome = await openConnectWindow(await authenticatedApi.reconnectAccount(accountId), authenticatedApi)
+    const outcome = await connectActions.reconnect(accountId, { holdBusy: true })
+    if (outcome) {
       toasts.add({ title: outcome === 'connected' ? 'Account reconnected.' : 'Complete the account reconnect in the pop-up window.', variant: 'success' })
-    } catch (err) {
-      if (err instanceof AuthPopupCancelledError) { setReconnectingAccountId(null); return }
-      console.error('Failed to initiate reconnect:', err)
-      toasts.add({ title: err instanceof Error ? err.message : 'Could not complete reconnect flow', variant: 'error' })
-      setReconnectingAccountId(null)
     }
-  }, [authenticatedApi, toasts])
+  }, [connectActions, toasts])
 
   const handleGatekeeperReadyChange = useCallback((bindingName: string, ready: boolean) => {
     setGatekeeperReady(prev => {
