@@ -24,6 +24,10 @@ import {
   stripTrailingSlashes,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { ArrayCursor } from "@gadgets/gatekeeper-kit/cursors";
+import {
+  APPLY_OUTCOME_UNKNOWN_MESSAGE, ActionJournal, ActionOutcomeUnknownError, type JournalRecord,
+} from "@gadgets/gatekeeper-kit/actions";
+import { SerialTaskQueue } from "@gadgets/gatekeeper-kit/serial-queue";
 import { startGitPull } from "@gadgets/gatekeeper-kit/git-pull-transfer";
 import {
   MAX_DIFF_BLOB_BYTES,
@@ -72,7 +76,6 @@ import {
   type CreateMergeRequestAction,
   type EntityKind,
   type GitLabAction,
-  type GitLabRevertInfo,
   type MergeMergeRequestAction,
   type PostCommentAction,
   type PostReviewAction,
@@ -259,11 +262,44 @@ function reviewedHeadMoved(realId: string, reviewedSha: string, liveSha?: string
     "changed. Re-read the diff and review it again.";
 }
 
+/**
+ * Whether a failed provider call leaves the action's effect in doubt. A 5xx answer, a failed
+ * `fetch` (TypeError), or a timeout may all have committed; anything else is a refusal.
+ * @param error The error a dispatch threw.
+ * @returns Whether the outcome is unknown.
+ */
+function isGitLabOutcomeUnknown(error: unknown): boolean {
+  if (error instanceof GitLabApiError) return error.status >= 500;
+  return error instanceof TypeError ||
+    (error instanceof DOMException && error.name === "TimeoutError");
+}
+
+/**
+ * Whether a re-dispatch of the action cannot land twice: a push carries a compare-and-swap
+ * old-sha, a merge is bound to the reviewed head's sha, and a review resumes from its recorded
+ * progress, which adopts or skips every step an earlier attempt already took. A claim left by an
+ * interrupted dispatch of such an action stays appliable; an unbound one may have committed, so
+ * its outcome is terminal-unknown instead.
+ * @param action The action being applied.
+ * @returns Whether a re-dispatch is repeat-safe.
+ */
+function isRepeatSafe(action: GitLabAction): boolean {
+  return action.type === "push" || action.type === "mergeMergeRequest" || action.type === "postReview";
+}
+
 @validateRpc()
 export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImplProps>
   implements Gatekeeper<GitLabProject | GitLabIssue | GitLabMergeRequest> {
 
-  #pendingActionsCache?: GitLabAction[];
+  /**
+   * The action store: the kit journal over the exact keys this gatekeeper kept before it, so a
+   * ported record moves nowhere. `upgradeRecord` is the old row shape minus its wrapper; the
+   * one-time adoption below rewrites every old row before anything else reads the store.
+   */
+  #actions: ActionJournal<GitLabAction> = this.#actionJournal();
+
+  /** Serializes applies and discards: a discard's cascade reads records an apply may settle. */
+  #resolutions = new SerialTaskQueue();
 
   /**
    * Commit ids this instance has served from the workspace git cache as part of simulating
@@ -374,14 +410,7 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
   // -- queued actions (read side) ---------------------------------------------------------
 
   #listPendingActions(): GitLabAction[] {
-    if (!this.#pendingActionsCache) {
-      this.#pendingActionsCache = [...this.ctx.storage.kv.list<StoredActionRecord>({ prefix: "action:" })]
-        .map(([, value]) => value)
-        .filter(record => record.state === "pending")
-        .map(record => record.action)
-        .toSorted((a, b) => a.submittedAt - b.submittedAt);
-    }
-    return this.#pendingActionsCache;
+    return this.#actions.listPending().map(({ action }) => action);
   }
 
   #getProvisionalResource(id: string): StoredProvisionalResource | undefined {
@@ -1612,10 +1641,6 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
     return value;
   }
 
-  #nextActionId(): number {
-    return this.#nextCounter("action");
-  }
-
   #nextProvisionalResourceId(): string {
     return `~${this.#nextCounter("resource")}`;
   }
@@ -1624,44 +1649,66 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
     return `~${prefix}${this.#nextCounter(prefix)}`;
   }
 
-  #actionRecordKey(approvalId: number): string {
-    return `action:${approvalId}`;
+  #actionJournal(): ActionJournal<GitLabAction> {
+    const journal = new ActionJournal<GitLabAction>(this.ctx.storage.kv, {
+      legacyKeys: { nextIdKey: "nextActionId", recordPrefix: "action:" },
+      upgradeRecord: raw => (raw as StoredActionRecord).action,
+    });
+    this.#adoptActionRecords(journal);
+    return journal;
   }
 
-  #retiredActionRecordKey(approvalId: number): string {
-    return `retiredAction:${approvalId}`;
+  /**
+   * One-time port of the records this gatekeeper kept by hand onto the journal. Idempotent by
+   * construction: every step consumes the storage it reads, so a crash mid-port leaves the rest
+   * for the next attempt, and the marker rules out a rerun once complete.
+   * @param journal The freshly constructed journal adopting the records.
+   */
+  #adoptActionRecords(journal: ActionJournal<GitLabAction>): void {
+    if (this.ctx.storage.kv.get("actionRecordsV2") !== undefined) return;
+    // The old counter held the last issued id; the journal's holds the next unused one.
+    const lastIssued = this.ctx.storage.kv.get<number>("counter:action");
+    if (lastIssued !== undefined) {
+      this.ctx.storage.kv.put("nextActionId", lastIssued + 1);
+      this.ctx.storage.kv.delete("counter:action");
+    }
+    // A review's partial progress and a revert's note target ride on the action itself now;
+    // the wrapper record is gone.
+    const asAction = (record: StoredActionRecord): GitLabAction => ({
+      ...record.action,
+      ...(record.progress ? { progress: record.progress } : {}),
+      ...(record.revertInfo ? { createdNoteId: record.revertInfo.noteId } : {}),
+    });
+    for (const [key, record] of this.ctx.storage.kv.list<StoredActionRecord>({ prefix: "action:" })) {
+      const id = Number(key.slice("action:".length));
+      this.ctx.storage.kv.delete(key);
+      journal.adopt(id, { state: record.state === "staged" ? "staged" : "pending", action: asAction(record) });
+    }
+    for (const [key, record] of this.ctx.storage.kv.list<StoredActionRecord>({ prefix: "retiredAction:" })) {
+      const id = Number(key.slice("retiredAction:".length));
+      this.ctx.storage.kv.delete(key);
+      if (record.state === "approved") {
+        journal.adopt(id, { state: "applied", action: asAction(record) });
+      } else {
+        journal.adopt(id, {
+          state: "failed",
+          action: asAction(record),
+          error: `GitLab action ${id} was discarded, or something it depended on was, so it cannot be applied.`,
+          undispatched: true,
+        });
+      }
+    }
+    this.ctx.storage.kv.put("actionRecordsV2", true);
   }
 
-  #getActionRecord(approvalId: number): StoredActionRecord | undefined {
-    return this.ctx.storage.kv.get<StoredActionRecord>(this.#actionRecordKey(approvalId))
-      ?? this.ctx.storage.kv.get<StoredActionRecord>(this.#retiredActionRecordKey(approvalId));
-  }
-
-  #requireActionRecord(approvalId: number): StoredActionRecord {
-    const record = this.#getActionRecord(approvalId);
+  #requireActionRecord(approvalId: number): JournalRecord<GitLabAction> {
+    const record = this.#actions.get(approvalId);
     if (!record) throw new Error(`No queued GitLab action exists with id ${approvalId}.`);
     return record;
   }
 
-  #putActionRecord(approvalId: number, record: StoredActionRecord): void {
-    this.ctx.storage.kv.put(this.#actionRecordKey(approvalId), record);
-    this.#pendingActionsCache = undefined;
-  }
-
-  #retireActionRecord(approvalId: number, record: StoredActionRecord): void {
-    this.ctx.storage.kv.delete(this.#actionRecordKey(approvalId));
-    this.ctx.storage.kv.put(this.#retiredActionRecordKey(approvalId), record);
-    this.#pendingActionsCache = undefined;
-  }
-
-  #stageAction(action: GitLabAction): void {
-    this.#putActionRecord(action.approvalId, { action, state: "staged" });
-  }
-
   #markActionPending(action: GitLabAction): void {
-    const record = this.#requireActionRecord(action.approvalId);
-    record.state = "pending";
-    this.#putActionRecord(action.approvalId, record);
+    this.#actions.markSubmitted(action.approvalId);
     if (action.type === "createIssue" || action.type === "createMergeRequest") {
       this.#setProvisionalResource(action.provisionalId, {
         kind: action.type === "createIssue" ? "issue" : "mergeRequest",
@@ -1669,19 +1716,10 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
     }
   }
 
-  #markActionApproved(action: GitLabAction, revertInfo?: GitLabRevertInfo): void {
-    const record = this.#requireActionRecord(action.approvalId);
-    record.state = "approved";
-    record.appliedAt = Date.now();
-    if (revertInfo) record.revertInfo = revertInfo;
-    this.#retireActionRecord(action.approvalId, record);
-  }
-
   #markActionRejected(action: GitLabAction): void {
-    const record = this.#requireActionRecord(action.approvalId);
-    record.state = "rejected";
-    record.rejectedAt = Date.now();
-    this.#retireActionRecord(action.approvalId, record);
+    this.#actions.markFailed(action.approvalId,
+      `GitLab action ${action.approvalId} was discarded, or something it depended on was, so it cannot be applied.`,
+      { undispatched: true });
   }
 
   #setProvisionalResource(id: string, record: StoredProvisionalResource): void {
@@ -1718,7 +1756,7 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
     for (const pending of this.#listPendingActions()) {
       if (!this.#actionDependsOnResource(pending, kind, provisionalId)) continue;
       // A nested cascade may have retired this one already (it depended on both).
-      if (this.#getActionRecord(pending.approvalId)?.state !== "pending") continue;
+      if (this.#actions.get(pending.approvalId)?.state !== "pending") continue;
       this.#markActionRejected(pending);
       if (pending.type === "createIssue" || pending.type === "createMergeRequest") {
         this.#retireProvisional(pending.type === "createIssue" ? "issue" : "mergeRequest", pending.provisionalId);
@@ -1837,7 +1875,10 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
     action: GitLabAction,
     presentation: { title: string; implementsRevert: boolean; pushedCommits?: string[] },
   ): Promise<void> {
-    this.#stageAction(action);
+    // Sessions reserve the id while building the payload; a hand-built action (tests, older
+    // callers) numbers itself, so the journal acknowledges the issuance here.
+    this.#actions.reserveThrough(action.approvalId);
+    this.#actions.stage(action.approvalId, action);
     try {
       // The text and the auto-approval verdict come from the staged payload, not the caller, so
       // they always describe what applies.
@@ -1845,8 +1886,7 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
         ...presentation, ...describeGitLabAction(action), ...autoApprovalOf(action),
       });
     } catch (error) {
-      this.ctx.storage.kv.delete(this.#actionRecordKey(action.approvalId));
-      this.#pendingActionsCache = undefined;
+      this.#actions.rollbackSubmission(action.approvalId);
       throw error;
     }
     this.#markActionPending(action);
@@ -1856,7 +1896,7 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
   // -- prepare ----------------------------------------------------------------------------
 
   #base() {
-    return { approvalId: this.#nextActionId(), submittedAt: Date.now(), projectPath: this.#projectPath() };
+    return { approvalId: this.#actions.reserveId(), submittedAt: Date.now(), projectPath: this.#projectPath() };
   }
 
   /** Assignees are usernames in the API and ids on GitLab; resolving them here means a typo fails now, not at apply. */
@@ -2010,20 +2050,71 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
   // -- apply ------------------------------------------------------------------------------
 
   async applyAction(actionId: number, cache: RpcStub<GitCache>): Promise<void> {
+    return this.#resolutions.run(() => this.#applyAction(actionId, cache));
+  }
+
+  /**
+   * Applies a decided action inside the resolution lane, claiming it first so an activation that
+   * dies mid-dispatch can never have the same effect delivered twice.
+   * @param actionId The action to apply.
+   * @param cache Action-scoped git cache capability.
+   */
+  async #applyAction(actionId: number, cache: RpcStub<GitCache>): Promise<void> {
     const record = this.#requireActionRecord(actionId);
-    if (record.state === "approved") {
+    if (record.state === "applied") {
       // Already applied: the overseer records completion only after this method returns, so a
       // crash or lost reply in that window re-delivers the apply. The durable record answers it
       // -- a desired-state re-check could not, since the world may have legitimately moved on --
       // and throwing would strand the action as forever un-appliable.
       return;
     }
-    if (record.state === "rejected") {
+    if (record.state === "failed") {
       // The Workshop's copy stays pending after a cascade (see `#retireProvisional`) until the
       // user discards it too, so this is how an apply learns why it cannot run.
-      throw new Error(`GitLab action ${actionId} was discarded, or something it depended on was, so it cannot be applied.`);
+      throw new Error(record.error);
     }
-    const action = record.action;
+    if (record.state === "claimed") {
+      // A previous activation died mid-dispatch. For an unbound action the effect may or may not
+      // exist at GitLab, so it must never be re-dispatched blindly; a repeat-safe one re-checks
+      // what that attempt left -- the provider refuses the repeat, or the review's recorded
+      // progress resumes past every step it already took.
+      if (isRepeatSafe(record.action)) {
+        this.#actions.restorePending(actionId);
+        throw new Error(
+          `A previous attempt to apply GitLab action ${actionId} was interrupted. Apply it again: ` +
+          "its provider calls re-check what the interruption left behind, so a repeat cannot land twice.");
+      }
+      this.#actions.markFailed(actionId, APPLY_OUTCOME_UNKNOWN_MESSAGE, { outcome: "unknown" });
+      throw new ActionOutcomeUnknownError(APPLY_OUTCOME_UNKNOWN_MESSAGE);
+    }
+
+    this.#actions.markClaimed(actionId);
+    try {
+      const applied = await this.#dispatchAction(record.action, cache);
+      this.#actions.retain(actionId, applied);
+      this.#clearCaches();
+    } catch (error) {
+      if (isGitLabOutcomeUnknown(error) && !isRepeatSafe(record.action)) {
+        const detail = error instanceof Error ? error.message : String(error);
+        const message = `${APPLY_OUTCOME_UNKNOWN_MESSAGE} (${detail})`;
+        this.#actions.markFailed(actionId, message, { outcome: "unknown" });
+        throw new ActionOutcomeUnknownError(message);
+      }
+      // A definitive refusal -- or an interrupted compare-and-swap-bound dispatch, whose repeat
+      // the provider itself refuses and the refusal path settles: the action stays appliable.
+      this.#actions.restorePending(actionId);
+      throw error;
+    }
+  }
+
+  /**
+   * Performs the provider calls for one action.
+   * @param action The action to dispatch.
+   * @param cache Action-scoped git cache capability.
+   * @returns The action as applied, carrying artifacts the apply created (a created note's id,
+   * or a multi-step review's partial progress).
+   */
+  async #dispatchAction(action: GitLabAction, cache: RpcStub<GitCache>): Promise<GitLabAction> {
     const projectPath = this.#projectPath();
 
     switch (action.type) {
@@ -2035,7 +2126,7 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
           assignee_ids: action.assigneeIds.length > 0 ? action.assigneeIds : undefined,
         }));
         this.#setProvisionalResource(action.provisionalId, { kind: "issue", realId: String(response.iid) });
-        break;
+        return action;
       }
       case "createMergeRequest": {
         let response;
@@ -2064,44 +2155,43 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
           throw error;
         }
         this.#setProvisionalResource(action.provisionalId, { kind: "mergeRequest", realId: String(response.iid) });
-        break;
+        return action;
       }
       case "setTitle": {
         const realId = this.#requireRealId(action.targetId);
         await this.#updateIssuable(action.targetKind, realId, { title: action.title });
-        break;
+        return action;
       }
       case "setBody": {
         const realId = this.#requireRealId(action.targetId);
         await this.#updateIssuable(action.targetKind, realId, { description: this.#postedText(action.bodyMarkdown, true) });
-        break;
+        return action;
       }
       case "addLabels": {
         const realId = this.#requireRealId(action.targetId);
         await this.#updateIssuable(action.targetKind, realId, { add_labels: action.labels });
-        break;
+        return action;
       }
       case "removeLabels": {
         const realId = this.#requireRealId(action.targetId);
         await this.#updateIssuable(action.targetKind, realId, { remove_labels: action.labels });
-        break;
+        return action;
       }
       case "changeState": {
         const realId = this.#requireRealId(action.targetId);
         await this.#updateIssuable(action.targetKind, realId, { state_event: action.state === "closed" ? "close" : "reopen" });
-        break;
+        return action;
       }
       case "postComment": {
         const realId = this.#requireRealId(action.targetId);
         const note = await this.#withApi(api => api.createNote(
           projectPath, apiKind(action.targetKind), Number(realId), this.#postedText(action.bodyMarkdown, true)));
-        this.#markActionApproved(action, { type: "note", kind: action.targetKind, noteId: note.id });
-        this.#clearCaches();
-        return;
+        return { ...action, createdNoteId: note.id };
       }
       case "postReview": {
-        await this.#publishReview(record, action);
-        break;
+        const applied = { ...action };
+        await this.#publishReview(applied);
+        return applied;
       }
       case "replyToDiffComment": {
         const realId = this.#requireRealId(action.mergeRequestId, "Merge request");
@@ -2109,19 +2199,17 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
         const note = await this.#withApi(api => api.addDiscussionNote(
           projectPath, Number(realId), discussionId, this.#postedText(action.bodyMarkdown, true)));
         this.ctx.storage.kv.put(`diffAlias:${action.provisionalCommentId}`, String(note.id));
-        this.#markActionApproved(action, { type: "note", kind: "mergeRequest", noteId: note.id });
-        this.#clearCaches();
-        return;
+        return { ...action, createdNoteId: note.id };
       }
       case "resolveDiffThread": {
         const realId = this.#requireRealId(action.mergeRequestId, "Merge request");
         await this.#withApi(api => api.setDiscussionResolved(projectPath, Number(realId), action.threadId, action.resolved));
-        break;
+        return action;
       }
       case "mergeMergeRequest": {
         const realId = this.#requireRealId(action.mergeRequestId, "Merge request");
         await this.#mergeMergeRequest(realId, action);
-        break;
+        return action;
       }
       case "push": {
         // No gatekeeper-side object walk: the overseer composes the pack from the action's
@@ -2156,15 +2244,12 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
               { cause: error });
           }
         }
-        break;
+        return action;
       }
       default:
         action satisfies never;
-        throw new Error(`GitLab action ${actionId} has a type this gatekeeper cannot apply.`);
+        throw new Error("A GitLab action has a type this gatekeeper cannot apply.");
     }
-
-    this.#markActionApproved(action);
-    this.#clearCaches();
   }
 
   async #updateIssuable(kind: EntityKind, realId: string, patch: {
@@ -2334,13 +2419,13 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
    * approval sets its own), so they publish their drafts one at a time and never touch the
    * user's -- at the cost of a grouped review: each comment arrives as its own note.
    */
-  async #publishReview(record: StoredActionRecord, action: PostReviewAction): Promise<void> {
+  async #publishReview(action: PostReviewAction): Promise<void> {
     const realId = this.#requireRealId(action.mergeRequestId, "Merge request");
     const projectPath = this.#projectPath();
     const iid = Number(realId);
     const review = action.review;
     const comments = review.diffComments ?? [];
-    const progress = record.progress ??= {};
+    const progress = action.progress ??= {};
     const entries = progress.comments ??= comments.map(() => null);
 
     // Every reference must resolve before anything is posted. A review left partway -- approved,
@@ -2353,37 +2438,37 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
     if (live.sha !== review.revision.headSha) throw new Error(reviewedHeadMoved(realId, review.revision.headSha, live.sha));
     const viewer = await this.#getViewer();
 
-    if (review.decision === "approve") await this.#approveReviewedHead(record, action, iid, viewer.id);
+    if (review.decision === "approve") await this.#approveReviewedHead(action, iid, viewer.id);
 
     if (review.decision === "requestChanges") {
       if (!progress.requestedChanges) {
-        refuseOverForeignDrafts(realId, await this.#reconcileReviewDrafts(record, action, iid, bodies));
-        await this.#createReviewDrafts(record, action, iid, bodies);
+        refuseOverForeignDrafts(realId, await this.#reconcileReviewDrafts(action, iid, bodies));
+        await this.#createReviewDrafts(action, iid, bodies);
         // Again, just before publishing: a draft the user started while ours were being created
         // would be published with them.
-        refuseOverForeignDrafts(realId, await this.#reconcileReviewDrafts(record, action, iid, bodies));
+        refuseOverForeignDrafts(realId, await this.#reconcileReviewDrafts(action, iid, bodies));
         await this.#withApi(api => api.bulkPublishDraftNotes(projectPath, iid, { reviewer_state: "requested_changes" }));
         entries.fill("published");
         progress.requestedChanges = true;
-        this.#saveProgress(record);
+        this.#saveProgress(action);
       }
     } else if (entries.some(entry => entry !== "published")) {
-      await this.#reconcileReviewDrafts(record, action, iid, bodies);
-      await this.#createReviewDrafts(record, action, iid, bodies);
+      await this.#reconcileReviewDrafts(action, iid, bodies);
+      await this.#createReviewDrafts(action, iid, bodies);
       for (const [index, entry] of entries.entries()) {
         if (typeof entry !== "number") continue;
         await this.#withApi(api => api.publishDraftNote(projectPath, iid, entry));
         entries[index] = "published";
-        this.#saveProgress(record);
+        this.#saveProgress(action);
       }
     }
 
-    if (summary !== undefined) await this.#postReviewSummary(record, iid, summary);
+    if (summary !== undefined) await this.#postReviewSummary(action, iid, summary);
   }
 
   /** Persist a review's progress before its next step (see `#publishReview`). */
-  #saveProgress(record: StoredActionRecord): void {
-    this.#putActionRecord(record.action.approvalId, record);
+  #saveProgress(action: PostReviewAction): void {
+    this.#actions.update(action.approvalId, action);
   }
 
   /**
@@ -2392,18 +2477,18 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
    * is this review's own if an attempt whose answer was lost made it (`"approving"`), and
    * otherwise one the account held before, which a discard leaves alone.
    */
-  async #approveReviewedHead(record: StoredActionRecord, action: PostReviewAction, iid: number, viewerId: number): Promise<void> {
-    const progress = record.progress ??= {};
+  async #approveReviewedHead(action: PostReviewAction, iid: number, viewerId: number): Promise<void> {
+    const progress = action.progress ??= {};
     if (progress.approval !== undefined && progress.approval !== "approving") return;
     const projectPath = this.#projectPath();
     const before = await this.#withApi(api => api.getMergeRequestApprovals(projectPath, iid));
     if (before.user_has_approved) {
       progress.approval = progress.approval === "approving" ? { approvedAt: approvedAtOf(before, viewerId) } : "preexisting";
-      this.#saveProgress(record);
+      this.#saveProgress(action);
       return;
     }
     progress.approval = "approving";
-    this.#saveProgress(record);
+    this.#saveProgress(action);
     let after: GitLabApprovalsResponse;
     try {
       after = await this.#withApi(api => api.approveMergeRequest(projectPath, iid, action.review.revision.headSha));
@@ -2411,14 +2496,14 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
       // A refusal approved nothing, so a retry starts afresh; an answer that never came may have.
       if (error instanceof GitLabApiError && error.status >= 400 && error.status < 500) {
         progress.approval = undefined;
-        this.#saveProgress(record);
+        this.#saveProgress(action);
         if (error.status === 409) throw new Error(reviewedHeadMoved(String(iid), action.review.revision.headSha), { cause: error });
         if (error.status === 401) throw new Error(`The connected GitLab account is not allowed to approve !${iid}.`, { cause: error });
       }
       throw error;
     }
     progress.approval = { approvedAt: approvedAtOf(after, viewerId) };
-    this.#saveProgress(record);
+    this.#saveProgress(action);
   }
 
   /**
@@ -2430,10 +2515,10 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
    * draft with its body at its anchor on the reviewed head, and is otherwise created again.
    */
   async #reconcileReviewDrafts(
-    record: StoredActionRecord, action: PostReviewAction, iid: number, bodies: string[],
+    action: PostReviewAction, iid: number, bodies: string[],
   ): Promise<GitLabDraftNoteResponse[]> {
     const comments = action.review.diffComments ?? [];
-    const entries = (record.progress ??= {}).comments ??= comments.map(() => null);
+    const entries = (action.progress ??= {}).comments ??= comments.map(() => null);
     const listed = await this.#withApi(api => api.listDraftNotes(this.#projectPath(), iid));
     const unclaimed = new Map(listed.map(draft => [draft.id, draft]));
     for (const [index, entry] of entries.entries()) {
@@ -2446,13 +2531,13 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
       if (adopted) unclaimed.delete(adopted.id);
       entries[index] = adopted?.id ?? null;
     }
-    this.#saveProgress(record);
+    this.#saveProgress(action);
     return [...unclaimed.values()];
   }
 
   /** Create, in order, the review's drafts that do not exist yet: see `#reconcileReviewDrafts`. */
-  async #createReviewDrafts(record: StoredActionRecord, action: PostReviewAction, iid: number, bodies: string[]): Promise<void> {
-    const entries = record.progress?.comments ?? [];
+  async #createReviewDrafts(action: PostReviewAction, iid: number, bodies: string[]): Promise<void> {
+    const entries = action.progress?.comments ?? [];
     if (!entries.includes(null)) return;
     const projectPath = this.#projectPath();
     const comments = action.review.diffComments ?? [];
@@ -2462,9 +2547,9 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
       if (entry !== null) continue;
       const position = await this.#positionFor(files, comments[index].target, action.review.revision);
       entries[index] = "creating";
-      this.#saveProgress(record);
+      this.#saveProgress(action);
       entries[index] = (await this.#withApi(api => api.createDraftNote(projectPath, iid, { note: bodies[index], position }))).id;
-      this.#saveProgress(record);
+      this.#saveProgress(action);
     }
   }
 
@@ -2473,11 +2558,11 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
    * again: a rare duplicate the user can see and delete, where searching for the lost one could
    * take an earlier note with the same text for it and leave the summary silently unposted.
    */
-  async #postReviewSummary(record: StoredActionRecord, iid: number, summary: string): Promise<void> {
-    const progress = record.progress ??= {};
+  async #postReviewSummary(action: PostReviewAction, iid: number, summary: string): Promise<void> {
+    const progress = action.progress ??= {};
     if (progress.summary !== undefined) return;
     progress.summary = (await this.#withApi(api => api.createNote(this.#projectPath(), "merge_requests", iid, summary))).id;
-    this.#saveProgress(record);
+    this.#saveProgress(action);
   }
 
   /**
@@ -2487,8 +2572,8 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
    * while GitLab still dates it as the one the review made -- the user may since have withdrawn
    * it and approved again -- or cannot say, on an instance that reports no `approved_at`.
    */
-  async #discardReviewLeftovers(record: StoredActionRecord, action: PostReviewAction): Promise<void> {
-    const progress = record.progress;
+  async #discardReviewLeftovers(action: PostReviewAction): Promise<void> {
+    const progress = action.progress;
     const realId = this.#realIdOf(action.mergeRequestId);
     if (!progress || !realId) return;
     const projectPath = this.#projectPath();
@@ -2498,12 +2583,12 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
     if (entries.some(entry => entry === "creating" || typeof entry === "number")) {
       // Unresolvable now means it was never sent, and then it matches no draft.
       const bodies = (action.review.diffComments ?? []).map(comment => this.#postedText(comment.bodyMarkdown, false));
-      await this.#reconcileReviewDrafts(record, action, iid, bodies);
+      await this.#reconcileReviewDrafts(action, iid, bodies);
       for (const [index, entry] of entries.entries()) {
         if (typeof entry !== "number") continue;
         await this.#withApi(api => api.deleteDraftNote(projectPath, iid, entry));
         entries[index] = null;
-        this.#saveProgress(record);
+        this.#saveProgress(action);
       }
     }
 
@@ -2517,18 +2602,26 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
         }
       }
       progress.approval = undefined;
-      this.#saveProgress(record);
+      this.#saveProgress(action);
     }
   }
 
   // -- reject and revert ------------------------------------------------------------------
 
   async rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
+    return this.#resolutions.run(() => this.#rejectAction(actionId));
+  }
+
+  /**
+   * Discards an action inside the resolution lane: its cascades read records an apply may settle.
+   * @param actionId The action to discard.
+   */
+  async #rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
     const record = this.#requireActionRecord(actionId);
     const action = record.action;
     // Discarded already: a cascade (see `#retireProvisional`) retires actions the Workshop still
     // shows as pending, and the user's discard of one must then succeed, not strand it.
-    if (record.state === "rejected") return;
+    if (record.state === "failed") return;
     if (record.state !== "pending" && record.state !== "staged") {
       throw new Error(`GitLab action ${actionId} is no longer pending.`);
     }
@@ -2536,7 +2629,7 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
     if (action.type === "postReview") {
       // Before the record is retired: a cleanup that fails leaves the action pending, so the
       // discard can be retried rather than stranding an approval or parked drafts.
-      await this.#discardReviewLeftovers(record, action);
+      await this.#discardReviewLeftovers(action);
     }
 
     this.#markActionRejected(action);
@@ -2602,11 +2695,12 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
       }
       case "postComment":
       case "replyToDiffComment": {
-        const info = record.revertInfo;
-        if (info?.type !== "note") return { message: "Missing note revert information.", canRetry: false };
+        const kind = action.type === "postComment" ? action.targetKind : "mergeRequest";
+        const noteId = action.createdNoteId;
+        if (noteId === undefined) return { message: "Missing note revert information.", canRetry: false };
         const realId = this.#realIdOf(action.type === "postComment" ? action.targetId : action.mergeRequestId);
         if (!realId) return gone;
-        await this.#withApi(api => api.deleteNote(this.#projectPath(), apiKind(info.kind), Number(realId), info.noteId));
+        await this.#withApi(api => api.deleteNote(this.#projectPath(), apiKind(kind), Number(realId), noteId));
         break;
       }
       case "resolveDiffThread": {

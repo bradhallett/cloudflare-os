@@ -69,13 +69,6 @@ export function escapeQuickActions(text: string): string {
 
 export type StoredActionState = "staged" | "pending" | "approved" | "rejected";
 
-/** Where a `postComment`/`replyToDiffComment` landed, so a revert can delete it. */
-export type GitLabRevertInfo = {
-  type: "note";
-  kind: EntityKind;
-  noteId: number;
-};
-
 type BaseAction = {
   approvalId: number;
   submittedAt: number;
@@ -137,6 +130,8 @@ export type PostCommentAction = BaseEntityAction & {
   type: "postComment";
   bodyMarkdown: string;
   provisionalCommentId: string;
+  /** The note GitLab created, once the apply dispatched: what its revert deletes. */
+  createdNoteId?: number;
 };
 
 export type StoredDraftDiffComment = GitLabDraftDiffComment & {
@@ -150,6 +145,8 @@ export type PostReviewAction = BaseAction & {
   review: Omit<GitLabMergeRequestReviewDraft, "diffComments"> & {
     diffComments?: StoredDraftDiffComment[];
   };
+  /** Steps already taken: the one action GitLab makes multi-call, persisted between attempts. */
+  progress?: ReviewProgress;
 };
 
 export type ReplyToDiffCommentAction = BaseAction & {
@@ -158,6 +155,8 @@ export type ReplyToDiffCommentAction = BaseAction & {
   commentId: string;
   bodyMarkdown: string;
   provisionalCommentId: string;
+  /** The reply note GitLab created, once the apply dispatched: what its revert deletes. */
+  createdNoteId?: number;
 };
 
 export type ResolveDiffThreadAction = BaseAction & {
@@ -333,12 +332,16 @@ export type ReviewProgress = {
   summary?: number;
 };
 
+/**
+ * Legacy row shape, read only by the one-time adoption onto the action journal.
+ */
 export type StoredActionRecord = {
   action: GitLabAction;
   state: StoredActionState;
   appliedAt?: number;
   rejectedAt?: number;
-  revertInfo?: GitLabRevertInfo;
+  /** Legacy field: where a note landed, folded into `createdNoteId` on the action at adoption. */
+  revertInfo?: { type: "note"; kind: EntityKind; noteId: number };
   /** A review's steps so far: the one action GitLab makes multi-call. */
   progress?: ReviewProgress;
 };

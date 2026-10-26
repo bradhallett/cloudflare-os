@@ -405,6 +405,25 @@ describe("issue mutations", () => {
     await unwrap(await hooks().applyAction(name, props, action.approvalId));
     expect(JSON.parse(gitlab.requests.find(r => r.method === "POST")!.body!)).toEqual({ body: posted });
   });
+
+  it("a 5xx mid-dispatch terminal-fails an unbound action: its next apply reports the recorded failure, not a re-post", async () => {
+    const { gitlab, props, name } = await setup("comment-500");
+    withIssue(gitlab, { issue: issue({ user_notes_count: 0 }) });
+    gitlab.on("GET", new RegExp(`^/api/v4/projects/${P}/issues/1/discussions`), () => json([]));
+    gitlab.on("POST", new RegExp(`^/api/v4/projects/${P}/issues/1/notes$`), () =>
+      json({ message: "500 Internal Server Error" }, { status: 500 }));
+    gitlab.install();
+
+    const action = await unwrap(await hooks().queueAction(name, props, "preparePostComment", ["issue", "1", "Looks good"], DESC));
+    const apply = async () => unwrap(await hooks().applyAction(name, props, action.approvalId));
+    // A 5xx may have committed, so the note is never posted again: the outcome is terminal.
+    const unknown = /may or may not have taken effect.*500 Internal Server Error/;
+    await expect(apply()).rejects.toThrow(unknown);
+    await expect(apply()).rejects.toThrow(unknown);
+    expect(gitlab.count("POST", /notes$/)).toBe(1);
+    // A discard of the failed action succeeds without doing anything.
+    await expect(unwrap(await hooks().rejectAction(name, props, action.approvalId))).resolves.toBeUndefined();
+  });
 });
 
 const MR = { ...fx.mergeRequestResponse.data, iid: 133, source_project_id: 1, target_project_id: 1 };
