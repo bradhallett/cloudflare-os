@@ -122,19 +122,50 @@ their reservation. Own-key calls spend the user's project, counted in a separate
 refused at the deployment-funded limit and never rolled into the deployment total. Quota
 exhaustion degrades to a clear refusal, never a silent failure.
 
-## What PR 4 adds (placeholders in this PR)
+## Triggers and webhooks
 
-Triggers (`createTrigger`/bindHook on the scheduler's contract), the webhook route with
-Standard-Webhooks signature verification keyed by key mode, the delivery queue with envelope
-dedupe, and the reconciliation alarm. `WEBHOOK_ORIGIN` is already declared in the worker's env
-surface; the Connect Link `callbackUrl` resolves from `BASE_URL` when set and otherwise points
-at the reserved callback path, which PR 4's webhook route completes.
+Agents arm triggers through the ambient session (`createTrigger(config, callback)`), which rides
+the Scheduled Tasks hook contract — `bindHook` parks the controller at the approval gate, and only
+the user's approval calls `enable`, which records the initiator in the account DO and upserts the
+upstream instance (`POST /trigger_instances/{slug}/upsert`). A denial or unbind calls `disable`:
+upstream instance deleted, initiator disposed, rows dropped. A config change is a disable plus a
+fresh `createTrigger`; controller props are immutable. Every delivered event passes
+`authorizeObservation` (title, description, capped payload preview) before the callback fires, and
+payloads stay fenced as untrusted data end to end.
+
+Composio delivers events to `POST /webhook` on this worker (under the gatekeeper base path when
+`BASE_URL` names a subpath). The route uses unverified envelope contents only to pick the account
+Durable Object (`metadata.user_id`, `workshop-{accountId}`); the account verifies the Standard
+Webhooks signature (HMAC-SHA256 over `id.timestamp.body`, 300s tolerance, multi-candidate
+`webhook-signature` so rotation overlaps) before acting on anything. Upstream is at-least-once, so
+ingest dedupes on the envelope id for 24h and uses it as the delivery idempotency key. Deliveries
+queue with the kit's backoff (1min→1h exponential, 8 attempts ≈3h, then drop) and are capped at
+96 KiB each. `composio.connected_account_expired` events on the same URL record an expiry notice
+the app panel shows (reconnect is the remedy; nothing here can renew OAuth).
+
+The webhook subscription itself is a project-level singleton the connector owns per key mode:
+created on first trigger enable (`409` → patch the existing one), signing secret stored in the
+account DO and rotatable from the app UI (`rotateWebhookSecret`). A failed verification retries
+once against the upstream secret — Composio can rotate under us — and only then refuses. The
+subscription URL is `BASE_URL` (manifest-templated to the router's public origin) with
+`WEBHOOK_ORIGIN` as the dev-tunnel override; without an https origin there is no webhook route
+worth registering, so trigger enablement refuses instead. Key switches rebuild their mode's
+subscription and re-upsert every trigger under the new key; `revoke()` deletes trigger instances
+and (in own-key mode) the mode's subscription, then drops all state.
+
+While any trigger is armed, the account DO's alarm runs every 15 minutes and reconciles both
+directions against `GET /trigger_instances/active` (cursor-paged, client-filtered to this
+account's composio user): upstream instances with no row are deleted; rows with a missing or
+disabled upstream instance are re-upserted under their stored id. Events are counted per workspace
+per UTC day (`EVENTS_PER_WORKSPACE_PER_DAY`, default 500); over-limit deliveries are dropped and
+the drop is visible in the app panel's usage section.
 
 ## Development
 
 `pnpm --filter gatekeeper-composio test:run` runs both suites: the Node project (classification,
-settlement map, policy chokepoint, quotas, slug registry) and the workerd project (facet mint
-policy, key-mode fencing, continuation lifecycle, observer consent) — the latter drives the real
+settlement map, policy chokepoint, quotas, slug registry, webhook signatures and envelopes) and
+the workerd project (facet mint policy, key-mode fencing, continuation lifecycle, observer
+consent, triggers) — the latter drives the real
 Durable Objects through a `TestHooks` DO, with Composio's REST surface faked through the
 worker's `setComposioFetchForTests()` seam. `wrangler.jsonc` is generated: edit
 `cloudflare.config.ts` and run `pnpm configs:generate`.

@@ -15,20 +15,46 @@ import type {
   GitCache,
   HookDescription,
   HookController,
+  HookTargetMetadata,
   ObservationDescription,
   ComposioToolkitInfo,
 } from "@gadgets/workshop-shared/gatekeeper";
 
-import type { ComposioAccount } from "../../src/account.js";
+import type {
+  ComposioAccount,
+  ComposioTriggerRowPublic,
+  ExpiryNotice,
+} from "../../src/account.js";
 import {
   ComposioSingletonGatekeeper,
   ComposioToolkitGatekeeper,
   type ToolkitFacetProps,
 } from "../../src/facet.js";
 import type { ComposioSessionImpl, ComposioToolkitSessionImpl } from "../../src/session.js";
-import type { ComposioCallResult, ComposioInputRequest } from "../../src/types.js";
+import type {
+  ComposioCallResult,
+  ComposioInputRequest,
+  ComposioTriggerFiring,
+} from "../../src/types.js";
+import { signWebhook } from "../../src/webhooks.js";
 import { GatekeeperVendor, setComposioFetchForTests } from "../../src/worker.js";
+import { BindMarkerCallback } from "../worker.js";
 
+/** The initiator entrypoint's test surface (minted through ctx.exports, never imported). */
+type TestInitiatorFetcher = {
+  configure(mode: string): void;
+  read(): {
+    firings: ComposioTriggerFiring[];
+    observations: { title: string; description: string }[];
+    startHookCalls: number;
+    initiatorDisposed: number;
+    callbacksDisposed: number;
+  };
+  reset(): void;
+};
+type TestInitiatorExports = {
+  TestTriggerInitiator(options: object): TestInitiatorFetcher;
+};
 // ---------------------------------------------------------------------------
 // The fake Composio REST surface. A spec is plain JSON so it can cross the RPC boundary from
 // the test; the router below turns it into responses shaped exactly as composio-api.ts parses
@@ -114,12 +140,22 @@ export type CapturedSubmission = {
   awaitDecision: boolean | undefined;
 };
 
+/** What the queue captured for one bound hook (enable/disable drive it from here). */
+export type CapturedHook = { title: string; description: string };
+
+/** One hook binding the queue holds: the controller fetcher, kept for enable/disable drives. */
+type HeldHook = {
+  controller: Fetcher<HookController<RpcTarget>>;
+};
+
 /** What the queue captured for one authorized observation. */
 export type CapturedObservation = { title: string; description: string; fieldsJson: string };
 
 export class TestApprovalQueue extends RpcTarget {
   readonly submissions: CapturedSubmission[] = [];
   readonly observations: CapturedObservation[] = [];
+  readonly heldHooks: HeldHook[] = [];
+  readonly hookDescriptions: CapturedHook[] = [];
 
   async authorizeObservation(description: ObservationDescription): Promise<void> {
     this.observations.push({
@@ -147,13 +183,171 @@ export class TestApprovalQueue extends RpcTarget {
   }
 
   async bindHook<Hook extends RpcTarget>(
-    _controller: Fetcher<HookController<Hook>>,
+    controller: Fetcher<HookController<Hook>>,
     _callback: RpcStub<Hook>,
-    _description: HookDescription,
+    description: HookDescription,
   ): Promise<void> {
-    throw new Error("the Composio tests accept no hooks");
+    this.heldHooks.push({ controller: controller as Fetcher<HookController<RpcTarget>> });
+    this.hookDescriptions.push({ title: description.title, description: description.description });
   }
 }
+
+// ---------------------------------------------------------------------------
+// The fake trigger/webhook upstream: in-memory state the fetch router below
+// serves, so suites can assert on every captured call and inject drift.
+
+type FakeSubscription = { id: string; webhook_url: string; enabled_events: string[]; secret: string };
+type FakeInstance = {
+  id: string; trigger_name: string; user_id: string;
+  trigger_config: unknown; disabled_at: string | null;
+};
+
+class FakeTriggerUpstream {
+  readonly subscriptions = new Map<string, FakeSubscription>();
+  readonly instances = new Map<string, FakeInstance>();
+  readonly upserts: { slug: string; userId: string; config: unknown }[] = [];
+  readonly instanceDeletes: string[] = [];
+  readonly subscriptionCreates: { url: string; events: string[] }[] = [];
+  readonly subscriptionPatches: { id: string; url?: string; events?: string[] }[] = [];
+  readonly rotations: string[] = [];
+  readonly subscriptionDeletes: string[] = [];
+  failUpserts = 0;
+  failListing = false;
+  #nextId = 1;
+
+  secret(): string {
+    return [...this.subscriptions.values()][0]?.secret ?? "";
+  }
+
+  /** Serves one request; returns undefined when the path is not this upstream's. */
+  route(method: string, path: string, init: RequestInit | undefined): Response | undefined {
+    const body = (): Record<string, unknown> =>
+      JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+    if (method === "POST" && path === "/webhook_subscriptions") {
+      const url = String(body().webhook_url ?? "");
+      if ([...this.subscriptions.values()].some(sub => sub.webhook_url === url)) {
+        return Response.json({ error: "conflict" }, { status: 409 });
+      }
+      const created: FakeSubscription = {
+        id: `sub_${this.#nextId++}`,
+        webhook_url: url,
+        enabled_events: body().enabled_events as string[] ?? [],
+        secret: `whsec_${Math.random().toString(36).slice(2, 10)}`,
+      };
+      this.subscriptions.set(created.id, created);
+      this.subscriptionCreates.push({ url, events: [...created.enabled_events] });
+      return Response.json(this.#row(created, true));
+    }
+    if (method === "GET" && path === "/webhook_subscriptions") {
+      return Response.json({
+        items: [...this.subscriptions.values()].map(sub => this.#row(sub, true)),
+        nextCursor: null,
+      });
+    }
+    const subMatch = path.match(/^\/webhook_subscriptions\/([^/]+)(\/rotate_secret)?$/);
+    if (subMatch !== null) {
+      const id = decodeURIComponent(subMatch[1]);
+      const sub = this.subscriptions.get(id);
+      if (method === "PATCH" && sub !== undefined) {
+        const patch = body();
+        if (typeof patch.webhook_url === "string") sub.webhook_url = patch.webhook_url;
+        if (Array.isArray(patch.enabled_events)) sub.enabled_events = patch.enabled_events as string[];
+        this.subscriptionPatches.push({
+          id,
+          url: typeof patch.webhook_url === "string" ? patch.webhook_url : undefined,
+          events: Array.isArray(patch.enabled_events)
+            ? patch.enabled_events as string[]
+            : undefined,
+        });
+        // Upstream omits the secret after PATCH; the account keeps its stored copy.
+        return Response.json(this.#row(sub, false));
+      }
+      if (method === "POST" && subMatch[2] === "/rotate_secret" && sub !== undefined) {
+        sub.secret = `whsec_rot_${Math.random().toString(36).slice(2, 10)}`;
+        this.rotations.push(id);
+        return Response.json({ secret: sub.secret });
+      }
+      if (method === "DELETE" && subMatch[2] === undefined) {
+        if (sub === undefined) return new Response(null, { status: 404 });
+        this.subscriptions.delete(id);
+        this.subscriptionDeletes.push(id);
+        return new Response(null, { status: 204 });
+      }
+    }
+    const upsertMatch = path.match(/^\/trigger_instances\/([^/]+)\/upsert$/);
+    if (method === "POST" && upsertMatch !== null) {
+      const slug = decodeURIComponent(upsertMatch[1]);
+      const payload = body();
+      const userId = String(payload.user_id ?? "");
+      this.upserts.push({ slug, userId, config: payload.trigger_config });
+      if (this.failUpserts > 0) {
+        this.failUpserts--;
+        return Response.json({ error: "upstream unavailable" }, { status: 500 });
+      }
+      let instance = [...this.instances.values()]
+        .find(row => row.user_id === userId && row.trigger_name === slug);
+      if (instance === undefined) {
+        instance = {
+          id: `ti_${this.#nextId++}`, trigger_name: slug, user_id: userId,
+          trigger_config: payload.trigger_config, disabled_at: null,
+        };
+        this.instances.set(instance.id, instance);
+      } else {
+        instance.trigger_config = payload.trigger_config;
+        instance.disabled_at = null;
+      }
+      return Response.json({ trigger_id: instance.id });
+    }
+    const manageMatch = path.match(/^\/trigger_instances\/manage\/([^/]+)$/);
+    if (method === "DELETE" && manageMatch !== null) {
+      const id = decodeURIComponent(manageMatch[1]);
+      if (!this.instances.has(id)) return new Response(null, { status: 404 });
+      this.instances.delete(id);
+      this.instanceDeletes.push(id);
+      return new Response(null, { status: 204 });
+    }
+    if (method === "GET" && path === "/trigger_instances/active") {
+      if (this.failListing) {
+        return Response.json({ error: "listing failed" }, { status: 500 });
+      }
+      return Response.json({
+        items: [...this.instances.values()].map(row => ({
+          id: row.id, trigger_name: row.trigger_name, user_id: row.user_id,
+          trigger_config: row.trigger_config, disabled_at: row.disabled_at,
+        })),
+        nextCursor: null,
+      });
+    }
+    return undefined;
+  }
+
+  #row(sub: FakeSubscription, withSecret: boolean): Record<string, unknown> {
+    return {
+      id: sub.id, webhook_url: sub.webhook_url, enabled_events: sub.enabled_events,
+      ...(withSecret ? { secret: sub.secret } : {}),
+    };
+  }
+
+  /** Rotates the first subscription's secret in place, as upstream would without telling us. */
+  rotateFirst(): void {
+    const first = [...this.subscriptions.values()][0];
+    if (first !== undefined) first.secret = `whsec_rot_${Math.random().toString(36).slice(2, 10)}`;
+  }
+}
+
+/** Test-driven mutations of the fake upstream, for drift and failure injection. */
+export type FakeTriggerMutation = {
+  killInstance?: string;
+  disableInstance?: string;
+  injectInstance?: {
+    id: string; triggerName: string; userId: string;
+    triggerConfig?: unknown; disabledAt?: string;
+  };
+  failUpserts?: number;
+  failListing?: boolean;
+  /** Rotates the upstream secret WITHOUT telling the account (drift the ingest must self-heal). */
+  rotateUpstreamSecret?: boolean;
+};
 
 /** The one answer the verifier ever gives: access confirmed, without asking any question. */
 class TestVerifier extends RpcTarget {
@@ -184,6 +378,7 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
   #executeCalls: FakeExecuteCall[] = [];
   #sessionCalls: FakeSessionCall[] = [];
   #getCounts: FakeGetCounts = { toolkits: 0, tools: 0 };
+  #triggers = new FakeTriggerUpstream();
 
   // -- Faking the Composio REST surface --------------------------------------
 
@@ -193,6 +388,7 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
       this.#executeCalls = [];
       this.#sessionCalls = [];
       this.#getCounts = { toolkits: 0, tools: 0 };
+      this.#triggers = new FakeTriggerUpstream();
       setComposioFetchForTests(undefined);
       return;
     }
@@ -270,6 +466,8 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
         });
         return Response.json(renderExecute(plan));
       }
+      const routed = this.#triggers.route(method, path, init);
+      if (routed !== undefined) return routed;
       return new Response("no such route in the fake Composio", { status: 404 });
     };
     setComposioFetchForTests(fake);
@@ -290,6 +488,200 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
     return this.#getCounts;
   }
 
+  // -- Triggers and webhooks ---------------------------------------------------
+
+  /** The fake trigger upstream's calls and current state, as plain JSON. */
+  triggerUpstreamState(): {
+    upserts: { slug: string; userId: string; configJson: string }[];
+    instanceDeletes: string[];
+    subscriptionCreates: { url: string; events: string[] }[];
+    subscriptionPatches: { id: string; url?: string; events?: string[] }[];
+    rotations: string[];
+    subscriptionDeletes: string[];
+    instances: { id: string; triggerName: string; userId: string; disabled: boolean }[];
+    subscriptions: { id: string; url: string }[];
+  } {
+    const t = this.#triggers;
+    return {
+      upserts: t.upserts.map(call => ({
+        slug: call.slug, userId: call.userId, configJson: JSON.stringify(call.config ?? null),
+      })),
+      instanceDeletes: [...t.instanceDeletes],
+      subscriptionCreates: t.subscriptionCreates.map(call => ({ ...call })),
+      subscriptionPatches: t.subscriptionPatches.map(call => ({ ...call })),
+      rotations: [...t.rotations],
+      subscriptionDeletes: [...t.subscriptionDeletes],
+      instances: [...t.instances.values()].map(row => ({
+        id: row.id, triggerName: row.trigger_name, userId: row.user_id,
+        disabled: row.disabled_at !== null,
+      })),
+      subscriptions: [...t.subscriptions.values()].map(sub => ({
+        id: sub.id, url: sub.webhook_url,
+      })),
+    };
+  }
+
+  /** Mutates the fake upstream: drift and failure injection between calls. */
+  mutateTriggers(mutation: FakeTriggerMutation): void {
+    const t = this.#triggers;
+    if (mutation.killInstance !== undefined) t.instances.delete(mutation.killInstance);
+    if (mutation.disableInstance !== undefined) {
+      const row = t.instances.get(mutation.disableInstance);
+      if (row !== undefined) row.disabled_at = new Date().toISOString();
+    }
+    if (mutation.injectInstance !== undefined) {
+      t.instances.set(mutation.injectInstance.id, {
+        id: mutation.injectInstance.id,
+        trigger_name: mutation.injectInstance.triggerName,
+        user_id: mutation.injectInstance.userId,
+        trigger_config: mutation.injectInstance.triggerConfig ?? {},
+        disabled_at: mutation.injectInstance.disabledAt ?? null,
+      });
+    }
+    if (mutation.failUpserts !== undefined) t.failUpserts += mutation.failUpserts;
+    if (mutation.failListing !== undefined) t.failListing = mutation.failListing;
+    if (mutation.rotateUpstreamSecret === true) t.rotateFirst();
+  }
+
+  /** The fake's current signing secret (what a signed ingest should use by default). */
+  fakeWebhookSecret(): string {
+    return this.#triggers.secret();
+  }
+
+  /** The persistent trigger initiator entrypoint, as the harness drives it. */
+  #initiatorInstance?: TestInitiatorFetcher;
+  #initiator(): TestInitiatorFetcher {
+    // Cached: each exports.X({}) call mints a fresh DO instance, and recordings must be shared.
+    return (this.#initiatorInstance ??=
+      (this.ctx.exports as unknown as TestInitiatorExports).TestTriggerInitiator({}));
+  }
+
+  /** Registers a trigger through the session: parks it at the approval gate (bindHook). */
+  createTrigger(
+    facetName: string,
+    config: { triggerSlug: string; filters?: Record<string, unknown> },
+  ): Promise<Attempt<string>> {
+    return this.#attempt(async () => {
+      const session = this.#session(facetName) as ComposioSessionImpl;
+      return await session.createTrigger(
+        {
+          triggerSlug: config.triggerSlug,
+          ...(config.filters === undefined ? {} : { filters: config.filters }),
+        },
+        new BindMarkerCallback() as never,
+      ) as string;
+    });
+  }
+
+  /** The approval-gate descriptions createTrigger parked, in bind order. */
+  capturedHooks(facetName: string): CapturedHook[] {
+    return this.#queue(facetName).hookDescriptions;
+  }
+
+  /** What the overseer does on approval: hands the controller a persistent initiator. */
+  enableCapturedHook(
+    facetName: string,
+    index: number,
+    target?: HookTargetMetadata,
+  ): Promise<Attempt<null>> {
+    return this.#attempt(async () => {
+      await this.#queue(facetName).heldHooks[index].controller.enable(
+        this.#initiator() as never,
+        target ?? { workspaceId: "ws-test" },
+      );
+      return null;
+    });
+  }
+
+  /** What the overseer does on denial or unbind. */
+  disableCapturedHook(facetName: string, index: number): Promise<Attempt<null>> {
+    return this.#attempt(async () => {
+      await this.#queue(facetName).heldHooks[index].controller.disable();
+      return null;
+    });
+  }
+
+  /**
+   * Delivers one signed webhook envelope straight to the account (the DO call the worker's
+   * route makes). Signs with `secret` (default: the fake's current secret) at `ageSeconds`.
+   */
+  async ingestSignedWebhook(
+    accountName: string,
+    envelope: Record<string, unknown>,
+    options?: { secret?: string; ageSeconds?: number },
+  ): Promise<number> {
+    const rawBody = JSON.stringify(envelope);
+    const webhookId = String(envelope.id ?? `msg_${Math.random().toString(36).slice(2)}`);
+    const timestamp = String(Math.floor(Date.now() / 1000) - (options?.ageSeconds ?? 0));
+    const signature = await signWebhook({
+      webhookId, timestamp, rawBody,
+      secret: options?.secret ?? this.#triggers.secret(),
+    });
+    return await this.#account(accountName).ingestWebhook(rawBody, webhookId, timestamp, signature);
+  }
+
+  /** The trigger initiator's recordings, as plain JSON (the full firing type does not cross RPC). */
+  async readInitiator(): Promise<{
+    firings: { triggerId: string; eventId: string; triggerSlug: string }[];
+    observations: { title: string; description: string }[];
+    startHookCalls: number;
+    initiatorDisposed: number;
+    callbacksDisposed: number;
+  }> {
+    const read = await this.#initiator().read();
+    return {
+      firings: read.firings.map(firing => ({
+        triggerId: firing.triggerId, eventId: firing.eventId, triggerSlug: firing.triggerSlug,
+      })),
+      observations: read.observations,
+      startHookCalls: read.startHookCalls,
+      initiatorDisposed: read.initiatorDisposed,
+      callbacksDisposed: read.callbacksDisposed,
+    };
+  }
+
+  async configureInitiator(mode: string): Promise<void> {
+    await this.#initiator().configure(mode);
+  }
+
+  async resetInitiator(): Promise<void> {
+    await this.#initiator().reset();
+  }
+
+  /** The account's armed triggers, for lifecycle assertions. */
+  async accountTriggers(accountName: string): Promise<ComposioTriggerRowPublic[]> {
+    return await this.#account(accountName).listTriggers();
+  }
+
+  async accountExpiryNotices(accountName: string): Promise<ExpiryNotice[]> {
+    return await this.#account(accountName).expiryNotices();
+  }
+
+  async accountWebhookState(accountName: string) {
+    return await this.#account(accountName).webhookState();
+  }
+
+  rotateWebhookSecretOnAccount(accountName: string): Promise<Attempt<null>> {
+    return this.#attempt(async () => {
+      await this.#account(accountName).rotateWebhookSecret();
+      return null;
+    });
+  }
+
+  /** The session's deleteTrigger (observation + account disable). */
+  deleteTriggerOnSession(facetName: string, triggerId: string): Promise<Attempt<null>> {
+    return this.#attempt(async () => {
+      await (this.#session(facetName) as ComposioSessionImpl).deleteTrigger(triggerId);
+      return null;
+    });
+  }
+
+  #queue(facetName: string): TestApprovalQueue {
+    const queue = this.#queues.get(facetName);
+    if (queue === undefined) throw new Error(`no queue named "${facetName}" in the test hooks`);
+    return queue;
+  }
+
 
   // -- Accounts ---------------------------------------------------------------
   //
@@ -297,13 +689,27 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
   // mapping drops `unknown`-bearing members (`ExecuteEnvelope.result`, `ToolInfo.inputSchema`)
   // that are in fact delivered verbatim (same note as facet.ts's `account()`.
 
+  #accountNames = new Set<string>();
+
   #account(accountName: string): ComposioAccount {
+    this.#accountNames.add(accountName);
     return this.ctx.exports.ComposioAccount.getByName(accountName) as unknown as ComposioAccount;
   }
+
+  /**
+   * Hands over every account name any test has touched and clears the registry, so a test file
+   * can cancel those Durable Objects' alarms before its own tests run: a trailing alarm firing
+   * inside a later file would hit that file's fake upstream and corrupt its recordings.
+   */
+  drainAccountAlarmRegistry(): string[] {
+    const names = [...this.#accountNames];
+    this.#accountNames.clear();
+    return names;
+  }
+
   #accountObjectId(accountName: string): string {
     return this.ctx.exports.ComposioAccount.getByName(accountName).id.toString();
   }
-
 
   async keyState(accountName: string) {
     return await this.#account(accountName).keyState();

@@ -84,4 +84,24 @@ export class ComposioAppUi extends RpcTarget implements ComposioAppUiClient {
   async getUsage() {
     return await this.#account.usage();
   }
+
+  /** The account's armed triggers (see account.ts listTriggers). */
+  async listTriggers() {
+    return await this.#account.listTriggers();
+  }
+
+  /** Upstream connected-account expiry notices the webhook route recorded. */
+  async expiryNotices() {
+    return await this.#account.expiryNotices();
+  }
+
+  /** The webhook subscription this account's triggers ride on. */
+  async webhookState() {
+    return await this.#account.webhookState();
+  }
+
+  /** Rotates the subscription signing secret upstream and re-stores it. */
+  async rotateWebhookSecret(): Promise<void> {
+    await this.#account.rotateWebhookSecret();
+  }
 }

@@ -3,6 +3,7 @@ import CatalogSection from "./CatalogSection";
 import DisclosureSection from "./DisclosureSection";
 import KeyModeSection from "./KeyModeSection";
 import SharingSection from "./SharingSection";
+import TriggersSection from "./TriggersSection";
 import UsageSection from "./UsageSection";
 import type {
   ComposioAppUiClient,
@@ -112,6 +113,7 @@ export default function ComposioPage({ ui }: Props) {
 
       <KeyModeSection ui={ui} keyMode={keyMode} onKeyModeChanged={refreshKeyMode} />
       <SharingSection ui={ui} enabled={sharingEnabled} onSharingChanged={refreshSharing} />
+      <TriggersSection ui={ui} />
       <UsageSection usage={usage} />
       <DisclosureSection />
     </main>

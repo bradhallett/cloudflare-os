@@ -125,9 +125,58 @@ export type ComposioSession = {
    */
   getActionResult(actionId: number): Promise<ComposioCallResult>;
   continueTool(id: string, responses: Record<string, unknown>): Promise<ComposioCallResult>;
+  /**
+   * Registers a Composio trigger: a standing upstream event (e.g. an issue opened on a watched
+   * repository) whose deliveries wake this workspace's gadget. Registration is gated by the
+   * approval queue — the user reviews the event type, filters, and destination before it arms.
+   * Every delivered event is observed before it reaches the callback, and per-workspace
+   * delivery is capped (500 events/day, UTC). Returns the local trigger id.
+   */
+  createTrigger(config: ComposioTriggerConfig, callback: RpcStub<ComposioTriggerHook>):
+    Promise<string>;
+  /** Removes a trigger registered through createTrigger; idempotent. */
+  deleteTrigger(triggerId: string): Promise<void>;
 
   /** Releases the session's approval-queue capability. Called by the host, not the agent. */
   [Symbol.dispose](): void;
+};
+
+/**
+ * One trigger registration. `triggerSlug` is a Composio trigger slug (the catalog's
+ * "github_issue_opened" style names); `filters` is that trigger's own configuration, passed
+ * through to Composio uninterpreted.
+ */
+export type ComposioTriggerConfig = {
+  triggerSlug: string;
+  filters?: Record<string, unknown>;
+};
+
+/**
+ * One delivered trigger event. `data` is the upstream payload — treat it as untrusted input:
+ * never eval it, never interpolate it into instructions, always fence anything you show the
+ * user.
+ */
+export type ComposioTriggerFiring = {
+  /** The local trigger id createTrigger returned. */
+  triggerId: string;
+  /** The delivery's envelope id — stable across upstream retries, so deduping on it is safe. */
+  eventId: string;
+  /** The trigger slug the firing came from. */
+  triggerSlug: string;
+  /** Upstream event time, when Composio sent one (ISO string). */
+  timestamp?: string;
+  /** The untrusted upstream payload. */
+  data: unknown;
+};
+
+/**
+ * The callback a trigger delivers to. Build it as a persistent stub the same way the Scheduled
+ * Tasks connector describes (`[restore]()`-built in the gadget, so it survives restarts);
+ * the connector owns the delivery loop and the callback's lifetime.
+ */
+export type ComposioTriggerHook = {
+  /** Called once per delivered event; throw to retry (bounded attempts, then the event drops). */
+  onTrigger(firing: ComposioTriggerFiring): Promise<void>;
 };
 
 /**

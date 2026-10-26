@@ -10,7 +10,7 @@
 // action (plans/composio-gatekeeper.md "Execution, approval, settlement").
 
 import { validateRpc } from "capnweb-validate";
-import { RpcTarget, type RpcStub } from "cloudflare:workers";
+import { RpcTarget, type RpcStub, type RpcStub as NativeRpcStub } from "cloudflare:workers";
 import {
   buildDescription,
   quoteUntrusted,
@@ -25,20 +25,6 @@ import type {
 } from "@gadgets/workshop-shared/gatekeeper";
 
 import type {
-  ComposioAccount,
-  ComposioExecuteOutcome,
-  ComposioExecuteRequest,
-} from "./account.js";
-import { MAX_QUESTION_BYTES, capUtf8, type InputRequest, type ToolInfo } from "./composio-api.js";
-import { isMetaTool } from "./config.js";
-import {
-  CONTINUATION_ACTION_KIND,
-  isAutoApplyEligible,
-  resolveToolkitPolicy,
-  ToolkitPolicy,
-  toolkitWriteActionKind,
-} from "./policy.js";
-import type {
   ComposioCallResult,
   ComposioInputRequest,
   ComposioSession,
@@ -46,7 +32,32 @@ import type {
   ComposioToolkitListing,
   ComposioToolkitSession,
   ComposioToolInfo,
+  ComposioTriggerConfig,
 } from "./types.js";
+import type {
+  ComposioAccount,
+  ComposioExecuteOutcome,
+  ComposioExecuteRequest,
+} from "./account.js";
+import { MAX_QUESTION_BYTES, capUtf8, type InputRequest, type ToolInfo } from "./composio-api.js";
+import { isMetaTool } from "./config.js";
+import type {
+  ComposioTriggerControllerProps,
+  ComposioTriggerControllerService,
+  ComposioTriggerHookTarget,
+} from "./triggers.js";
+import {
+  CONTINUATION_ACTION_KIND,
+  isAutoApplyEligible,
+  resolveToolkitPolicy,
+  ToolkitPolicy,
+  toolkitWriteActionKind,
+} from "./policy.js";
+
+/** A trigger slug longer than this is garbage input, not a catalog name. */
+const TRIGGER_SLUG_LIMIT = 120;
+/** Filters are passthrough config; past this the approval card stops being readable. */
+const TRIGGER_FILTERS_LIMIT = 16 * 1024;
 
 /** The execution request shape a read dispatches as (no continuation or decline fields). */
 type ReadRequest = Pick<ComposioExecuteRequest, "tool" | "arguments" | "toolkitSlug" | "account" | "generation">;
@@ -74,6 +85,10 @@ export interface FacetHost {
   revertContinuation(continuationId: string): Promise<void>;
   /** Pushes the facet's pending count to the account (its key-switch fence reads the counter). */
   syncPending(): Promise<void>;
+  /** Mints one trigger hook controller bound to this facet's account (triggers.ts). */
+  createTriggerController(
+    props: Omit<ComposioTriggerControllerProps, "accountObjectId">,
+  ): Fetcher<ComposioTriggerControllerService>;
 }
 
 /** What the session builds on: how it is scoped, and whether writes can ever auto-apply. */
@@ -497,6 +512,74 @@ export class ComposioSessionImpl extends ComposioSessionBase implements Composio
       ).finish().description,
     });
     return scoped.map(tool => this.listed(tool));
+  }
+
+  /**
+   * Registers one Composio trigger on the Scheduled Tasks hook contract: the controller the
+   * facet mints carries the trigger's immutable identity, and `bindHook` parks it at the
+   * approval gate with the event type, filters, and destination spelled out — nothing arms
+   * until the user approves, and a denial or unbind disarms through the same controller.
+   */
+  async createTrigger(
+    config: ComposioTriggerConfig,
+    callback: NativeRpcStub<ComposioTriggerHookTarget>,
+  ): Promise<string> {
+    if (typeof config !== "object" || config === null) {
+      throw new Error("createTrigger() requires a trigger config object.");
+    }
+    const triggerSlug = config.triggerSlug;
+    if (typeof triggerSlug !== "string" || triggerSlug.length === 0) {
+      throw new Error("createTrigger() requires a non-empty triggerSlug.");
+    }
+    if (triggerSlug.length > TRIGGER_SLUG_LIMIT) {
+      throw new Error(`createTrigger() triggerSlug must be at most ${TRIGGER_SLUG_LIMIT} characters.`);
+    }
+    const filters = config.filters ?? {};
+    if (typeof filters !== "object" || filters === null || Array.isArray(filters)) {
+      throw new Error("createTrigger() filters must be an object.");
+    }
+    if (JSON.stringify(filters).length > TRIGGER_FILTERS_LIMIT) {
+      throw new Error(`createTrigger() filters must serialize to at most ${TRIGGER_FILTERS_LIMIT} characters.`);
+    }
+    const triggerId = crypto.randomUUID();
+    const title = sanitizeTitle(`Composio trigger: ${triggerSlug}`);
+    const rendered = buildDescription(
+      `Arm the Composio trigger **${triggerSlug}**. When it fires upstream, the event is ` +
+        `delivered to this workspace's gadget — observed first, and capped per day — before ` +
+        `the registered callback runs.`,
+    ).json("Filters", filters).finish();
+    // HookDescription carries prose only (no fields member), so the filter values are folded
+    // into the description as their already-escaped JSON field values.
+    const description = rendered.fields?.length
+      ? `${rendered.description}\n\n${rendered.fields.map(field => `**${field.label}:** ${field.kind === "json" ? field.value : JSON.stringify(field)}`).join("\n\n")}`
+      : rendered.description;
+    const controller = this.host.facet.createTriggerController({
+      triggerId,
+      triggerSlug,
+      filters,
+      title,
+      description,
+    });
+    await this.queue.bindHook(
+      // @ts-expect-error Workers currently widens the controller's hook type across bindHook RPC.
+      controller,
+      callback,
+      // bindHook takes only the display metadata; the bound callback stays in the controller.
+      { title, description },
+    );
+    return triggerId;
+  }
+
+  /** Removes a trigger (and its upstream instance); idempotent. */
+  async deleteTrigger(triggerId: string): Promise<void> {
+    await this.queue.authorizeObservation({
+      title: `${this.host.serverName}: remove trigger`,
+      description: buildDescription(
+        `Stop delivering the Composio trigger ${quoteUntrusted(triggerId, 80)} and delete its ` +
+          `upstream instance.`,
+      ).finish().description,
+    });
+    await this.host.account.disableTrigger(triggerId);
   }
 }
 

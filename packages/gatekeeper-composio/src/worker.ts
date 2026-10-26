@@ -17,11 +17,20 @@ import type {
   SupportedResource,
   VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
-import { workerVersionTag } from "@gadgets/workshop-shared/gatekeeper";
+import {
+  workerVersionTag,
+} from "@gadgets/workshop-shared/gatekeeper";
 
 import { ComposioApi } from "./composio-api.js";
-import { deploymentApiKey, VENDOR_ID } from "./config.js";
+import {
+  CONNECT_LINK_CALLBACK_PATH,
+  deploymentApiKey,
+  gatekeeperBasePath,
+  VENDOR_ID,
+} from "./config.js";
+
 import { isAutoApplyEligible, ToolkitPolicy } from "./policy.js";
+import { MAX_ENVELOPE_BYTES, parseWebhookEnvelope } from "./webhooks.js";
 import TYPES_CODE from "./types.txt";
 export { default as TYPES_CODE } from "./types.txt";
 
@@ -31,6 +40,7 @@ export {
   ComposioToolkitGatekeeper,
 } from "./facet.js";
 export { startAppUi } from "./app-ui.js";
+export { ComposioTriggerHookController } from "./triggers.js";
 
 // ---------------------------------------------------------------------------
 // Logging and the Composio fetch seam.
@@ -57,6 +67,12 @@ export type ComposioLogFields = McpLogFields & {
   chainDepth: number;
   /** Generic count (pending actions, admissions, ...) for the event on the line. */
   count: number;
+  /** The upstream trigger slug a trigger lifecycle line is about. */
+  triggerSlug: string;
+  /** The workspace a delivered trigger event or quota line belongs to. */
+  workspaceId: string;
+  /** The webhook envelope kind an ingest line dropped (trigger/expired). */
+  webhookType: string;
 };
 
 /** The package's one logger; siblings derive scoped copies with .with(). */
@@ -222,4 +238,86 @@ export class ComposioVerifier
   verify(): void {}
 }
 
-export default GatekeeperVendor;
+// ---------------------------------------------------------------------------
+// HTTP surface. The vendor stays the RPC entrypoint (bindings name `GatekeeperVendor`); the
+// default object adds the plain-HTTP routes the outside world reaches: Composio's webhook
+// deliveries and the Connect Link completion page. The webhook route routes by unverified
+// envelope contents only to pick a Durable Object — the account verifies the Standard Webhooks
+// signature before any parsed field is acted on, so a forged user_id reaches at most an
+// unsatisfiable 401. Body contents are never logged here.
+
+const ACCOUNT_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Connect Link completion page: static, inert (polling confirms completion, never this URL). */
+const CONNECT_CALLBACK_HTML =
+  "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" +
+  "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
+  "<title>Composio connection</title></head>" +
+  "<body style=\"font-family:system-ui;padding:3rem;text-align:center\">" +
+  "<h1>Connection complete</h1>" +
+  "<p>You can close this window and return to the Workshop.</p></body></html>";
+
+export default {
+  async fetch(request: Request, env: Cloudflare.Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+    const basePath = gatekeeperBasePath(env);
+    const relPath = url.pathname.slice(basePath.length);
+
+    if (request.method === "POST"
+      && (relPath === "/webhook" || (basePath === "" && url.pathname === "/webhook"))) {
+      return await handleWebhook(request, ctx);
+    }
+
+    const callbackPath = basePath === "" ? "/connect-callback" : `${basePath}/connect-callback`;
+    if (url.pathname === callbackPath || url.pathname === CONNECT_LINK_CALLBACK_PATH) {
+      return new Response(CONNECT_CALLBACK_HTML, {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+
+    return new Response("Not Found", { status: 404 });
+  },
+};
+
+/** Routes one webhook delivery to the account its (unverified) envelope names. */
+async function handleWebhook(request: Request, ctx: ExecutionContext): Promise<Response> {
+  const webhookId = request.headers.get("webhook-id") ?? "";
+  const timestamp = request.headers.get("webhook-timestamp") ?? "";
+  const signature = request.headers.get("webhook-signature") ?? "";
+  if (webhookId === "" || timestamp === "" || signature === "") {
+    return new Response(null, { status: 400 });
+  }
+  const rawBody = await request.text();
+  if (rawBody.length > MAX_ENVELOPE_BYTES) {
+    return new Response(null, { status: 413 });
+  }
+  const parsed = parseWebhookEnvelope(rawBody);
+  if (!parsed.ok) {
+    return new Response(null, { status: 400 });
+  }
+  const event = parsed.event;
+  if (event.kind === "unknown") {
+    // An event type this deployment never subscribed to; ACK so Composio stops delivering it.
+    return new Response(null, { status: 200 });
+  }
+  if (event.routedAccountId === null) {
+    // Connected-account expiry without the deprecated user_id field: no account to route to.
+    logger.info("webhook event unroutable, acknowledged and dropped", {
+      event: "webhook.ingest.unroutable",
+      webhookType: event.kind,
+    });
+    return new Response(null, { status: 200 });
+  }
+  if (!ACCOUNT_ID_PATTERN.test(event.routedAccountId)) {
+    // Never a name this deployment minted (createAccount uses uuids); ACK rather than mint
+    // junk Durable Objects from forged posts.
+    logger.info("webhook routed to a non-account id, acknowledged", {
+      event: "webhook.ingest.bad-account",
+    });
+    return new Response(null, { status: 200 });
+  }
+  const account = ctx.exports.ComposioAccount.getByName(event.routedAccountId);
+  const status = await account.ingestWebhook(rawBody, webhookId, timestamp, signature);
+  return new Response(null, { status });
+}

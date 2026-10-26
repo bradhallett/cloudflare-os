@@ -48,6 +48,11 @@ import {
   type ComposioSessionHost,
   type ContinuationRound,
 } from "./session.js";
+import { skipRpcValidation } from "capnweb-validate";
+import type {
+  ComposioTriggerControllerProps,
+  ComposioTriggerControllerService,
+} from "./triggers.js";
 import type { ComposioSession, ComposioToolkitSession } from "./types.js";
 import { TYPES_CODE, actionStoreLog, composioTestHooksEnabled, logger } from "./worker.js";
 
@@ -152,6 +157,24 @@ abstract class ComposioFacetCore<Props> extends DurableObject<Cloudflare.Env, Pr
   protected account(): ComposioAccount {
     const account = this.ctx.exports.ComposioAccount;
     return account.get(account.idFromString(this.accountObjectId)) as unknown as ComposioAccount;
+  }
+
+  /**
+   * Mints one trigger hook controller in this worker (triggers.ts): the controller carries the
+   * trigger's immutable identity plus this facet's account, and forwards enable/disable to the
+   * account DO that owns the rows, queue, and upstream instances.
+   *
+   * Validation is skipped: the minted stub is forwarded onward (to bindHook) rather than
+   * returned over RPC, and a validated return would hand the session a proxy-wrapped stub
+   * that cannot be serialized again.
+   */
+  @skipRpcValidation()
+  createTriggerController(
+    props: Omit<ComposioTriggerControllerProps, "accountObjectId">,
+  ): Fetcher<ComposioTriggerControllerService> {
+    return this.ctx.exports.ComposioTriggerHookController({
+      props: { ...props, accountObjectId: this.accountObjectId },
+    });
   }
 
   #actions(): ActionStore {

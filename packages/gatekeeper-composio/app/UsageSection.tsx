@@ -31,6 +31,15 @@ export default function UsageSection({ usage }: Props) {
         <span className="text-kumo-subtle"> ({countersLine(usage.own)})</span>. Own-key calls spend
         your project’s quota and are never refused at the deployment limit.
       </p>
+      <p className="mt-1 text-sm text-kumo-default">
+        Trigger events: <strong>{usage.events.delivered}</strong> delivered today
+        {usage.events.dropped > 0 && (
+          <>
+            , <strong>{usage.events.dropped}</strong> dropped over the limit
+          </>
+        )}{" "}
+        — capped at {usage.events.limit} per workspace per UTC day.
+      </p>
     </section>
   );
 }

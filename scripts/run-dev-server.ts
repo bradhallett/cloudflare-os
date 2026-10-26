@@ -506,7 +506,8 @@ const PASSTHROUGH_GATEKEEPER_VARS: Record<string, string[]> = {
   "gatekeeper-gitlab": ["GITLAB_URL", "GITLAB_API_URL", "CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET"],
   // The Composio project key the gatekeeper runs against, and each user's daily call limit; the
   // key is unset only for BYO-key-only local experiments.
-  "gatekeeper-composio": ["COMPOSIO_API_KEY", "COMPOSIO_DAILY_CALL_LIMIT"],
+  // WEBHOOK_ORIGIN: the https tunnel origin Composio webhook deliveries target in dev.
+  "gatekeeper-composio": ["COMPOSIO_API_KEY", "COMPOSIO_DAILY_CALL_LIMIT", "WEBHOOK_ORIGIN"],
   // Each connection's daily read limit; unset, the in-code default.
   "gatekeeper-x": ["X_DAILY_READ_LIMIT"],
 };
