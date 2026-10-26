@@ -29,6 +29,7 @@ import type { CodeChange } from "./code-change.js";
 import type { GitOid } from "./gatekeeper.js";
 import type { UiFeatureFlags } from "./feature-flags.js";
 import type { ModelTier, EntitlementsPlanId } from "./entitlements.js";
+import { codedErrorFamily } from "./errors.js";
 
 export const SERVICE_SALT = new Uint8Array([
   0xd9, 0x4e, 0x54, 0x1d, 0x29, 0xc1, 0x03, 0x74, 0x73, 0x7e, 0xb3, 0xe3, 0x34, 0x6d, 0x8f, 0x21
@@ -371,22 +372,6 @@ export interface ObserverConfigCallback extends RpcTarget {
   configure(needs: ObserverBindingNeed[]): Promise<ObserverAccountChoice[]>;
 }
 
-/** Builds the create/read helpers for a family of expected errors carrying stable
- * machine-readable codes. The per-code messages double as the classification fallback for errors
- * from older deployments that lost the code in transit, so changing one is a compatibility break. */
-function codedErrorFamily<Code extends string>(messages: Record<Code, string>) {
-  const codes = new Set<unknown>(Object.keys(messages));
-  return {
-    create: (code: Code): Error & { code: Code } =>
-        Object.assign(new Error(messages[code]), { code }),
-    getCode: (error: unknown): Code | undefined => {
-      const candidate = typeof error === "object" && error !== null && "code" in error
-          ? error.code : undefined;
-      return codes.has(candidate) ? candidate as Code : undefined;
-    },
-  };
-}
-
 /** Stable error codes attached to expected failures from `AuthenticatedApi.openGadget()`. */
 export const OPEN_GADGET_ERROR_CODES = {
   workspaceNotFound: "WORKSPACE_NOT_FOUND",
@@ -398,7 +383,7 @@ export const OPEN_GADGET_ERROR_CODES = {
 export type OpenGadgetErrorCode =
     typeof OPEN_GADGET_ERROR_CODES[keyof typeof OPEN_GADGET_ERROR_CODES];
 
-const openGadgetErrors = codedErrorFamily<OpenGadgetErrorCode>({
+const openGadgetErrors = codedErrorFamily(OPEN_GADGET_ERROR_CODES, {
   [OPEN_GADGET_ERROR_CODES.workspaceNotFound]: "Workspace not found.",
   [OPEN_GADGET_ERROR_CODES.workspaceAccessDenied]: "You don't have access to this workspace.",
   [OPEN_GADGET_ERROR_CODES.shareLinksDisabled]:
@@ -428,7 +413,7 @@ export const AUTH_ERROR_MESSAGES: Record<AuthErrorCode, string> = {
   [AUTH_ERROR_CODES.notAuthenticatedWithAccess]: "Not authenticated with Access.",
 };
 
-const authErrors = codedErrorFamily(AUTH_ERROR_MESSAGES);
+const authErrors = codedErrorFamily(AUTH_ERROR_CODES, AUTH_ERROR_MESSAGES);
 
 /** Creates an authentication failure with a machine-readable code. */
 export const createAuthError = authErrors.create;
@@ -449,25 +434,20 @@ export const PLAN_REFUSAL_CODES = {
  * the throw site rather than fixed per code. */
 export type PlanRefusalCode = typeof PLAN_REFUSAL_CODES[keyof typeof PLAN_REFUSAL_CODES];
 
-const planRefusalCodes = new Set<unknown>(Object.values(PLAN_REFUSAL_CODES));
+const planRefusalErrors = codedErrorFamily(PLAN_REFUSAL_CODES);
 
-/** Creates a plan-enforcement refusal carrying its machine-readable code. */
+/** Creates a plan-enforcement refusal carrying its machine-readable code; the message names the
+ * refused thing, so it is composed at the throw site and passed in. */
 export function createPlanRefusalError(code: PlanRefusalCode, message: string):
     Error & { code: PlanRefusalCode } {
-  return Object.assign(new Error(message), { code });
+  return planRefusalErrors.create(code, message);
 }
 
 /** Reads the plan-refusal code from an error, if it carries one. */
-export function getPlanRefusalCode(error: unknown): PlanRefusalCode | undefined {
-  const candidate = typeof error === "object" && error !== null && "code" in error
-      ? error.code : undefined;
-  return planRefusalCodes.has(candidate) ? candidate as PlanRefusalCode : undefined;
-}
+export const getPlanRefusalCode = planRefusalErrors.getCode;
 
 /** Whether `code` is a plan-refusal code — the client-side test for error surfaces. */
-export function isPlanRefusalCode(code: unknown): code is PlanRefusalCode {
-  return planRefusalCodes.has(code);
-}
+export const isPlanRefusalCode = planRefusalErrors.isCode;
 
 /**
  * One user as listed in the deployment-wide user directory (see
