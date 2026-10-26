@@ -62,3 +62,73 @@ describe('AdminComposioPanel cross-listed slugs', () => {
     expect(document.body.textContent).not.toContain(INERT)
   })
 })
+
+describe('AdminComposioPanel live slug validation', () => {
+  let root: Root | null = null
+
+  afterEach(() => {
+    root?.unmount()
+    root = null
+    document.body.innerHTML = ''
+    vi.clearAllMocks()
+    vi.useRealTimers()
+  })
+
+  const render = async (getComposioToolkitInfo: ReturnType<typeof vi.fn>) => {
+    const admin = { getComposioToolkitInfo } as unknown as RpcStub<AdminApi>
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    root = createRoot(container)
+    await act(async () => root!.render(
+      <AdminComposioPanel
+        admin={admin}
+        excludedToolkits={[]}
+        autoApplyToolkits={[]}
+        onSaved={() => {}}
+      />))
+  }
+
+  // Type like a user: bypass React's value tracker (which dedupes direct `.value` writes) with
+  // the native setter, then let the bubbling input event reach the controlled textarea.
+  const typeInto = (index: number, text: string) => {
+    const area = document.querySelectorAll('textarea')[index]!
+    const setValue = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!
+    act(() => {
+      setValue.call(area, text)
+      area.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+  }
+
+  it('checks a slug against the catalog as it is typed, before Save', async () => {
+    vi.useFakeTimers()
+    // The catalog knows gmail only; a typed unknown slug must be flagged without a save.
+    const getComposioToolkitInfo = vi.fn<AdminApi['getComposioToolkitInfo']>(
+      async (slugs) => slugs.map((slug) => ({
+        slug, exists: slug === 'gmail', eligibleToolCount: 3, destructiveToolCount: 1,
+      })))
+    await render(getComposioToolkitInfo)
+    expect(getComposioToolkitInfo).not.toHaveBeenCalled()
+
+    typeInto(0, 'slack')
+    expect(getComposioToolkitInfo).not.toHaveBeenCalled()
+    await act(async () => { await vi.advanceTimersByTimeAsync(400) })
+
+    expect(getComposioToolkitInfo).toHaveBeenCalledTimes(1)
+    expect(getComposioToolkitInfo).toHaveBeenCalledWith(['slack'])
+    expect(document.body.textContent).toContain('matches no toolkit in Composio’s catalog')
+  })
+
+  it('debounces keystrokes into one catalog check of the typed slugs', async () => {
+    vi.useFakeTimers()
+    const getComposioToolkitInfo = vi.fn<AdminApi['getComposioToolkitInfo']>(async () => [])
+    await render(getComposioToolkitInfo)
+
+    typeInto(0, 'gmail')
+    await act(async () => { await vi.advanceTimersByTimeAsync(250) })
+    typeInto(0, 'gmail\nnotion')
+    await act(async () => { await vi.advanceTimersByTimeAsync(400) })
+
+    expect(getComposioToolkitInfo).toHaveBeenCalledTimes(1)
+    expect(getComposioToolkitInfo).toHaveBeenCalledWith(['gmail', 'notion'])
+  })
+})

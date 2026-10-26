@@ -33,6 +33,8 @@ const ComposioToolkitList = ({
   title,
   description,
   saved,
+  draft,
+  onDraftChange,
   infoBySlug,
   infoPending,
   hiddenSlugs,
@@ -42,6 +44,9 @@ const ComposioToolkitList = ({
   title: string
   description: string
   saved: string[]
+  /** The list's edited text (one slug per line); owned by the parent, which validates it live. */
+  draft: string
+  onDraftChange: (draft: string) => void
   infoBySlug: Validation
   infoPending: boolean
   onSave: (slugs: string[]) => void
@@ -49,12 +54,7 @@ const ComposioToolkitList = ({
   hiddenSlugs?: ReadonlySet<string>
   saving: boolean
 }) => {
-  const [draft, setDraft] = useState(saved.join('\n'))
   const slugs = parseSlugs(draft)
-
-  useEffect(() => {
-    setDraft(saved.join('\n'))
-  }, [saved])
 
   return (
     <div>
@@ -62,7 +62,7 @@ const ComposioToolkitList = ({
       <p className="text-xs text-kumo-subtle mt-1 mb-2">{description}</p>
       <WorkshopInputArea
         value={draft}
-        onChange={(e) => setDraft(e.target.value)}
+        onChange={(e) => onDraftChange(e.target.value)}
         spellCheck={false}
         aria-label={title}
         placeholder="one toolkit slug per line, e.g. gmail"
@@ -126,24 +126,21 @@ export const AdminComposioPanel = ({
 }: AdminComposioPanelProps) => {
   const toasts = useKumoToastManager()
   const [saving, setSaving] = useState<'excluded' | 'autoApply' | null>(null)
-  // Live catalog answers for the union of both lists' drafts: null while the first check is out,
-  // 'unavailable' when the connector isn't bound so slugs cannot be validated.
+  // The two lists' draft texts, owned here so the debounced catalog check below reads what is
+  // being typed. Seeded once at mount (the admin page mounts this panel only after its settings
+  // read) and re-canonicalized in save() when the server takes a list.
   const [excludedDraft, setExcludedDraft] = useState(excludedToolkits.join('\n'))
   const [autoApplyDraft, setAutoApplyDraft] = useState(autoApplyToolkits.join('\n'))
+  // Live catalog answers for the union of both lists' drafts: null while the first check is out,
+  // 'unavailable' when the connector isn't bound so slugs cannot be validated.
   const [info, setInfo] = useState<Validation | null>(null)
-
-  useEffect(() => {
-    setExcludedDraft(excludedToolkits.join('\n'))
-  }, [excludedToolkits])
-  useEffect(() => {
-    setAutoApplyDraft(autoApplyToolkits.join('\n'))
-  }, [autoApplyToolkits])
-
-  const slugs = [...new Set([...parseSlugs(excludedDraft), ...parseSlugs(autoApplyDraft)])]
   // Hiding wins over auto-apply, so a slug on both drafts renders its auto-apply listing inert.
-  const crossListed = new Set(parseSlugs(excludedDraft).filter((s) => parseSlugs(autoApplyDraft).includes(s)))
+  const crossListed = new Set(
+    parseSlugs(excludedDraft).filter((slug) => parseSlugs(autoApplyDraft).includes(slug)),
+  )
 
   useEffect(() => {
+    const slugs = [...new Set([...parseSlugs(excludedDraft), ...parseSlugs(autoApplyDraft)])]
     if (slugs.length === 0) {
       setInfo(null)
       return
@@ -163,7 +160,7 @@ export const AdminComposioPanel = ({
       cancelled = true
       clearTimeout(timer)
     }
-  }, [admin, slugs.join('\n'), toasts])
+  }, [admin, excludedDraft, autoApplyDraft, toasts])
 
   const save = async (which: 'excluded' | 'autoApply', slugs: string[]) => {
     setSaving(which)
@@ -172,6 +169,9 @@ export const AdminComposioPanel = ({
         ? admin.setComposioExcludedToolkits
         : admin.setComposioAutoApplyToolkits
       await setter(slugs)
+      // Canonicalize the draft to what the server kept, matching the seed above.
+      if (which === 'excluded') setExcludedDraft(slugs.join('\n'))
+      else setAutoApplyDraft(slugs.join('\n'))
       onSaved(which, slugs)
     } catch (err) {
       toasts.add({ title: rpcFailureDescription(err) ?? 'Update failed', variant: 'error' })
@@ -186,6 +186,8 @@ export const AdminComposioPanel = ({
         title="Hidden toolkits"
         description="Composio toolkits this deployment hides from every surface: connecting, the agent catalog, and toolkit facets. Slugs must match Composio's exactly. Hiding wins: a toolkit on both lists is treated as hidden everywhere."
         saved={excludedToolkits}
+        draft={excludedDraft}
+        onDraftChange={setExcludedDraft}
         infoBySlug={info ?? new Map()}
         infoPending={info === null}
         onSave={(slugs) => void save('excluded', slugs)}
@@ -196,6 +198,8 @@ export const AdminComposioPanel = ({
         description="Toolkits whose create/update-tagged write tools users may arm for auto-apply on the connections page. Listing a toolkit vouches for all current and future eligible write tools in it. Hiding a toolkit is enforced everywhere immediately; unlisting affects only new bindings — a facet already armed keeps auto-applying new writes until its binding is re-minted."
         hiddenSlugs={crossListed}
         saved={autoApplyToolkits}
+        draft={autoApplyDraft}
+        onDraftChange={setAutoApplyDraft}
         infoBySlug={info ?? new Map()}
         infoPending={info === null}
         onSave={(slugs) => void save('autoApply', slugs)}

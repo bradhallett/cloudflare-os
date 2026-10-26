@@ -9,15 +9,6 @@ import { Check } from '@phosphor-icons/react'
  */
 export type ResolveClickResult = boolean | PromiseLike<boolean | void> | void
 
-/** Wraps a click result so a `false` outcome tracks as the button's error state. */
-function trackedOutcome(result: ResolveClickResult): PromiseLike<unknown> | null {
-  if (result === false) return Promise.reject(undefined)
-  if (!(result instanceof Promise)) return null
-  return result.then((value) => {
-    if (value === false) throw undefined
-  })
-}
-
 function FeedbackSpinner({ className = '' }: { className?: string }) {
   return (
     <span
@@ -65,8 +56,7 @@ export function ResolveButton({
       type="button"
       {...holdProps}
       onClick={() => {
-        const outcome = trackedOutcome(onClick())
-        if (outcome) feedback.track(outcome)
+        feedback.trackBoolean(onClick())
       }}
       disabled={disabled}
       aria-describedby={describedBy}
