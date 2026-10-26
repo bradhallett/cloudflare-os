@@ -40,8 +40,8 @@ import { reportIssue } from './errorReporting'
 import { useSiteName } from './ServerConfigContext'
 import { AccountsSubscriberAdapter } from './accountsSubscriber'
 import { useDialogSelectPortalContainer } from './useDialogSelectPortalContainer'
-import { openConnectWindow } from './connectHandoff'
-import { AuthPopupCancelledError } from './features/native-app/authPopup'
+import { useConnectAccountActions } from './useConnectAccountActions'
+import { useReportRpcFailure } from './useReportRpcFailure'
 import { SaasUpgradeModal, planRefusalPrompt } from './features/saas/commerceGate'
 import { Suspense } from 'react'
 
@@ -234,9 +234,9 @@ export default function GatekeeperModal({
   const [searchText, setSearchText] = useState('')
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set())
   const [creating, setCreating] = useState(false)
-  const [connectingVendor, setConnectingVendor] = useState<string | null>(null)
-  const [grantingAccountId, setGrantingAccountId] = useState<number | null>(null)
-  const [reconnectingAccountId, setReconnectingAccountId] = useState<number | null>(null)
+  const connectActions = useConnectAccountActions(authenticatedApi)
+  const { connectingVendor, grantingAccountId, reconnectingAccountId } = connectActions
+  const reportFailure = useReportRpcFailure()
   const [accounts, setAccounts] = useState<AccountOption[]>([])
   const [vendors, setVendors] = useState<VendorOption[]>([])
 
@@ -398,8 +398,7 @@ export default function GatekeeperModal({
     setSearchText('')
     setExpandedGroups(new Set())
     setCreating(false)
-    setConnectingVendor(null)
-    setReconnectingAccountId(null)
+    // Connect-flow busy state lives in useConnectAccountActions and clears as each flow settles.
     setVendors([])
     setSelectedAccountId(null)
     updateConfiguratorFrameState(null)
@@ -646,20 +645,17 @@ export default function GatekeeperModal({
   }
 
   const handleConnectAccount = async (vendorId: string, resourceUrlPatterns?: string[]) => {
-    setConnectingVendor(vendorId)
-    try {
-      const outcome = await openConnectWindow(await authenticatedApi.connectAccount(vendorId, resourceUrlPatterns), authenticatedApi)
+    const outcome = await connectActions.connect(vendorId, resourceUrlPatterns, {
+      onError: (error) => {
+        // A plan refusal opens the upgrade prompt instead of the generic error toast.
+        const refusal = planRefusalPrompt(error)
+        if (refusal) { setRefusal(refusal); return }
+        reportIssue('gatekeeper.connect-start', error, { gatekeeperVendorId: vendorId })
+        reportFailure('Could not complete connection flow', error)
+      },
+    })
+    if (outcome) {
       toasts.add({ title: outcome === 'connected' ? 'Account connected.' : 'Complete the account connection in the pop-up window.', variant: 'success' })
-    } catch (error) {
-      if (error instanceof AuthPopupCancelledError) return
-      // A plan refusal opens the upgrade prompt instead of the generic error toast.
-      const refusal = planRefusalPrompt(error)
-      if (refusal) { setRefusal(refusal); return }
-      console.error('Failed to initiate connection:', error)
-      reportIssue('gatekeeper.connect-start', error, { gatekeeperVendorId: vendorId })
-      toasts.add({ title: error instanceof Error ? error.message : 'Could not complete connection flow', variant: 'error' })
-    } finally {
-      setConnectingVendor(null)
     }
   }
 
@@ -670,41 +666,36 @@ export default function GatekeeperModal({
     const granted = account?.description.grantedResourceUrlPatterns
     const missing = granted === undefined ? [] : required.filter(p => !granted.includes(p))
     if (missing.length === 0) return
-    setGrantingAccountId(accountId)
-    try {
-      await requestAccountResources(authenticatedApi, toasts, accountId, missing)
+    const outcome = await connectActions.grant(accountId, missing, {
+      onError: (error) => {
+        const refusal = planRefusalPrompt(error)
+        if (refusal) { setRefusal(refusal); return }
+        reportIssue('gatekeeper.resource-grant', error, {
+          gatekeeperVendorId: selectedConnection?.vendorId,
+        })
+        reportFailure('Failed to request additional access', error)
+      },
+    })
+    if (outcome && outcome !== 'already-granted') {
       // After ticket redemption the new grant arrives via subscribeConnectedAccounts(),
       // the account's flag then clears and the configurator loads automatically.
-    } catch (error) {
-      if (error instanceof AuthPopupCancelledError) return
-      const refusal = planRefusalPrompt(error)
-      if (refusal) { setRefusal(refusal); return }
-      console.error('Failed to request additional access:', error)
-      reportIssue('gatekeeper.resource-grant', error, {
-        gatekeeperVendorId: selectedConnection?.vendorId,
-      })
-      toasts.add({ title: error instanceof Error ? error.message : 'Failed to request additional access', variant: 'error' })
-    } finally {
-      setGrantingAccountId(null)
+      toasts.add({ title: outcome === 'connected' ? 'Access granted.' : 'Grant the additional access in the pop-up window.', variant: 'success' })
     }
   }
 
   const handleReconnectAccount = async (accountId: number) => {
-    setReconnectingAccountId(accountId)
-    try {
-      const outcome = await openConnectWindow(await authenticatedApi.reconnectAccount(accountId), authenticatedApi)
+    const outcome = await connectActions.reconnect(accountId, {
+      onError: (error) => {
+        const refusal = planRefusalPrompt(error)
+        if (refusal) { setRefusal(refusal); return }
+        reportIssue('gatekeeper.reconnect-start', error, {
+          gatekeeperVendorId: selectedConnection?.vendorId,
+        })
+        reportFailure('Could not complete reconnect flow', error)
+      },
+    })
+    if (outcome) {
       toasts.add({ title: outcome === 'connected' ? 'Account reconnected.' : 'Complete the account reconnect in the pop-up window.', variant: 'success' })
-    } catch (error) {
-      if (error instanceof AuthPopupCancelledError) return
-      const refusal = planRefusalPrompt(error)
-      if (refusal) { setRefusal(refusal); return }
-      console.error('Failed to initiate reconnect:', error)
-      reportIssue('gatekeeper.reconnect-start', error, {
-        gatekeeperVendorId: selectedConnection?.vendorId,
-      })
-      toasts.add({ title: error instanceof Error ? error.message : 'Could not complete reconnect flow', variant: 'error' })
-    } finally {
-      setReconnectingAccountId(null)
     }
   }
 
@@ -803,8 +794,7 @@ export default function GatekeeperModal({
         toasts.add({ title: 'Failed to create connection', variant: 'error' })
       }
     } catch (err) {
-      console.error('Failed to create resource gatekeeper:', err)
-      toasts.add({ title: err instanceof Error && err.message ? err.message : 'Failed to create connection', variant: 'error' })
+      reportFailure('Failed to create connection', err)
     } finally {
       if (gatekeeper && !transferred) gatekeeper[Symbol.dispose]()
       setCreating(false)
