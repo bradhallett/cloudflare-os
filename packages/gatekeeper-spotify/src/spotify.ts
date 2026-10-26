@@ -18,11 +18,16 @@ import {
   type VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { buildDescription, type RenderedDescription } from "@gadgets/gatekeeper-kit/action-description";
+import {
+  ActionJournal,
+  type ActionJournalKv,
+  defineActions,
+  type TaggedAction,
+} from "@gadgets/gatekeeper-kit/actions";
 import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import {
-  clearConnectionSubject, commitReconnect, pinConnectionSubject, stageReconnect,
+  commitReconnectOrThrow, pinForConnect, stageReconnect,
 } from "@gadgets/gatekeeper-kit/credential-stage";
-import { canTransition, type ActionState } from "./action-state";
 import { type CallbackResult, fetchSubject, type PinnedSubject, pinRefusal } from "./connect-subject";
 import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
 import {
@@ -609,16 +614,15 @@ export class UserAccount extends DurableObject<Env> {
       handoff = await callback.reconnectComplete(staged.stageId);
     } else {
       this.#storeCredentials(credentials);
-      pinConnectionSubject(this.ctx.storage.kv, subject);
-      try {
-        const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
-        handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
-      } catch (err) {
-        this.ctx.storage.kv.delete("refreshToken");
-        this.ctx.storage.kv.delete("accessToken");
-        clearConnectionSubject(this.ctx.storage.kv);
-        throw err;
-      }
+      const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
+      // The pin brackets the handoff: a connect that fails unpins and drops the credentials
+      // stored ahead of it.
+      handoff = await pinForConnect(this.ctx.storage.kv, subject,
+        () => callback.complete(this.ctx.exports.GatekeeperUserImpl({ props })),
+        () => {
+          this.ctx.storage.kv.delete("refreshToken");
+          this.ctx.storage.kv.delete("accessToken");
+        });
     }
 
     await this.ctx.storage.deleteAlarm();
@@ -628,8 +632,8 @@ export class UserAccount extends DurableObject<Env> {
   /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. The kit
    * re-pins the staged subject, adopting a connection made before the pin existed. */
   async commitReconnect(stageId: string): Promise<void> {
-    const credentials = commitReconnect<StoredCredentials>(this.ctx.storage.kv, Date.now(), stageId);
-    if (!credentials) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+    const credentials = commitReconnectOrThrow<StoredCredentials>(
+      this.ctx.storage.kv, Date.now(), stageId);
     this.#storeCredentials(credentials);
   }
 
@@ -829,7 +833,7 @@ export class SpotifyVerifier extends WorkerEntrypoint<Env> implements Gatekeeper
 type WithApi = <T>(fn: (api: SpotifyApi) => Promise<T>) => Promise<T>;
 
 
-type BaseAction = { approvalId: number; submittedAt: number };
+type BaseAction = { submittedAt: number };
 
 type SaveTracksAction = BaseAction & { type: "saveTracks"; trackIds: string[] };
 type RemoveSavedTracksAction = BaseAction & { type: "removeSavedTracks"; trackIds: string[] };
@@ -986,13 +990,295 @@ type RevertInfo =
   | { kind: "playlistDetails"; realId: string; previous: SpotifyPlaylistDetailsUpdate }
   | { kind: "playlistCreate"; realId: string };
 
-type StoredActionRecord = {
+/** A retained action body: the write that was applied, plus the snapshot its revert needs. */
+type StoredActionBody = SpotifyAction & { revert?: RevertInfo };
+
+/** One kind per action type: the map the kit's action engine resolves records through. */
+type SpotifyActionKinds = { [K in SpotifyAction["type"]]: Extract<SpotifyAction, { type: K }> };
+
+/** The record shape this gatekeeper stored before adopting the kit journal. */
+type LegacyStoredAction = {
   action: SpotifyAction;
-  state: ActionState;
+  state: "staged" | "pending" | "failed" | "approved" | "rejected";
+  revert?: RevertInfo;
   appliedAt?: number;
   rejectedAt?: number;
-  revert?: RevertInfo;
 };
+
+/** Provider operations the apply/reject handlers of an action kind run. */
+type SpotifyActionHost = {
+  withApi<T>(fn: (api: SpotifyApi) => Promise<T>): Promise<T>;
+  /** Resolves a logical playlist id, refusing a provisional one that was never created. */
+  requireRealPlaylistId(playlistId: string): string;
+  /** Resolves a provisional id to the real Spotify id its create bound, if it applied. */
+  provisionalRealId(logicalId: string): string | undefined;
+  playlistSummary(realId: string): Promise<SpotifyPlaylistSummary>;
+  materializePlaylist(realId: string): Promise<PlaylistEntry[]>;
+  applyAddTracks(realId: string, uris: string[], position?: number): Promise<void>;
+  setPlaylistTracks(realId: string, uris: string[]): Promise<void>;
+  invalidatePlaylist(realId: string): void;
+  bindProvisional(provisionalId: string, realId: string): void;
+  dropProvisional(provisionalId: string): void;
+  pruneRetiredActions(): void;
+};
+
+// Approval titles for playback commands, one per `PlayerCommand` op.
+const PLAYER_COMMAND_TITLES: Record<PlayerCommand["op"], string> = {
+  play: "Start/resume playback",
+  pause: "Pause playback",
+  next: "Skip to next track",
+  previous: "Skip to previous track",
+  seek: "Seek playback",
+  setVolume: "Set volume",
+  setShuffle: "Set shuffle",
+  setRepeat: "Set repeat mode",
+  transfer: "Transfer playback",
+  addToQueue: "Add to queue",
+};
+
+/** The provisional ("~N") playlist reference an action depends on; a real id depends on nothing. */
+const provisionalRef = (playlistId: string): string[] => (playlistId.startsWith("~") ? [playlistId] : []);
+
+// The pre-edit snapshot a playlist write retains for revert, when the playlist is small enough to
+// keep the stored value bounded (PLAYLIST_REVERT_SNAPSHOT_MAX). Best-effort, as before: dropped
+// unavailable items, and a replace-based restore resets added_at/added_by/snapshot_id.
+async function snapshotPlaylistForRevert(host: SpotifyActionHost, realId: string): Promise<RevertInfo | undefined> {
+  if ((await host.playlistSummary(realId)).trackCount > PLAYLIST_REVERT_SNAPSHOT_MAX) return undefined;
+  const previous = await host.materializePlaylist(realId);
+  return { kind: "playlistTracks", realId, previousUris: previous.map(entry => entry.uri).filter(Boolean) };
+}
+
+/**
+ * Every queued Spotify write, on the kit's action engine. All kinds claim before they dispatch:
+ * a write that loses its activation mid-apply has an unknown outcome at Spotify and must never be
+ * re-dispatched by a retry, so an interrupted claim ends terminal rather than pending.
+ */
+const SPOTIFY_ACTIONS = defineActions<SpotifyActionHost, SpotifyActionKinds>({
+  saveTracks: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: a => ({ title: `Save ${a.trackIds.length} track(s)`, implementsRevert: true, ...describeSpotifyAction(a) }),
+    apply: async (a, host) => { await host.withApi(api => api.saveToLibrary(a.trackIds.map(trackUri))); },
+  },
+  removeSavedTracks: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: a => ({ title: `Remove ${a.trackIds.length} saved track(s)`, implementsRevert: true, ...describeSpotifyAction(a) }),
+    apply: async (a, host) => { await host.withApi(api => api.removeFromLibrary(a.trackIds.map(trackUri))); },
+  },
+  saveAlbums: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: a => ({ title: `Save ${a.albumIds.length} album(s)`, implementsRevert: true, ...describeSpotifyAction(a) }),
+    apply: async (a, host) => { await host.withApi(api => api.saveToLibrary(a.albumIds.map(albumUri))); },
+  },
+  removeSavedAlbums: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: a => ({ title: `Remove ${a.albumIds.length} saved album(s)`, implementsRevert: true, ...describeSpotifyAction(a) }),
+    apply: async (a, host) => { await host.withApi(api => api.removeFromLibrary(a.albumIds.map(albumUri))); },
+  },
+  followArtists: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: a => ({ title: `Follow ${a.artistIds.length} artist(s)`, implementsRevert: true, ...describeSpotifyAction(a) }),
+    apply: async (a, host) => { await host.withApi(api => api.saveToLibrary(a.artistIds.map(artistUri))); },
+  },
+  unfollowArtists: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: a => ({ title: `Unfollow ${a.artistIds.length} artist(s)`, implementsRevert: true, ...describeSpotifyAction(a) }),
+    apply: async (a, host) => { await host.withApi(api => api.removeFromLibrary(a.artistIds.map(artistUri))); },
+  },
+  playlistCreate: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: a => ({ title: `Create playlist "${a.name}"`, implementsRevert: true, ...describeSpotifyAction(a) }),
+    provides: a => [a.provisionalId],
+    apply: async (a, host) => {
+      const created = await host.withApi(api => api.createPlaylist({
+        name: a.name,
+        description: a.description,
+        public: a.public,
+        collaborative: a.collaborative,
+      }));
+      host.bindProvisional(a.provisionalId, created.id);
+      return { action: { ...a, revert: { kind: "playlistCreate", realId: created.id } } };
+    },
+    // The provisional playlist will never exist; the engine strands every dependent on it.
+    reject: async (a, host) => { host.dropProvisional(a.provisionalId); },
+  },
+  playlistAdd: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: a => ({ title: `Add ${a.uris.length} track(s) to playlist`, implementsRevert: true, ...describeSpotifyAction(a) }),
+    dependsOn: a => provisionalRef(a.playlistId),
+    apply: async (a, host) => {
+      const realId = host.requireRealPlaylistId(a.playlistId);
+      const revert = await snapshotPlaylistForRevert(host, realId);
+      await host.applyAddTracks(realId, a.uris, a.position);
+      host.invalidatePlaylist(realId);
+      return revert === undefined ? undefined : { action: { ...a, revert } };
+    },
+  },
+  playlistRemove: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: a => ({ title: `Remove ${a.uris.length} track(s) from playlist`, implementsRevert: true, ...describeSpotifyAction(a) }),
+    dependsOn: a => provisionalRef(a.playlistId),
+    apply: async (a, host) => {
+      const realId = host.requireRealPlaylistId(a.playlistId);
+      const revert = await snapshotPlaylistForRevert(host, realId);
+      await host.withApi(api => api.removePlaylistItems(realId, a.uris));
+      host.invalidatePlaylist(realId);
+      return revert === undefined ? undefined : { action: { ...a, revert } };
+    },
+  },
+  playlistReorder: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: a => ({ title: "Reorder playlist tracks", implementsRevert: true, ...describeSpotifyAction(a) }),
+    dependsOn: a => provisionalRef(a.playlistId),
+    apply: async (a, host) => {
+      const realId = host.requireRealPlaylistId(a.playlistId);
+      const revert = await snapshotPlaylistForRevert(host, realId);
+      await host.withApi(api => api.reorderPlaylistItems(realId, a.rangeStart, a.insertBefore, a.rangeLength));
+      host.invalidatePlaylist(realId);
+      return revert === undefined ? undefined : { action: { ...a, revert } };
+    },
+  },
+  playlistReplace: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: a => ({ title: "Replace playlist tracks", implementsRevert: true, ...describeSpotifyAction(a) }),
+    dependsOn: a => provisionalRef(a.playlistId),
+    apply: async (a, host) => {
+      const realId = host.requireRealPlaylistId(a.playlistId);
+      const revert = await snapshotPlaylistForRevert(host, realId);
+      await host.setPlaylistTracks(realId, a.uris);
+      host.invalidatePlaylist(realId);
+      return revert === undefined ? undefined : { action: { ...a, revert } };
+    },
+  },
+  playlistDetails: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: a => ({ title: "Change playlist details", implementsRevert: true, ...describeSpotifyAction(a) }),
+    dependsOn: a => provisionalRef(a.playlistId),
+    apply: async (a, host) => {
+      const realId = host.requireRealPlaylistId(a.playlistId);
+      const current = normalizePlaylistSummary(await host.withApi(api => api.getPlaylist(realId)));
+      const revert: RevertInfo = {
+        kind: "playlistDetails",
+        realId,
+        previous: {
+          name: current.name,
+          description: current.description ?? undefined,
+          public: current.public ?? undefined,
+          collaborative: current.collaborative,
+        },
+      };
+      await host.withApi(api => api.changePlaylistDetails(realId, a.update));
+      host.invalidatePlaylist(realId);
+      return { action: { ...a, revert } };
+    },
+  },
+  playlistUnfollow: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: a => ({ title: "Remove playlist from library", implementsRevert: true, ...describeSpotifyAction(a) }),
+    dependsOn: a => provisionalRef(a.playlistId),
+    apply: async (a, host) => {
+      const realId = host.requireRealPlaylistId(a.playlistId);
+      await host.withApi(api => api.removeFromLibrary([playlistUri(realId)]));
+      host.invalidatePlaylist(realId);
+    },
+  },
+  playlistFollow: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: a => ({ title: "Add playlist to library", implementsRevert: true, ...describeSpotifyAction(a) }),
+    dependsOn: a => provisionalRef(a.playlistId),
+    apply: async (a, host) => {
+      const realId = host.requireRealPlaylistId(a.playlistId);
+      await host.withApi(api => api.saveToLibrary([playlistUri(realId)]));
+      host.invalidatePlaylist(realId);
+    },
+  },
+  player: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: a => ({
+      title: PLAYER_COMMAND_TITLES[a.command.op],
+      implementsRevert: false,
+      ...describeSpotifyAction(a),
+    }),
+    apply: async (a, host) => {
+      await host.withApi(async api => applyPlayerCommand(api, a.command));
+    },
+  },
+}, {
+  fence: "none",
+  vendorId: "spotify",
+  retainApplied: true,
+  isResolvedReference: (host, ref) => host.provisionalRealId(ref) !== undefined,
+  afterResolve: host => { host.pruneRetiredActions(); },
+});
+
+/** One `PlayerCommand` dispatched to the API. */
+async function applyPlayerCommand(api: SpotifyApi, command: PlayerCommand): Promise<void> {
+  switch (command.op) {
+    case "play": await api.play(command.deviceId, command.body); return;
+    case "pause": await api.pause(command.deviceId); return;
+    case "next": await api.next(command.deviceId); return;
+    case "previous": await api.previous(command.deviceId); return;
+    case "seek": await api.seek(command.positionMs, command.deviceId); return;
+    case "setVolume": await api.setVolume(command.volumePercent, command.deviceId); return;
+    case "setShuffle": await api.setShuffle(command.shuffle, command.deviceId); return;
+    case "setRepeat": await api.setRepeat(command.mode, command.deviceId); return;
+    case "transfer": await api.transfer(command.deviceId, command.play); return;
+    case "addToQueue": await api.addToQueue(command.uri, command.deviceId); return;
+  }
+}
+
+/**
+ * The account's action journal, keyed to the storage this gatekeeper used before adopting the kit:
+ * `action:<id>` rows upgrade in place, and the last-issued `counter:approval` seeds the journal's
+ * next-unused id counter.
+ */
+function spotifyActionJournal(kv: ActionJournalKv): ActionJournal<TaggedAction<SpotifyActionKinds>> {
+  const lastIssued = kv.get<number>("counter:approval");
+  if (lastIssued !== undefined) {
+    kv.put("counter:nextFreeActionId", lastIssued + 1);
+    kv.delete("counter:approval");
+  }
+  // Old terminal rows: applied ones move into the journal's retained tier with their revert
+  // snapshot folded into the retained payload; rejected ones only ever answered the lenient
+  // re-decision an absent id answers too, so they are dropped.
+  for (const [key, record] of kv.list<LegacyStoredAction>({ prefix: "retiredAction:" })) {
+    kv.delete(key);
+    if (record.state !== "approved") continue;
+    kv.put(`retained:action:${key.slice("retiredAction:".length)}`, {
+      v: 2,
+      state: "applied",
+      action: {
+        kind: record.action.type,
+        payload: record.revert === undefined
+          ? record.action
+          : { ...record.action, revert: record.revert },
+      },
+    });
+  }
+  return new ActionJournal<TaggedAction<SpotifyActionKinds>>(kv, {
+    legacyKeys: { nextIdKey: "counter:nextFreeActionId", recordPrefix: "action:" },
+    upgradeRecord: raw => {
+      if (typeof raw !== "object" || raw === null) return undefined;
+      const record = raw as LegacyStoredAction;
+      if (typeof record.action?.type !== "string") return undefined;
+      return { kind: record.action.type, payload: record.action } as TaggedAction<SpotifyActionKinds>;
+    },
+  });
+}
 
 // A track as it sits in a (possibly simulated) playlist.
 type PlaylistEntry = {
@@ -1222,6 +1508,7 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
   // -------------------------------------------------------------------------
   // Action storage & lookup
 
+  // One per resource: ids for "~N" provisional playlists referenced before their create applies.
   #counter(name: string): number {
     const value = (this.ctx.storage.kv.get<number>(`counter:${name}`) ?? 0) + 1;
     this.ctx.storage.kv.put(`counter:${name}`, value);
@@ -1229,78 +1516,49 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
   }
 
   #newBase(): BaseAction {
-    return { approvalId: this.#counter("approval"), submittedAt: Date.now() };
+    return { submittedAt: Date.now() };
   }
 
-  #actionKey(id: number): string { return `action:${id}`; }
-  #retiredKey(id: number): string { return `retiredAction:${id}`; }
+  #journal = spotifyActionJournal(this.ctx.storage.kv);
 
-  #getRecord(id: number): StoredActionRecord | undefined {
-    return this.ctx.storage.kv.get<StoredActionRecord>(this.#actionKey(id))
-      ?? this.ctx.storage.kv.get<StoredActionRecord>(this.#retiredKey(id));
-  }
+  // The engine-bound host: every provider operation an action kind's handlers run, resolved
+  // against this resource's account, caches, and provisional bindings.
+  #actions = SPOTIFY_ACTIONS.bind(this.#journal, {
+    withApi: fn => this.#withApi(fn),
+    requireRealPlaylistId: playlistId => this.#requireRealPlaylistId(playlistId),
+    provisionalRealId: logicalId => this.#resolveRealPlaylistId(logicalId),
+    playlistSummary: realId => this.#getPlaylistSummary(realId),
+    materializePlaylist: realId => this.#materializePlaylistEntries(realId),
+    applyAddTracks: (realId, uris, position) => this.#applyAddTracks(realId, uris, position),
+    setPlaylistTracks: (realId, uris) => this.#setPlaylistTracks(realId, uris),
+    invalidatePlaylist: realId => this.#invalidatePlaylist(realId),
+    bindProvisional: (provisionalId, realId) => {
+      this.ctx.storage.kv.put(this.#provisionalKey(provisionalId), { realId });
+    },
+    dropProvisional: provisionalId => { this.ctx.storage.kv.delete(this.#provisionalKey(provisionalId)); },
+    pruneRetiredActions: () => this.#pruneRetiredActions(),
+  });
 
-  #requireRecord(id: number): StoredActionRecord {
-    const record = this.#getRecord(id);
-    if (!record) throw new Error(`No queued Spotify action exists with id ${id}.`);
-    return record;
-  }
-
-  /**
-   * Moves the live record for `id` to `to`, if the state it is stored in still allows that step.
-   * Only the live key is read — never the retired fallback — and a record that reached a terminal
-   * state meanwhile (applied or rejected through the queue while a submit or apply on it was
-   * awaiting its own RPC reply) keeps the state the lifecycle gave it: nothing brings a retired
-   * action back, so an applied action cannot go pending and be applied twice.
-   */
-  #advance(id: number, to: ActionState): void {
-    const record = this.ctx.storage.kv.get<StoredActionRecord>(this.#actionKey(id));
-    if (record === undefined || !canTransition(record.state, to)) return;
-    record.state = to;
-    this.ctx.storage.kv.put(this.#actionKey(id), record);
-    this.#invalidatePendingCache();
-  }
-
-  #retire(id: number, record: StoredActionRecord): void {
-    this.ctx.storage.kv.delete(this.#actionKey(id));
-    this.ctx.storage.kv.put(this.#retiredKey(id), record);
-    this.#invalidatePendingCache();
-    this.#maybePruneRetiredActions();
-  }
-
-  // Retired (applied/rejected) records are kept so the overseer can still revert recently-applied
-  // actions, but they (and their revert snapshots, up to ~PLAYLIST_REVERT_SNAPSHOT_MAX URIs) must
-  // not accumulate forever. Drop records older than the retention window. Reverting beyond it is no
-  // longer possible (the overseer doesn't offer revert that far back). Rate-limited so we don't
-  // rescan the retired keyspace on every apply/reject.
-  #maybePruneRetiredActions(): void {
+  // Retained (applied) records are kept so the overseer can still revert recently-applied actions,
+  // but they (and their revert snapshots, up to ~PLAYLIST_REVERT_SNAPSHOT_MAX URIs) must not
+  // accumulate forever. Drop records submitted longer ago than the retention window; a record
+  // approved very late is pruned from the submission date, which only shortens its revert window.
+  // Rate-limited so we don't rescan the retained keyspace on every resolution.
+  #pruneRetiredActions(): void {
     const last = this.ctx.storage.kv.get<number>("meta:lastRetiredPrune") ?? 0;
     if (Date.now() - last < RETIRED_ACTION_PRUNE_INTERVAL_MS) return;
     this.ctx.storage.kv.put("meta:lastRetiredPrune", Date.now());
     const cutoff = Date.now() - RETIRED_ACTION_RETENTION_MS;
-    for (const [key, record] of this.ctx.storage.kv.list<StoredActionRecord>({ prefix: "retiredAction:" })) {
-      const retiredAt = record.appliedAt ?? record.rejectedAt ?? 0;
-      if (retiredAt > 0 && retiredAt < cutoff) this.ctx.storage.kv.delete(key);
+    for (const [key, record] of this.ctx.storage.kv
+      .list<{ v: number; action: { payload: { submittedAt?: number } } }>({ prefix: "retained:action:" })) {
+      if ((record.action.payload.submittedAt ?? 0) < cutoff) this.ctx.storage.kv.delete(key);
     }
   }
 
-  // Memoized list of pending actions. Reads call this 2-4x per request and it scans the action:*
-  // keyspace, so cache it on the instance and invalidate whenever an action record changes.
-  #pendingCache?: SpotifyAction[];
-
-  #invalidatePendingCache(): void {
-    this.#pendingCache = undefined;
-  }
-
+  // Pending (and claimed, in-flight) actions, oldest first: the journal orders by id, which the
+  // submission counter allocates in order.
   #listPending(): SpotifyAction[] {
-    if (!this.#pendingCache) {
-      this.#pendingCache = [...this.ctx.storage.kv.list<StoredActionRecord>({ prefix: "action:" })]
-        .map(([, record]) => record)
-        .filter(record => record.state === "pending")
-        .map(record => record.action)
-        .toSorted((a, b) => a.submittedAt - b.submittedAt || a.approvalId - b.approvalId);
-    }
-    return this.#pendingCache;
+    return this.#journal.listPending().map(({ action }) => action.payload);
   }
 
   #provisionalKey(provisionalId: string): string { return `provisional:${provisionalId}`; }
@@ -1841,20 +2099,10 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     return { ...this.#newBase(), type: "player", command };
   }
 
-  async submitActionForApproval(
-    queue: RpcStub<ApprovalQueue>,
-    action: SpotifyAction,
-    presentation: { title: string; implementsRevert: boolean },
-  ): Promise<void> {
-    this.ctx.storage.kv.put<StoredActionRecord>(this.#actionKey(action.approvalId), { action, state: "staged" });
-    try {
-      // The text comes from the prepared payload, not the caller, so it always shows what applies.
-      await queue.submitAction(action.approvalId, { ...presentation, ...describeSpotifyAction(action) });
-    } catch (error) {
-      this.ctx.storage.kv.delete(this.#actionKey(action.approvalId));
-      throw error;
-    }
-    this.#advance(action.approvalId, "pending");
+  async submitActionForApproval(queue: RpcStub<ApprovalQueue>, action: SpotifyAction): Promise<void> {
+    // Description, id allocation, staging, and rollback all belong to the engine; the approval
+    // text is rendered from the payload it will apply.
+    await this.#actions.submit(queue, action.type, action);
   }
 
   // -------------------------------------------------------------------------
@@ -1876,20 +2124,7 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     }
   }
 
-  async #applyPlayerCommand(command: PlayerCommand): Promise<void> {
-    switch (command.op) {
-      case "play": await this.#withApi(api => api.play(command.deviceId, command.body)); return;
-      case "pause": await this.#withApi(api => api.pause(command.deviceId)); return;
-      case "next": await this.#withApi(api => api.next(command.deviceId)); return;
-      case "previous": await this.#withApi(api => api.previous(command.deviceId)); return;
-      case "seek": await this.#withApi(api => api.seek(command.positionMs, command.deviceId)); return;
-      case "setVolume": await this.#withApi(api => api.setVolume(command.volumePercent, command.deviceId)); return;
-      case "setShuffle": await this.#withApi(api => api.setShuffle(command.shuffle, command.deviceId)); return;
-      case "setRepeat": await this.#withApi(api => api.setRepeat(command.mode, command.deviceId)); return;
-      case "transfer": await this.#withApi(api => api.transfer(command.deviceId, command.play)); return;
-      case "addToQueue": await this.#withApi(api => api.addToQueue(command.uri, command.deviceId)); return;
-    }
-  }
+  // The player kind's apply handler dispatches a command itself (see `applyPlayerCommand`).
 
   // Resolve a (possibly provisional) playlist id to its real id at apply time. A dependent action
   // on a provisional playlist (e.g. add tracks to a just-created playlist) can only be applied
@@ -1904,135 +2139,30 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     return realId;
   }
 
+  // Claim-before-dispatch, retry on a plain provider error, and the terminal unknown outcome all
+  // belong to the engine; see `SPOTIFY_ACTIONS` for the per-kind behavior.
   async applyAction(actionId: number): Promise<void> {
-    const record = this.#requireRecord(actionId);
-    // "failed" is retryable (a prior apply threw); the overseer may call applyAction again.
-    if (!canTransition(record.state, "approved")) {
-      throw new Error(`Spotify action ${actionId} is no longer pending.`);
-    }
-    const action = record.action;
-    try {
-      await this.#performAction(action, record);
-    } catch (error) {
-      // Apply failed (and won't take effect on Spotify). Mark it failed so its simulated effect
-      // stops masking real library/follow/playlist state, while keeping it retryable/discardable —
-      // unless the record retired while the attempt was in flight, in which case it stays there.
-      this.#advance(actionId, "failed");
-      throw error;
-    }
-    record.state = "approved";
-    record.appliedAt = Date.now();
-    this.#retire(actionId, record);
-  }
-
-  async #performAction(action: SpotifyAction, record: StoredActionRecord): Promise<void> {
-    switch (action.type) {
-      case "saveTracks": await this.#withApi(api => api.saveToLibrary(action.trackIds.map(trackUri))); break;
-      case "removeSavedTracks": await this.#withApi(api => api.removeFromLibrary(action.trackIds.map(trackUri))); break;
-      case "saveAlbums": await this.#withApi(api => api.saveToLibrary(action.albumIds.map(albumUri))); break;
-      case "removeSavedAlbums": await this.#withApi(api => api.removeFromLibrary(action.albumIds.map(albumUri))); break;
-      case "followArtists": await this.#withApi(api => api.saveToLibrary(action.artistIds.map(artistUri))); break;
-      case "unfollowArtists": await this.#withApi(api => api.removeFromLibrary(action.artistIds.map(artistUri))); break;
-      case "playlistCreate": {
-        const created = await this.#withApi(api => api.createPlaylist({
-          name: action.name,
-          description: action.description,
-          public: action.public,
-          collaborative: action.collaborative,
-        }));
-        this.ctx.storage.kv.put(this.#provisionalKey(action.provisionalId), { realId: created.id });
-        record.revert = { kind: "playlistCreate", realId: created.id };
-        break;
-      }
-      case "playlistAdd":
-      case "playlistRemove":
-      case "playlistReorder":
-      case "playlistReplace": {
-        const realId = this.#requireRealPlaylistId(action.playlistId);
-        // Snapshot the pre-edit ordering so revert can restore it via replace, but only for
-        // reasonably-sized playlists (keeps the stored value small). NOTE: revert is best-effort —
-        // unavailable items (no uri) and local files are dropped, and the replace-based restore
-        // resets added_at/added_by/snapshot_id for every track.
-        if ((await this.#getPlaylistSummary(realId)).trackCount <= PLAYLIST_REVERT_SNAPSHOT_MAX) {
-          const previous = await this.#materializePlaylistEntries(realId);
-          record.revert = { kind: "playlistTracks", realId, previousUris: previous.map(e => e.uri).filter(Boolean) };
-        }
-        if (action.type === "playlistAdd") await this.#applyAddTracks(realId, action.uris, action.position);
-        else if (action.type === "playlistRemove") await this.#withApi(api => api.removePlaylistItems(realId, action.uris));
-        else if (action.type === "playlistReplace") await this.#setPlaylistTracks(realId, action.uris);
-        else await this.#withApi(api => api.reorderPlaylistItems(realId, action.rangeStart, action.insertBefore, action.rangeLength));
-        this.#invalidatePlaylist(realId);
-        break;
-      }
-      case "playlistDetails": {
-        const realId = this.#requireRealPlaylistId(action.playlistId);
-        const current = normalizePlaylistSummary(await this.#withApi(api => api.getPlaylist(realId)));
-        record.revert = {
-          kind: "playlistDetails",
-          realId,
-          previous: {
-            name: current.name,
-            description: current.description ?? undefined,
-            public: current.public ?? undefined,
-            collaborative: current.collaborative,
-          },
-        };
-        await this.#withApi(api => api.changePlaylistDetails(realId, action.update));
-        this.#invalidatePlaylist(realId);
-        break;
-      }
-      case "playlistUnfollow": {
-        const realId = this.#requireRealPlaylistId(action.playlistId);
-        await this.#withApi(api => api.removeFromLibrary([playlistUri(realId)]));
-        this.#invalidatePlaylist(realId);
-        break;
-      }
-      case "playlistFollow": {
-        const realId = this.#requireRealPlaylistId(action.playlistId);
-        await this.#withApi(api => api.saveToLibrary([playlistUri(realId)]));
-        this.#invalidatePlaylist(realId);
-        break;
-      }
-      case "player": await this.#applyPlayerCommand(action.command); break;
-    }
+    await this.#actions.apply(actionId);
   }
 
   async rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
-    // Be lenient: a reject for an action we don't have pending (already applied/rejected, or a
-    // stale queue entry from a prior session) is treated as a no-op success so the overseer can
-    // always clear it from its queue. Throwing here would leave such entries stuck.
-    const record = this.#getRecord(actionId);
-    if (!record || !canTransition(record.state, "rejected")) {
-      return;
-    }
-    const action = record.action;
-    record.state = "rejected";
-    record.rejectedAt = Date.now();
-    this.#retire(actionId, record);
-
-    if (action.type === "playlistCreate") {
-      // The provisional playlist will never exist; reject everything that depended on it.
-      for (const dependent of this.#listPending()) {
-        if ((isPlaylistTrackAction(dependent) || dependent.type === "playlistDetails" ||
-             dependent.type === "playlistUnfollow" || dependent.type === "playlistFollow") &&
-            dependent.playlistId === action.provisionalId) {
-          const depRecord = this.#requireRecord(dependent.approvalId);
-          depRecord.state = "rejected";
-          depRecord.rejectedAt = Date.now();
-          this.#retire(dependent.approvalId, depRecord);
-        }
-      }
-      this.ctx.storage.kv.delete(this.#provisionalKey(action.provisionalId));
-      return { restart: true };
-    }
+    // The engine is lenient on an unknown id (a stale queue entry can always be cleared), strands
+    // dependents of a rejected provisional create, and releases the provisional binding. Rejecting
+    // a create must also restart sessions: their simulated view still shows the playlist.
+    const kind = this.#journal.get(actionId)?.action.kind;
+    await this.#actions.reject(actionId);
+    return kind === "playlistCreate" ? { restart: true } : undefined;
   }
 
   async revertAction(actionId: number): Promise<void | { message?: string; canRetry?: boolean; restart?: boolean }> {
-    const record = this.#requireRecord(actionId);
-    if (record.state !== "approved") {
+    const record = this.#journal.get(actionId);
+    if (record === undefined) throw new Error(`No queued Spotify action exists with id ${actionId}.`);
+    if (record.state !== "applied") {
       return { message: "This action has not been applied, so there is nothing to revert.", canRetry: false };
     }
-    const action = record.action;
+    // The retained payload is the applied write plus the snapshot its apply retained for revert.
+    const action = record.action.payload as StoredActionBody;
+    const revert = action.revert;
     switch (action.type) {
       case "saveTracks": await this.#withApi(api => api.removeFromLibrary(action.trackIds.map(trackUri))); return;
       case "removeSavedTracks": await this.#withApi(api => api.saveToLibrary(action.trackIds.map(trackUri))); return;
@@ -2054,10 +2184,10 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
         return;
       }
       case "playlistCreate": {
-        if (record.revert?.kind !== "playlistCreate") {
+        if (revert?.kind !== "playlistCreate") {
           return { message: "This playlist was never created, so there is nothing to revert.", canRetry: false };
         }
-        const realId = record.revert.realId;
+        const realId = revert.realId;
         // "Deleting" a playlist on Spotify means unfollowing it (removing it from your library).
         await this.#withApi(api => api.removeFromLibrary([playlistUri(realId)]));
         return;
@@ -2066,22 +2196,22 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
       case "playlistRemove":
       case "playlistReorder":
       case "playlistReplace": {
-        if (record.revert?.kind !== "playlistTracks") {
+        if (revert?.kind !== "playlistTracks") {
           return {
             message: "This playlist was too large to snapshot, so it can't be reverted automatically. " +
               "Please restore it manually.",
             canRetry: false,
           };
         }
-        await this.#setPlaylistTracks(record.revert.realId, record.revert.previousUris);
-        this.#invalidatePlaylist(record.revert.realId);
+        await this.#setPlaylistTracks(revert.realId, revert.previousUris);
+        this.#invalidatePlaylist(revert.realId);
         return;
       }
       case "playlistDetails": {
-        if (record.revert?.kind !== "playlistDetails") {
+        if (revert?.kind !== "playlistDetails") {
           return { message: "Revert information is unavailable for this action.", canRetry: false };
         }
-        const { realId, previous } = record.revert;
+        const { realId, previous } = revert;
         await this.#withApi(api => api.changePlaylistDetails(realId, previous));
         this.#invalidatePlaylist(realId);
         return;
@@ -2114,9 +2244,9 @@ class SpotifyPlayerImpl extends RpcTarget implements SpotifyPlayer {
     disposeQueue(this.#queue);
   }
 
-  async #submit(command: PlayerCommand, title: string): Promise<void> {
+  async #submit(command: PlayerCommand): Promise<void> {
     const action = this.#gk.preparePlayer(command);
-    await this.#gk.submitActionForApproval(this.#queue, action, { title, implementsRevert: false });
+    await this.#gk.submitActionForApproval(this.#queue, action);
   }
 
   async getState(): Promise<SpotifyPlaybackState> {
@@ -2164,19 +2294,19 @@ class SpotifyPlayerImpl extends RpcTarget implements SpotifyPlayer {
     if (options?.trackUris) body.uris = options.trackUris.map(toTrackUri);
     if (options?.offsetPosition !== undefined) body.offset = { position: options.offsetPosition };
     if (options?.positionMs !== undefined) body.position_ms = options.positionMs;
-    await this.#submit({ op: "play", deviceId: options?.deviceId, body }, "Start/resume playback");
+    await this.#submit({ op: "play", deviceId: options?.deviceId, body });
   }
 
   async pause(deviceId?: string): Promise<void> {
-    await this.#submit({ op: "pause", deviceId }, "Pause playback");
+    await this.#submit({ op: "pause", deviceId });
   }
 
   async next(deviceId?: string): Promise<void> {
-    await this.#submit({ op: "next", deviceId }, "Skip to next track");
+    await this.#submit({ op: "next", deviceId });
   }
 
   async previous(deviceId?: string): Promise<void> {
-    await this.#submit({ op: "previous", deviceId }, "Skip to previous track");
+    await this.#submit({ op: "previous", deviceId });
   }
 
   async seek(positionMs: number, deviceId?: string): Promise<void> {
@@ -2184,7 +2314,7 @@ class SpotifyPlayerImpl extends RpcTarget implements SpotifyPlayer {
       throw new Error("seek(): positionMs must be a non-negative number of milliseconds.");
     }
     const pos = Math.floor(positionMs);
-    await this.#submit({ op: "seek", positionMs: pos, deviceId }, "Seek playback");
+    await this.#submit({ op: "seek", positionMs: pos, deviceId });
   }
 
   async setVolume(volumePercent: number, deviceId?: string): Promise<void> {
@@ -2192,7 +2322,7 @@ class SpotifyPlayerImpl extends RpcTarget implements SpotifyPlayer {
       throw new Error("setVolume(): volumePercent must be between 0 and 100.");
     }
     const volume = Math.round(volumePercent);
-    await this.#submit({ op: "setVolume", volumePercent: volume, deviceId }, "Set volume");
+    await this.#submit({ op: "setVolume", volumePercent: volume, deviceId });
   }
 
   @skipRpcValidation()
@@ -2201,7 +2331,7 @@ class SpotifyPlayerImpl extends RpcTarget implements SpotifyPlayer {
       throw new Error("setShuffle(): shuffle must be a boolean (true or false).");
     }
     assertOptionalDeviceId(deviceId);
-    await this.#submit({ op: "setShuffle", shuffle, deviceId }, "Set shuffle");
+    await this.#submit({ op: "setShuffle", shuffle, deviceId });
   }
 
   @skipRpcValidation()
@@ -2210,19 +2340,19 @@ class SpotifyPlayerImpl extends RpcTarget implements SpotifyPlayer {
       throw new Error(`setRepeat(): mode must be one of "off", "track", or "context".`);
     }
     assertOptionalDeviceId(deviceId);
-    await this.#submit({ op: "setRepeat", mode: mode as SpotifyRepeatMode, deviceId }, "Set repeat mode");
+    await this.#submit({ op: "setRepeat", mode: mode as SpotifyRepeatMode, deviceId });
   }
 
   async transferTo(deviceId: string, play?: boolean): Promise<void> {
     if (typeof deviceId !== "string" || deviceId.trim() === "") {
       throw new Error("transferTo(): deviceId must be a non-empty string.");
     }
-    await this.#submit({ op: "transfer", deviceId, play: play ?? false }, "Transfer playback");
+    await this.#submit({ op: "transfer", deviceId, play: play ?? false });
   }
 
   async addToQueue(uri: string, deviceId?: string): Promise<void> {
     const trackUriValue = toTrackUri(uri);
-    await this.#submit({ op: "addToQueue", uri: trackUriValue, deviceId }, "Add to queue");
+    await this.#submit({ op: "addToQueue", uri: trackUriValue, deviceId });
   }
 }
 
@@ -2272,10 +2402,7 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
     const uris = trackUris.map(toTrackUri);
     await this.#gk.assertEditablePlaylist(this.#logicalId);
     const action = this.#gk.preparePlaylistAdd(this.#logicalId, uris, position);
-    await this.#gk.submitActionForApproval(this.#queue, action, {
-      title: `Add ${uris.length} track(s) to playlist`,
-      implementsRevert: true,
-    });
+    await this.#gk.submitActionForApproval(this.#queue, action);
   }
 
   async removeTracks(trackUris: string[]): Promise<void> {
@@ -2283,10 +2410,7 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
     const uris = trackUris.map(toTrackUri);
     await this.#gk.assertEditablePlaylist(this.#logicalId);
     const action = this.#gk.preparePlaylistRemove(this.#logicalId, uris);
-    await this.#gk.submitActionForApproval(this.#queue, action, {
-      title: `Remove ${uris.length} track(s) from playlist`,
-      implementsRevert: true,
-    });
+    await this.#gk.submitActionForApproval(this.#queue, action);
   }
 
   async reorderTracks(rangeStart: number, insertBefore: number, rangeLength?: number): Promise<void> {
@@ -2301,10 +2425,7 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
       throw new Error(`reorderTracks(): range is out of bounds for a playlist with ${trackCount} track(s).`);
     }
     const action = this.#gk.preparePlaylistReorder(this.#logicalId, rangeStart, insertBefore, length);
-    await this.#gk.submitActionForApproval(this.#queue, action, {
-      title: "Reorder playlist tracks",
-      implementsRevert: true,
-    });
+    await this.#gk.submitActionForApproval(this.#queue, action);
   }
 
   async replaceTracks(trackUris: string[]): Promise<void> {
@@ -2314,10 +2435,7 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
     const uris = trackUris.map(toTrackUri);
     await this.#gk.assertEditablePlaylist(this.#logicalId);
     const action = this.#gk.preparePlaylistReplace(this.#logicalId, uris);
-    await this.#gk.submitActionForApproval(this.#queue, action, {
-      title: "Replace playlist tracks",
-      implementsRevert: true,
-    });
+    await this.#gk.submitActionForApproval(this.#queue, action);
   }
 
   async changeDetails(update: SpotifyPlaylistDetailsUpdate): Promise<void> {
@@ -2327,26 +2445,17 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
     }
     await this.#gk.assertEditablePlaylist(this.#logicalId);
     const action = this.#gk.preparePlaylistDetails(this.#logicalId, update);
-    await this.#gk.submitActionForApproval(this.#queue, action, {
-      title: "Change playlist details",
-      implementsRevert: true,
-    });
+    await this.#gk.submitActionForApproval(this.#queue, action);
   }
 
   async unfollow(): Promise<void> {
     const action = this.#gk.preparePlaylistUnfollow(this.#logicalId);
-    await this.#gk.submitActionForApproval(this.#queue, action, {
-      title: "Remove playlist from library",
-      implementsRevert: true,
-    });
+    await this.#gk.submitActionForApproval(this.#queue, action);
   }
 
   async follow(): Promise<void> {
     const action = this.#gk.preparePlaylistFollow(this.#logicalId);
-    await this.#gk.submitActionForApproval(this.#queue, action, {
-      title: "Add playlist to library",
-      implementsRevert: true,
-    });
+    await this.#gk.submitActionForApproval(this.#queue, action);
   }
 
   async isFollowing(): Promise<boolean> {
@@ -2482,60 +2591,42 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
     if (trackIds.length === 0) return;
     trackIds = trackIds.map(id => toBareId(id, "track"));
     const action = this.#gk.prepareSaveTracks(trackIds);
-    await this.#gk.submitActionForApproval(this.#queue, action, {
-      title: `Save ${trackIds.length} track(s)`,
-      implementsRevert: true,
-    });
+    await this.#gk.submitActionForApproval(this.#queue, action);
   }
 
   async removeSavedTracks(trackIds: string[]): Promise<void> {
     if (trackIds.length === 0) return;
     trackIds = trackIds.map(id => toBareId(id, "track"));
     const action = this.#gk.prepareRemoveSavedTracks(trackIds);
-    await this.#gk.submitActionForApproval(this.#queue, action, {
-      title: `Remove ${trackIds.length} saved track(s)`,
-      implementsRevert: true,
-    });
+    await this.#gk.submitActionForApproval(this.#queue, action);
   }
 
   async saveAlbums(albumIds: string[]): Promise<void> {
     if (albumIds.length === 0) return;
     albumIds = albumIds.map(id => toBareId(id, "album"));
     const action = this.#gk.prepareSaveAlbums(albumIds);
-    await this.#gk.submitActionForApproval(this.#queue, action, {
-      title: `Save ${albumIds.length} album(s)`,
-      implementsRevert: true,
-    });
+    await this.#gk.submitActionForApproval(this.#queue, action);
   }
 
   async removeSavedAlbums(albumIds: string[]): Promise<void> {
     if (albumIds.length === 0) return;
     albumIds = albumIds.map(id => toBareId(id, "album"));
     const action = this.#gk.prepareRemoveSavedAlbums(albumIds);
-    await this.#gk.submitActionForApproval(this.#queue, action, {
-      title: `Remove ${albumIds.length} saved album(s)`,
-      implementsRevert: true,
-    });
+    await this.#gk.submitActionForApproval(this.#queue, action);
   }
 
   async followArtists(artistIds: string[]): Promise<void> {
     if (artistIds.length === 0) return;
     artistIds = artistIds.map(id => toBareId(id, "artist"));
     const action = this.#gk.prepareFollowArtists(artistIds);
-    await this.#gk.submitActionForApproval(this.#queue, action, {
-      title: `Follow ${artistIds.length} artist(s)`,
-      implementsRevert: true,
-    });
+    await this.#gk.submitActionForApproval(this.#queue, action);
   }
 
   async unfollowArtists(artistIds: string[]): Promise<void> {
     if (artistIds.length === 0) return;
     artistIds = artistIds.map(id => toBareId(id, "artist"));
     const action = this.#gk.prepareUnfollowArtists(artistIds);
-    await this.#gk.submitActionForApproval(this.#queue, action, {
-      title: `Unfollow ${artistIds.length} artist(s)`,
-      implementsRevert: true,
-    });
+    await this.#gk.submitActionForApproval(this.#queue, action);
   }
 
   async isFollowingArtists(artistIds: string[]): Promise<boolean[]> {
@@ -2574,10 +2665,7 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
       throw new Error("createPlaylist(): a collaborative playlist must be private (public and collaborative cannot both be true).");
     }
     const action = this.#gk.preparePlaylistCreate(name, options);
-    await this.#gk.submitActionForApproval(this.#queue, action, {
-      title: `Create playlist "${name}"`,
-      implementsRevert: true,
-    });
+    await this.#gk.submitActionForApproval(this.#queue, action);
     return new SpotifyPlaylistImpl(this.#gk, this.#queue.dup(), action.provisionalId);
   }
 

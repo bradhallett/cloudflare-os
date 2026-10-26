@@ -9,9 +9,9 @@ import {
 } from "@gadgets/workshop-shared/gatekeeper";
 import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import {
-  clearConnectionSubject, commitReconnect, ConnectionSubject, pinConnectionSubject,
-  stageReconnect,
+  commitReconnectOrThrow, ConnectionSubject, pinForConnect, stageReconnect,
 } from "@gadgets/gatekeeper-kit/credential-stage";
+import { TokenCursor } from "@gadgets/gatekeeper-kit/cursors";
 import {
   SlackApi, SlackApiError, SlackAccessToken, SlackConversationTypeFilter, SlackOAuthGrant,
   exchangeAuthCode, refreshAccessToken, revokeToken, isWorkspaceId, type SlackInstallation,
@@ -51,7 +51,9 @@ type CallbackResult = { handoff: ConnectHandoff } | { refused: { title: string; 
 type ExchangeOutcome =
     | { refused: { title: string; detail: string } }
     | { callback: Fetcher<GatekeeperConnectCallback>; grant: SlackOAuthGrant; stageId: string }
-    | { callback: Fetcher<GatekeeperConnectCallback>; grant: SlackOAuthGrant };
+    // `subject` rides along so the pin is written around the handoff (see `pinForConnect`), not
+    // inside the locked section.
+    | { callback: Fetcher<GatekeeperConnectCallback>; grant: SlackOAuthGrant; subject: SlackSubject };
 
 /**
  * The subject a grant pins the connection to: the Slack installation it was made as, spelled
@@ -495,9 +497,8 @@ export class UserAccount extends DurableObject<Env> {
       }
 
       this.#writeGrant(grant);
-      pinConnectionSubject(this.ctx.storage.kv, subject);
       this.ctx.storage.kv.delete("requestedScopes");
-      return { callback, grant };
+      return { callback, grant, subject };
     });
 
     if ("refused" in completion) return { refused: completion.refused };
@@ -507,21 +508,19 @@ export class UserAccount extends DurableObject<Env> {
       handoff = await completion.callback.reconnectComplete(
           completion.stageId, completion.grant.accessToken.expires);
     } else {
-      try {
-        let props: SlackUserImplProps = { userObjectId: this.ctx.id.toString() };
-        handoff = await completion.callback.complete(
-            this.ctx.exports.SlackUserImpl({ props }), completion.grant.accessToken.expires);
-      } catch (err) {
-        await this.#updateCredentials(async () => {
+      let props: SlackUserImplProps = { userObjectId: this.ctx.id.toString() };
+      // The pin brackets the handoff: a connect that fails unpins and drops the credentials
+      // written ahead of it — but only if nothing replaced them meanwhile.
+      handoff = await pinForConnect(this.ctx.storage.kv, completion.subject,
+        () => completion.callback.complete(
+          this.ctx.exports.SlackUserImpl({ props }), completion.grant.accessToken.expires),
+        () => this.#updateCredentials(async () => {
           let storedToken = this.ctx.storage.kv.get<SlackAccessToken>("accessToken");
           if (storedToken?.token === completion.grant.accessToken.token) {
             this.ctx.storage.kv.delete("accessToken");
             this.ctx.storage.kv.delete("refreshToken");
-            clearConnectionSubject(this.ctx.storage.kv);
           }
-        });
-        throw err;
-      }
+        }));
     }
     return { handoff };
   }
@@ -531,8 +530,7 @@ export class UserAccount extends DurableObject<Env> {
    * connection made before the pin existed adopts its first reconnect's account. */
   async commitReconnect(stageId: string): Promise<void> {
     await this.#updateCredentials(async () => {
-      let grant = commitReconnect<SlackOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
-      if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+      let grant = commitReconnectOrThrow<SlackOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
       this.#writeGrant(grant);
     });
   }
@@ -977,64 +975,38 @@ function validateSearchQuery(query: string): void {
 
 // ── Cursor ──────────────────────────────────────────────────────────
 
-// Provider pages one next() may walk past when they keep coming back empty, matching the
-// gatekeeper-kit cursors' default. SlackCursor authorizes every page as it reads it (inside
-// loadPage), so the bound's job is spend, not disclosure: without it a listing whose pages come
-// back empty walks the workspace until something matches — one provider read and one observation
-// per page — before the caller sees a single result.
-const DEFAULT_MAX_PROVIDER_PAGES_PER_CALL = 2;
+// SlackCursor authorizes every page as it reads it (inside loadPage), so the engine's page bound
+// is spend, not disclosure: without it a listing whose pages keep coming back empty walks the
+// workspace — one provider read and one observation per page — before the caller sees a single
+// result. The bound itself is the kit cursor default (`DEFAULT_MAX_PROVIDER_PAGES_PER_CALL`).
 
 /**
- * Each page is authorized by loadPage before it can reach the caller, and the position advances
- * only past pages that authorization accepted.
+ * Each page is authorized by `loadPage` before it can reach the caller, so `authorizePage` is a
+ * no-op: the engine's job here is serialization, the empty-page walk, spend bounds, and refusing
+ * a repeated continuation token. Owns a duplicated session context, disposed with the cursor.
  */
-export class SlackCursor<T> extends RpcTarget implements Cursor<T> {
-  #ctx: SlackSessionContext;
-  #loadPage: (
-    ctx: SlackSessionContext, cursor: string | undefined,
-  ) => Promise<{ items: T[]; nextCursor?: string }>;
-  #maxProviderPages: number;
-  #cursor: string | undefined;
-  #exhausted = false;
-  // Serialize concurrent next() calls so each consumes a distinct page.
-  #tail: Promise<void> = Promise.resolve();
-
+export class SlackCursor<T> extends TokenCursor<T> implements Cursor<T> {
   constructor(
       ctx: SlackSessionContext,
       loadPage: (
         ctx: SlackSessionContext, cursor: string | undefined,
       ) => Promise<{ items: T[]; nextCursor?: string }>,
       options?: { maxProviderPagesPerCall?: number }) {
-    super();
-    this.#ctx = dupSessionContext(ctx);
-    this.#loadPage = loadPage;
-    this.#maxProviderPages =
-        options?.maxProviderPagesPerCall ?? DEFAULT_MAX_PROVIDER_PAGES_PER_CALL;
-  }
-
-  [Symbol.dispose]() {
-    this.#ctx.approvalQueue[Symbol.dispose]();
-  }
-
-  next(): Promise<T[] | null> {
-    let result = this.#tail.then(() => this.#nextPage());
-    this.#tail = result.then(() => undefined, () => undefined);
-    return result;
-  }
-
-  async #nextPage(): Promise<T[] | null> {
-    let items: T[] = [];
-    for (let fetched = 1; !this.#exhausted; fetched++) {
-      let page = await this.#loadPage(this.#ctx, this.#cursor);
-      this.#cursor = page.nextCursor;
-      this.#exhausted = !page.nextCursor;
-      items = page.items;
-      if (items.length > 0 || this.#exhausted) break;
-      // Out of budget with pages still ahead. An empty page is not the end of the results: the
-      // caller drains, and the next call resumes where this one stopped.
-      if (fetched >= this.#maxProviderPages) break;
-    }
-    return items.length === 0 && this.#exhausted ? null : items;
+    const owned = dupSessionContext(ctx);
+    super({
+      fetchPage: async (cursor: string | undefined) => {
+        const page = await loadPage(owned, cursor);
+        return { items: page.items, nextToken: page.nextCursor };
+      },
+      // One provider page per next(), the shape Slack listings already have.
+      pageSize: Number.MAX_SAFE_INTEGER,
+      fillPage: false,
+      maxProviderPagesPerCall: options?.maxProviderPagesPerCall,
+      authorizePage: async () => {},
+      dispose: () => {
+        owned.approvalQueue[Symbol.dispose]();
+      },
+    });
   }
 }
 

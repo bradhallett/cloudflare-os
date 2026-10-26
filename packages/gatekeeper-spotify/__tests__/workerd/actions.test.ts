@@ -1,13 +1,10 @@
-// The gatekeeper's approval flow: an action's approval is a one-way transition. Once applied or
-// rejected, the record is retired — a submission whose approval is still in flight cannot revive
-// it, an apply that loses the race to a rejection does not run its effect, and an apply whose
-// write fails after a rejection raced it stays rejected. Everything is asserted behaviorally: a
-// resurrected record would show up as a second library save or a successful re-decision. Spotify
-// is faked at `fetch`.
+// The gatekeeper's approval flow, over the kit's action engine: an applied action stays applied, a
+// rejected one stays rejected, and a submission whose approval is still in flight cannot revive
+// either. Everything is asserted behaviorally — a resurrected record would show up as a second
+// library save or a successful re-decision. Spotify is faked at `fetch`.
 
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { canTransition } from "../../src/action-state";
 import { FakeSpotify, failure, hooks, unwrap } from "./fake-spotify";
 
 type GatekeeperProps = { userObjectId: string; resourceKind: "account" | "playlist"; playlistId?: string };
@@ -38,14 +35,15 @@ describe("an approval in flight", () => {
     const props = await connectedProps(x);
     const result = unwrap(await hooks().submitRacingDecision("race-apply", props, ["spotify:track:1"], "apply"));
     // The decision ran while the submit was held; the submit returned after, and could not
-    // resurrect the record — so the action saved once and every re-decision is refused.
+    // resurrect the record — so the action saved exactly once.
     expect(result.decided).toEqual({ ok: undefined });
     expect(result.submitted).toEqual({ ok: undefined });
-    expect(failure(result.afterwards)).toMatch(/no longer pending/);
-    expect(failure(await hooks().applyAction("race-apply", props, result.actionId))).toMatch(/no longer pending/);
-    // Lenient by design: the queue may always clear an entry, but clearing it changes nothing.
-    expect(await hooks().rejectAction("race-apply", props, result.actionId)).toEqual({ ok: undefined });
-    expect(failure(await hooks().applyAction("race-apply", props, result.actionId))).toMatch(/no longer pending/);
+    // The engine is idempotent on an applied id: re-applying answers success without re-saving.
+    expect(result.afterwards).toEqual({ ok: undefined });
+    expect(await hooks().applyAction("race-apply", props, result.actionId)).toEqual({ ok: undefined });
+    // Clearing a decided entry from the queue is refused: an applied action has nothing to reject.
+    expect(failure(await hooks().rejectAction("race-apply", props, result.actionId))).toMatch(/no longer pending/);
+    expect(await hooks().applyAction("race-apply", props, result.actionId)).toEqual({ ok: undefined });
     expect(x.saves).toEqual([["spotify:track:1"]]);
     expect(await hooks().queueLog("race-apply")).toEqual([{ actionId: result.actionId }]);
   });
@@ -56,48 +54,26 @@ describe("an approval in flight", () => {
     const result = unwrap(await hooks().submitRacingDecision("race-reject", props, ["spotify:track:2"], "reject"));
     expect(result.decided).toEqual({ ok: undefined });
     expect(result.submitted).toEqual({ ok: undefined });
-    // No library write ever ran, and the record cannot be applied afterwards.
-    expect(failure(result.afterwards)).toMatch(/no longer pending/);
-    expect(failure(await hooks().applyAction("race-reject", props, result.actionId))).toMatch(/no longer pending/);
+    // No library write ever ran, and the rejected record is gone, so a later apply is refused.
+    expect(failure(result.afterwards)).toMatch(/Unknown pending action/);
+    expect(failure(await hooks().applyAction("race-reject", props, result.actionId))).toMatch(/Unknown pending action/);
     expect(x.saves).toEqual([]);
   });
 
-  it("stays rejected when an apply's write fails after a rejection raced it", async () => {
+  it("ends rejected when its apply fails and the rejection follows it", async () => {
     const x = new FakeSpotify().install();
     const props = await connectedProps(x);
     const actionId = unwrap(await hooks().queueSaveTracks("fail-after-reject", props, ["spotify:track:3"]));
-    // Hold the apply's library write so the rejection can land while the apply is in flight, then
-    // answer the write with a 502: the apply's own failure handling must not un-reject the record.
+    // Answer the apply's library write with a 502: the failure restores the record pending (a
+    // plain provider error is retryable, never terminal), so the queued rejection can still take
+    // it — the write ran once and the action ends rejected.
     x.holdWrites();
     const applying = hooks().applyAction("fail-after-reject", props, actionId);
     await x.writeArrived();
-    expect(await hooks().rejectAction("fail-after-reject", props, actionId)).toEqual({ ok: undefined });
     x.releaseWrites(502);
     expect(failure(await applying)).toBeDefined();
-    expect(failure(await hooks().applyAction("fail-after-reject", props, actionId))).toMatch(/no longer pending/);
+    expect(await hooks().rejectAction("fail-after-reject", props, actionId)).toEqual({ ok: undefined });
+    expect(failure(await hooks().applyAction("fail-after-reject", props, actionId))).toMatch(/Unknown pending action/);
     expect(x.saves).toEqual([["spotify:track:3"]]);
-  });
-});
-
-describe("action-state transitions", () => {
-  it("treats applied and rejected as terminal", () => {
-    expect(canTransition("staged", "pending")).toBe(true);
-    expect(canTransition("staged", "approved")).toBe(true);
-    expect(canTransition("staged", "rejected")).toBe(true);
-    expect(canTransition("pending", "approved")).toBe(true);
-    expect(canTransition("pending", "rejected")).toBe(true);
-    expect(canTransition("pending", "failed")).toBe(true);
-    // `failed` is retryable, and may be re-marked failed by another throwing retry.
-    expect(canTransition("failed", "approved")).toBe(true);
-    expect(canTransition("failed", "rejected")).toBe(true);
-    expect(canTransition("failed", "failed")).toBe(true);
-    expect(canTransition("failed", "pending")).toBe(false);
-    // Nothing leaves the terminal states — not even a repeat of the same one.
-    for (const terminal of ["approved", "rejected"] as const) {
-      expect(canTransition(terminal, "pending")).toBe(false);
-      expect(canTransition(terminal, "approved")).toBe(false);
-      expect(canTransition(terminal, "rejected")).toBe(false);
-      expect(canTransition(terminal, "failed")).toBe(false);
-    }
   });
 });

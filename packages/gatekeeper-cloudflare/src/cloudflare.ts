@@ -7,7 +7,7 @@ import {
   GitCache, stripTrailingSlashes, workerVersionTag, type ConnectHandoff,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
-import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import { commitReconnectOrThrow, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
 import {
   getOAuthConfig, buildAuthorizeUrl, generatePkce, exchangeCode, refreshTokens, isGrantDeath,
@@ -346,8 +346,7 @@ export class UserAccount extends DurableObject<Env> {
 
   /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
   async commitReconnect(stageId: string): Promise<void> {
-    const grant = commitStagedCredentials<StoredGrant>(this.ctx.storage.kv, Date.now(), stageId);
-    if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+    const grant = commitReconnectOrThrow<StoredGrant>(this.ctx.storage.kv, Date.now(), stageId);
     this.#writeGrant(grant);
   }
 

@@ -211,7 +211,7 @@ describe("ShareCollectionDialog", () => {
     await choose(addRole(), "Owner");
     expect(addRole()?.textContent).toContain("Owner");
 
-    await choose(document.querySelector<HTMLElement>("[aria-label='Role for you']"), "Can edit");
+    await choose(document.querySelector<HTMLElement>("[aria-label='Role for you']"), "Editor");
     await flush();
     expect(addRole()?.textContent).toContain("Editor");
 
@@ -238,7 +238,7 @@ describe("ShareCollectionDialog", () => {
     const onChanged = vi.fn<() => void>();
     root = await renderDialog(onChanged);
 
-    await choose(document.querySelector<HTMLElement>("[aria-label='Role for Bob']"), "Can edit");
+    await choose(document.querySelector<HTMLElement>("[aria-label='Role for Bob']"), "Editor");
     await flush();
     expect(document.body.textContent).toContain("Git tokens could not be revoked yet");
     expect(document.body.textContent).toContain("Network down.");
@@ -301,7 +301,7 @@ describe("ShareCollectionDialog", () => {
     } as unknown as ContextApi;
     root = await renderDialog();
 
-    await choose(document.querySelector("[aria-label='Role for you']"), "Can edit");
+    await choose(document.querySelector("[aria-label='Role for you']"), "Editor");
     expect(button("Select users")?.disabled).toBe(true);
     expect(document.querySelector<HTMLButtonElement>("[aria-label='Role for Bob']")?.disabled).toBe(true);
     await act(async () => refreshedSharing.resolve({
@@ -440,7 +440,7 @@ describe("ShareCollectionDialog", () => {
     } as unknown as ContextApi;
     root = await renderDialog();
 
-    await choose(document.querySelector<HTMLElement>("[aria-label='Role for Organization org-9']"), "Can view");
+    await choose(document.querySelector<HTMLElement>("[aria-label='Role for Organization org-9']"), "Viewer");
     expect(setContextCollectionMemberRole).toHaveBeenCalledWith("collection", "org-9", "viewer");
   });
 });

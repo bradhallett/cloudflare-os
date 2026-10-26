@@ -85,13 +85,24 @@ type CursorShape<T> = {
    */
   maxProviderPagesPerCall?: number;
   /**
-   * Releases resources the fetch callback owns — a duplicated RPC stub, most often — when the
-   * cursor is disposed. Without it a fetch callback may only borrow stubs the session owns for at
-   * least as long as the walk: dropping the cursor stub would otherwise leak whatever the callback
-   * duplicated for itself. Return a cursor to exactly one RPC call: capnweb disposes the target
-   * once per stub, so the first drop of a shared cursor would release the walk another still uses.
+   * Whether one `next()` gathers provider pages until it has `pageSize` items (the default), or
+   * fetches only while nothing is buffered (`false`), so a call serves at most the one provider
+   * page it fetched — a short page is returned short instead of being topped up from a second
+   * provider call — and empty pages alone are walked onward within the fetch bound. Pass `false`
+   * for a provider whose own page is already the unit the caller asked for.
    */
-  dispose?(): void;
+  fillPage?: boolean;
+  /**
+   * Releases resources the fetch callback owns — a duplicated RPC stub, most often — when the
+   * cursor is disposed, receiving the items of a page an authorization refusal is still holding:
+   * entries a retry would re-offer, which a dropped walk must release instead of leak (`undefined`
+   * when no page is held). Without it a fetch callback may only borrow stubs the session owns for
+   * at least as long as the walk: dropping the cursor stub would otherwise leak whatever the
+   * callback duplicated for itself. Return a cursor to exactly one RPC call: capnweb disposes the
+   * target once per stub, so the first drop of a shared cursor would release the walk another
+   * still uses.
+   */
+  dispose?(heldItems?: readonly T[]): void;
   /** Simulated rows to merge into the provider's; see `CursorInjection`. */
   inject?: CursorInjection<T>;
   /**
@@ -122,7 +133,8 @@ type CursorShape<T> = {
   authorizePage(items: readonly T[], context: { terminal: boolean }): Promise<void>;
 };
 
-const DEFAULT_MAX_PROVIDER_PAGES_PER_CALL = 2;
+/** The default fetch bound, exported for a connector that names it beside an explicit override. */
+export const DEFAULT_MAX_PROVIDER_PAGES_PER_CALL = 2;
 
 const DEFAULT_REMOTE_PAGE_SIZE = 100;
 
@@ -150,7 +162,7 @@ abstract class BufferedCursor<T> extends RpcTarget implements Cursor<T>, Disposa
   readonly #pageSize: number;
   readonly #maxProviderPagesPerCall: number;
   readonly #queue = new SerialTaskQueue();
-  readonly #dispose?: () => void;
+  readonly #dispose?: (heldItems?: readonly T[]) => void;
   readonly #authorizePage: CursorShape<T>["authorizePage"];
   readonly #inject: CursorInjection<T>;
   readonly #buffer: Entry<T>[] = [];
@@ -163,6 +175,7 @@ abstract class BufferedCursor<T> extends RpcTarget implements Cursor<T>, Disposa
   #answered = false;
   #held?: Outgoing<T>;
   #disposed = false;
+  readonly #fillPage: boolean;
   protected readonly remotePageSize: number;
 
   /**
@@ -183,6 +196,7 @@ abstract class BufferedCursor<T> extends RpcTarget implements Cursor<T>, Disposa
         requirePositiveInt("remotePageSize", options.remotePageSize ?? DEFAULT_REMOTE_PAGE_SIZE);
       this.#maxProviderPagesPerCall = requirePositiveInt("maxProviderPagesPerCall",
         options.maxProviderPagesPerCall ?? DEFAULT_MAX_PROVIDER_PAGES_PER_CALL);
+      this.#fillPage = options.fillPage ?? true;
     } catch (error) {
       this[Symbol.dispose]();
       throw error;
@@ -197,7 +211,7 @@ abstract class BufferedCursor<T> extends RpcTarget implements Cursor<T>, Disposa
   [Symbol.dispose](): void {
     if (this.#disposed) return;
     this.#disposed = true;
-    this.#dispose?.();
+    this.#dispose?.(this.#held?.items);
   }
 
   /** Fetches the next provider page and passes it to `[enqueue]`. */
@@ -272,6 +286,11 @@ abstract class BufferedCursor<T> extends RpcTarget implements Cursor<T>, Disposa
     while (page.items.length < this.#pageSize) {
       if (page.consumed === (held?.consumed ?? this.#buffer.length)) {
         if (held || this.#remoteExhausted || fetches++ === this.#maxProviderPagesPerCall) break;
+        // A non-refill walk fetches only while nothing is buffered: one provider page (or less,
+        // once the page size is reached) per `next()`, never a second fetch to top up a short
+        // one. A held page's retry never fetches at all, so it re-offers exactly what the
+        // refusal held.
+        if (!this.#fillPage && this.#buffer.length > 0) break;
         await this[loadMore]();
         continue;
       }
@@ -459,6 +478,7 @@ export type TokenCursorOptions<T> = CursorShape<T> & {
  */
 export class TokenCursor<T> extends BufferedCursor<T> {
   readonly #fetchPage: TokenCursorOptions<T>["fetchPage"];
+  readonly #seenTokens = new Set<string>();
   #token?: string;
 
   /**
@@ -474,14 +494,22 @@ export class TokenCursor<T> extends BufferedCursor<T> {
   protected override async [loadMore](): Promise<void> {
     const asked = this.#token;
     const page = await this.#fetchPage(asked, this.remotePageSize);
-    const exhausted = page.nextToken === undefined;
-    // Refuse an echoed token before moving cursor state so retrying asks for the same token.
-    if (!exhausted && page.nextToken === asked) {
-      throw new Error(
-        "Provider returned the same continuation token it was asked to continue from.");
+    const next = page.nextToken;
+    // Refuse an echoed token before moving cursor state so retrying asks for the same token, and
+    // any token the walk has already followed: a cycle of full pages would page forever, and the
+    // fetch bound is no backstop against it.
+    if (next !== undefined) {
+      if (next === asked) {
+        throw new Error(
+          "Provider returned the same continuation token it was asked to continue from.");
+      }
+      if (this.#seenTokens.has(next)) {
+        throw new Error("Provider returned a continuation token this walk already followed.");
+      }
     }
-    this[enqueue](page.items, exhausted);
-    this.#token = page.nextToken;
+    this[enqueue](page.items, next === undefined);
+    if (next !== undefined) this.#seenTokens.add(next);
+    this.#token = next;
   }
 }
 

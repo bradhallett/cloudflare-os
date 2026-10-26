@@ -733,6 +733,120 @@ describe("TokenCursor", () => {
     expect(ids(await cursor.next())).toEqual([11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
     expect(await cursor.next()).toBeNull();
   });
+
+  it("serves one provider page per next() without topping up a short page", async () => {
+    // fillPage: false is the one-billed-read-per-page contract: a caller draining Slack-sized
+    // pages must not pay for a second provider page just to fill out a short local one.
+    const fetchPage = fourRowTokenApi();
+    const cursor = new TokenCursor<Issue>({
+      fetchPage,
+      authorizePage,
+      pageSize: 10,
+      remotePageSize: 4,
+      fillPage: false,
+    });
+
+    // Each next() returns exactly the four rows one provider page carried, despite pageSize 10.
+    expect(ids(await cursor.next())).toEqual([1, 2, 3, 4]);
+    expect(ids(await cursor.next())).toEqual([5, 6, 7, 8]);
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+    expect(ids(await cursor.next())).toEqual([9, 10, 11, 12]);
+    expect(ids(await cursor.next())).toEqual([13, 14, 15, 16]);
+    expect(ids(await cursor.next())).toEqual([17, 18, 19, 20]);
+    expect(await cursor.next()).toBeNull();
+    expect(fetchPage).toHaveBeenCalledTimes(5);
+  });
+
+  it("walks empty provider pages within one call when not filling pages", async () => {
+    // The no-top-up break only fires once something is buffered, so a provider answering empty
+    // pages mid-walk is still walked to the fetch bound, not stalled one page per next().
+    const fetchPage = tokenApi([
+      { items: [], nextToken: "a" },
+      { items: [], nextToken: "b" },
+      { items: [{ id: 1, open: true }] },
+    ]);
+    const cursor = new TokenCursor<Issue>({
+      fetchPage,
+      authorizePage,
+      pageSize: 10,
+      remotePageSize: 4,
+      fillPage: false,
+      // Deep enough that the walk of three pages happens in one call.
+      maxProviderPagesPerCall: 5,
+    });
+
+    expect(ids(await cursor.next())).toEqual([1]);
+    expect(fetchPage).toHaveBeenCalledTimes(3);
+    expect(await cursor.next()).toBeNull();
+  });
+
+  it("re-offers a refused page unchanged when not filling pages", async () => {
+    const fetchPage = fourRowTokenApi();
+    let call = 0;
+    const cursor = new TokenCursor<Issue>({
+      fetchPage,
+      authorizePage: async () => {
+        if (++call === 2) throw new Error("authorization unavailable");
+      },
+      pageSize: 10,
+      remotePageSize: 4,
+      fillPage: false,
+    });
+
+    expect(ids(await cursor.next())).toEqual([1, 2, 3, 4]);
+    await expect(cursor.next()).rejects.toThrow("authorization unavailable");
+    // The retry re-offers the second page's four rows without a third provider page.
+    expect(ids(await cursor.next())).toEqual([5, 6, 7, 8]);
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+  });
+
+  it("refuses a provider that loops back to a token the walk already followed", async () => {
+    // An echo is caught on the spot; a longer cycle -- the provider handing back a token two
+    // pages old -- would page full pages forever, and the fetch bound is no backstop.
+    const fetchPage = tokenApi([
+      { items: [{ id: 1, open: true }], nextToken: "a" },
+      { items: [{ id: 2, open: true }], nextToken: "b" },
+      { items: [{ id: 3, open: true }], nextToken: "a" },
+    ]);
+    const cursor = new TokenCursor<Issue>(
+      { fetchPage, authorizePage, pageSize: 1, remotePageSize: 1 });
+
+    expect(ids(await cursor.next())).toEqual([1]);
+    expect(ids(await cursor.next())).toEqual([2]);
+    await expect(cursor.next()).rejects.toThrow(
+      "Provider returned a continuation token this walk already followed.");
+  });
+
+  it("hands a still-held page to dispose, and nothing when no page is held", async () => {
+    // A refused page's rows were fetched but never served: releasing them is the gatekeeper's
+    // job once the caller drops the cursor instead of retrying.
+    const fetchPage = tokenApi([{ items: [{ id: 1, open: true }], nextToken: "a" }]);
+    let disposed: readonly Issue[] | null | undefined;
+    const cursor = new TokenCursor<Issue>({
+      fetchPage,
+      authorizePage: async () => {
+        throw new Error("authorization unavailable");
+      },
+      pageSize: 10,
+      remotePageSize: 1,
+      dispose: held => void (disposed = held ?? null),
+    });
+
+    await expect(cursor.next()).rejects.toThrow("authorization unavailable");
+    cursor[Symbol.dispose]();
+    expect(disposed?.map(issue => issue.id)).toEqual([1]);
+
+    // A cursor that never held a refused page releases the callback's own resources the same way.
+    const quiet = new TokenCursor<Issue>({
+      fetchPage: tokenApi([{ items: [{ id: 2, open: true }] }]),
+      authorizePage,
+      pageSize: 10,
+      dispose: held => void (disposed = held ?? null),
+    });
+    expect(ids(await quiet.next())).toEqual([2]);
+    quiet[Symbol.dispose]();
+    expect(disposed).toBeNull();
+  });
 });
 
 describe("injected rows", () => {

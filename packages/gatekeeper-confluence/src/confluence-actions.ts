@@ -14,8 +14,9 @@ import {
   buildDescription,
 } from "@gadgets/gatekeeper-kit/action-description";
 import {
-  APPLY_OUTCOME_UNKNOWN_MESSAGE, ActionOutcomeUnknownError,
-} from "@gadgets/gatekeeper-kit/actions";
+  applyClaimedAction,
+  markOutcomeUnknown,
+} from "@gadgets/gatekeeper-kit/outcome-unknown";
 import { ActionFileStore, type ActionFileReference } from "@gadgets/gatekeeper-kit/action-files";
 import type { ActionDescription, ApprovalQueue, ObservationDescription } from "@gadgets/workshop-shared/gatekeeper";
 import {
@@ -666,44 +667,16 @@ async function applyAction(store: ConfluenceStore, record: StoredActionRecord): 
 }
 
 export async function applyStoredAction(store: ConfluenceStore, id: number): Promise<void> {
-  const record = store.getAction(id);
-  if (!record) throw new Error(`Unknown action: ${id}`);
-  // The Workshop marks its side approved only after this RPC returns, so a replayed apply
-  // (restart, retry, duplicate click) settles here instead of dispatching again.
-  if (record.state === "applied" || record.state === "reverted") return;
-  // A terminal failure answers every later attempt with the same message, no Confluence call.
-  if (record.state === "failed") throw new Error(record.failure ?? "This action previously failed.");
-  // A claim left behind means a previous dispatch's outcome is unknown: the call may have
-  // reached Confluence. Record it terminally and surface it — never silently re-run a write.
-  if (record.state === "claimed") throw failUnknownOutcome(store, record);
-
-  // Claim before the first Confluence call: the record durably says a dispatch began, so an
-  // interrupted apply can never be mistaken for never-run.
-  store.putAction({ ...record, state: "claimed" });
-  try {
-    await applyAction(store, record);
-  } catch (error) {
-    if (isConfluenceOutcomeUnknown(error)) {
-      // No definitive answer arrived, so the write may have landed. Record the action terminally
-      // with the reason and surface it; a rejection clears the record after the user checks.
-      const message = `${APPLY_OUTCOME_UNKNOWN_MESSAGE} (${error instanceof Error ? error.message : String(error)})`;
-      store.putAction({ ...record, state: "failed", failure: message });
-      throw new ActionOutcomeUnknownError(message);
-    }
-    // Atlassian answered with a refusal (or the failure is internal): the write did not land, so
-    // the record goes back to pending and the failure stays retryable, as before.
-    store.putAction(record);
-    throw error;
-  }
-}
-
-/**
- * Records that the outcome of a dispatched action cannot be known, and returns the error that
- * surfaces it. Terminal: only a rejection clears the record.
- */
-function failUnknownOutcome(store: ConfluenceStore, record: StoredActionRecord): ActionOutcomeUnknownError {
-  store.putAction({ ...record, state: "failed", failure: APPLY_OUTCOME_UNKNOWN_MESSAGE });
-  return new ActionOutcomeUnknownError(APPLY_OUTCOME_UNKNOWN_MESSAGE);
+  // The claim-state loop (settled-is-settled, terminal failure, claim-before-dispatch, outcome
+  // unknown) is the kit's; the connector supplies only the Confluence dispatch and its
+  // classifier. The dispatch mutates the claimed copy it is handed, so intermediates (a created
+  // attachment id) now persist on the claimed record too.
+  await applyClaimedAction(
+    store,
+    id,
+    (record) => applyAction(store, record),
+    isConfluenceOutcomeUnknown,
+  );
 }
 
 export function rejectStoredAction(store: ConfluenceStore, id: number): void | { restart?: boolean } {
@@ -713,7 +686,7 @@ export function rejectStoredAction(store: ConfluenceStore, id: number): void | {
     // The Confluence call may already have run; deleting the record would discard the only trace
     // that it might have. The user checks Confluence, then rejects again to clear the failure
     // this records.
-    throw failUnknownOutcome(store, record);
+    throw markOutcomeUnknown(store, record);
   }
   store.deleteAction(id);
   // Rejecting a creation invalidates any pending actions on that (now-nonexistent) content,

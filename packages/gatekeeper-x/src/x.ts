@@ -40,8 +40,8 @@ import {
 } from "@gadgets/gatekeeper-kit/credentials";
 import { notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
 import {
-  clearConnectionSubject, commitReconnect, ConnectionSubject, discardStagedCredentials,
-  pinConnectionSubject, stageReconnect,
+  commitReconnectOrThrow, ConnectionSubject, discardStagedCredentials,
+  pinForConnect, stageReconnect,
 } from "@gadgets/gatekeeper-kit/credential-stage";
 import { probeAccess } from "@gadgets/gatekeeper-kit/http-errors";
 import {
@@ -443,18 +443,19 @@ export class UserAccount extends DurableObject<Env> {
         throw new Error("The X account was disconnected while it was being authorized. Connect it again.",
           { cause: error });
       }
-      pinConnectionSubject<XSubject>(kv, { id: identity.id, username: identity.username });
-      try {
-        const props = { userObjectId: this.ctx.id.toString() };
-        handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
-      } catch (error) {
-        // A connection the Workshop never took leaves its tokens with nobody: revoke them.
-        const abandoned = this.#creds.stored() ?? grant;
-        this.#creds.clear();
-        clearConnectionSubject(kv);
-        await this.#revokeGrant(abandoned);
-        throw error;
-      }
+      // The pin lives only as long as the handoff: a connect that fails unpins again, and a
+      // connection the Workshop never took leaves its tokens with nobody, so they are revoked.
+      handoff = await pinForConnect<XSubject, ConnectHandoff>(kv,
+        { id: identity.id, username: identity.username },
+        () => {
+          const props = { userObjectId: this.ctx.id.toString() };
+          return callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
+        },
+        async () => {
+          const abandoned = this.#creds.stored() ?? grant;
+          this.#creds.clear();
+          await this.#revokeGrant(abandoned);
+        });
     }
     await this.ctx.storage.deleteAlarm();
     return { handoff };
@@ -466,8 +467,7 @@ export class UserAccount extends DurableObject<Env> {
    * moves an established pin.
    */
   async commitReconnect(stageId: string): Promise<void> {
-    const staged = commitReconnect<ReconnectStage>(this.ctx.storage.kv, Date.now(), stageId);
-    if (!staged) throw new Error("No reconnect is awaiting confirmation. Please try again.");
+    const staged = commitReconnectOrThrow<ReconnectStage>(this.ctx.storage.kv, Date.now(), stageId);
     try {
       this.#creds.connect(staged.grant, { ifGeneration: staged.startedUnder });
     } catch (error) {

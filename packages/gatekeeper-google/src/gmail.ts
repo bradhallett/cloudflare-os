@@ -2466,7 +2466,6 @@ function gmailMessageCursor(
     threadId: string;
     snippet?: string;
     }, OwnedGmailMessageEntry>({
-    provider: "Gmail",
     async fetchPage(pageToken) {
       const page = await ctx.api.listMessages(20, request.query, pageToken, request.labelIds);
       return {items: page.messages, nextPageToken: page.nextPageToken};
@@ -2519,7 +2518,6 @@ function gmailMessageCursor(
 function gmailFullThreadCursor(
     ctx: GmailContext, request: GmailListRequest): Cursor<GmailThreadEntry> {
   return new RpcCursor(new CursorPager<{id: string; snippet?: string}, OwnedGmailThreadEntry>({
-    provider: "Gmail",
     async fetchPage(pageToken) {
       const page = await ctx.api.listThreads(20, request.query, pageToken, request.labelIds);
       return {items: page.threads, nextPageToken: page.nextPageToken};
@@ -2624,7 +2622,6 @@ function gmailRestrictedThreadCursor(
     threadId: string;
     messages: GmailMessageRef[];
   }, OwnedGmailThreadEntry>({
-    provider: "Gmail",
     async fetchPage(pageToken) {
       const groups = await getGroups();
       const offset = pageToken === undefined ? 0 : Number(pageToken);
@@ -4067,7 +4064,6 @@ function gmailDraftCursor(ctx: GmailContext): Cursor<GmailDraftEntry> {
   if (ctx.restricted) return restrictedDraftCursor(ctx);
   const emittedLogicalIds = new Set<string>();
   return new RpcCursor(new CursorPager<DraftCursorRef, OwnedGmailDraftEntry>({
-    provider: "Gmail",
     async fetchPage(pageToken) {
       const page = await ctx.api.listDrafts(20, pageToken);
       const items: DraftCursorRef[] = [];
@@ -4125,7 +4121,6 @@ function restrictedDraftCursor(ctx: GmailContext): Cursor<GmailDraftEntry> {
   const resources = ctx.store.listDrafts().filter(resource => resource.source &&
     resource.status === "active");
   return new RpcCursor(new CursorPager<GmailDraftResource, OwnedGmailDraftEntry>({
-    provider: "Gmail",
     async fetchPage(pageToken) {
       const offset = pageToken ? Number(pageToken) : 0;
       const items = resources.slice(offset, offset + 20);

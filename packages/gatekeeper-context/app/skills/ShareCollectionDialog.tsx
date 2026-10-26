@@ -43,12 +43,6 @@ type ShareState = {
   orgs: ContextViewerOrg[];
 };
 
-const MEMBER_ROLE_LABELS: Record<ContextCollectionRole, string> = {
-  viewer: "Can view",
-  editor: "Can edit",
-  owner: "Owner",
-};
-
 // The Workshop knows org names; the gatekeeper only ever sees the opaque org ids its grants are
 // keyed by, so rows and the picker can only name the id.
 const orgLabel = (orgId: string) => `Organization ${orgId}`;
@@ -273,7 +267,7 @@ export const ShareCollectionDialog = ({
                   className="group shrink-0 gap-1.5 text-xs"
                   aria-label={`Role for ${member.isViewer ? "you" : name}`}
                 >
-                  {MEMBER_ROLE_LABELS[member.role]}
+                  {COLLECTION_ROLE_LABELS[member.role]}
                   <CaretDown size={10} weight="bold" className="group-data-[popup-open]:rotate-180" />
                 </Button>
               )}
@@ -286,7 +280,7 @@ export const ShareCollectionDialog = ({
                   className="text-xs"
                   onClick={() => { if (role !== member.role) void changeRole(member, role); }}
                 >
-                  <span className="min-w-0 flex-1 pr-4">{MEMBER_ROLE_LABELS[role]}</span>
+                  <span className="min-w-0 flex-1 pr-4">{COLLECTION_ROLE_LABELS[role]}</span>
                 </DropdownMenu.Item>
               ))}
               {canRemove && (
@@ -308,7 +302,7 @@ export const ShareCollectionDialog = ({
           </DropdownMenu>
         ) : (
           <span className="shrink-0 px-2 text-xs font-medium text-kumo-default">
-            {MEMBER_ROLE_LABELS[member.role]}
+            {COLLECTION_ROLE_LABELS[member.role]}
           </span>
         )}
       </li>

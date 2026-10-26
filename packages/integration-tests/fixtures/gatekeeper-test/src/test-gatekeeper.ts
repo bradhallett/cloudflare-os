@@ -24,6 +24,7 @@ import {
 } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
+import { NO_RECONNECT_AWAITING_CONFIRMATION } from "@gadgets/gatekeeper-kit/credential-stage";
 import type {
   AccountDescription, ActionDescription, ActionKind, AgentCatalog, ApprovalQueue, ConnectHandoff,
   Gatekeeper, GatekeeperConnectCallback, GatekeeperUser, GatekeeperUserVerifier, HookController,
@@ -372,7 +373,7 @@ export class TestControl extends DurableObject<Cloudflare.Env> {
   commitReconnect(label: string, stageId: string): void {
     const stageKey = `reconnect-stage:${label}`;
     if (this.ctx.storage.kv.get<string>(stageKey) !== stageId) {
-      throw new Error("No reconnect is awaiting confirmation.");
+      throw new Error(NO_RECONNECT_AWAITING_CONFIRMATION);
     }
     this.ctx.storage.kv.delete(stageKey);
     this.ctx.storage.kv.put(`credential:${label}`, this.getCredential(label)! + 1);

@@ -522,9 +522,12 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
       let actor = await this.getResolvedAccess(actorId);
       this.#authorizeGrantChange(actorId, actor, { type: "org", orgId }, role);
       await this.#assertActorInOrg(actorId, orgId);
+      // The registry indexes the collection before the grant is written, mirroring `share`'s
+      // index-first order: a failure leaves at most a registry entry, which confers nothing
+      // (every listing re-checks the grant live), and repeating the share completes it.
+      await this.#registry().addOrgCollection(this.#domain(), orgId, this.getMetadata().id);
       let previous = this.storage.orgGrants.get(orgId);
       this.storage.orgGrants.put({ orgId, role, grantedAt: previous?.grantedAt ?? new Date() });
-      await this.#registry().addOrgCollection(this.#domain(), orgId, this.getMetadata().id);
       // Members' access may have fallen (e.g. editor demoted to viewer), so re-check tokens.
       this.#assertGitTokensRevoked(await this.#revokeUnauthorizedGitTokens(), actorId);
     });

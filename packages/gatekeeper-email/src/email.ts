@@ -20,6 +20,7 @@ import {
   type ConnectHandoff,
 } from '@gadgets/workshop-shared/gatekeeper';
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
+import { NO_RECONNECT_AWAITING_CONFIRMATION } from "@gadgets/gatekeeper-kit/credential-stage";
 import {
   EmailSession,
   EmailHook,
@@ -429,7 +430,7 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
 
   async commitReconnect(_stageId: string): Promise<void> {
     // reconnect() never starts a flow, so nothing can ever be staged.
-    throw new Error("No reconnect is awaiting confirmation. Please try again.");
+    throw new Error(NO_RECONNECT_AWAITING_CONFIRMATION);
   }
 
   async ensureResources(_resourceUrlPatterns: string[]): Promise<{url?: string}> {
