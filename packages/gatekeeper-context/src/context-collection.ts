@@ -659,12 +659,17 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
   }
 
   async setEveryoneCanView(actorId: string, everyoneCanView: boolean): Promise<void> {
-    let access = await this.getResolvedAccess(actorId);
-    if (!access.exists || access.role === null) throw new Error(NOT_FOUND);
-    if (!collectionPermissions(access, false).canShare) {
-      throw new Error("Only editors and owners can change who has access to this collection.");
-    }
-    this.storage.everyoneCanView.put(everyoneCanView);
+    // Serialized with every other access change, so a flag change and a grant change can never
+    // interleave: a flip racing a grant removal would briefly widen or narrow read access against
+    // a half-updated grant table.
+    await this.#serializeAccessChange(async () => {
+      let access = await this.getResolvedAccess(actorId);
+      if (!access.exists || access.role === null) throw new Error(NOT_FOUND);
+      if (!collectionPermissions(access, false).canShare) {
+        throw new Error("Only editors and owners can change who has access to this collection.");
+      }
+      this.storage.everyoneCanView.put(everyoneCanView);
+    });
   }
 
   // Resolved (org-aware) edit right, so a member's token dies with their org grant or membership.
