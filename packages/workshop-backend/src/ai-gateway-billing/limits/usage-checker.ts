@@ -12,7 +12,7 @@ import { CloudflareUsageInfo } from "@gadgets/workshop-shared/api";
 import { isCloudflareLimitsEnabled } from "../config.js";
 import { getConnectionStatus, resolveConnection, ByokGatewayRouting } from "../cloudflare/connection-service.js";
 import type { UserDurableObject } from "../../user.js";
-import { resolveEntitlements, resolveUsagePolicy } from "../../entitlements.js";
+import { overageAllowedFrom, resolveEntitlements, resolveUsagePolicy } from "../../entitlements.js";
 
 export interface UsageCheckResult {
   /** Whether the request may proceed. */
@@ -119,11 +119,10 @@ export async function checkUsageAndBalance(
 
   // A blocked decision is the one point a bound plan's overage policy matters: a plan that allows
   // spend past the included allowance proceeds on the platform (the SaaS meters it), so only
-  // hard-capped plans ever see the block. Unbound — every OSS deployment — nothing changes, and a
-  // bound port that fails keeps the block (overage is refused rather than granted by an outage).
-  let entitlements = !decision.allowed ? await resolveEntitlements(env, userId) : undefined;
-  if (!decision.allowed && entitlements?.status === "resolved" &&
-      entitlements.entitlements.overageAllowed === true) {
+  // hard-capped plans ever see the block. The fold reads unbound as no overage — every OSS
+  // deployment, as pre-port code — and unavailable the same way: no outage grants overage.
+  if (!decision.allowed &&
+      overageAllowedFrom(await resolveEntitlements(env, userId))) {
     return {
       allowed: true,
       shouldUseByok: false,

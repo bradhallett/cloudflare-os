@@ -28,8 +28,9 @@ import AI_MODEL_BINDING_TYPES from "./ai-model-binding.txt";
 import { DecisionAnswer, DecisionModelBinding, DecisionRequest } from "./decision-model-binding";
 import DECISION_MODEL_BINDING_TYPES from "./decision-model-binding.txt";
 import {
-  AiChatAuthorInfo, AiModelConfig, AiModelProvider, BuiltInReasoning, GatewayModelCapabilities,
-  REASONING_LEVELS, ReasoningLevel, SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT,
+  AiChatAuthorInfo, AiModelConfig, AiModelProvider, BuiltInReasoning, createPlanRefusalError,
+  GatewayModelCapabilities, REASONING_LEVELS, ReasoningLevel, SUGGESTED_MODELS,
+  WORKERS_AI_OUTPUT_LIMIT,
 } from "@gadgets/workshop-shared/api";
 import { traceChat } from "./agent-tracing.js";
 import {
@@ -38,7 +39,7 @@ import {
 import { completeText } from "./ai-invoke.js";
 import { bindingUsageGate } from "./ai-model-usage-gate.js";
 import { emitUsageEvent, usageTokens } from "./usage-events.js";
-import { resolveEntitlements } from "./entitlements.js";
+import { allowedSetFrom, resolveEntitlements } from "./entitlements.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
 import {
   estimateSharedHeadTokens, hasGpt56PromptCaching, splitSystemPrompt,
@@ -1126,31 +1127,29 @@ export type AiModelGatekeeperProps = {
  * at its next call. While users may not add their own models, so does a binding for any other
  * model: one a user added, or one the admin added and removed. A durable binding also outlives the
  * plan it was minted under, so when it names a workspace owner (ownerUserId) its model's catalog
- * tier is re-checked against that owner's plan on every session — mirroring the #requireModel
- * refusal a chat naming the model gets (see UserDurableObject) — and a downgrade stops the binding
- * at its next call rather than running a premium tier forever.
+ * tier is re-checked against that owner's plan on every session — refusing with the same coded
+ * MODEL_NOT_ON_PLAN refusal a chat naming the model gets (see UserDurableObject) — and a downgrade
+ * stops the binding at its next call rather than running a premium tier forever.
  */
 async function refuseRevokedModel(env: Cloudflare.Env, props: AiModelGatekeeperProps) {
   let models = await getGatewayModels(env);
-  let entry = models?.get(props.config.model);
-  if (entry?.provider === props.config.provider) {
-    models!.refuseDisabled(props.config.model);
-    if (props.ownerUserId !== undefined) {
-      let answer = await resolveEntitlements(env, props.ownerUserId);
-      if (answer.status === "resolved") {
-        if (entry.tier !== undefined &&
-            !answer.entitlements.allowedModelTiers.includes(entry.tier)) {
-          throw new Error(`The "${entry.name}" model isn't available on your plan.`);
-        }
-      } else if (answer.status === "unavailable" && entry.tier !== undefined) {
-        // A bound plan service that failed reads as the empty tier set, as it does for the
-        // chat-side gate (see #allowedModelTiers); "unbound" is an OSS deployment, where no
-        // gate applies at all.
-        throw new Error(`The "${entry.name}" model isn't available on your plan.`);
-      }
-    }
-  } else {
-    models?.refuseUserModel(props.displayName);
+  // No gateway catalog: AI Gateway mode is off, so nothing below can name the binding's model.
+  if (models === null) return;
+  let entry = models.get(props.config.model);
+  if (entry?.provider !== props.config.provider) {
+    models.refuseUserModel(props.displayName);
+    return;
+  }
+  models.refuseDisabled(props.config.model);
+  if (props.ownerUserId === undefined || entry.tier === undefined) return;
+  // The fold reads unbound as "no gate" (every OSS deployment) and unavailable as the empty set,
+  // as every plan gate does (see entitlements.ts).
+  let tiers = allowedSetFrom(
+      await resolveEntitlements(env, props.ownerUserId),
+      entitlements => entitlements.allowedModelTiers);
+  if (tiers !== null && !tiers.has(entry.tier)) {
+    throw createPlanRefusalError("MODEL_NOT_ON_PLAN",
+        `The "${entry.name}" model isn't available on your plan.`);
   }
 }
 
