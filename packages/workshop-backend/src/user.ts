@@ -537,8 +537,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         });
       }
     }
-    await this.#severSharedWorkspaceAccess();
-    await this.#leaveOrgsOnDeprovision();
+    // Independent teardowns of what the account leaves behind — shared workspaces' collaborator
+    // edges, org memberships — run concurrently (each is already best-effort per item), so one
+    // slow cross-DO hop doesn't serialize the whole deprovision behind it.
+    await Promise.allSettled([this.#severSharedWorkspaceAccess(), this.#leaveOrgsOnDeprovision()]);
     logger.info("user deprovisioned", { event: "user.deprovisioned" });
   }
 
@@ -1649,20 +1651,23 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     // restores the listing, and opening re-resolves regardless -- and records written before
     // the gate name no org, so they list as they always did.
     let me = this.ctx.id.name!;
+    // Every distinct org's gate is asked at once (the mirror image of server.ts's concurrent
+    // describeForMember fanout), rather than org N+1's gate starting only after org N's
+    // resolves. Each is a pure read, retried across an org-DO reset, memoized per org; an
+    // unreadable org answers as if removed, so the listing fails closed.
     let memberOf = new Map<string, Promise<boolean>>();
-    for (let record of this.storage.libraryBlueprints.list()) {
-      if (record.orgOwner !== undefined) {
-        let gate = memberOf.get(record.orgOwner);
-        if (gate === undefined) {
-          // A pure read, retried across an org-DO reset; an unreadable org answers as if
-          // removed, so the listing fails closed.
-          gate = retryOnDoReset(() =>
-              this.ctx.exports.OrgDurableObject.getByName(record.orgOwner!).getMember(me))
-              .then(isActiveMember, () => false);
-          memberOf.set(record.orgOwner, gate);
-        }
-        if (!(await gate)) continue;
+    let askOrg = (orgId: string) => {
+      let gate = memberOf.get(orgId);
+      if (gate === undefined) {
+        gate = retryOnDoReset(() =>
+            this.ctx.exports.OrgDurableObject.getByName(orgId).getMember(me))
+            .then(isActiveMember, () => false);
+        memberOf.set(orgId, gate);
       }
+      return gate;
+    };
+    for (let record of this.storage.libraryBlueprints.list()) {
+      if (record.orgOwner !== undefined && !(await askOrg(record.orgOwner))) continue;
       result.push({
         id: record.id,
         metadata: record.metadata,

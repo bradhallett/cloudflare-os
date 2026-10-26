@@ -99,21 +99,24 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
    */
   async #sweepExpiredInvitations(): Promise<void> {
     const now = Date.now();
-    // The snapshot is materialized because the loop awaits (the mirror) mid-iteration, and a
-    // second kv.list() (however triggered) would invalidate a still-live iterator.
-    const expired = [...this.storage.invitations.list()];
-    let sweptAny = false;
+    // The snapshot is materialized because the loop deletes rows mid-sweep, and a second
+    // kv.list() (however triggered) would invalidate a still-live iterator.
+    const expired = [...this.storage.invitations.list()]
+        .filter(invitation => invitation.expiresAt.getTime() <= now);
+    if (expired.length === 0) return;
     for (const invitation of expired) {
-      if (invitation.expiresAt.getTime() > now) continue;
       this.storage.invitations.delete(invitation.inviteeId);
       this.storage.members.delete(invitation.inviteeId);
       this.#log.debug("swept an expired org invitation", {
         event: "org.invitation.expired",
       });
-      await this.#mirror(invitation.inviteeId, null);
-      sweptAny = true;
     }
-    if (sweptAny) this.#syncCommerceMembers();
+    // The mirrors fan out concurrently rather than one invitee's unreachable user DO stalling
+    // the sweep on all the rest. #mirror swallows and logs its own failures, so this never
+    // rejects; allSettled keeps that true even if that contract changes.
+    await Promise.allSettled(
+        expired.map(invitation => this.#mirror(invitation.inviteeId, null)));
+    this.#syncCommerceMembers();
   }
 
   /**
@@ -462,19 +465,22 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
 
   // Tell every org-owned workspace that a membership ended or narrowed, so each can sever live
   // sessions (the workspace's own sharing graph stays the authority and re-checks at every
-  // open; the sever is role-counted, so it names no member). Best-effort and awaited inline,
-  // like #mirror: an unreachable workspace costs a logged warning, and the membership change
-  // itself never fails because of it.
+  // open; the sever is role-counted, so it names no member). Best-effort like #mirror, fanned
+  // out concurrently (allSettled, like the user DO's deprovision revokes): an unreachable
+  // workspace costs a logged warning, and the membership change itself never fails because
+  // of it.
   async #severOwnedGadgetSessions(): Promise<void> {
-    for (const gadget of this.storage.ownedGadgets.list()) {
-      try {
-        await this.ctx.exports.OverseerDurableObject
+    const gadgets = [...this.storage.ownedGadgets.list()];
+    const results = await Promise.allSettled(gadgets.map(gadget =>
+        this.ctx.exports.OverseerDurableObject
             .get(this.ctx.exports.OverseerDurableObject.idFromString(gadget.gadgetId))
-            .severOrgMemberSessions();
-      } catch (error) {
+            .severOrgMemberSessions()));
+    for (const [index, result] of results.entries()) {
+      if (result.status === "rejected") {
         this.#log.warn("failed to notify an org-owned workspace of a membership change", {
           event: "org.gadget.membership.notify.failed",
-          error,
+          gadgetId: gadgets[index]!.gadgetId,
+          error: result.reason,
         });
       }
     }
