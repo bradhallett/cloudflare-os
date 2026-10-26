@@ -3,8 +3,13 @@ import path from 'node:path'
 import type { Plugin } from 'vite'
 import { defineConfig } from 'vitest/config'
 import { cloudflareTest } from '@cloudflare/vitest-plugin'
-import { COMPATIBILITY_DATE } from '@gadgets/scripts/worker-config'
+import deployed from './cloudflare.config.ts'
 import capnwebValidate from 'capnweb-validate/vite'
+
+// The deployed runtime the pool must model (see cloudflare.config.ts), so a flag added there —
+// like global_fetch_strictly_public, the SSRF guard the webFetch tool depends on — reaches the
+// tests without a second copy here.
+const { compatibilityDate, compatibilityFlags = [] } = deployed.worker
 
 // Wrangler ships `*.txt` imports as Text modules (its default module rules; see
 // src/text-modules.d.ts), but this config drives the pool from inline miniflare settings, and
@@ -86,9 +91,10 @@ export default defineConfig({
       // The production Worker plus test-only entrypoints (see __tests__/test-worker.ts).
       main: './__tests__/test-worker.ts',
       miniflare: {
-        compatibilityDate: COMPATIBILITY_DATE,
-        // `allow_irrevocable_stub_storage` as in cloudflare.config.ts: the user DO persists account stubs.
-        compatibilityFlags: ['experimental', 'nodejs_compat', 'allow_irrevocable_stub_storage'],
+        compatibilityDate,
+        // `experimental` is the pool's own addition: the streaming-tail span recorder and the
+        // usage-events recorder below are test-only workers that need it.
+        compatibilityFlags: [...compatibilityFlags, 'experimental'],
         streamingTails: ['span-recorder'],
         serviceBindings: {
           SPAN_RECORDER: { name: 'span-recorder', entrypoint: 'SpanRecorder' },
@@ -99,14 +105,14 @@ export default defineConfig({
             name: 'span-recorder',
             modules: true,
             script: spanRecorder,
-            compatibilityDate: COMPATIBILITY_DATE,
+            compatibilityDate,
             compatibilityFlags: ['experimental', 'streaming_tail_worker'],
           },
           {
             name: 'usage-recorder',
             modules: true,
             script: usageRecorder,
-            compatibilityDate: COMPATIBILITY_DATE,
+            compatibilityDate,
             compatibilityFlags: ['experimental'],
           },
         ],
