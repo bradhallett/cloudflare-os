@@ -22,7 +22,7 @@ import {
   Plugs,
   Hexagon,
 } from '@phosphor-icons/react'
-import AddModelModal from './AddModelModal'
+import AddModelModal from './features/ai-models/AddModelModal'
 import { persistSelectedModel } from './modelSelection'
 import { logoComponents } from './components/ConnectionLogos'
 import { getVendorIconBackground } from './components/vendorColors'

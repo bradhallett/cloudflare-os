@@ -12,7 +12,7 @@ import {
   PencilSimple,
   Copy,
 } from '@phosphor-icons/react'
-import AddModelModal, { type ModelModalMode } from '../AddModelModal'
+import AddModelModal, { type ModelModalMode } from '../features/ai-models/AddModelModal'
 import { useDocumentTitle } from '../useDocumentTitle'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER } from '../components/menuStyles'
 

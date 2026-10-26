@@ -3,12 +3,12 @@ import { Dialog, Button, Input, Select, Collapsible, useKumoToastManager } from 
 import { AiChatAuthorInfo, AiModelProvider, AiGatewayInfo, RedactedAiModelConfig, SUGGESTED_MODELS, modelKind } from '@gadgets/workshop-shared/api'
 import { RpcStub } from 'capnweb'
 import { AuthenticatedApi } from '@gadgets/workshop-shared/api'
-import { ExtraHeadersEditor } from './features/ai-models/ExtraHeadersEditor'
-import { StoredSecretInput } from './features/ai-models/StoredSecretInput'
+import { ExtraHeadersEditor } from './ExtraHeadersEditor'
+import { StoredSecretInput } from './StoredSecretInput'
 import {
   headerRowsFromRecord, headerRowsToRecord, validateHeaderRows, type HeaderRow,
-} from './features/ai-models/extraHeaders'
-import { PROVIDER_LABELS, parseTokenLimit } from './features/ai-models/modelForm'
+} from './extraHeaders'
+import { PROVIDER_LABELS, parseTokenLimit } from './modelForm'
 
 /**
  * Whether the modal adds a model from scratch, edits a stored one, or adds a model based on a
