@@ -360,9 +360,9 @@ class ChatRpcTarget extends ApprovalQueueRpcTarget {
 
 function chatCursor<Item, Entry>(
   ctx: ChatContext,
-  options: Omit<CursorPagerOptions<Item, Entry>, "provider">,
+  options: CursorPagerOptions<Item, Entry>,
 ): Cursor<Entry> {
-  return new RpcCursor(new CursorPager({ provider: "Google Chat", ...options }), ctx.queue);
+  return new RpcCursor(new CursorPager(options), ctx.queue);
 }
 
 type FetchPage<Item> = (pageToken: string | undefined) => Promise<ChatPage<Item>>;
@@ -502,7 +502,6 @@ async function readThreadPage(
 ): Promise<ChatMessageInfo[] | null> {
   const thread = resolveThread(ctx, name);
   const pager = new CursorPager({
-    provider: "Google Chat",
     fetchPage: messagePages(ctx, thread.spaceName, { order: metadata ? "newestFirst" : "oldestFirst" }, name),
     buildEntries: async items => items,
     authorize: () => observe(ctx,
@@ -1460,7 +1459,6 @@ export class GoogleChatGatekeeperImpl
       if (!info.supportsThreads) throw new Error("This Google Chat conversation does not support threads.");
       // Hidden and deleted messages are dropped after Chat pages, so a page can come back empty.
       const [first] = await new CursorPager<ChatMessageInfo, ChatMessageInfo>({
-        provider: "Google Chat",
         fetchPage: pageToken => api.listMessages(boundSpace, {
           threadName: boundThread, order: "oldestFirst", pageSize: 10, pageToken,
         }),

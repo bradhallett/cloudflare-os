@@ -488,7 +488,6 @@ export class DriveSessionCore extends DriveCoreBase {
 
   async #cursor(query: DriveListFilesOptions, denyEmptySearch = false): Promise<Pager<DriveEntry>> {
     return new CursorPager<DriveFile, DriveEntry>({
-      provider: "Google Drive",
       fetchPage: async pageToken => {
         let page = await this.api.listFiles({...query, corpus: {kind: "user"}, pageToken});
         return {items: page.files, ...(page.nextPageToken ? {nextPageToken: page.nextPageToken} : {})};
@@ -501,7 +500,6 @@ export class DriveSessionCore extends DriveCoreBase {
   #exactFileCursor(): Pager<DriveEntry> {
     let fileId = this.#scope.kind === "file" ? this.#scope.fileId : outsideScope();
     return new CursorPager<DriveFile, DriveEntry>({
-      provider: "Google Drive",
       fetchPage: async () => ({items: [await this.api.getFile(fileId)]}),
       buildEntries: async files => {
         if (files.length !== 1 || files[0].id !== fileId) outsideScope();
@@ -707,7 +705,6 @@ export class DriveFolderSessionCore extends DriveCoreBase {
     let parentIds = childFolderIds ?? [this.#currentFolderId()];
     let audited = childFolderIds ? {...query, directParentIds: childFolderIds} : query;
     return new CursorPager<DriveFile, DriveEntry>({
-      provider: "Google Drive",
       fetchPage: async pageToken => {
         afterFetch = undefined;
         let {driveId} = await readScope();

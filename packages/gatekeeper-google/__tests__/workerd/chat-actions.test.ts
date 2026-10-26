@@ -1365,7 +1365,10 @@ describe("Google Chat thread capabilities", () => {
     expect(await cursor.next()).toBeNull();
     const scans = backend.state.lists.filter(url => !(url.searchParams.get("filter") ?? "").includes("thread.name"));
     expect(scans[0].searchParams.get("pageToken")).toBeNull();
-    expect(scans[2].searchParams.get("pageToken")).toBeNull();
+    // The kit engine holds a refused page and the retry re-offers it without re-fetching, so
+    // every scan advances and no continuation token is ever requested twice.
+    const tokens = scans.map(url => url.searchParams.get("pageToken"));
+    expect(new Set(tokens).size).toBe(tokens.length);
   });
 
   it("keeps delegated threads alive after discovery is disposed, without parent or sibling access", async () => {

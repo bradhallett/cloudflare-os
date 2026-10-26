@@ -78,4 +78,10 @@ export class RpcCursor<Entry> extends ApprovalQueueRpcTarget implements Cursor<E
   next(): Promise<Entry[] | null> {
     return this.#pager.next();
   }
+
+  /** Releases the queue reference and, when the pager is a disposable cursor, its held page. */
+  [Symbol.dispose](): void {
+    super[Symbol.dispose]();
+    (this.#pager as Partial<Disposable>)[Symbol.dispose]?.();
+  }
 }

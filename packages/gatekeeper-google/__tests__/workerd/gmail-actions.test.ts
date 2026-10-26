@@ -6408,9 +6408,10 @@ describe("Gmail draft dependency reconciliation", () => {
     const pageObservations = (await queue.read!()).observations.filter(observation =>
       typeof observation === "object" && observation !== null && "title" in observation &&
       /^Read \d+ Gmail drafts$/.test(String(observation.title)));
+    // The kit engine ends an already-disclosing walk at null without observing a final empty
+    // page; only pages that carried rows (or a zero-result walk's single answer) are observed.
     expect(pageObservations).toEqual([
       {title: "Read 1 Gmail drafts", description: expect.any(String)},
-      {title: "Read 0 Gmail drafts", description: expect.any(String)},
     ]);
   });
 

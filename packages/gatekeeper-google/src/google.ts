@@ -4,7 +4,7 @@ import { GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor as GatekeeperV
 import { buildDescription, codeSpan, plainInline } from "@gadgets/gatekeeper-kit/action-description";
 import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import {
-  clearConnectionSubject, commitReconnect, pinConnectionSubject, stageReconnect,
+  commitReconnectOrThrow, pinForConnect, stageReconnect,
 } from "@gadgets/gatekeeper-kit/credential-stage";
 import {
   PreviewOAuth,
@@ -468,6 +468,9 @@ type AuthCodeCompletion = {
   mode: OAuthFlowMode;
   stageId?: string;
   refused?: { title: string; detail: string };
+  /** The account the first-connect grant was verified as; carried out of the locked section so the
+   * pin is written around the handoff (see `pinForConnect`), not inside it. */
+  subject?: string;
 };
 
 /** How the callback ended: a handoff for the browser, or a refusal to show it. */
@@ -611,8 +614,7 @@ export class UserAccount extends DurableObject<Env> {
       this.#mintFailure = undefined;
       this.ctx.storage.kv.put<string[]>("grantedScopes", response.grantedScopes);
       mergeGrantedResources(this.ctx.storage.kv, flow.requestedResources);
-      pinConnectionSubject(this.ctx.storage.kv, { id: subject });
-      return { callback, mode: flow.mode, stageId: undefined };
+      return { callback, mode: flow.mode, stageId: undefined, subject };
     });
 
     if (completion.refused !== undefined) return { refused: completion.refused };
@@ -622,14 +624,18 @@ export class UserAccount extends DurableObject<Env> {
     if (completion.stageId !== undefined) {
       handoff = await callback.reconnectComplete(completion.stageId);
     } else {
-      try {
-        let props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
-        handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({props}));
-      } catch (err) {
-        this.ctx.storage.kv.delete("refreshToken");
-        clearConnectionSubject(this.ctx.storage.kv);
-        throw err;
-      }
+      let props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
+      // The pin brackets the handoff only: a connect that fails unpins, drops the credentials it
+      // wrote ahead, and revokes the now-orphaned grant (best-effort) rather than leaving a live
+      // token nothing will ever use.
+      handoff = await pinForConnect(this.ctx.storage.kv,
+        completion.subject === undefined ? undefined : { id: completion.subject },
+        () => callback.complete(this.ctx.exports.GatekeeperUserImpl({ props })),
+        async () => {
+          const orphaned = this.ctx.storage.kv.get<string>("refreshToken");
+          this.ctx.storage.kv.delete("refreshToken");
+          if (orphaned) await this.#revokeRefreshToken(orphaned);
+        });
 
       if (completion.mode === "auth") {
         this.ctx.storage.kv.put("deleteCredentialsOnAlarm", true);
@@ -656,9 +662,8 @@ export class UserAccount extends DurableObject<Env> {
    */
   async commitReconnect(stageId: string): Promise<void> {
     await this.#credentials.run(async () => {
-      let staged = commitReconnect<StagedGoogleCredentials>(
+      let staged = commitReconnectOrThrow<StagedGoogleCredentials>(
           this.ctx.storage.kv, Date.now(), stageId);
-      if (!staged) throw new Error("No reconnect is awaiting confirmation. Please try again.");
       this.ctx.storage.kv.put<string>("refreshToken", staged.refreshToken);
       this.ctx.storage.kv.put<GoogleAccessToken>("accessToken", staged.accessToken);
       // These credentials are new, so any recorded permanent failure no longer applies
