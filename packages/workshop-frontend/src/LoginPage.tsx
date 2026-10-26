@@ -8,6 +8,7 @@ import { hashPassword } from './passwordHash'
 import { useServerConfig, useServerConfigError, useSiteName } from './ServerConfigContext'
 import { useDocumentTitle } from './useDocumentTitle'
 import { useConnectionLost } from './RpcContext'
+import { rpcFailureDescription } from './rpcErrors'
 import OAuthButtons from './components/auth/OAuthButtons'
 import SiteLogo from './components/SiteLogo'
 import { deviceSessionSearch } from './features/native-app/DeviceSessionHandoff'
@@ -49,7 +50,7 @@ export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
         setError('Invalid username or password')
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Login failed')
+      setError(rpcFailureDescription(err) ?? 'Login failed')
     } finally {
       setLoading(false)
     }

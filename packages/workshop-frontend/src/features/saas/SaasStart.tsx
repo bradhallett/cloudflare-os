@@ -11,6 +11,7 @@ import { AuthenticatedApi, CommercePlan } from '@gadgets/workshop-shared/api'
 import { Button } from '@cloudflare/kumo'
 import { useRpcStub } from '../../RpcContext'
 import { hashPassword } from '../../passwordHash'
+import { rpcFailureDescription } from '../../rpcErrors'
 import { INPUT_LG } from '../../components/inputStyles'
 
 /** One step of the funnel; the card keeps its height between steps so the page doesn't jump. */
@@ -89,7 +90,7 @@ export default function SaasStart() {
       setToken(minted)
       setStep('org')
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not reach the server.')
+      setError(rpcFailureDescription(err) ?? 'Could not reach the server.')
     } finally {
       setBusy(false)
     }
@@ -105,7 +106,7 @@ export default function SaasStart() {
       setSeats(1)
       setStep('plan')
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not create the organization.')
+      setError(rpcFailureDescription(err) ?? 'Could not create the organization.')
     } finally {
       setBusy(false)
     }
@@ -119,7 +120,7 @@ export default function SaasStart() {
       const { url } = await authed.startOrgCheckout(orgId, planId, seats)
       window.location.assign(url)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not start checkout.')
+      setError(rpcFailureDescription(err) ?? 'Could not start checkout.')
       setBusy(false)
     }
   }

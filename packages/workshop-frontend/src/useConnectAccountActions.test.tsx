@@ -48,7 +48,7 @@ function mockConnectPopup() {
   const popup = {
     close() {},
     opener: window as Window | null,
-    sessionStorage: { setItem: vi.fn(), removeItem: vi.fn() },
+    sessionStorage: { setItem: vi.fn<(k: string, v: string) => void>(), removeItem: vi.fn<(k: string) => void>() },
     location: { replace: vi.fn<(url: string) => void>() },
   }
   vi.spyOn(window, 'open').mockImplementation(() => popup as unknown as Window)
@@ -57,10 +57,10 @@ function mockConnectPopup() {
 
 function fakeApi(overrides: Partial<Record<'connectAccount' | 'ensureAccountResources' | 'reconnectAccount' | 'provisionAmbientAccount', Mock>>): AuthenticatedApi {
   return {
-    connectAccount: overrides.connectAccount ?? vi.fn(async () => FLOW),
-    ensureAccountResources: overrides.ensureAccountResources ?? vi.fn(async () => FLOW),
-    reconnectAccount: overrides.reconnectAccount ?? vi.fn(async () => FLOW),
-    provisionAmbientAccount: overrides.provisionAmbientAccount ?? vi.fn(async () => {}),
+    connectAccount: overrides.connectAccount ?? vi.fn<() => Promise<typeof FLOW>>(async () => FLOW),
+    ensureAccountResources: overrides.ensureAccountResources ?? vi.fn<() => Promise<typeof FLOW>>(async () => FLOW),
+    reconnectAccount: overrides.reconnectAccount ?? vi.fn<() => Promise<typeof FLOW>>(async () => FLOW),
+    provisionAmbientAccount: overrides.provisionAmbientAccount ?? vi.fn<() => Promise<void>>(async () => {}),
   } as unknown as AuthenticatedApi
 }
 
@@ -83,7 +83,7 @@ afterEach(() => {
 describe('useConnectAccountActions', () => {
   it('marks the vendor busy while a connect flow runs, then releases it', async () => {
     let release: ((flow: ConnectFlowStart) => void) | null = null
-    const connectAccount = vi.fn(() => new Promise<ConnectFlowStart>(resolve => { release = resolve }))
+    const connectAccount = vi.fn<() => Promise<ConnectFlowStart>>(() => new Promise<ConnectFlowStart>(resolve => { release = resolve }))
     renderProbe(fakeApi({ connectAccount }))
     let pending: Promise<'opened' | 'connected' | 'provisioned' | 'already-granted' | undefined> | null = null
     await act(async () => { pending = probe!.connect('google') })
@@ -95,7 +95,7 @@ describe('useConnectAccountActions', () => {
   })
 
   it('toasts the standard idiom on failure: title names the action, description is sanitized', async () => {
-    const connectAccount = vi.fn(async () => { throw new Error('Vendor refused the request') })
+    const connectAccount = vi.fn<() => Promise<ConnectFlowStart>>(async () => { throw new Error('Vendor refused the request') })
     renderProbe(fakeApi({ connectAccount }))
     let outcome: unknown
     await act(async () => { outcome = await probe!.connect('google') })
@@ -111,7 +111,7 @@ describe('useConnectAccountActions', () => {
 
   it('hides transport strings from the toast description', async () => {
     // A capnweb transport failure carries no flags, so its message must not surface.
-    const connectAccount = vi.fn(async () => { throw new Error('Peer closed WebSocket') })
+    const connectAccount = vi.fn<() => Promise<ConnectFlowStart>>(async () => { throw new Error('Peer closed WebSocket') })
     renderProbe(fakeApi({ connectAccount }))
     await act(async () => { await probe!.connect('google') })
     expect(toastAdd).toHaveBeenCalledWith({
@@ -122,7 +122,7 @@ describe('useConnectAccountActions', () => {
   })
 
   it('stays quiet when the user cancels the pop-up', async () => {
-    const connectAccount = vi.fn(async () => { throw new AuthPopupCancelledError() })
+    const connectAccount = vi.fn<() => Promise<ConnectFlowStart>>(async () => { throw new AuthPopupCancelledError() })
     renderProbe(fakeApi({ connectAccount }))
     let outcome: unknown
     await act(async () => { outcome = await probe!.connect('google') })
@@ -134,8 +134,8 @@ describe('useConnectAccountActions', () => {
 
   it('hands failures to onError instead of toasting (plan-refusal surfaces)', async () => {
     const refusal = new Error('Plan limit reached')
-    const connectAccount = vi.fn(async () => { throw refusal })
-    const onError = vi.fn()
+    const connectAccount = vi.fn<() => Promise<ConnectFlowStart>>(async () => { throw refusal })
+    const onError = vi.fn<(err: unknown) => void>()
     renderProbe(fakeApi({ connectAccount }))
     await act(async () => { await probe!.connect('google', undefined, { onError }) })
     expect(onError).toHaveBeenCalledWith(refusal)
@@ -143,7 +143,7 @@ describe('useConnectAccountActions', () => {
   })
 
   it('provisions ambient accounts without a pop-up', async () => {
-    const provisionAmbientAccount = vi.fn(async () => {})
+    const provisionAmbientAccount = vi.fn<() => Promise<void>>(async () => {})
     renderProbe(fakeApi({ provisionAmbientAccount }))
     let outcome: unknown
     await act(async () => { outcome = await probe!.connectAmbient('google') })
@@ -154,7 +154,7 @@ describe('useConnectAccountActions', () => {
   })
 
   it('reports already-granted access without opening a pop-up', async () => {
-    const ensureAccountResources = vi.fn(async () => null)
+    const ensureAccountResources = vi.fn<() => Promise<ConnectFlowStart | null>>(async () => null)
     renderProbe(fakeApi({ ensureAccountResources }))
     let outcome: unknown
     await act(async () => { outcome = await probe!.grant(7, ['https://mail.google.com/*']) })
@@ -173,7 +173,7 @@ describe('useConnectAccountActions', () => {
   })
 
   it('releases a held reconnect on failure', async () => {
-    const reconnectAccount = vi.fn(async () => { throw new Error('expired session') })
+    const reconnectAccount = vi.fn<() => Promise<ConnectFlowStart>>(async () => { throw new Error('expired session') })
     renderProbe(fakeApi({ reconnectAccount }))
     await act(async () => { await probe!.reconnect(9, { holdBusy: true }) })
     expect(probe!.reconnectingAccountId).toBeNull()

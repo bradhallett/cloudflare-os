@@ -10,6 +10,7 @@ import { useDocumentTitle } from "./useDocumentTitle";
 import OAuthButtons from "./components/auth/OAuthButtons";
 import SiteLogo from "./components/SiteLogo";
 import { useConnectionLost } from "./RpcContext";
+import { rpcFailureDescription } from "./rpcErrors";
 import {
   deviceSessionDestination,
   deviceSessionSearch,
@@ -79,7 +80,7 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
         setError("Username already exists");
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Account creation failed");
+      setError(rpcFailureDescription(err) ?? "Account creation failed");
     } finally {
       setLoading(false);
     }

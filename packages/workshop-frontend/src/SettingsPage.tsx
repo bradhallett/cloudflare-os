@@ -1,5 +1,6 @@
 import { useKumoToastManager } from '@cloudflare/kumo'
 import { useAuthenticatedApi } from './AuthContext'
+import { rpcFailureDescription } from './rpcErrors'
 import { Suspense, useState, useEffect, useRef } from 'react'
 import { AiChatAuthorInfo, validateCommitEmail } from '@gadgets/workshop-shared/api'
 import { hashPassword } from './passwordHash'
@@ -338,7 +339,7 @@ export default function SettingsPage({ org }: { org?: string }) {
       setNewPassword('')
       setConfirmPassword('')
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Failed to change password'
+      const errorMessage = rpcFailureDescription(err) ?? 'Failed to change password'
       setPasswordError(errorMessage)
     } finally {
       setPasswordLoading(false)
