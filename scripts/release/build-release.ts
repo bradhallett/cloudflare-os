@@ -105,6 +105,8 @@ function parseArgs(argv: string[]): {
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--out") out = resolve(argv[++i]);
     else if (argv[i] === "--release-id") releaseId = argv[++i];
+    // --scan-root's value is validated by scanRootArgs at the return; here we only skip the pair.
+    else if (argv[i] === "--scan-root") i++;
     else if (argv[i] === "--concurrency") {
       concurrency = Number(argv[++i]);
       if (!Number.isInteger(concurrency) || concurrency < 1) {
