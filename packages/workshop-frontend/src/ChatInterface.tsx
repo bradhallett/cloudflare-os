@@ -28,21 +28,21 @@ import {
   WorkpieceId,
   BlueprintOutput,
 } from "@gadgets/workshop-shared/api";
-import { isTransientRpcError, logRpcFailure } from "./rpcErrors";
-import type { FailedChatSend } from "./features/chat/transcript/failedSends";
+import { logRpcFailure } from "./rpcErrors";
 import { ChatListPanel, type ChatListScope } from "./features/chat/ChatListPanel";
 import { ChatTranscript } from "./features/chat/ChatTranscript";
 import { ChatDialogs } from "./features/chat/ChatDialogs";
 import { ChatHeaderBar } from "./features/chat/ChatHeaderBar";
 import { ChatComposerBar } from "./features/chat/ChatComposerBar";
 import { useChatActions } from "./features/chat/useChatActions";
+import { useChatListActions } from "./features/chat/useChatListActions";
+import { useChatChanges } from "./features/chat/useChatChanges";
+import { useConnectionRequests } from "./features/chat/useConnectionRequests";
 import type { ChatContentReader } from "./features/code/otClient";
+import { triggerBlobDownload } from "./fileTransfers";
 import { useAlwaysApproveTag } from "./useAlwaysApproveTag";
 import { useResolveAction } from "./useResolveAction";
 import { useAuthenticatedApi } from "./AuthContext";
-import {
-  type UnresolvedConflict,
-} from "./features/chat/mergeConflicts";
 import {
   type ActiveFileTarget,
   type ChatCodeChanges,
@@ -239,30 +239,8 @@ function ChatInterface({
   const [chatListScope, setChatListScope] = useState<ChatListScope>("all");
   // Fetching the page before the selected chat's compaction boundary.
   const [isLoadingEarlier, setIsLoadingEarlier] = useState(false);
-  const [isEditingTitle, setIsEditingTitle] = useState(false);
-  const [titleInput, setTitleInput] = useState("");
-  const [renamingChatId, setRenamingChatId] = useState<number | null>(null);
-  const renamingChatIdRef = useRef<number | null>(null);
-  const [renamingInput, setRenamingInput] = useState("");
-  const [deleteTarget, setDeleteTarget] = useState<{
-    id: number;
-    title: string;
-  } | null>(null);
-  const [isDeleting, setIsDeleting] = useState(false);
-  const [discardChangesTarget, setDiscardChangesTarget] = useState<{
-    chatId: number;
-  } | null>(null);
-  const [discardingChangesChatIds, setDiscardingChangesChatIds] = useState(
-    () => new Set<number>(),
-  );
-  // Chat whose accept came back "stale" (mainline advanced past its pins), awaiting the user's
-  // decision in the update-from-mainline dialog.
-  const [staleAcceptChatId, setStaleAcceptChatId] = useState<number | null>(null);
-  const [isUpdatingFromMainline, setIsUpdatingFromMainline] = useState(false);
-  // The conflict markers that held up an accept of the selected chat's changes, awaiting the
-  // user's decision in the unresolved-conflicts dialog.
-  const [unresolvedConflicts, setUnresolvedConflicts] = useState<UnresolvedConflict[] | null>(null);
-
+  // List, changes, and connection-request flow state lives in its hooks below
+  // (useChatListActions, useChatChanges, useConnectionRequests).
   const [expandedToolCalls, setExpandedToolCalls] = useState<Set<string>>(
     new Set(),
   );
@@ -274,25 +252,6 @@ function ChatInterface({
   );
   const [expandedErrors, setExpandedErrors] = useState<Set<string>>(new Set());
   const [expandedCompactions, setExpandedCompactions] = useState<Set<number>>(new Set());
-  const [processingActions, setProcessingActions] = useState<Set<number>>(
-    new Set(),
-  );
-  // Connection-request (agent requestConnection) accept flow. When set, the GatekeeperModal opens
-  // pre-seeded with the agent's vendor/resource; on creation we finalize acceptConnectionRequest.
-  const [connectionAccept, setConnectionAccept] = useState<{
-    requestId: string;
-    vendorId: string;
-    resourceUrl?: string;
-    resourceUrlPattern?: string;
-  } | null>(null);
-  // Read via this ref inside handleConnectionCreated to avoid a stale closure: that callback is
-  // passed as the `onCreated` prop to GatekeeperModal, so it would otherwise capture an outdated
-  // `connectionAccept`.
-  const connectionAcceptRef = useRef<typeof connectionAccept>(null);
-  connectionAcceptRef.current = connectionAccept;
-  const [processingConnections, setProcessingConnections] = useState<Set<string>>(
-    new Set(),
-  );
   const [sidebarActiveTab, setSidebarActiveTab] = useState<
     "chat" | "connections"
   >("chat");
@@ -409,6 +368,110 @@ function ChatInterface({
     return cacheRef.current.compacted.get(selectedChatId) ?? [];
   }, [selectedChatId, updateCounter]);
   const messageStates = useMemo(() => computeMessageStates(currentMessages), [currentMessages]);
+  // Declared bots for the composer's agent picker, plus its pick (a chat's own bot wins while
+  // that chat is open; Home's stored pick covers the no-chat case).
+  const [bots, setBots] = useState<BotInfo[]>([]);
+  const [selectedBot, setSelectedBot] = useState<BotSelection | null>(null);
+
+  // The selected chat's metadata, undefined while it has not loaded.
+  const currentChatMetadata =
+    selectedChatId !== null ? cacheRef.current.chats.get(selectedChatId) : null;
+
+  // ─── action hooks ──────────────────────────────────────────────────────────
+  // Each flow owns its own state; ChatInterface orchestrates the results.
+  const {
+    handleSend,
+    handleNewChatSend,
+    handleModelChange,
+    handleBotChange,
+    retryModelId,
+    handleStop,
+    handleToggleHook,
+    processingActions,
+    setProcessingActions,
+    handleRetry,
+    handleCopyMessage,
+    currentFailedSends,
+    retryFailedSend,
+    dismissFailedSend,
+  } = useChatActions({
+    overseer,
+    selectedChatId,
+    selectedModel,
+    setSelectedModel,
+    bots,
+    selectedBot,
+    setSelectedBot,
+    onNavigateToChatRef,
+    forceUpdate,
+    applyOptimisticHookEnabled,
+    toasts,
+    currentChatMetadata,
+  });
+
+  const {
+    titleInput,
+    setTitleInput,
+    isEditingTitle,
+    setIsEditingTitle,
+    renamingChatId,
+    renamingInput,
+    setRenamingInput,
+    deleteTarget,
+    setDeleteTarget,
+    isDeleting,
+    handleSaveChatTitle,
+    handleCancelTitleEdit,
+    handleDeleteChat,
+    handleDeleteConfirm,
+    cancelListRename,
+    startListRename,
+    handleSaveListRename,
+  } = useChatListActions({
+    overseer,
+    selectedChatId,
+    currentChatMetadata,
+    cacheRef,
+    forceUpdate,
+    bumpChatListVersion,
+    toasts,
+  });
+
+  const {
+    staleAcceptChatId,
+    setStaleAcceptChatId,
+    isUpdatingFromMainline,
+    unresolvedConflicts,
+    setUnresolvedConflicts,
+    discardChangesTarget,
+    setDiscardChangesTarget,
+    discardingChangesChatIds,
+    handleMergeChanges,
+    handleAcceptChanges,
+    handleUpdateFromMainline,
+    handleFinalizeDraftChanges,
+    handleDiscardDraftChanges,
+    handleDiscardPendingChanges,
+    handleRevertChanges,
+  } = useChatChanges({
+    overseer,
+    selectedChatId,
+    selectedChatIdRef,
+    currentChatMetadata,
+    currentMessages,
+    messageStates,
+    chatContent,
+    toasts,
+  });
+
+  const {
+    connectionAccept,
+    setConnectionAccept,
+    processingConnections,
+    handleAcceptConnection,
+    handleConnectionCreated,
+    handleDenyConnection,
+  } = useConnectionRequests({ overseer, toasts });
   // A pending agent connection request blocks the composer: the user must accept ("Set up") or deny
   // it before continuing the conversation.
   const hasPendingConnectionRequest = useMemo(
@@ -435,15 +498,6 @@ function ChatInterface({
     [outputOfWorkpiece],
   );
 
-  // User sends the server definitively rejected (this session only — nothing durable records
-  // them), held so their chat's transcript can show the failed message with a retry.
-  const [failedSends, setFailedSends] = useState<FailedChatSend[]>([]);
-
-  // Failed sends are session-local, so filter to the open chat before feeding the transcript.
-  const currentFailedSends = useMemo(
-    () => (selectedChatId === null ? [] : failedSends.filter((s) => s.chatId === selectedChatId)),
-    [failedSends, selectedChatId],
-  );
 
   const displayEntries = useMemo(
     () =>
@@ -463,9 +517,6 @@ function ChatInterface({
     return out;
   }, [displayEntries]);
 
-  // Get metadata for selected chat
-  const currentChatMetadata =
-    selectedChatId !== null ? cacheRef.current.chats.get(selectedChatId) : null;
   const queuedSteers = currentChatMetadata?.queuedSteers;
 
   // Hide the user name on user message rows when the only human in the chat is the
@@ -506,21 +557,13 @@ function ChatInterface({
   const downloadChatAttachment = useCallback(async (chatId: number, attachment: ChatAttachmentRef) => {
     try {
       let bytes = attachment.content;
-      const mimeType = attachment.mimeType;
-      const name = attachment.name;
       if (!bytes) {
         bytes = await overseer.getChatAttachmentContent(chatId, attachment.id);
       }
-      const url = URL.createObjectURL(
-        new Blob([bytes as BlobPart], {type: mimeType || "application/octet-stream"}));
-      try {
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = name ?? "attachment";
-        a.click();
-      } finally {
-        setTimeout(() => URL.revokeObjectURL(url), 0);
-      }
+      triggerBlobDownload(
+        new Blob([bytes as BlobPart], {type: attachment.mimeType || "application/octet-stream"}),
+        attachment.name ?? "attachment",
+      );
     } catch (err: any) {
       console.error("Failed to download chat attachment:", err);
       toasts.add({ title: err?.message || "Failed to download attachment", variant: "error" });
@@ -656,11 +699,6 @@ function ChatInterface({
     }
   }, [currentChatMetadata?.title]);
 
-  // Declared bots for the composer's agent picker, plus its pick (a chat's own bot wins while
-  // that chat is open; Home's stored pick covers the no-chat case).
-  const [bots, setBots] = useState<BotInfo[]>([]);
-  const [selectedBot, setSelectedBot] = useState<BotSelection | null>(null);
-
   // Update selected model when switching chats
   useEffect(() => {
     if (selectedChatId === null) {
@@ -757,101 +795,6 @@ function ChatInterface({
       if (applyOptimisticActionState(actionId, state)) forceUpdate();
     });
 
-  const {
-    handleSend,
-    handleNewChatSend,
-    handleModelChange,
-    handleBotChange,
-    retryModelId,
-    handleStop,
-    handleSaveChatTitle,
-    handleCancelTitleEdit,
-    handleDeleteChat,
-    handleDeleteConfirm,
-    cancelListRename,
-    startListRename,
-    handleSaveListRename,
-    handleMergeChanges,
-    handleAcceptChanges,
-    handleUpdateFromMainline,
-    handleFinalizeDraftChanges,
-    handleDiscardDraftChanges,
-    handleDiscardPendingChanges,
-    handleRevertChanges,
-    handleToggleHook,
-    handleAcceptConnection,
-    handleConnectionCreated,
-    handleDenyConnection,
-    handleRetry,
-    handleCopyMessage,
-  } = useChatActions({
-    overseer,
-    selectedChatId,
-    selectedModel,
-    setSelectedModel,
-    bots,
-    selectedBot,
-    setSelectedBot,
-    selectedChatIdRef,
-    onNavigateToChatRef,
-    cacheRef,
-    forceUpdate,
-    bumpChatListVersion,
-    applyOptimisticHookEnabled,
-    toasts,
-    currentChatMetadata,
-    currentMessages,
-    messageStates,
-    chatContent,
-    titleInput,
-    setTitleInput,
-    setIsEditingTitle,
-    deleteTarget,
-    setDeleteTarget,
-    setIsDeleting,
-    renamingInput,
-    setRenamingInput,
-    renamingChatIdRef,
-    setRenamingChatId,
-    staleAcceptChatId,
-    setStaleAcceptChatId,
-    setIsUpdatingFromMainline,
-    setUnresolvedConflicts,
-    discardChangesTarget,
-    setDiscardChangesTarget,
-    setDiscardingChangesChatIds,
-    setProcessingActions,
-    connectionAcceptRef,
-    setConnectionAccept,
-    setProcessingConnections,
-    setFailedSends,
-  });
-
-  // Retry drops the bubble first so a success leaves no duplicate; a definitive failure re-records
-  // a fresh bubble via handleSend itself, while a transient failure would leave the retry
-  // outcome-unknown — so the original bubble is restored to keep the message reachable.
-  const retryFailedSend = useCallback(
-    async (send: FailedChatSend) => {
-      setFailedSends((prev) => prev.filter((s) => s.id !== send.id));
-      try {
-        await handleSend(
-          send.payload.message,
-          send.payload.modelId,
-          send.payload.capsules,
-          send.payload.attachments,
-          send.payload.formats,
-          send.payload.bot,
-        );
-      } catch (err) {
-        if (isTransientRpcError(err)) setFailedSends((prev) => [...prev, send]);
-      }
-    },
-    [handleSend],
-  );
-
-  const dismissFailedSend = useCallback((send: FailedChatSend) => {
-    setFailedSends((prev) => prev.filter((s) => s.id !== send.id));
-  }, []);
 
   const toggleToolCallExpansion = useCallback((expansionKey: string) => {
     setExpandedToolCalls((prev) => {
