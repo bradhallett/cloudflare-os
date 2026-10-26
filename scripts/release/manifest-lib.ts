@@ -423,10 +423,13 @@ export function gatekeeperBindingName(pkgName: string): string {
  * the fixed point of every runtime transform a slug passes through — the router lowercases and
  * maps _ -> -, and the backend's inverse GATEKEEPER_ + `toUpperCase()` breaks on anything else —
  * so a slug outside it does not survive the round trip through binding names.
+ *
+ * Shared with the integration harness (packages/integration-tests/src/harness.ts), which binds
+ * gatekeepers the same way and must not build an environment production cannot have.
  */
-const SLUG_RE = /^[a-z][a-z0-9]*$/;
+export const SLUG_RE = /^[a-z][a-z0-9]*$/;
 /** The deploy service's install-slug length cap. */
-const MAX_SLUG_LEN = 20;
+export const MAX_SLUG_LEN = 20;
 
 /**
  * The release manifest's shortName. Deployed instances bind gatekeepers as GATEKEEPER_<SLUG> and

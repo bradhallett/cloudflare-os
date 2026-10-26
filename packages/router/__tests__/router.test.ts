@@ -58,6 +58,17 @@ describe('router fetch', () => {
     expect(await route(env, '/gatekeeper/my-service/oauth')).toBe('my-service');
   });
 
+  // GATEKEEPER_EMAIL is bound as an EmailEntrypoint (no fetch); any GATEKEEPER_* binding without
+  // a fetch entrypoint must fall through to the routes below rather than throw at the call.
+  it('skips GATEKEEPER_* bindings with no fetch entrypoint instead of throwing', async () => {
+    const env = makeEnv({
+      ASSETS: stubFetcher('assets'),
+      GATEKEEPER_EMAIL: {} as unknown as Fetcher,
+    });
+    expect(await route(env, '/gatekeeper/email')).toBe('assets');
+    expect(await route(env, '/gatekeeper/email/anything')).toBe('assets');
+  });
+
   it('does not match gatekeeper prefixes on longer path segments', async () => {
     const env = makeEnv({
       ASSETS: stubFetcher('assets'),

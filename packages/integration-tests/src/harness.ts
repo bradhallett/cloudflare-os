@@ -9,6 +9,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { MAX_SLUG_LEN, SLUG_RE } from "@gadgets/scripts/release/manifest-lib";
 import { parse } from "jsonc-parser";
 import { createTestHarness, type TestHarness } from "wrangler";
 import { z } from "zod";
@@ -156,6 +157,18 @@ export async function startHarness(opts: {
   patchWorkshop?: (config: WorkerConfig) => void;
   enableGadgetExecution?: boolean;
 }): Promise<Harness> {
+  // The harness's value is modeling production's topology: deployed instances bind
+  // GATEKEEPER_<SLUG> with SLUG_RE's charset (manifest-lib.ts, single-sourced), and the router and
+  // backend only lowercase what they find — so a suffix outside it (an underscore, a hyphen, a
+  // leading digit) builds vendor ids and routes no customer instance can have. Fail closed.
+  for (const gk of opts.gatekeepers) {
+    const slug = gk.binding.toLowerCase();
+    if (!SLUG_RE.test(slug) || slug.length > MAX_SLUG_LEN) {
+      throw new Error(`gatekeeper binding "${gk.binding}" cannot exist in production: install ` +
+          `slugs are 1-${MAX_SLUG_LEN} lowercase letters and digits starting with a letter`);
+    }
+  }
+
   // Each gatekeeper's config is read (and patched) exactly once; the service binding below points at
   // the name the booted worker will actually carry, patches included.
   const gatekeepers = opts.gatekeepers.map(gk => {
