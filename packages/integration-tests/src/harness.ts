@@ -190,9 +190,7 @@ export async function startHarness(opts: {
         return;
       } catch {
         if (Date.now() > deadline) throw new Error("the redeployed Workshop never answered");
-        const { promise, resolve } = Promise.withResolvers<void>();
-        setTimeout(resolve, 100);
-        await promise;
+        await new Promise((resolve) => setTimeout(resolve, 100));
       }
     }
   };

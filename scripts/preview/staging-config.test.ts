@@ -532,22 +532,23 @@ test("every gatekeeper handed an OAuth app is a package that exists, and reads t
   }
 });
 
-test("a plain overlay worker gets a baseline/preview split with its vars passed through", () => {
+test("a plain overlay worker fails closed rather than half-wiring a preview", () => {
   // An overlay workspace's workers (extra scan roots) are not part of this repo's release; their
-  // fixture stands in for one. It has no connector surface, so its preview is just the standard
-  // split — fresh resources per preview, workers.dev off (only the router is an origin).
+  // fixture stands in for one. Preview deployment only orchestrates this repo's tiers, so a plain
+  // overlay worker's service and cross-script Durable Object bindings would resolve to the
+  // *baseline* workers — healthy-looking and wired to the wrong code. Failing here, before any
+  // config is written, is the supported posture.
   const overlayRoot = join(import.meta.dirname, "..", "release", "testdata", "overlay-root");
   const packages = readDeployablePackages([PACKAGES_DIR, overlayRoot]);
   const billing = packages.find((pkg) => pkg.name === "saas-billing");
   assert.ok(billing, "fixture overlay package saas-billing not found");
-  const configs = buildPreviewConfigs({
-    previewName: PREVIEW_NAME,
-    packages,
-    accountId: ACCOUNT_ID,
-    workersDevHost: WORKERS_DEV_HOST,
-  });
-  const config = configs.get("saas-billing");
-  assert.ok(config, "saas-billing: no preview config");
-  assert.equal(config.workers_dev, false);
-  assert.equal(config.previews?.vars?.POLAR_WEBHOOK_PATH, "/webhooks/polar");
+  assert.throws(
+      () => buildPreviewConfigs({
+        previewName: PREVIEW_NAME,
+        packages,
+        accountId: ACCOUNT_ID,
+        workersDevHost: WORKERS_DEV_HOST,
+      }),
+      /preview deploys of overlay workers are not supported: saas-billing/,
+  );
 });

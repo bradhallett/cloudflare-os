@@ -198,23 +198,4 @@ jobs:
         run: |
           out="$(mktemp -d)"
           node scripts/release/build-release.ts --out "$out" --release-id ci-smoke
-          # The script's own exit code is the main gate; this catches a build that "succeeds"
-          # while emitting a manifest whose blobs are not all on disk.
-          node - "$out" <<'EOF'
-          const { readFileSync, existsSync } = require("node:fs");
-          const out = process.argv[2];
-          const manifest = JSON.parse(readFileSync(`${out}/manifest.json`, "utf8"));
-          const workers = Object.entries(manifest.workers);
-          if (workers.length === 0) throw new Error("release smoke: manifest lists no workers");
-          for (const [name, worker] of workers) {
-            if (worker.mainModule === undefined) {
-              throw new Error(`release smoke: ${name} has no main module`);
-            }
-            for (const mod of worker.modules) {
-              if (!existsSync(`${out}/modules/${mod.sha256}`)) {
-                throw new Error(`release smoke: ${name} module blob missing: ${mod.sha256}`);
-              }
-            }
-          }
-          console.log(`release smoke: ${workers.length} workers, all module blobs present`);
-          EOF
+          node scripts/release/verify-release.ts --out "$out"

@@ -152,7 +152,21 @@ Blueprint data is stored in three places, with one-way propagation: Gadget DO ->
 
 2. **User DO** (`blueprints` collection) -- a denormalized copy for efficient listing. Stores `BlueprintUserRecord` with metadata and a reference to the source gadget. This allows a user to audit and manage their blueprints even if the source gadget has been deleted.
 
-3. **Workers KV** (`BLUEPRINTS` namespace) -- the public-facing lookup store. Stores `BlueprintKvRecord` keyed by blueprint hex ID. This is what `PublicApi.getBlueprint()` reads from. Every record carries an owner subject -- `{type: 'user'}` for one the workspace's owner published or a user imported, `{type: 'org'}` for one an organization owns, or none for one the deployment installed itself (a bundled blueprint). A user-owned or unowned blueprint sits at the bare `<blueprintId>` key, where its id is a bearer share link anyone can read it by; an org-owned one sits inside its org's scope at `org/<orgId>/<blueprintId>`, which the public by-id reads never enter, so only an org's members can reach it (`blueprint-access.ts` resolves a blueprint for a user by re-checking their membership against the org's Durable Object live, so a removed member's access ends at the next read). The reserved mirror keys (`.featured`, `.adminConfig`) hold in every scope, and a caller-supplied id containing `/` is refused, so no id can forge a key inside some org's scope. Records written before owner subjects exist carry a bare `ownerId`; parsing reads it as a `{type: 'user'}` subject, and a one-shot migration (`migrateBlueprintOwnership`, triggered on a deployment's first `/api` request by `AdminSettings.ensureBlueprintOwnershipMigrated`) rewrites them in place, idempotently.
+3. **Workers KV** (`BLUEPRINTS` namespace) -- the public-facing lookup store. Stores
+   `BlueprintKvRecord` keyed by blueprint hex ID. This is what `PublicApi.getBlueprint()` reads
+   from. Every record carries an owner subject -- `{type: 'user'}` for one the workspace's owner
+   published or a user imported, `{type: 'org'}` for one an organization owns, or none for one
+   the deployment installed itself (a bundled blueprint). A user-owned or unowned blueprint sits
+   at the bare `<blueprintId>` key, where its id is a bearer share link anyone can read it by;
+   an org-owned one sits inside its org's scope at `org/<orgId>/<blueprintId>`, which the public
+   by-id reads never enter, so only an org's members can reach it (`blueprint-access.ts` resolves
+   a blueprint for a user by re-checking their membership against the org's Durable Object live,
+   so a removed member's access ends at the next read). The reserved mirror keys (`.featured`,
+   `.adminConfig`) hold in every scope, and a caller-supplied id containing `/` is refused, so
+   no id can forge a key inside some org's scope. Records written before owner subjects exist
+   carry a bare `ownerId`; parsing reads it as a `{type: 'user'}` subject, and a one-shot
+   migration (`migrateBlueprintOwnership`, triggered on a deployment's first `/api` request by
+   `AdminSettings.ensureBlueprintOwnershipMigrated`) rewrites them in place, idempotently.
 
 Blueprint **code content** is stored separately in an **R2 bucket** (`BLUEPRINT_CONTENT`), in one of two forms (`blueprintContentKey`):
 

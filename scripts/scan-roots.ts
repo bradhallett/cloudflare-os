@@ -21,8 +21,8 @@ export const DEFAULT_PACKAGES_DIR = join(ROOT, "packages");
 
 /**
  * Extra scan roots named by repeatable `--scan-root <dir>` flags, in order. Every other argument
- * is ignored, so callers whose own parsing is strict about unknown flags (build-release.ts)
- * collect the flag themselves and hand the values to {@link resolveScanRoots}.
+ * is ignored, so callers whose own parsing is strict about unknown flags (build-release.ts) can
+ * throw on those themselves while delegating `--scan-root` here.
  */
 export function scanRootArgs(argv: readonly string[]): string[] {
   const roots: string[] = [];

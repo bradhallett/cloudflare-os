@@ -62,6 +62,8 @@ export interface PreviewOverrides {
   kv_namespaces?: BindingDecl[];
   /** R2 buckets to auto-provision per preview. */
   r2_buckets?: BindingDecl[];
+  /** D1 databases to auto-provision per preview. None today; stripped alongside the others. */
+  d1_databases?: BindingDecl[];
   /** Worker Loader bindings (the Gadget sandbox). */
   worker_loaders?: BindingDecl[];
   /** Workers AI binding. */
@@ -302,6 +304,29 @@ function routerGatekeeperServices(gatekeepers: string[]): PreviewService[] {
   }));
 }
 
+/**
+ * The `previews` block every worker gets: invocation logs on, committed vars and pass-through
+ * blocks carried over, and every `{binding}`-shaped resource list (see {@link
+ * BASELINE_RESOURCE_KEYS}) declared binding-only so Wrangler auto-provisions a fresh resource per
+ * preview. `extras` — e.g. the service bindings preview.ts later patches with sibling preview
+ * ids — are added on top.
+ */
+function previewOverrides(config: StagingConfig, extras: PreviewOverrides = {}): PreviewOverrides {
+  const overrides: PreviewOverrides = {
+    observability: previewObservability(config),
+    ...(config.vars ? { vars: { ...config.vars } } : {}),
+    ...(config.unsafe ? { unsafe: config.unsafe } : {}),
+    ...(config.artifacts ? { artifacts: config.artifacts } : {}),
+    ...(config.ai ? { ai: config.ai } : {}),
+    ...(config.browser ? { browser: config.browser } : {}),
+  };
+  for (const key of BASELINE_RESOURCE_KEYS) {
+    const bindings = previewResourceBindings(config[key]);
+    if (bindings) overrides[key] = bindings;
+  }
+  return { ...overrides, ...extras };
+}
+
 function applyGatekeeper(
   pkgName: string,
   config: StagingConfig,
@@ -316,21 +341,7 @@ function applyGatekeeper(
     // (gatekeeper-mcp-portal is "mcpportal").
     BASE_URL: `${baseUrl}/gatekeeper/${releaseShortName(pkgName)}`,
   };
-  config.previews = {
-    observability: previewObservability(config),
-    vars: { ...config.vars },
-    ...(config.unsafe ? { unsafe: config.unsafe } : {}),
-    ...(config.artifacts ? { artifacts: config.artifacts } : {}),
-    ...(config.ai ? { ai: config.ai } : {}),
-    ...(config.browser ? { browser: config.browser } : {}),
-  };
-
-  // KV namespaces and R2 buckets are auto-provisioned per preview: each preview gets its own,
-  // and `wrangler preview delete` collects them.
-  const kvNamespaces = previewResourceBindings(config.kv_namespaces);
-  if (kvNamespaces) config.previews.kv_namespaces = kvNamespaces;
-  const r2Buckets = previewResourceBindings(config.r2_buckets);
-  if (r2Buckets) config.previews.r2_buckets = r2Buckets;
+  config.previews = previewOverrides(config);
 }
 
 function applyBackend(
@@ -349,18 +360,10 @@ function applyBackend(
     ...config.vars,
     PUBLIC_BASE_URL: baseUrl,
   };
-  config.previews = {
-    observability: previewObservability(config),
-    vars: { ...config.vars },
-    ...(config.unsafe ? { unsafe: config.unsafe } : {}),
+  config.previews = previewOverrides(config, {
     // preview.ts patches each entry's preview_id once the gatekeeper previews exist.
     services: backendGatekeeperServices(gatekeepers, baseUrl),
-    kv_namespaces: previewResourceBindings(config.kv_namespaces),
-    r2_buckets: previewResourceBindings(config.r2_buckets),
-    worker_loaders: previewResourceBindings(config.worker_loaders),
-    ai: config.ai,
-    ...(config.browser ? { browser: config.browser } : {}),
-  };
+  });
 }
 
 function applyRouter(config: StagingConfig, { gatekeepers }: PreviewContext): void {
@@ -372,32 +375,11 @@ function applyRouter(config: StagingConfig, { gatekeepers }: PreviewContext): vo
     { binding: "WORKSHOP_BACKEND", service: "workshop-backend" },
     ...routerGatekeeperServices(gatekeepers),
   ];
-  config.previews = {
-    observability: previewObservability(config),
+  config.previews = previewOverrides(config, {
     // Patched with preview_ids for the backend and every gatekeeper by preview.ts. Static
     // assets are not a `previews` key — the preview inherits the top-level `assets` stanza.
     services: structuredClone(config.services),
-  };
-}
-
-// A plain overlay worker (see `DeployablePackage.overlay` in manifest-lib.ts): no public URL, no
-// connector surface — its preview needs only the baseline/preview split, with fresh resources per
-// preview and its committed vars passed through.
-function applyPlainWorker(config: StagingConfig): void {
-  config.previews = {
-    observability: previewObservability(config),
-    vars: { ...config.vars },
-    ...(config.unsafe ? { unsafe: config.unsafe } : {}),
-    ...(config.artifacts ? { artifacts: config.artifacts } : {}),
-    ...(config.ai ? { ai: config.ai } : {}),
-    ...(config.browser ? { browser: config.browser } : {}),
-  };
-  const kvNamespaces = previewResourceBindings(config.kv_namespaces);
-  if (kvNamespaces) config.previews.kv_namespaces = kvNamespaces;
-  const r2Buckets = previewResourceBindings(config.r2_buckets);
-  if (r2Buckets) config.previews.r2_buckets = r2Buckets;
-  const workerLoaders = previewResourceBindings(config.worker_loaders);
-  if (workerLoaders) config.previews.worker_loaders = workerLoaders;
+  });
 }
 
 /**
@@ -450,8 +432,13 @@ export function buildPreviewConfigs({
     if (isGatekeeperPackage(pkg.name)) applyGatekeeper(pkg.name, config, context);
     else if (pkg.name === "workshop-backend") applyBackend(config, context);
     else if (pkg.name === "router") applyRouter(config, context);
-    else if (pkg.overlay) applyPlainWorker(config);
-    else throw new Error(`cannot build a preview config for package: ${pkg.name}`);
+    else if (pkg.overlay) {
+      // Fail closed, matching workerKind's posture in manifest-lib.ts: a plain overlay worker's
+      // service and cross-script Durable Object bindings would resolve to the *baseline* workers
+      // (preview.ts only patches this repo's tiers), so a half-wired deploy would come up looking
+      // healthy while talking to the wrong code.
+      throw new Error(`preview deploys of overlay workers are not supported: ${pkg.name}`);
+    } else throw new Error(`cannot build a preview config for package: ${pkg.name}`);
 
     configs.set(pkg.name, config);
   }
