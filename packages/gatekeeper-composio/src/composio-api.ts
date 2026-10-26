@@ -343,12 +343,19 @@ export class ComposioApi {
   }
 
   /**
-   * Create a session MCP session for `composioUserId` with every meta-tool knob disabled and
+   * Create a session for `composioUserId` with every meta-tool knob disabled and
    * multi-account mode on. `autoApplyToolkits` (admin-listed, not excluded) configures
    * Composio's server-side approval fence — `tags.require_approval` over the non-read tags
    * everywhere, overridden per listed toolkit down to the destructive tag only, so connector
    * auto-apply can actually apply its create/update verdicts. The fence is defense in depth;
    * the connector's own queue stays the authority (tags are third-party metadata).
+   *
+   * Post transport-pivot the connector executes over REST and never opens the MCP transport,
+   * but the session is still created with `mcp: true` and the response's `mcp` block
+   * (url/headers) is still required and validated: the flag is what makes Composio mint the
+   * full session shape, and pinning the whole contract here means a silent provider change to
+   * the session envelope surfaces as a validation error instead of drifting unnoticed. The
+   * caller discards `mcpUrl`; it stays in the return type so the envelope stays honest.
    */
   async createSession(composioUserId: string, autoApplyToolkits: string[]): Promise<{
     sessionId: string; mcpUrl: string; headers: Record<string, string>;
