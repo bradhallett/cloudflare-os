@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Check, Plus, UserCircle } from '@phosphor-icons/react'
 import { AccountDescription, SupportedResource, VendorDescription } from '@gadgets/workshop-shared/gatekeeper'
+import type { AccountEvent } from '../accountsSubscriber'
 
 /**
  * Account info as consumed by the chooser. Matches the shape used by GatekeeperModal and the
@@ -13,6 +14,13 @@ export type AccountOption = {
   vendorDescription: VendorDescription
   supportedResources: SupportedResource[]
   credentialsValid: boolean
+}
+
+/** The chooser's option for one connected-accounts subscription event (field names align). */
+export function accountOptionFromEvent({
+  id, description, vendor: vendorDescription, vendorId, supportedResources, credentialsValid,
+}: AccountEvent): AccountOption {
+  return { id, description, vendorId, vendorDescription, supportedResources, credentialsValid }
 }
 
 /**

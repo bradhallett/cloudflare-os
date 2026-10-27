@@ -7,6 +7,7 @@ import type {
 } from '@gadgets/workshop-shared/api'
 import { WorkshopButton, WorkshopIconButton } from '../../components/WorkshopControls'
 import { copyToClipboard } from '../../clipboard'
+import { useReportRpcFailure } from '../../useReportRpcFailure'
 import { isImeComposing } from '../../keyboardEvent'
 import { DependentKeepList, InlineConfirm, RoleBadge, RoleMenu } from './ShareDialogControls'
 
@@ -68,6 +69,7 @@ export default function InviteLinkSection({
   resetSignal: number
 }) {
   const toasts = useKumoToastManager()
+  const reportFailure = useReportRpcFailure()
   const [newLinkNote, setNewLinkNote] = useState('')
   const [newShareLink, setNewShareLink] = useState<string | null>(null)
   const [newShareLinkCopied, setNewShareLinkCopied] = useState(false)
@@ -115,9 +117,9 @@ export default function InviteLinkSection({
       onOfferedChange(true, linkId)
       await reload()
       onLinkLanded([linkId])
-    } catch (err: any) {
+    } catch (err) {
       // Keep the composer and its values open so the user can retry without re-entering them.
-      toasts.add({ title: err.message || 'Failed to create share link.', variant: 'error' })
+      reportFailure('Failed to create share link.', err)
     } finally {
       creatingLinkRef.current = false
       setCreatingLink(false)
@@ -237,6 +239,7 @@ export function ShareLinksSection({
   reload: () => Promise<unknown>
 }) {
   const toasts = useKumoToastManager()
+  const reportFailure = useReportRpcFailure()
   const [revokeTarget, setRevokeTarget] = useState<RevokeTarget | null>(null)
   const [confirmationBusy, setConfirmationBusy] = useState(false)
   const [editingShareLinkId, setEditingShareLinkId] = useState<string | null>(null)
@@ -289,8 +292,8 @@ export function ShareLinksSection({
         copiedTimerRef.current = null
       }, 2000)
       toasts.add({ title: 'Link copied to clipboard.', variant: 'success' })
-    } catch (err: any) {
-      toasts.add({ title: err.message || 'Failed to copy share link.', variant: 'error' })
+    } catch (err) {
+      reportFailure('Failed to copy share link.', err)
     } finally {
       copyingLinkRef.current = false
       setCopyingLinkId(null)
@@ -325,8 +328,8 @@ export function ShareLinksSection({
       await reload()
       onLinkLanded([linkId])
       toasts.add({ title: 'Share link renamed.', variant: 'success' })
-    } catch (err: any) {
-      toasts.add({ title: err.message || 'Failed to rename share link.', variant: 'error' })
+    } catch (err) {
+      reportFailure('Failed to rename share link.', err)
     } finally {
       savingShareLinkNoteRef.current = false
       setSavingShareLinkNote(false)
@@ -341,9 +344,9 @@ export function ShareLinksSection({
       setRevokeTarget(current => current?.kind === 'revoke' && current.linkId === linkId
         ? { ...current, dependents, previewing: false }
         : current)
-    } catch (err: any) {
+    } catch (err) {
       setRevokeTarget(current => current?.kind === 'revoke' && current.linkId === linkId ? null : current)
-      toasts.add({ title: err.message || 'Failed to preview share-link revocation.', variant: 'error' })
+      reportFailure('Failed to preview share-link revocation.', err)
     }
   }
 
@@ -357,8 +360,8 @@ export function ShareLinksSection({
       if (revokedFreshLink) onFreshLinkRevoked()
       toasts.add({ title: 'Share link revoked.', variant: 'success' })
       await reload()
-    } catch (err: any) {
-      toasts.add({ title: err.message || 'Failed to revoke share link.', variant: 'error' })
+    } catch (err) {
+      reportFailure('Failed to revoke share link.', err)
     } finally {
       setConfirmationBusy(false)
     }

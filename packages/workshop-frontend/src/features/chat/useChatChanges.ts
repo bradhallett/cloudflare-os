@@ -153,8 +153,7 @@ export function useChatChanges({
       // naming the file and what to do about it (see Overseer.updateChatFromMainline()).
       console.error("Failed to update from mainline:", err);
       toasts.add({
-        title: err instanceof Error && err.message
-          ? err.message : "Failed to bring in the latest changes",
+        title: rpcFailureDescription(err) ?? "Failed to bring in the latest changes",
         variant: "error",
       });
     } finally {
@@ -206,8 +205,7 @@ export function useChatChanges({
       console.error("Failed to discard pending changes:", err);
       // See handleRevertChanges: the server's refusals are instructive, so surface them.
       toasts.add({
-        title: err instanceof Error && err.message
-          ? err.message : "Failed to discard pending changes",
+        title: rpcFailureDescription(err) ?? "Failed to discard pending changes",
         variant: "error",
       });
     } finally {
@@ -231,7 +229,7 @@ export function useChatChanges({
       // The server's refusals here are instructive (e.g. a still-proposed update-from-mainline
       // batch can't be reverted), so surface them rather than a generic failure.
       toasts.add({
-        title: err instanceof Error && err.message ? err.message : "Failed to rewind draft",
+        title: rpcFailureDescription(err) ?? "Failed to rewind draft",
         variant: "error",
       });
     }

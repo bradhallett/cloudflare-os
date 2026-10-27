@@ -5,6 +5,8 @@ import { RpcStub } from 'capnweb'
 import { BlueprintGadgetSummary, GadgetClient, GadgetMetadata, Overseer, BlueprintBindingAnnotation, BlueprintScreenshotUpload } from '@gadgets/workshop-shared/api'
 import { WorkshopButton, WorkshopIconButton, WorkshopInput, WorkshopInputArea } from './components/WorkshopControls'
 import { copyToClipboard } from './clipboard'
+import { rpcFailureDescription } from './rpcErrors'
+import { useReportRpcFailure } from './useReportRpcFailure'
 import {
   BindingCardData,
   BlueprintBindingCard,
@@ -72,6 +74,7 @@ type Props = {
 
 export default function BlueprintModal({ open, onClose, overseer, gadget, metadata }: Props) {
   const toasts = useKumoToastManager()
+  const reportFailure = useReportRpcFailure()
 
   const [blueprints, setBlueprints] = useState<BlueprintGadgetSummary[]>([])
   const [loading, setLoading] = useState(false)
@@ -213,8 +216,8 @@ export default function BlueprintModal({ open, onClose, overseer, gadget, metada
       setNewScreenshotUrl(null)
       setClearScreenshot(false)
       await loadBlueprints()
-    } catch (err: any) {
-      setCreateError(err.message || 'Could not create blueprint.')
+    } catch (err) {
+      setCreateError(rpcFailureDescription(err) ?? 'Could not create blueprint.')
     } finally {
       setCreating(false)
     }
@@ -251,8 +254,8 @@ export default function BlueprintModal({ open, onClose, overseer, gadget, metada
       setNewScreenshotUrl(null)
       setClearScreenshot(false)
       await loadBlueprints()
-    } catch (err: any) {
-      setCreateError(err.message || 'Could not update blueprint.')
+    } catch (err) {
+      setCreateError(rpcFailureDescription(err) ?? 'Could not update blueprint.')
     } finally {
       setCreating(false)
     }
@@ -265,8 +268,8 @@ export default function BlueprintModal({ open, onClose, overseer, gadget, metada
       toasts.add({ title: 'Blueprint deleted.', variant: 'success' })
       setConfirmingDeleteId(null)
       await loadBlueprints()
-    } catch (err: any) {
-      toasts.add({ title: err.message || 'Failed to delete blueprint.', variant: 'error' })
+    } catch (err) {
+      reportFailure('Failed to delete blueprint.', err)
     } finally {
       setDeletingId(null)
     }
@@ -512,8 +515,8 @@ export default function BlueprintModal({ open, onClose, overseer, gadget, metada
                           await overseer.updateBlueprint(bp.id, { updateCode: true })
                           toasts.add({ title: 'Blueprint updated to current code.', variant: 'success' })
                           loadBlueprints()
-                        } catch (err: any) {
-                          toasts.add({ title: err.message || 'Failed to update blueprint.', variant: 'error' })
+                        } catch (err) {
+                          reportFailure('Failed to update blueprint.', err)
                         }
                       }}
                       onRetryPublish={async () => {
@@ -521,8 +524,8 @@ export default function BlueprintModal({ open, onClose, overseer, gadget, metada
                           await overseer.retryBlueprintPublish(bp.id)
                           toasts.add({ title: 'Blueprint published successfully.', variant: 'success' })
                           loadBlueprints()
-                        } catch (err: any) {
-                          toasts.add({ title: err.message || 'Retry failed.', variant: 'error' })
+                        } catch (err) {
+                          reportFailure('Retry failed.', err)
                         }
                       }}
                       onCopyLink={async () => {

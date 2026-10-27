@@ -15,6 +15,7 @@ import { PersonAvatar } from '../../components/PersonAvatar'
 import { copyToClipboard } from '../../clipboard'
 import { isImeComposing } from '../../keyboardEvent'
 import { rpcFailureDescription } from '../../rpcErrors'
+import { useReportRpcFailure } from '../../useReportRpcFailure'
 import { useServerConfig } from '../../ServerConfigContext'
 import { useUserDirectorySearch } from '../user-directory/useUserDirectorySearch'
 import { DependentKeepList, InlineConfirm, RoleBadge, RoleMenu } from './ShareDialogControls'
@@ -579,6 +580,7 @@ export function PeopleSection({
   reload: () => Promise<unknown>
 }) {
   const toasts = useKumoToastManager()
+  const reportFailure = useReportRpcFailure()
   const [removeTarget, setRemoveTarget] = useState<RemoveTarget | null>(null)
   const [confirmationBusy, setConfirmationBusy] = useState(false)
 
@@ -589,9 +591,9 @@ export function PeopleSection({
       setRemoveTarget(current => current?.kind === 'remove' && current.profileId === profileId
         ? { ...current, dependents, previewing: false }
         : current)
-    } catch (err: any) {
+    } catch (err) {
       setRemoveTarget(current => current?.kind === 'remove' && current.profileId === profileId ? null : current)
-      toasts.add({ title: err.message || 'Failed to preview collaborator removal.', variant: 'error' })
+      reportFailure('Failed to preview collaborator removal.', err)
     }
   }
 
@@ -608,8 +610,8 @@ export function PeopleSection({
         variant: 'success',
       })
       await reload()
-    } catch (err: any) {
-      toasts.add({ title: err.message || 'Failed to remove collaborator.', variant: 'error' })
+    } catch (err) {
+      reportFailure('Failed to remove collaborator.', err)
     } finally {
       setConfirmationBusy(false)
     }

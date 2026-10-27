@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { Dialog, Select, Loader, Text, useKumoToastManager } from '@cloudflare/kumo'
 import { Warning, Plus, ArrowClockwise, CheckCircle } from '@phosphor-icons/react'
 import { RpcStub } from 'capnweb'
@@ -9,14 +9,12 @@ import {
   ObserverAccountChoice,
 } from '@gadgets/workshop-shared/api'
 import {
-  AccountDescription,
-  VendorDescription,
-  SupportedResource,
   resolveRequestedResource,
 } from '@gadgets/workshop-shared/gatekeeper'
 import { WorkshopButton } from './components/WorkshopControls'
 import Avatar from './components/Avatar'
-import { AccountsSubscriberAdapter } from './accountsSubscriber'
+import { type AccountEvent } from './accountsSubscriber'
+import { useConnectedAccounts } from './useConnectedAccounts'
 import { mergeGrantedPatterns, useConnectAccountActions } from './useConnectAccountActions'
 
 // Shown when a non-owner opens a shared Gadget that reads data through one or more gatekeeper
@@ -29,18 +27,9 @@ import { mergeGrantedPatterns, useConnectAccountActions } from './useConnectAcco
 // what fulfills that call. Resolving with one ObserverAccountChoice per need lets the open proceed;
 // cancelling rejects it (the open is denied and the caller shows an access-denied page).
 
-interface AccountInfo {
-  id: number
-  description: AccountDescription
-  vendor: VendorDescription
-  vendorId: string
-  supportedResources: SupportedResource[]
-  credentialsValid: boolean
-}
-
 // How to name one of the user's accounts in the UI. Falls back to the id, which is all we can show
 // for an account that has since been disconnected (so `accounts` no longer has it).
-function accountLabel(account: AccountInfo | undefined, accountId: number): string {
+function accountLabel(account: AccountEvent | undefined, accountId: number): string {
   return account?.description.uniqueName || account?.description.displayName || `Account ${accountId}`
 }
 
@@ -51,7 +40,7 @@ function accountLabel(account: AccountInfo | undefined, accountId: number): stri
 function requiredResourceUrlPatterns(
   need: ObserverBindingNeed,
   vendor: GatekeeperVendorInfo | undefined,
-  account?: AccountInfo,
+  account?: AccountEvent,
 ): string[] {
   const supportedResources = account?.supportedResources.length
     ? account.supportedResources
@@ -63,7 +52,7 @@ function requiredResourceUrlPatterns(
 
 // Older account records may not list which resources were granted. Ask the gatekeeper to check
 // instead of assuming the account has access.
-function missingResourceUrlPatterns(account: AccountInfo, required: string[]): string[] {
+function missingResourceUrlPatterns(account: AccountEvent, required: string[]): string[] {
   const granted = account.description.grantedResourceUrlPatterns
   return granted === undefined ? required : required.filter(pattern => !granted.includes(pattern))
 }
@@ -83,8 +72,21 @@ export default function ObserverConfigModal({
 }: ObserverConfigModalProps) {
   const toasts = useKumoToastManager()
 
-  const [accounts, setAccounts] = useState<Map<number, AccountInfo>>(new Map())
-  const [ready, setReady] = useState(false)
+  const { accounts: subscribed, ready, failed: accountsFailed } = useConnectedAccounts(
+    authenticatedApi, { includeForcedAutoProvisionedAccounts: true })
+  // Grants the gatekeeper confirmed without an OAuth flow never reach the subscription (the server
+  // doesn't rewrite the account record for them), so their patterns are merged in locally. Keyed by
+  // account id; a later subscription event for the account still wins wholesale.
+  const [confirmedGrants, setConfirmedGrants] = useState<Map<number, string[]>>(new Map())
+  const accounts = useMemo(() => {
+    if (confirmedGrants.size === 0) return subscribed
+    const merged = new Map(subscribed)
+    for (const [id, patterns] of confirmedGrants) {
+      const event = merged.get(id)
+      if (event) merged.set(id, { ...event, description: mergeGrantedPatterns(event.description, patterns) })
+    }
+    return merged
+  }, [confirmedGrants, subscribed])
   // gatekeeperId -> chosen accountId (undefined = not yet chosen).
   const [choices, setChoices] = useState<Record<number, number | undefined>>({})
   // Vendor metadata keyed by vendorId, used both for display and to resolve the resource scopes each
@@ -100,49 +102,14 @@ export default function ObserverConfigModal({
   // Held only while the request that starts a flow is in flight (see useConnectAccountActions).
   const { connectingVendor: connecting, grantingAccountId: granting, reconnectingAccountId: reconnecting } = connectActions
 
-  // ── subscribe to the user's connected accounts ────────────────────────────────
+  // ── accounts subscription failure ─────────────────────────────────────────────
   useEffect(() => {
-    let cancelled = false
-
-    const subscriber = new AccountsSubscriberAdapter({
-      add({ id, description, vendor, supportedResources, credentialsValid, vendorId }) {
-        if (cancelled) return
-        setAccounts(prev => {
-          const next = new Map(prev)
-          next.set(id, { id, description, vendor, vendorId, supportedResources, credentialsValid })
-          return next
-        })
-      },
-      remove(id) {
-        if (cancelled) return
-        setAccounts(prev => {
-          if (!prev.has(id)) return prev
-          const next = new Map(prev)
-          next.delete(id)
-          return next
-        })
-      },
-      ready() {
-        if (cancelled) return
-        setReady(true)
-      },
-    })
-
-    const subscription = authenticatedApi.subscribeConnectedAccounts(
-      subscriber, { includeForcedAutoProvisionedAccounts: true })
-    subscription.catch(err => {
-      if (cancelled) return
-      // Loud on purpose: the modal has no retry path, so a quieted transient failure would
-      // strand the user on a permanent loader.
-      console.error('Failed to subscribe to connected accounts:', err)
+    // Loud on purpose: the modal has no retry path, so a quieted transient failure would
+    // strand the user on a permanent loader.
+    if (accountsFailed) {
       toasts.add({ title: 'Failed to load your connected accounts', variant: 'error' })
-    })
-
-    return () => {
-      cancelled = true
-      subscription[Symbol.dispose]()
     }
-  }, [authenticatedApi])
+  }, [accountsFailed, toasts])
 
   // ── load vendor metadata for display and resource-scope resolution ─────────────
   useEffect(() => {
@@ -209,7 +176,7 @@ export default function ObserverConfigModal({
     void connectActions.reconnect(accountId)
   }
 
-  const handleGrantResourceAccess = async (need: ObserverBindingNeed, account: AccountInfo) => {
+  const handleGrantResourceAccess = async (need: ObserverBindingNeed, account: AccountEvent) => {
     const required = requiredResourceUrlPatterns(
       need,
       vendorsById.get(need.vendorId),
@@ -219,28 +186,19 @@ export default function ObserverConfigModal({
     if (missing.length === 0) return
     const outcome = await connectActions.grant(account.id, missing)
     if (outcome === 'already-granted') {
-      // The gatekeeper confirmed this account already has access. Update the modal so the user can
-      // continue without an OAuth flow.
-      setAccounts(prev => {
-        const current = prev.get(account.id)
-        if (!current) return prev
-        const next = new Map(prev)
-        next.set(account.id, {
-          ...current,
-          description: mergeGrantedPatterns(current.description, missing),
-        })
-        return next
-      })
+      // The gatekeeper confirmed this account already has access. Record it so the user can
+      // continue without an OAuth flow (see `confirmedGrants`).
+      setConfirmedGrants(prev => new Map(prev).set(account.id, missing))
     }
   }
 
   // A binding is satisfied only when its chosen account has valid credentials and every grantable
   // resource type needed for observer verification.
-  const accountFor = (gatekeeperId: number): AccountInfo | undefined => {
+  const accountFor = (gatekeeperId: number): AccountEvent | undefined => {
     const id = choices[gatekeeperId]
     return id === undefined ? undefined : accounts.get(id)
   }
-  const accountSatisfies = (need: ObserverBindingNeed, account: AccountInfo | undefined) => {
+  const accountSatisfies = (need: ObserverBindingNeed, account: AccountEvent | undefined) => {
     if (!account?.credentialsValid) return false
     const required = requiredResourceUrlPatterns(
       need,
@@ -277,7 +235,7 @@ export default function ObserverConfigModal({
               ? 'We couldn’t confirm your access to everything this workspace has read. Depending on ' +
                 'the reason below, re-authenticate an expired account, choose a different one, or ask ' +
                 'the workspace owner to share what your account can’t access.'
-              : 'Before opening this workspace, confirm that your own accounts can access the connected ' +
+              : 'Before opening this workspace, confirm that your own connected accounts can access the connected ' +
                 'data it uses.'}
           </Text>
         </div>

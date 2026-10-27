@@ -1,5 +1,5 @@
 import { logRpcFailure } from './rpcErrors'
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Switch, useKumoToastManager } from '@cloudflare/kumo'
 import { useAuthenticatedApi } from './AuthContext'
 import {
@@ -7,9 +7,6 @@ import {
   AiGatewayInfo,
   GatekeeperVendorInfo,
 } from '@gadgets/workshop-shared/api'
-import {
-  VendorDescription,
-} from '@gadgets/workshop-shared/gatekeeper'
 import {
   Camera,
   ArrowRight,
@@ -24,41 +21,21 @@ import {
 } from '@phosphor-icons/react'
 import AddModelModal from './features/ai-models/AddModelModal'
 import { persistSelectedModel } from './modelSelection'
-import { logoComponents } from './components/ConnectionLogos'
-import { getVendorIconBackground } from './components/vendorColors'
 import { GatekeeperIcon } from './components/GatekeeperIcon'
 import { refreshGatekeeperApps } from './useGatekeeperApps'
 import { compressAvatar, avatarBlobUrl } from './avatarUtils'
 import { invalidateAvatarCache } from './useAvatar'
-import { useTheme } from './ThemeContext'
 import { useSiteName } from './ServerConfigContext'
 import SiteLogo from './components/SiteLogo'
 import { useDocumentTitle } from './useDocumentTitle'
-import { AccountsSubscriberAdapter } from './accountsSubscriber'
+import { useConnectedAccounts } from './useConnectedAccounts'
+import { useVendors } from './useVendors'
 import { useConnectAccountActions } from './useConnectAccountActions'
 
 // ─── constants ──────────────────────────────────────────────────────────────────
 
 const TOTAL_STEPS_WITH_CONNECTIONS = 4
 const CONNECTIONS_STEP = 2
-
-// Maps RPC vendor IDs to logo keys in our logoComponents map
-const VENDOR_LOGO_MAP: Record<string, string> = {
-  slack: 'slack',
-  discord: 'discord',
-  jira: 'jira',
-  google: 'google',
-  github: 'github',
-  notion: 'notion',
-  linear: 'linear',
-  figma: 'figma',
-}
-
-interface VendorEntry {
-  id: string
-  description: VendorDescription
-  logoKey: string
-}
 
 // ─── component ──────────────────────────────────────────────────────────────────
 
@@ -68,7 +45,6 @@ export default function OnboardingWizard({
   onComplete: () => void
 }) {
   const { authenticatedApi, currentUser } = useAuthenticatedApi()
-  const { resolvedThemeMode } = useTheme()
   const toasts = useKumoToastManager()
   const siteName = useSiteName()
   useDocumentTitle('Setup')
@@ -96,9 +72,11 @@ export default function OnboardingWizard({
   const canAddModels = aiConfig?.enabled !== true || aiConfig.userModelsEnabled
 
   // Connections state
-  const [vendors, setVendors] = useState<VendorEntry[]>([])
-  const [connectedVendorIds, setConnectedVendorIds] = useState<Set<string>>(new Set())
-  const [vendorsLoading, setVendorsLoading] = useState(true)
+  const { vendors, loading: vendorsLoading } = useVendors(authenticatedApi)
+  // Connected vendors read straight off the subscription events' vendorId; no url→id guessing.
+  const { accounts } = useConnectedAccounts(authenticatedApi)
+  const connectedVendorIds = useMemo(
+    () => new Set(Array.from(accounts.values(), (event) => event.vendorId)), [accounts])
   const connectActions = useConnectAccountActions(authenticatedApi)
   const connectingVendorId = connectActions.connectingVendor
 
@@ -151,86 +129,6 @@ export default function OnboardingWizard({
     fetchModels()
   }, [fetchModels])
 
-  // Load vendors and subscribe to connected accounts.
-  // We use a url→vendorId lookup map (built from listGatekeeperVendors) so the
-  // subscriber can resolve vendor IDs reliably instead of guessing from display names.
-  useEffect(() => {
-    let cancelled = false
-    const connectedUrls = new Set<string>()
-    const accountIdToUrl = new Map<number, string>()
-
-    // Lookup populated by listGatekeeperVendors, used by the subscriber.
-    const urlToVendorId = new Map<string, string>()
-    // Pending accounts that arrived before the vendor list loaded.
-    const pendingUrls: string[] = []
-
-    const refreshConnectedIds = () => {
-      const ids = new Set<string>()
-      for (const url of connectedUrls) {
-        const vid = urlToVendorId.get(url)
-        if (vid) ids.add(vid)
-      }
-      if (!cancelled) setConnectedVendorIds(ids)
-    }
-
-    authenticatedApi
-      .listGatekeeperVendors()
-      .then((vendorList) => {
-        if (cancelled) return
-        for (const v of vendorList) {
-          urlToVendorId.set(v.description.url, v.id)
-        }
-        setVendors(
-          vendorList.map((v) => ({
-            id: v.id,
-            description: v.description,
-            logoKey: VENDOR_LOGO_MAP[v.id] ?? v.id.toLowerCase(),
-          })),
-        )
-        // Resolve any accounts that arrived before the vendor list.
-        if (pendingUrls.length > 0) refreshConnectedIds()
-      })
-      .catch((err) => {
-        console.error('Failed to load vendors:', err)
-      })
-      .finally(() => {
-        if (!cancelled) setVendorsLoading(false)
-      })
-
-    const subscriber = new AccountsSubscriberAdapter({
-      add({ id, vendor }) {
-        if (cancelled) return
-        const url = vendor.url
-        accountIdToUrl.set(id, url)
-        connectedUrls.add(url)
-        if (urlToVendorId.size > 0) {
-          refreshConnectedIds()
-        } else {
-          pendingUrls.push(url)
-        }
-      },
-      remove(id) {
-        const url = accountIdToUrl.get(id)
-        if (url) {
-          accountIdToUrl.delete(id)
-          const stillHas = Array.from(accountIdToUrl.values()).includes(url)
-          if (!stillHas) connectedUrls.delete(url)
-          refreshConnectedIds()
-        }
-      },
-    })
-
-    const subscription = authenticatedApi.subscribeConnectedAccounts(subscriber)
-    subscription.catch((err) => {
-      if (cancelled) return
-      logRpcFailure('Failed to subscribe to connected accounts:', err)
-    })
-
-    return () => {
-      cancelled = true
-      subscription[Symbol.dispose]()
-    }
-  }, [authenticatedApi])
 
   useEffect(() => {
     let cancelled = false
@@ -628,7 +526,6 @@ export default function OnboardingWizard({
                 ) : vendors.length > 0 && (
                   <div className="grid max-h-64 grid-cols-1 gap-2 overflow-y-auto pr-1 min-[360px]:grid-cols-2">
                     {sortedVendors.map((vendor) => {
-                      const Logo = logoComponents[vendor.logoKey]
                       const isConnected = connectedVendorIds.has(vendor.id)
                       const isConnecting = connectingVendorId === vendor.id
                       return (
@@ -647,18 +544,13 @@ export default function OnboardingWizard({
                             }
                           `}
                         >
-                          <div
-                            className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0"
-                            style={{ backgroundColor: getVendorIconBackground(vendor.id, resolvedThemeMode) }}
-                          >
-                            {Logo ? (
-                              <Logo size={16} />
-                            ) : (
-                              <span className="text-xs font-bold text-kumo-strong">
-                                {vendor.description.displayName[0]}
-                              </span>
-                            )}
-                          </div>
+                          <GatekeeperIcon
+                            vendorId={vendor.id}
+                            fallbackText={vendor.description.displayName}
+                            logoUrl={vendor.description.logo?.url}
+                            color={vendor.description.color}
+                            size={16}
+                          />
                           <div className="flex-1 min-w-0">
                             <p className="text-sm font-medium text-kumo-default truncate">
                               {vendor.description.displayName}
