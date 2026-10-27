@@ -157,9 +157,10 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     let isOperatingOwner = (userId == this.impl.ownerId);
-    // An org-owned workspace (see transferToOrg) has no user owner: every caller -- the
-    // operating owner included -- is authorized through the sharing graph, which baselines each
-    // active org member's role at their org role and re-checks membership live on every open.
+    // An org-owned workspace (historic: transferred by the removed org-transfer flow) has no
+    // user owner: every caller -- the operating owner included -- is authorized through the
+    // sharing graph, which baselines each active org member's role at their org role and
+    // re-checks membership live on every open.
     let isOwner = isOperatingOwner && this.impl.workspaceOwner()?.type !== "org";
 
     // Cache the owner's profileId in memory when the owner opens.
