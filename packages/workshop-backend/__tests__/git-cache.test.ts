@@ -4,13 +4,12 @@ import { deflate } from "pako";
 import type { GitPullHints, GitOid } from "@gadgets/workshop-shared/gatekeeper";
 import { READ_FILES_RESPONSE_BUDGET } from "@gadgets/workshop-shared/api";
 import { makeMockStorage } from "./mock-storage";
+import { GitCacheImpl, WorkspaceGitCache } from "../src/git-cache";
 import {
   EAGER_BLOB_LIMIT,
-  GitCacheImpl,
   GitObjectTooLargeError,
   MAX_GIT_OBJECT_SIZE,
-  WorkspaceGitCache,
-} from "../src/git-cache";
+} from "../src/git-walker";
 import { buildSnapshotRelease } from "../src/blueprint-release";
 import { GITDIR, GitStore, blobOid, makeGitObjectsFs } from "../src/git-store";
 import { makeOverseerStorage } from "../src/storage-schema/overseer-storage";
@@ -155,7 +154,7 @@ const ARRIVALS: {
   },
   {
     route: "an import",
-    deliver: (t, object) => t.cache.importObjects([object]),
+    deliver: (t, object) => t.cache.walker.importObjects([object]),
   },
   {
     // As isomorphic-git writes a loose object, through the fs that GitStore hands it.
@@ -207,7 +206,7 @@ async function setupCrossRemote(options: { materializeTree?: boolean } = {}) {
   // G1 proves COMMIT_1, whose tree is TREE_1 -- recording TREE_1 as pullable from G1.
   await t.cache.putFromGatekeeper(G1, "commit", fixture(COMMIT_1).payload);
   if (options.materializeTree ?? true) {
-    await t.cache.ensureObject(TREE_1, { type: "tree" });
+    await t.cache.walker.ensureObject(TREE_1, { type: "tree" });
   }
 
   let child = await storeLocal(t.storage, {
@@ -225,7 +224,7 @@ describe("puts and metadata recording", () => {
     let readme = fixture("ca69e6d08b5b8bb4f11a74f9695e329c203cbfd8");  // README.md v1
     let oid = await t.cache.putFromGatekeeper(G1, "blob", readme.payload);
     expect(oid).toBe("ca69e6d08b5b8bb4f11a74f9695e329c203cbfd8");
-    expect(t.cache.readLocalObject(oid)).toStrictEqual({ type: "blob", payload: readme.payload });
+    expect(t.cache.walker.readLocalObject(oid)).toStrictEqual({ type: "blob", payload: readme.payload });
 
     let meta = t.storage.gitObjectMetadata.get(oid)!;
     expect(meta.onRemote).toStrictEqual([G1]);
@@ -311,14 +310,14 @@ describe("puts and metadata recording", () => {
       expect(t.storage.gitObjectMetadata.get(DOCS_FILE)!.pullableFrom.toSorted())
           .toStrictEqual(by === undefined ? [G1] : [G1, by]);
       // Which is what lets the file be pulled at all.
-      expect((await t.cache.ensureObject(DOCS_FILE, { type: "blob" })).type).toBe("blob");
+      expect((await t.cache.walker.ensureObject(DOCS_FILE, { type: "blob" })).type).toBe("blob");
     });
   }
 
   it("extends a source that a held object gains later, as far down as objects are held",
       async () => {
     let t = makeCache();
-    await t.cache.importObjects([fixture(COMMIT_1), fixture(TREE_1), fixture(DOCS_TREE)]);
+    await t.cache.walker.importObjects([fixture(COMMIT_1), fixture(TREE_1), fixture(DOCS_TREE)]);
     expect(Array.from(t.storage.gitObjectMetadata.list())).toStrictEqual([]);
 
     t.cache.advertiseCommit(G1, COMMIT_1);
@@ -336,7 +335,7 @@ describe("puts and metadata recording", () => {
 
   it("does not walk again beneath an object the gatekeeper is already a source of", async () => {
     let t = makeCache();
-    await t.cache.importObjects([fixture(COMMIT_1), fixture(TREE_1), fixture(DOCS_TREE)]);
+    await t.cache.walker.importObjects([fixture(COMMIT_1), fixture(TREE_1), fixture(DOCS_TREE)]);
     t.cache.advertiseCommit(G1, COMMIT_1);
     await t.cache.putFromGatekeeper(G2, "tree", fixture(TREE_1).payload);
 
@@ -361,7 +360,7 @@ describe("puts and metadata recording", () => {
         G1, "tree", treePayload([{ mode: "100644", name: "not-a-file", oid: TREE_1 }]));
     expect(t.storage.gitObjectMetadata.get(TREE_1)!.type).toBe("blob");
 
-    await t.cache.importObjects([fixture(TREE_1)]);
+    await t.cache.walker.importObjects([fixture(TREE_1)]);
     let readme = parseGitTree(fixture(TREE_1).payload, TREE_1)[0];
     expect(t.storage.gitObjectMetadata.get(readme.oid)!.pullableFrom).toStrictEqual([G1]);
   });
@@ -398,10 +397,10 @@ describe("puts and metadata recording", () => {
     expect(meta.size).toBe(MAX_GIT_OBJECT_SIZE + 1);
     expect(meta.type).toBe("blob");
     expect(meta.onRemote).toStrictEqual([G1]);  // the bytes were hash-verified, just not kept
-    expect(t.cache.hasLocalObject(oid)).toBe(false);
+    expect(t.cache.walker.hasLocalObject(oid)).toBe(false);
 
     // Later reads fail fast on the recorded measurement, without re-downloading.
-    await expect(t.cache.ensureObject(oid, { type: "blob" }))
+    await expect(t.cache.walker.ensureObject(oid, { type: "blob" }))
         .rejects.toThrow(GitObjectTooLargeError);
     expect(t.pulls).toHaveLength(0);
   });
@@ -553,7 +552,7 @@ describe("pull driver", () => {
     let t = makeCache();
     t.sources.set(G1, fixtureSource(t, G1));
     await t.cache.putFromGatekeeper(G1, "commit", fixture(COMMIT_1).payload);
-    let tree = await t.cache.ensureObject(TREE_1, { type: "tree", referencedBy: COMMIT_1 });
+    let tree = await t.cache.walker.ensureObject(TREE_1, { type: "tree", referencedBy: COMMIT_1 });
     expect(tree.payload).toStrictEqual(fixture(TREE_1).payload);
     expect(t.pulls).toHaveLength(1);
     expect(t.pulls[0].hints.referencedBy).toBe(COMMIT_1);
@@ -568,7 +567,7 @@ describe("pull driver", () => {
     t.sources.set(G1, async () => { throw new Error("G1 is down"); });
     t.sources.set(G2, fixtureSource(t, G2));
 
-    let tree = await t.cache.ensureObject(TREE_1, { type: "tree" });
+    let tree = await t.cache.walker.ensureObject(TREE_1, { type: "tree" });
     expect(tree.type).toBe("tree");
     expect(t.pulls.map(p => p.gatekeeperId)).toStrictEqual([G1, G2]);
   });
@@ -577,10 +576,10 @@ describe("pull driver", () => {
     let t = makeCache();
     await t.cache.putFromGatekeeper(G1, "commit", fixture(COMMIT_1).payload);
     t.sources.set(G1, async () => { throw new Error("connection deleted; reconnect it"); });
-    await expect(t.cache.ensureObject(TREE_1, { type: "tree" }))
+    await expect(t.cache.walker.ensureObject(TREE_1, { type: "tree" }))
         .rejects.toThrow(/Could not pull git object .* reconnect it/s);
 
-    await expect(t.cache.ensureObject("f".repeat(40), { type: "blob" }))
+    await expect(t.cache.walker.ensureObject("f".repeat(40), { type: "blob" }))
         .rejects.toThrow(/no connection is known to provide it/);
   });
 
@@ -593,12 +592,12 @@ describe("pull driver", () => {
     // ...but serves nothing for it (as a filtered fetch would for an oversized blob).
     t.sources.set(G1, async () => {});
 
-    await expect(t.cache.ensureObject(bigOid, { type: "blob" }))
+    await expect(t.cache.walker.ensureObject(bigOid, { type: "blob" }))
         .rejects.toThrow(GitObjectTooLargeError);
     // Absence is gatekeeper behavior, not a measurement: nothing recorded, so the next read
     // retries (self-healing if the omission was a bug).
     expect(t.storage.gitObjectMetadata.get(bigOid)!.size).toBeUndefined();
-    await expect(t.cache.ensureObject(bigOid, { type: "blob" }))
+    await expect(t.cache.walker.ensureObject(bigOid, { type: "blob" }))
         .rejects.toThrow(GitObjectTooLargeError);
     expect(t.pulls).toHaveLength(2);
   });
@@ -885,7 +884,7 @@ describe("the marking walk", () => {
     let docsTree = parseGitTree(fixture(TREE_1).payload, TREE_1).find(e => e.name === "docs")!;
     let naive = parseGitTree(fixture(docsTree.oid).payload).find(e => e.name === "naïve.md")!;
     expect(marked.has(naive.oid)).toBe(false);  // docs' *children* not yet visible...
-    expect(t.cache.hasLocalObject(docsTree.oid)).toBe(false);
+    expect(t.cache.walker.hasLocalObject(docsTree.oid)).toBe(false);
     expect(pendingPushOf(t.storage, docsTree.oid)).toStrictEqual(
         [{ gatekeeperId: G2, actionId: ACTION }]);
   });
@@ -940,7 +939,7 @@ describe("the marking walk", () => {
     t.cache.markPushClosure(G2, ACTION, [t.child]);
     // The destination turns out to have TREE_1 after all, so has everything in it.
     await t.cache.putFromGatekeeper(G2, "commit", commitPayload(TREE_1, [], "dest has tree"));
-    await t.cache.importObjects([fixture(TREE_1)]);
+    await t.cache.walker.importObjects([fixture(TREE_1)]);
     expect(new Set(listMarks(t.storage, ACTION))).toStrictEqual(new Set([t.child, TREE_1]));
   });
 });
@@ -1041,7 +1040,7 @@ describe("buildPack", () => {
     let t2 = makeCache();
     let stored = await t2.cache.consumePackFromGatekeeper(G2, byteStream(pack));
     expect(new Set(stored)).toStrictEqual(oids);
-    expect(t2.cache.readLocalObject(t.child)!.type).toBe("commit");
+    expect(t2.cache.walker.readLocalObject(t.child)!.type).toBe("commit");
   });
 
   it("packs the whole closure though a marked tree arrived outside any pull", async () => {
@@ -1049,7 +1048,7 @@ describe("buildPack", () => {
     t.cache.markPushClosure(G2, ACTION, [t.child]);
     // The same tree turns up in, say, a blueprint. The pack still needs everything under it,
     // which is still to be pulled from where the tree was recorded as being.
-    await t.cache.importObjects([fixture(TREE_1)]);
+    await t.cache.walker.importObjects([fixture(TREE_1)]);
 
     let pack = await collect(await new GitCacheImpl(t.cache, G2, ACTION).buildPack());
     expect(await decodePack(pack)).toHaveLength(11);
@@ -1084,7 +1083,7 @@ describe("consumePack", () => {
 
     for (let oid of PACKED_OIDS) {
       let expected = fixture(oid);
-      expect(t.cache.readLocalObject(oid)).toStrictEqual(
+      expect(t.cache.walker.readLocalObject(oid)).toStrictEqual(
           { type: expected.type, payload: expected.payload });
       let meta = t.storage.gitObjectMetadata.get(oid)!;
       expect(meta.onRemote).toStrictEqual([G1]);
@@ -1132,7 +1131,7 @@ describe("consumePack", () => {
       await sender.gitPull(b64Bytes(PACK_OFS_DELTA)));
     expect(new Set(stored)).toStrictEqual(new Set(PACKED_OIDS));
     for (let oid of PACKED_OIDS) {
-      expect(t.cache.readLocalObject(oid)).toStrictEqual(fixture(oid));
+      expect(t.cache.walker.readLocalObject(oid)).toStrictEqual(fixture(oid));
     }
   });
 
@@ -1161,7 +1160,7 @@ describe("consumePack", () => {
         .rejects.toThrow(/invalid packfile/);
     // The commits and trees must wait for the trailer: a present commit is treated as mounted.
     for (let oid of PACKED_OIDS.filter(o => fixture(o).type !== "blob")) {
-      expect(t.cache.hasLocalObject(oid)).toBe(false);
+      expect(t.cache.walker.hasLocalObject(oid)).toBe(false);
     }
   });
 
@@ -1175,7 +1174,7 @@ describe("consumePack", () => {
         [{ type: "commit", payload: commit }, { type: "tree", payload: tree }]));
     await expect(new GitCacheImpl(t.cache, G1).consumePack(byteStream(pack)))
         .rejects.toThrow(/corrupt tree object/);
-    expect(t.cache.hasLocalObject(await gitObjectOid("commit", commit))).toBe(false);
+    expect(t.cache.walker.hasLocalObject(await gitObjectOid("commit", commit))).toBe(false);
   });
 
   it("measures an oversized entry, skips storing it, and omits it from the result", async () => {
@@ -1189,7 +1188,7 @@ describe("consumePack", () => {
 
     let stored = await new GitCacheImpl(t.cache, G1).consumePack(byteStream(pack));
     expect(stored).toStrictEqual([smallOid]);
-    expect(t.cache.hasLocalObject(bigOid)).toBe(false);
+    expect(t.cache.walker.hasLocalObject(bigOid)).toBe(false);
     let meta = t.storage.gitObjectMetadata.get(bigOid)!;
     expect(meta.size).toBe(MAX_GIT_OBJECT_SIZE + 5);
     expect(meta.onRemote).toStrictEqual([G1]);
@@ -1214,7 +1213,7 @@ describe("consumePack", () => {
     let target = big.subarray(0, 16);
     let stored = await new GitCacheImpl(t.cache, G1).consumePack(byteStream(pack));
     expect(stored).toStrictEqual([await gitObjectOid("blob", target)]);
-    expect(t.cache.readLocalObject(stored[0])!.payload).toStrictEqual(target);
+    expect(t.cache.walker.readLocalObject(stored[0])!.payload).toStrictEqual(target);
     expect(t.storage.gitObjectMetadata.get(bigOid)!.size).toBe(big.byteLength);
   });
 });
@@ -1227,10 +1226,10 @@ describe("importObjects", () => {
   it("stores a release's objects, invisible to every gatekeeper's scoped view", async () => {
     let t = makeCache();
     let { commitId, objects } = await buildSnapshotRelease(FILES);
-    await t.cache.importObjects(objects.values());
+    await t.cache.walker.importObjects(objects.values());
 
     for (let [oid, object] of objects) {
-      expect(t.cache.readLocalObject(oid)).toStrictEqual(object);
+      expect(t.cache.walker.readLocalObject(oid)).toStrictEqual(object);
       for (let gatekeeperId of [G1, G2]) {
         let stub = new GitCacheImpl(t.cache, gatekeeperId);
         expect(await stub.get(oid)).toBeNull();
@@ -1240,7 +1239,7 @@ describe("importObjects", () => {
     }
     expect(Array.from(t.storage.gitObjectMetadata.list())).toStrictEqual([]);
     // The workspace's own reads see them like any commit authored here.
-    expect(await t.cache.readFileAtCommit(commitId, "lib/util.js")).toBe("export {};\n");
+    expect(await t.cache.walker.readFileAtCommit(commitId, "lib/util.js")).toBe("export {};\n");
     expect(t.pulls).toHaveLength(0);
   });
 
@@ -1253,21 +1252,21 @@ describe("importObjects", () => {
     let metadata = Array.from(t.storage.gitObjectMetadata.list());
 
     let puts = countPuts(t);
-    await t.cache.importObjects(objects.values());
+    await t.cache.walker.importObjects(objects.values());
     expect(puts.count).toBe(objects.size - 1);
     expect(Array.from(t.storage.gitObjectMetadata.list())).toStrictEqual(metadata);
     expect(await new GitCacheImpl(t.cache, G1).has(shared)).toBe(true);
     expect(await new GitCacheImpl(t.cache, G2).has(shared)).toBe(false);
 
     // Importing it all again, each object twice over, writes nothing.
-    await t.cache.importObjects([...objects.values(), ...objects.values()]);
+    await t.cache.walker.importObjects([...objects.values(), ...objects.values()]);
     expect(puts.count).toBe(objects.size - 1);
   });
 
   it("stores each object under the oid of its content", async () => {
     let t = makeCache();
     let payload = new TextEncoder().encode("hello world\n");
-    await t.cache.importObjects([{ type: "blob", payload }]);
+    await t.cache.walker.importObjects([{ type: "blob", payload }]);
     // `echo 'hello world' | git hash-object --stdin`
     expect(Array.from(t.storage.gitObjects.list(), record => record.oid))
         .toStrictEqual(["3b18e512dba79e4c8300dd08aeb37f8e728b8dad"]);
@@ -1282,7 +1281,7 @@ describe("importObjects", () => {
       if (puts.count === objects.size - 1) throw new Error("storage refused the record");
       put(record);
     };
-    await expect(t.cache.importObjects(objects.values())).rejects.toThrow(/storage refused/);
+    await expect(t.cache.walker.importObjects(objects.values())).rejects.toThrow(/storage refused/);
     expect(puts.count).toBe(objects.size - 1);
     expect(Array.from(t.storage.gitObjects.list())).toStrictEqual([]);
   });
@@ -1307,13 +1306,13 @@ describe("lazy walker reads", () => {
     });
 
     for (let [path, text] of files) {
-      expect(await t.cache.readFileAtCommit(commit, path)).toBe(text);
+      expect(await t.cache.walker.readFileAtCommit(commit, path)).toBe(text);
     }
-    expect((await t.cache.listTreeEntries(commit)).map(e => [e.name, e.kind])).toStrictEqual([
+    expect((await t.cache.walker.listTreeEntries(commit)).map(e => [e.name, e.kind])).toStrictEqual([
       ["README.md", "file"],
       ["src", "dir"],
     ]);
-    expect((await t.cache.listTreeEntries(commit, "src/lib")).map(e => e.name))
+    expect((await t.cache.walker.listTreeEntries(commit, "src/lib")).map(e => e.name))
         .toStrictEqual(["util.js"]);
     expect(t.pulls).toHaveLength(0);  // gadget-history-style reads never fault
   });
@@ -1328,14 +1327,14 @@ describe("lazy walker reads", () => {
       }
     }
 
-    expect(await t.cache.readFileAtCommit(COMMIT_3, "src/util.js"))
+    expect(await t.cache.walker.readFileAtCommit(COMMIT_3, "src/util.js"))
         .toBe('export const answer = 42;\nexport const question = "unknown";\n');
     expect(t.pulls).toHaveLength(1);
     expect(t.pulls[0].hints.type).toBe("blob");
     expect(t.pulls[0].hints.filterBlobSize).toBe(MAX_GIT_OBJECT_SIZE + 1);
 
     // Non-ASCII UTF-8 names resolve.
-    expect(await t.cache.readFileAtCommit(COMMIT_1, "docs/naïve.md")).toBe("naïve UTF-8 name\n");
+    expect(await t.cache.walker.readFileAtCommit(COMMIT_1, "docs/naïve.md")).toBe("naïve UTF-8 name\n");
   });
 
   it("a fault against a worktree base pulls the whole tree and small blobs in one round trip",
@@ -1367,7 +1366,7 @@ describe("lazy walker reads", () => {
     await t.cache.putFromGatekeeper(G1, "commit", fixture(COMMIT_1).payload);
     t.pulls.length = 0;
 
-    expect(await t.cache.readFileAtCommitIfExists(COMMIT_1, "src/util.js")).toBeDefined();
+    expect(await t.cache.walker.readFileAtCommitIfExists(COMMIT_1, "src/util.js")).toBeDefined();
     expect(t.pulls).toHaveLength(1);
     expect(t.pulls[0].hints.type).toBe("tree");
     expect(t.pulls[0].hints.filterTreeDepth).toBeUndefined();
@@ -1375,8 +1374,8 @@ describe("lazy walker reads", () => {
 
     // The eager pull brought the whole tree structure and every small blob: reads elsewhere in
     // the tree fault nothing further.
-    expect(await t.cache.readFileAtCommitIfExists(COMMIT_1, "README.md")).toBe("# Fixture\n");
-    expect(await t.cache.readFileAtCommitIfExists(COMMIT_1, "docs/naïve.md"))
+    expect(await t.cache.walker.readFileAtCommitIfExists(COMMIT_1, "README.md")).toBe("# Fixture\n");
+    expect(await t.cache.walker.readFileAtCommitIfExists(COMMIT_1, "docs/naïve.md"))
         .toBe("naïve UTF-8 name\n");
     expect(t.pulls).toHaveLength(1);
   });
@@ -1386,7 +1385,7 @@ describe("lazy walker reads", () => {
     t.sources.set(G1, fixtureSource(t, G1));
     await t.cache.putFromGatekeeper(G1, "commit", fixture(COMMIT_1).payload);
 
-    expect((await t.cache.listTreeEntries(COMMIT_1)).map(e => [e.name, e.kind])).toStrictEqual([
+    expect((await t.cache.walker.listTreeEntries(COMMIT_1)).map(e => [e.name, e.kind])).toStrictEqual([
       ["README.md", "file"],
       ["docs", "dir"],
       ["link.md", "symlink"],
@@ -1401,15 +1400,15 @@ describe("lazy walker reads", () => {
     t.sources.set(G1, fixtureSource(t, G1));
     await t.cache.putFromGatekeeper(G1, "commit", fixture(COMMIT_1).payload);
 
-    await expect(t.cache.readFileAtCommit(COMMIT_1, "link.md"))
+    await expect(t.cache.walker.readFileAtCommit(COMMIT_1, "link.md"))
         .rejects.toThrow("link.md is a symlink to README.md");
-    await expect(t.cache.readFileAtCommit(COMMIT_1, "vendored"))
+    await expect(t.cache.walker.readFileAtCommit(COMMIT_1, "vendored"))
         .rejects.toThrow(`vendored is a submodule (gitlink) pointing at commit ${GITLINK_TARGET}`);
-    await expect(t.cache.readFileAtCommit(COMMIT_1, "src"))
+    await expect(t.cache.walker.readFileAtCommit(COMMIT_1, "src"))
         .rejects.toThrow("src: no such file");
-    await expect(t.cache.readFileAtCommit(COMMIT_1, "no/such/file.txt"))
+    await expect(t.cache.walker.readFileAtCommit(COMMIT_1, "no/such/file.txt"))
         .rejects.toThrow("no/such/file.txt: no such file");
-    await expect(t.cache.readFileAtCommit(COMMIT_1, "../escape"))
+    await expect(t.cache.walker.readFileAtCommit(COMMIT_1, "../escape"))
         .rejects.toThrow(/invalid file path/);
   });
 
@@ -1423,7 +1422,7 @@ describe("lazy walker reads", () => {
     });
     let commit = await storeLocal(t.storage,
         { type: "commit", payload: commitPayload(tree, [], "binary") });
-    await expect(t.cache.readFileAtCommit(commit, "logo.png"))
+    await expect(t.cache.walker.readFileAtCommit(commit, "logo.png"))
         .rejects.toThrow("logo.png is not a text file");
   });
 
@@ -1438,7 +1437,7 @@ describe("lazy walker reads", () => {
     });
     let commit = await storeLocal(t.storage,
         { type: "commit", payload: commitPayload(tree, [], "huge") });
-    await expect(t.cache.readFileAtCommit(commit, "huge.txt"))
+    await expect(t.cache.walker.readFileAtCommit(commit, "huge.txt"))
         .rejects.toThrow(/huge\.txt is too large to read/);
     expect(t.pulls).toHaveLength(0);
   });
@@ -1454,9 +1453,9 @@ describe("lazy walker reads", () => {
     });
     let commit = await storeLocal(t.storage,
         { type: "commit", payload: commitPayload(tree, [], "huge") });
-    expect(await t.cache.readFileAtCommit(commit, "huge.txt")).toBe(text);
-    expect(await t.cache.readTextBlob(big, undefined, "huge.txt")).toBe(text);
-    expect(await t.cache.readFilesAtCommit(commit, ["huge.txt"]))
+    expect(await t.cache.walker.readFileAtCommit(commit, "huge.txt")).toBe(text);
+    expect(await t.cache.walker.readTextBlob(big, undefined, "huge.txt")).toBe(text);
+    expect(await t.cache.walker.readFilesAtCommit(commit, ["huge.txt"]))
         .toEqual([["huge.txt", { kind: "text", text }]]);
     expect(t.pulls).toHaveLength(0);
   });
@@ -1466,9 +1465,9 @@ describe("lazy walker reads", () => {
     await storeLocal(t.storage, fixture(BAD_NAME_TREE));
     let commit = await storeLocal(t.storage,
         { type: "commit", payload: commitPayload(BAD_NAME_TREE, [], "bad name") });
-    await expect(t.cache.listTreeEntries(commit))
+    await expect(t.cache.walker.listTreeEntries(commit))
         .rejects.toThrow(new RegExp(`${BAD_NAME_TREE}.*not valid UTF-8`));
-    await expect(t.cache.readFileAtCommit(commit, "anything.txt"))
+    await expect(t.cache.walker.readFileAtCommit(commit, "anything.txt"))
         .rejects.toThrow(/not valid UTF-8/);
   });
 });
@@ -1491,7 +1490,7 @@ describe("client-facing reads (readCommitTree / readFilesAtCommit)", () => {
 
   it("nests the tree in git order with all five kinds, touching no blobs", async () => {
     let t = await fixtureWithRemoteBlobs();
-    expect(await t.cache.readCommitTree(COMMIT_1)).toStrictEqual([
+    expect(await t.cache.walker.readCommitTree(COMMIT_1)).toStrictEqual([
       { name: "README.md", kind: "file" },
       { name: "docs", kind: "dir", children: [{ name: "naïve.md", kind: "file" }] },
       { name: "link.md", kind: "symlink" },
@@ -1510,7 +1509,7 @@ describe("client-facing reads (readCommitTree / readFilesAtCommit)", () => {
     let t = makeCache();
     t.sources.set(G1, fixtureSource(t, G1));
     await t.cache.putFromGatekeeper(G1, "commit", fixture(COMMIT_1).payload);
-    let tree = await t.cache.readCommitTree(COMMIT_1);
+    let tree = await t.cache.walker.readCommitTree(COMMIT_1);
     expect(tree.map(node => node.name))
         .toStrictEqual(["README.md", "docs", "link.md", "run.sh", "src", "vendored"]);
     expect(t.pulls.length).toBeGreaterThan(0);
@@ -1522,7 +1521,7 @@ describe("client-facing reads (readCommitTree / readFilesAtCommit)", () => {
     let t = await fixtureWithRemoteBlobs();
     let paths = ["src/util.js", "nope.txt", "src", "link.md", "vendored", "docs/naïve.md",
                  "no/such/dir/file.txt", "README.md/child", "README.md", "src/util.js"];
-    let result = await t.cache.readFilesAtCommit(COMMIT_1, paths);
+    let result = await t.cache.walker.readFilesAtCommit(COMMIT_1, paths);
     expect(result).toStrictEqual([
       ["src/util.js", { kind: "text", text: "export const answer = 42;\n" }],
       ["nope.txt", { kind: "absent" }],
@@ -1547,9 +1546,9 @@ describe("client-facing reads (readCommitTree / readFilesAtCommit)", () => {
       "ca69e6d08b5b8bb4f11a74f9695e329c203cbfd8",  // README.md
     ]);
     // Everything is local now: a second read faults nothing.
-    await t.cache.readFilesAtCommit(COMMIT_1, ["README.md", "src/main.js"]);
+    await t.cache.walker.readFilesAtCommit(COMMIT_1, ["README.md", "src/main.js"]);
     expect(t.pulls).toHaveLength(2);  // main.js was not in the first batch
-    await t.cache.readFilesAtCommit(COMMIT_1, ["README.md", "src/main.js"]);
+    await t.cache.walker.readFilesAtCommit(COMMIT_1, ["README.md", "src/main.js"]);
     expect(t.pulls).toHaveLength(2);
   });
 
@@ -1587,7 +1586,7 @@ describe("client-facing reads (readCommitTree / readFilesAtCommit)", () => {
     let commit = await t.cache.putFromGatekeeper(G1, "commit", commitPayload(tree, [], "mixed"));
     t.pulls.length = 0;
 
-    let result = await t.cache.readFilesAtCommit(
+    let result = await t.cache.walker.readFilesAtCommit(
         commit, ["huge-measured.txt", "text.txt", "huge-omitted.txt", "binary.png"]);
     expect(result).toStrictEqual([
       ["huge-measured.txt", { kind: "unreadable", message:
@@ -1620,7 +1619,7 @@ describe("client-facing reads (readCommitTree / readFilesAtCommit)", () => {
 
     // Eight files fill the budget exactly; the ninth pushes past it and is still delivered;
     // the tenth is omitted (not reported absent).
-    let result = await t.cache.readFilesAtCommit(commit, names);
+    let result = await t.cache.walker.readFilesAtCommit(commit, names);
     expect(result.map(([path]) => path)).toStrictEqual(names.slice(0, 9));
     expect(result.every(([, file]) =>
         file.kind === "text" && file.text.length === FILE_SIZE)).toBe(true);
@@ -1630,7 +1629,7 @@ describe("client-facing reads (readCommitTree / readFilesAtCommit)", () => {
   it("fails the whole call on a pull failure rather than answering per file", async () => {
     let t = await fixtureWithRemoteBlobs();
     t.sources.delete(G1);  // provenance loss: the only source is gone
-    await expect(t.cache.readFilesAtCommit(COMMIT_1, ["README.md", "nope.txt"]))
+    await expect(t.cache.walker.readFilesAtCommit(COMMIT_1, ["README.md", "nope.txt"]))
         .rejects.toThrow(/Could not pull git object/);
   });
 });
@@ -1691,8 +1690,8 @@ describe("changedFilePathsBetween", () => {
       "edit.js", "gone.js", "run.sh", "new.js", "src/lib/deep.js", "src/lib/added.js",
       "docs/old.md", "shape", "shape/inner.js",
     ]);
-    expect(await t.cache.changedFilePathsBetween(before, after)).toStrictEqual(expected);
-    expect(await t.cache.changedFilePathsBetween(after, before)).toStrictEqual(expected);
+    expect(await t.cache.walker.changedFilePathsBetween(before, after)).toStrictEqual(expected);
+    expect(await t.cache.walker.changedFilePathsBetween(after, before)).toStrictEqual(expected);
     expect(t.pulls).toHaveLength(0);
   });
 
@@ -1702,9 +1701,9 @@ describe("changedFilePathsBetween", () => {
     let unheld = "ab".repeat(20);
     let before = await storeTreeCommit(t, { "a.js": "a\n", "vendor": new Subtree(unheld) });
     let after = await storeTreeCommit(t, { "a.js": "A\n", "vendor": new Subtree(unheld) });
-    expect(await t.cache.changedFilePathsBetween(before, after)).toStrictEqual(new Set(["a.js"]));
+    expect(await t.cache.walker.changedFilePathsBetween(before, after)).toStrictEqual(new Set(["a.js"]));
     // Nor is a commit compared with itself read at all.
-    expect(await t.cache.changedFilePathsBetween(unheld, unheld)).toStrictEqual(new Set());
+    expect(await t.cache.walker.changedFilePathsBetween(unheld, unheld)).toStrictEqual(new Set());
     expect(t.pulls).toHaveLength(0);
   });
 });
@@ -1717,18 +1716,18 @@ describe("worktree read/write helpers", () => {
     t.sources.set(G1, fixtureSource(t, G1));
     await t.cache.putFromGatekeeper(G1, "commit", fixture(COMMIT_1).payload);
 
-    expect(await t.cache.readFileAtCommitIfExists(COMMIT_1, "README.md"))
+    expect(await t.cache.walker.readFileAtCommitIfExists(COMMIT_1, "README.md"))
         .toBe("# Fixture\n");
     // Absence in all its shapes: missing leaf, missing intermediate, non-directory
     // intermediate, and a directory path.
-    expect(await t.cache.readFileAtCommitIfExists(COMMIT_1, "nope.txt")).toBeUndefined();
-    expect(await t.cache.readFileAtCommitIfExists(COMMIT_1, "no/such/file.txt")).toBeUndefined();
-    expect(await t.cache.readFileAtCommitIfExists(COMMIT_1, "README.md/child")).toBeUndefined();
-    expect(await t.cache.readFileAtCommitIfExists(COMMIT_1, "src")).toBeUndefined();
+    expect(await t.cache.walker.readFileAtCommitIfExists(COMMIT_1, "nope.txt")).toBeUndefined();
+    expect(await t.cache.walker.readFileAtCommitIfExists(COMMIT_1, "no/such/file.txt")).toBeUndefined();
+    expect(await t.cache.walker.readFileAtCommitIfExists(COMMIT_1, "README.md/child")).toBeUndefined();
+    expect(await t.cache.walker.readFileAtCommitIfExists(COMMIT_1, "src")).toBeUndefined();
     // The descriptive errors still throw: absence is the only softened case.
-    await expect(t.cache.readFileAtCommitIfExists(COMMIT_1, "link.md"))
+    await expect(t.cache.walker.readFileAtCommitIfExists(COMMIT_1, "link.md"))
         .rejects.toThrow("link.md is a symlink to README.md");
-    await expect(t.cache.readFileAtCommitIfExists(COMMIT_1, "vendored"))
+    await expect(t.cache.walker.readFileAtCommitIfExists(COMMIT_1, "vendored"))
         .rejects.toThrow("vendored is a submodule");
   });
 
@@ -1739,26 +1738,26 @@ describe("worktree read/write helpers", () => {
 
     // The read's oid is the content's address: computable from the text alone, and equal to
     // what fileOidAtCommit reports for the same path -- with no blob read on that side.
-    let read = (await t.cache.readFileAtCommitWithOid(COMMIT_1, "README.md"))!;
+    let read = (await t.cache.walker.readFileAtCommitWithOid(COMMIT_1, "README.md"))!;
     expect(read.text).toBe("# Fixture\n");
     expect(read.oid).toBe(await blobOid(read.text));
-    expect(await t.cache.fileOidAtCommit(COMMIT_1, "README.md")).toBe(read.oid);
+    expect(await t.cache.walker.fileOidAtCommit(COMMIT_1, "README.md")).toBe(read.oid);
     expect(t.pulls.some(pull => pull.oids.includes(read.oid))).toBe(true);  // the read pulled it
-    let main = (await t.cache.fileOidAtCommit(COMMIT_1, "src/main.js"))!;
+    let main = (await t.cache.walker.fileOidAtCommit(COMMIT_1, "src/main.js"))!;
     expect(t.pulls.some(pull => pull.oids.includes(main))).toBe(false);  // the blob: never read
-    expect(t.cache.hasLocalObject(main)).toBe(false);
+    expect(t.cache.walker.hasLocalObject(main)).toBe(false);
 
     // Commit 2 rewrote README.md and left src/main.js alone: the freshness question an edit
     // asks, answered per file by oid equality.
     await t.cache.putFromGatekeeper(G1, "commit", fixture(COMMIT_2).payload);
-    expect(await t.cache.fileOidAtCommit(COMMIT_2, "README.md")).not.toBe(read.oid);
-    expect(await t.cache.fileOidAtCommit(COMMIT_2, "src/main.js")).toBe(main);
+    expect(await t.cache.walker.fileOidAtCommit(COMMIT_2, "README.md")).not.toBe(read.oid);
+    expect(await t.cache.walker.fileOidAtCommit(COMMIT_2, "src/main.js")).toBe(main);
 
     // Only regular files have an oid here: absent, directory, symlink, gitlink are undefined.
     for (let path of ["nope.txt", "src", "link.md", "vendored"]) {
-      expect(await t.cache.fileOidAtCommit(COMMIT_1, path)).toBeUndefined();
+      expect(await t.cache.walker.fileOidAtCommit(COMMIT_1, path)).toBeUndefined();
     }
-    expect(await t.cache.readFileAtCommitWithOid(COMMIT_1, "nope.txt")).toBeUndefined();
+    expect(await t.cache.walker.readFileAtCommitWithOid(COMMIT_1, "nope.txt")).toBeUndefined();
   });
 
   it("assertWorktreePathWritable rejects symlink, gitlink, and directory paths, passes the rest",
@@ -1767,19 +1766,19 @@ describe("worktree read/write helpers", () => {
     t.sources.set(G1, fixtureSource(t, G1));
     await t.cache.putFromGatekeeper(G1, "commit", fixture(COMMIT_1).payload);
 
-    await expect(t.cache.assertWorktreePathWritable(COMMIT_1, "link.md"))
+    await expect(t.cache.walker.assertWorktreePathWritable(COMMIT_1, "link.md"))
         .rejects.toThrow("link.md is a symlink to README.md");
-    await expect(t.cache.assertWorktreePathWritable(COMMIT_1, "vendored"))
+    await expect(t.cache.walker.assertWorktreePathWritable(COMMIT_1, "vendored"))
         .rejects.toThrow(`vendored is a submodule (gitlink) pointing at commit ${GITLINK_TARGET}`);
     // A write at a directory-named path could never commit (a git tree cannot hold a file and
     // a directory of one name), so it fails here, next to its cause.
-    await expect(t.cache.assertWorktreePathWritable(COMMIT_1, "src"))
+    await expect(t.cache.walker.assertWorktreePathWritable(COMMIT_1, "src"))
         .rejects.toThrow("src is a directory");
     // Regular files (either mode) and new paths -- including under a base directory -- pass.
-    await t.cache.assertWorktreePathWritable(COMMIT_1, "README.md");
-    await t.cache.assertWorktreePathWritable(COMMIT_1, "run.sh");
-    await t.cache.assertWorktreePathWritable(COMMIT_1, "brand-new.txt");
-    await t.cache.assertWorktreePathWritable(COMMIT_1, "src/brand-new.txt");
+    await t.cache.walker.assertWorktreePathWritable(COMMIT_1, "README.md");
+    await t.cache.walker.assertWorktreePathWritable(COMMIT_1, "run.sh");
+    await t.cache.walker.assertWorktreePathWritable(COMMIT_1, "brand-new.txt");
+    await t.cache.walker.assertWorktreePathWritable(COMMIT_1, "src/brand-new.txt");
   });
 
   it("assertWorktreePathWritable passes an oversized base blob (a set needs no readable base)",
@@ -1793,7 +1792,7 @@ describe("worktree read/write helpers", () => {
     });
     let commit = await storeLocal(t.storage,
         { type: "commit", payload: commitPayload(tree, [], "huge") });
-    await t.cache.assertWorktreePathWritable(commit, "huge.txt");
+    await t.cache.walker.assertWorktreePathWritable(commit, "huge.txt");
   });
 });
 
@@ -1807,14 +1806,14 @@ describe("resolveCommitId", () => {
     t.storage.gitObjectMetadata.put(
         { oid: remote, type: "blob", onRemote: [G1], pullableFrom: [], pendingPush: [] });
 
-    expect(t.cache.resolveCommitId(commit)).toBe(commit);
+    expect(t.cache.walker.resolveCommitId(commit)).toBe(commit);
     // The reader rule: an id known only from metadata resolves regardless of its recorded type
     // (the caller's pull lets the decoded bytes decide).
-    expect(t.cache.resolveCommitId(remote)).toBe(remote);
+    expect(t.cache.walker.resolveCommitId(remote)).toBe(remote);
     for (let id of [commit.slice(0, 8), commit.slice(0, 39), commit.toUpperCase(), "main"]) {
-      expect(() => t.cache.resolveCommitId(id)).toThrow(/not a full git commit id/);
+      expect(() => t.cache.walker.resolveCommitId(id)).toThrow(/not a full git commit id/);
     }
-    expect(() => t.cache.resolveCommitId("feed".repeat(10))).toThrow(/not known/);
-    expect(() => t.cache.resolveCommitId(tree)).toThrow(`${tree} is a tree, not a commit.`);
+    expect(() => t.cache.walker.resolveCommitId("feed".repeat(10))).toThrow(/not known/);
+    expect(() => t.cache.walker.resolveCommitId(tree)).toThrow(`${tree} is a tree, not a commit.`);
   });
 });

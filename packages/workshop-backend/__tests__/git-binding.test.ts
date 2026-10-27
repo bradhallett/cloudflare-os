@@ -290,7 +290,7 @@ describe("env.GIT readCommit", () => {
       () => withImpl(async impl => {
     impl.gitCache.advertiseCommit(999, COMMIT_2);
     let pulls: { oids: string[], hints: GitPullHints }[] = [];
-    impl.gitCache.puller = {
+    impl.gitCache.walker.puller = {
       pull: async (gatekeeperId: number, oids: string[], hints: GitPullHints) => {
         pulls.push({ oids, hints });
         for (let object of FIXTURE_OBJECTS.filter(candidate => oids.includes(candidate.oid))) {

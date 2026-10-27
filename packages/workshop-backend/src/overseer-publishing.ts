@@ -243,7 +243,7 @@ export abstract class OverseerPublishing extends OverseerFacets {
     if (previous === undefined && record.commitId !== undefined) {
       let snapshot = await buildSnapshotRelease(
           await this.gitStore.readCommitFiles(record.commitId));
-      await this.gitCache.importObjects(snapshot.objects.values());
+      await this.gitCache.walker.importObjects(snapshot.objects.values());
       previous = snapshot.commitId;
     }
     let merged = await this.releasesMergedSince(sourceCommit, record.commitId, previous);
@@ -256,7 +256,7 @@ export abstract class OverseerPublishing extends OverseerFacets {
     };
     let mint = async (release: Pick<Release, "tree" | "parents" | "version">) => {
       let payload = encodeReleaseCommit({ ...release, ...publication });
-      await this.gitCache.importObjects([{ type: "commit", payload }]);
+      await this.gitCache.walker.importObjects([{ type: "commit", payload }]);
       return await gitObjectOid("commit", payload);
     };
 
@@ -294,7 +294,7 @@ export abstract class OverseerPublishing extends OverseerFacets {
   async releasesMergedSince(head: string, since: string | undefined, previous: string | undefined)
       : Promise<string[]> {
     let read = (oid: string) => {
-      let object = this.gitCache.readLocalObject(oid);
+      let object = this.gitCache.walker.readLocalObject(oid);
       if (object?.type !== "commit") throw new Error(`Commit ${oid} is not in the git store.`);
       let releases = releasesMergedBy(object.payload, oid);
       let own = parseGitCommitRefs(object.payload, oid).parents
@@ -336,7 +336,7 @@ export abstract class OverseerPublishing extends OverseerFacets {
 
   /** Builds the pack of a release this workspace minted. A release always yields the same bytes. */
   async buildBlueprintPack(releaseCommit: string): Promise<Uint8Array> {
-    return await buildReleasePack(oid => this.gitCache.readLocalObject(oid), releaseCommit);
+    return await buildReleasePack(oid => this.gitCache.walker.readLocalObject(oid), releaseCommit);
   }
 
   /**
@@ -353,7 +353,7 @@ export abstract class OverseerPublishing extends OverseerFacets {
       owner: BlueprintOwnerSubject | undefined,
   ): Promise<string> {
     let release = await readBlueprintRelease(this.env, owner, blueprintId, metadata);
-    await this.gitCache.importObjects(release.objects.values());
+    await this.gitCache.walker.importObjects(release.objects.values());
     return release.commitId;
   }
 

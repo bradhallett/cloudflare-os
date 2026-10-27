@@ -29,7 +29,8 @@ import type {
 import type { AiChatAuthorInfo, WorkpieceId } from "@gadgets/workshop-shared/api";
 import { diffFiles, validateCodeChangeSchema, type FileChange, type FileContent } from "@gadgets/workshop-shared/code-change";
 
-import { UnreadableContentError, type WorkspaceGitCache } from "./git-cache";
+import { UnreadableContentError } from "./git-walker";
+import type { WorkspaceGitCache } from "./git-cache";
 import { commitIdentityForAuthor, type GitStore } from "./git-store";
 import { formatUnifiedDiff, type WorktreeTurnAccess } from "./agent";
 import { formatGrep, matchLines, scanWorkpieceForGrep } from "./grep";
@@ -92,7 +93,7 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
 
     if (overlay.has(scope)) throw new Error(`${scope} is not a directory`);
     let baseScope = scope === "" || !removed.has(scope)
-        ? await this.host.gitCache.pathEntryAtCommit(base, scope) : undefined;
+        ? await this.host.gitCache.walker.pathEntryAtCommit(base, scope) : undefined;
     if (baseScope !== undefined && baseScope.kind !== "dir") {
       throw new Error(`${scope} is not a directory`);
     }
@@ -108,7 +109,7 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
     let removedInScope = [...removed].some(removedPath => removedPath.startsWith(prefix));
     let entries = new Map<string, WorktreeFileEntry["kind"]>();
     if (baseScope !== undefined) {
-      let listing = await this.host.gitCache.listCommitTreePaths(
+      let listing = await this.host.gitCache.walker.listCommitTreePaths(
           base, scope === "" ? undefined : scope, { recursive: recursive || removedInScope });
       for (let entry of listing) {
         if (!recursive && entry.path.slice(prefix.length).includes("/")) continue;
@@ -166,7 +167,7 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
     const value = overlay.get(path);
     if (value !== undefined) return value;
     if (this.turn.getRemovedPaths(this.worktreeId).has(path)) throw new Error(`${path}: no such file`);
-    const base = await this.host.gitCache.fileBytesAtCommit(this.#pinBase(), path);
+    const base = await this.host.gitCache.walker.fileBytesAtCommit(this.#pinBase(), path);
     // The session may have closed while the base faulted in; do not serve it after revocation.
     this.#pinBase();
     if (!base) throw new Error(`${path}: no such file`);
@@ -188,7 +189,7 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
     }}, {highWaterMark: 0});
   }
   async writeBytes(path: string, content: Uint8Array): Promise<void> {
-    await this.host.gitCache.assertWorktreePathWritable(this.#pinBase(), path);
+    await this.host.gitCache.walker.assertWorktreePathWritable(this.#pinBase(), path);
     this.#pinBase();
     const value = await this.host.gitStore.writeBlob(content);
     const change = {setBytes: value};
@@ -208,7 +209,7 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
       // descriptive read errors (the same rule as the writeFile tool), then read the base text
       // -- faulting it into the session content, so the diffed edit below applies against it.
       // Unreadable *content* is fine: a whole-file set is coherent against any base.
-      await this.host.gitCache.assertWorktreePathWritable(base, path);
+      await this.host.gitCache.walker.assertWorktreePathWritable(base, path);
       try {
         before = await this.turn.readFile(this.worktreeId, path);
       } catch (err) {
@@ -237,8 +238,8 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
       // Same base-entry rules as writes: symlink/gitlink/directory paths throw their
       // descriptive errors (deleting a directory's last *file* prunes the directory at commit
       // instead). Unreadable content is deletable -- only the entry's shape matters.
-      await this.host.gitCache.assertWorktreePathWritable(base, path);
-      if (await this.host.gitCache.pathEntryAtCommit(base, path) === undefined) {
+      await this.host.gitCache.walker.assertWorktreePathWritable(base, path);
+      if (await this.host.gitCache.walker.pathEntryAtCommit(base, path) === undefined) {
         throw new Error(`${path}: no such file`);
       }
     }
@@ -247,14 +248,14 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
 
   async grep(pattern: RegExp, path?: string | string[]): Promise<string> {
     let scan = await scanWorkpieceForGrep(
-        this.host.gitCache, this.turn, this.worktreeId, this.#pinBase(), path);
+        this.host.gitCache.walker, this.turn, this.worktreeId, this.#pinBase(), path);
     return formatGrep(scan, pattern, Infinity);
   }
 
   async structuredGrep(pattern: RegExp, path?: string | string[])
       : Promise<StructuredGrepResult> {
     let { files, errors } = await scanWorkpieceForGrep(
-        this.host.gitCache, this.turn, this.worktreeId, this.#pinBase(), path);
+        this.host.gitCache.walker, this.turn, this.worktreeId, this.#pinBase(), path);
     return {
       matches: files.flatMap(file =>
           matchLines(file.text, pattern).map(match => ({ file: file.path, ...match }))),
@@ -346,13 +347,13 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
   async #changedFiles(commitId?: string): Promise<ChangedFile[]> {
     let base = this.#pinBase();
     let target = commitId !== undefined
-        ? this.host.gitCache.resolveCommitId(commitId) : this.#head();
+        ? this.host.gitCache.walker.resolveCommitId(commitId) : this.#head();
     let overlay = this.turn.getOverlayFiles(this.worktreeId);
     let removed = this.turn.getRemovedPaths(this.worktreeId);
 
     // Candidate paths: the oid-level tree diff between the target and the pin base, plus the
     // overlay's touches -- bounded by activity on both sides, never the tree's size.
-    let paths = await this.host.gitCache.changedFilePathsBetween(target, base);
+    let paths = await this.host.gitCache.walker.changedFilePathsBetween(target, base);
     for (let path of overlay.keys()) paths.add(path);
     for (let path of removed) paths.add(path);
 
@@ -363,13 +364,13 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
     // failure (a pull outage, a corrupt object) still fails the diff rather than silently
     // rendering an incomplete one.
     let readSide = async (commit: string, path: string): Promise<DiffSide> => {
-      let entry = await this.host.gitCache.pathEntryAtCommit(commit, path);
+      let entry = await this.host.gitCache.walker.pathEntryAtCommit(commit, path);
       if (entry === undefined || entry.kind === "dir") return {};
       if (entry.kind === "submodule") {
         return { note: `${path} is a submodule (gitlink) pointing at commit ${entry.oid}` };
       }
       try {
-        let text = await this.host.gitCache.readTextBlob(entry.oid, entry.referencedBy, path);
+        let text = await this.host.gitCache.walker.readTextBlob(entry.oid, entry.referencedBy, path);
         // A symlink's blob is its target, so the note names it (the shape readFile throws).
         return entry.kind === "symlink" ? { note: `${path} is a symlink to ${text}` }
             : { text, kind: entry.kind };
@@ -386,7 +387,7 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
       if (overlay.has(path)) {
         // An overlay file keeps its base entry's mode (the one a commit would write, see
         // GitStore.writeChangedFilesAsCommit); a new one is a regular file.
-        let baseEntry = await this.host.gitCache.pathEntryAtCommit(base, path);
+        let baseEntry = await this.host.gitCache.walker.pathEntryAtCommit(base, path);
         const value = overlay.get(path);
         newSide = typeof value === "string" ? { text: value,
           kind: baseEntry?.kind === "executable" ? "executable" : "file" } : {note: "binary content changed"};

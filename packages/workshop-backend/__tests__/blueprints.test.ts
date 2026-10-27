@@ -176,12 +176,12 @@ async function parentsOf(impl: any, commitId: string): Promise<string[]> {
 
 /** The releases that a commit in the workspace's store marks as merged. */
 function releasesMarkedBy(impl: any, commitId: string): string[] {
-  return releasesMergedBy(impl.gitCache.readLocalObject(commitId).payload, commitId);
+  return releasesMergedBy(impl.gitCache.walker.readLocalObject(commitId).payload, commitId);
 }
 
 /** The names of a commit's headers, in order. */
 function headerNames(impl: any, commitId: string): string[] {
-  let text = new TextDecoder().decode(impl.gitCache.readLocalObject(commitId).payload);
+  let text = new TextDecoder().decode(impl.gitCache.walker.readLocalObject(commitId).payload);
   return text.slice(0, text.indexOf("\n\n")).split("\n").map(line => line.split(" ")[0]);
 }
 

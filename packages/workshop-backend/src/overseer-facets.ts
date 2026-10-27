@@ -501,7 +501,7 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
     if (worktree) {
       // Uploads use root filenames. Reserve base and overlay root names (including directories)
       // without loading file contents, so an upload cannot overwrite agent-created work.
-      for (const entry of await this.gitCache.listCommitTreePaths(worktree.pinBase)) used.add(entry.path);
+      for (const entry of await this.gitCache.walker.listCommitTreePaths(worktree.pinBase)) used.add(entry.path);
       const content = await this.getCurrentChatContent(chatId, this.getChatMetaOrThrow(chatId));
       for (const path of content.get(worktree.id)?.keys() ?? []) used.add(path.split("/")[0]);
     }

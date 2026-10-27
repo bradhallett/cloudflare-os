@@ -91,6 +91,20 @@ export function workspaceCapFrom(answer: EntitlementsAnswer): WorkspaceCapGate {
 }
 
 /**
+ * The refusal every workspace-cap gate throws when {@link workspaceCapFrom} folded
+ * `unavailable` — a bound port that failed must not hand out workspaces past a cap it couldn't
+ * read. `refusedVerb` ("created", "transferred", …) names the refused action in the message the
+ * user sees; the message lives here, once, beside the fold, so the gates consume it instead of
+ * restating it.
+ */
+export function refuseUnverifiableWorkspaceCap(gate: WorkspaceCapGate, refusedVerb: string): void {
+  if (gate.status === "unavailable") {
+    throw new Error(
+        `Your plan couldn't be verified, so the workspace wasn't ${refusedVerb}. Please try again.`);
+  }
+}
+
+/**
  * Whether an {@link EntitlementsAnswer} lets spend continue past the exhausted allowance: only
  * a resolved plan that allows overage does. An unbound deployment is hard-capped exactly as
  * pre-port code was, and an unavailable port keeps the block — overage is granted by no outage.

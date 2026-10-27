@@ -483,7 +483,7 @@ export abstract class OverseerChanges extends OverseerPublishing {
           if (base === undefined) continue;
           for (let [path, fileChange] of entries) {
             if ("edit" in fileChange || content.get(Number(key))?.has(path)) continue;
-            await this.gitCache.assertWorktreePathWritable(base, path);
+            await this.gitCache.walker.assertWorktreePathWritable(base, path);
           }
         }
       }

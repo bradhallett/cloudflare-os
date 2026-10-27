@@ -37,7 +37,8 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { ConnectHandoff, GatekeeperConnectCallback, GatekeeperUser } from "@gadgets/workshop-shared/gatekeeper";
 import { createWorkshopLogger } from "../observability";
-import { CLOUDFLARE_VENDOR_ID, type UserDurableObject } from "../user.js";
+import { CLOUDFLARE_VENDOR_ID } from "../user-accounts.js";
+import type { UserDurableObject } from "../user.js";
 import { readAdminConfig } from "../admin-config.js";
 import {
   CONNECT_FLOW_LIFETIME_MS, handoffTargetOrigin, hashPresentedSecret, newSecretToken,

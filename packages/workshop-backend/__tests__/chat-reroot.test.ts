@@ -355,7 +355,7 @@ describe("accepting a re-rooted chat", () => {
         .toEqual({ outcome: "merged" });
     let accepted = head(impl);
     expect((await impl.gitStore.readCommitObject(accepted)).parent).toEqual([merge, release]);
-    expect(releasesMergedBy(impl.gitCache.readLocalObject(accepted).payload, accepted))
+    expect(releasesMergedBy(impl.gitCache.walker.readLocalObject(accepted).payload, accepted))
         .toEqual([release]);
     expect(impl.storage.gadgets.get(GADGET).upstream)
         .toEqual({ blueprintId: "blueprint-id", commitId: release });

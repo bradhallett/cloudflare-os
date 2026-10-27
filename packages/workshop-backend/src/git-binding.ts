@@ -81,11 +81,11 @@ class InMemoryWorktree implements WorktreeTurnAccess, WorktreeSessionHost {
 
   async readFile(_worktreeId: unknown, path: string): Promise<string | undefined> {
     const textOf = (value: FileContent) => typeof value === "string" ? value
-      : this.gitCache.readTextBlob(value.oid, undefined, path);
+      : this.gitCache.walker.readTextBlob(value.oid, undefined, path);
     let existing = this.#files.get(path);
     if (existing !== undefined) return textOf(existing);
     if (this.#removed.has(path)) return undefined;
-    let text = await this.gitCache.readFileAtCommitIfExists(this.base, path);
+    let text = await this.gitCache.walker.readFileAtCommitIfExists(this.base, path);
     // A concurrent call may have written or deleted the file while the read was in flight;
     // its change wins over the base text.
     if (this.#files.has(path)) return textOf(this.#files.get(path)!);
@@ -125,15 +125,15 @@ export class GitImpl extends RpcTarget implements Git {
   }
 
   async newWorktree(commitId: string): Promise<Worktree> {
-    let base = await this.host.gitCache.fetchCommit(commitId);
+    let base = await this.host.gitCache.walker.fetchCommit(commitId);
     let worktree = new InMemoryWorktree(this.host.gitCache, this.host.gitStore, base);
     return new WorktreeSessionImpl(worktree, IN_MEMORY_WORKTREE_ID, worktree, this.author);
   }
 
   async readCommit(commitId: string): Promise<CommitMetadata> {
-    let oid = this.host.gitCache.resolveCommitId(commitId);
+    let oid = this.host.gitCache.walker.resolveCommitId(commitId);
     // Pulls only the commit object itself, if absent -- unlike newWorktree, which wants the tree.
-    await this.host.gitCache.ensureObject(oid, { type: "commit" });
+    await this.host.gitCache.walker.ensureObject(oid, { type: "commit" });
     let commit = await this.host.gitStore.readCommitObject(oid);
     return {
       parents: commit.parent,

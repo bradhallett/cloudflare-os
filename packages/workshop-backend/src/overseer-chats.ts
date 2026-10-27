@@ -477,12 +477,12 @@ export abstract class OverseerChats extends OverseerCore {
         content.state.workspacePath === undefined) {
       throw new Error("Chat attachment has no stored content.");
     }
-    const entry = await this.gitCache.pathEntryAtCommit(
+    const entry = await this.gitCache.walker.pathEntryAtCommit(
         content.state.workspaceCommitId, content.state.workspacePath);
     if (!entry || entry.kind === "dir" || entry.kind === "submodule") {
       throw new Error("Chat attachment content is missing from Git.");
     }
-    return (await this.gitCache.ensureObject(entry.oid,
+    return (await this.gitCache.walker.ensureObject(entry.oid,
       {type: "blob", referencedBy: entry.referencedBy})).payload;
   }
 

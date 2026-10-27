@@ -9,7 +9,8 @@ import type { OverseerDurableObject } from "../src/overseer.js";
 import { WorktreeSessionImpl, type WorktreeSessionHost } from "../src/worktree-session";
 import type { WorktreeTurnAccess } from "../src/agent";
 import { formatUnifiedDiff } from "../src/agent";
-import { MAX_GIT_OBJECT_SIZE, WorkspaceGitCache } from "../src/git-cache";
+import { WorkspaceGitCache } from "../src/git-cache";
+import { MAX_GIT_OBJECT_SIZE } from "../src/git-walker";
 import { GitStore } from "../src/git-store";
 import { makeOverseerStorage } from "../src/storage-schema/overseer-storage";
 import { concatBytes } from "../src/git-codec";
@@ -178,7 +179,7 @@ function makeLocalHarness(
       getBufferedHead: () => undefined,
       getOverlayFiles: () => new Map(),
       getRemovedPaths: () => new Set(),
-      readFile: async (_id, path) => cache.readFileAtCommitIfExists(pinBase, path),
+      readFile: async (_id, path) => cache.walker.readFileAtCommitIfExists(pinBase, path),
       appendChange: () => { throw new Error("read-only test"); },
       appendCommit: () => { throw new Error("read-only test"); },
     };
@@ -207,8 +208,8 @@ describe("listFiles", () => {
     const commit = await commitFiles(impl, {"a.txt": "same text\n"});
     const before = [...impl.storage.gitObjects.list()];
     const [a, b] = await Promise.all([
-      impl.gitCache.fileBytesAtCommit(commit, "a.txt"),
-      impl.gitCache.fileBytesAtCommit(commit, "a.txt"),
+      impl.gitCache.walker.fileBytesAtCommit(commit, "a.txt"),
+      impl.gitCache.walker.fileBytesAtCommit(commit, "a.txt"),
     ]);
     expect(a).toEqual(b);
     addChat(impl, 1);
@@ -249,13 +250,13 @@ describe("listFiles", () => {
     const commit = await session.commit("binary replacement");
     await turn.barrier();
     expect(impl.getWorktreeRecord(id).headCommit).toBe(commit);
-    const value = await impl.gitCache.fileBytesAtCommit(commit, "image.bin");
+    const value = await impl.gitCache.walker.fileBytesAtCommit(commit, "image.bin");
     expect(impl.gitStore.readBlob(value.oid, value.byteLength)).toEqual(Uint8Array.of(0, 5, 0, 3, 4));
     await expect(session.readFile("image.bin")).rejects.toThrow(/Binary/);
     await session.deleteFile("image.bin");
     const deleted = await session.commit("delete binary");
     await turn.barrier();
-    expect(await impl.gitCache.fileBytesAtCommit(deleted, "image.bin")).toBeUndefined();
+    expect(await impl.gitCache.walker.fileBytesAtCommit(deleted, "image.bin")).toBeUndefined();
   }));
   it("surfaces all five entry kinds, non-recursively and recursively",
       () => withImpl(async impl => {
@@ -605,7 +606,7 @@ describe("commit and diff", () => {
 
     // Eager objects, in-memory head: the record advances only at the barrier (a crash -- or an
     // abort -- before it leaves the head unchanged and the commit dangling harmlessly).
-    expect(impl.gitCache.hasLocalObject(commit)).toBe(true);
+    expect(impl.gitCache.walker.hasLocalObject(commit)).toBe(true);
     expect(impl.storage.gadgets.get(id)!.headCommit).toBe(c1);
     expect(await session.diff()).toBe("");  // HEAD now reads as the buffered commit
 
@@ -695,15 +696,15 @@ describe("commit and diff", () => {
 
     await session.writeFile("run.sh", "#!/bin/sh\necho run2\n");
     let commit = await session.commit("edit the script");
-    expect((await impl.gitCache.pathEntryAtCommit(commit, "run.sh"))!.kind)
+    expect((await impl.gitCache.walker.pathEntryAtCommit(commit, "run.sh"))!.kind)
         .toBe("executable");
-    expect((await impl.gitCache.pathEntryAtCommit(commit, "link.md"))!.kind).toBe("symlink");
-    expect((await impl.gitCache.pathEntryAtCommit(commit, "vendored"))!.kind)
+    expect((await impl.gitCache.walker.pathEntryAtCommit(commit, "link.md"))!.kind).toBe("symlink");
+    expect((await impl.gitCache.walker.pathEntryAtCommit(commit, "vendored"))!.kind)
         .toBe("submodule");
     // New files default to regular non-executable.
     await session.writeFile("plain.txt", "text\n");
     let commit2 = await session.commit("add a file");
-    expect((await impl.gitCache.pathEntryAtCommit(commit2, "plain.txt"))!.kind).toBe("file");
+    expect((await impl.gitCache.walker.pathEntryAtCommit(commit2, "plain.txt"))!.kind).toBe("file");
   }));
 
   it("diff() renders unified diffs of the overlay against a commit", () => withImpl(async impl => {

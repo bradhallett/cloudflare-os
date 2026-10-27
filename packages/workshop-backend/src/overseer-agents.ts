@@ -689,7 +689,7 @@ export abstract class OverseerAgents extends OverseerMainline {
       if (attachmentFiles.size) {
         await this.getCurrentChatContent(chatId, this.getChatMetaOrThrow(chatId));
         for (const path of attachmentFiles.keys()) {
-          await this.gitCache.assertWorktreePathWritable(scratchWorktree.pinBase, path);
+          await this.gitCache.walker.assertWorktreePathWritable(scratchWorktree.pinBase, path);
         }
       }
     } else {

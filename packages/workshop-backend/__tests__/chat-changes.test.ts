@@ -1252,7 +1252,7 @@ describe("updateChatFromMainline", () => {
       let head = impl.storage.gadgets.get(1)!.commitId!;
       let merged = (await filesAt(impl, head))["big.txt"];
       expect(merged).toContain(wide);
-      expect(await impl.gitCache.readFileAtCommit(head, "big.txt")).toBe(merged);
+      expect(await impl.gitCache.walker.readFileAtCommit(head, "big.txt")).toBe(merged);
     }));
   });
 

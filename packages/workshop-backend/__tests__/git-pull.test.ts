@@ -46,7 +46,7 @@ async function inOverseer(
     const gitPull = vi.fn(async () => transfer);
     impl.getGatekeeperFacet = vi.fn(async () => ({gitPull}));
     const cache: WorkspaceGitCache = impl.gitCache;
-    await test(cache, (oids, options) => cache["puller"].pull(GATEKEEPER, oids, options), gitPull);
+    await test(cache, (oids, options) => cache.walker["puller"].pull(GATEKEEPER, oids, options), gitPull);
     expect(transfer[Symbol.dispose]).toHaveBeenCalledOnce();
   });
 }
@@ -63,8 +63,8 @@ describe("Git pull consumption through the Overseer delegate", () => {
       expect(gitPull).toHaveBeenCalledExactlyOnceWith([COMMIT_1], OPTIONS);
       expect(transfer.stream).toHaveBeenCalledOnce();
       expect(transfer.status).toHaveBeenCalledOnce();
-      expect(cache.hasLocalObject(COMMIT_1)).toBe(true);
-      expect(cache.readLocalObject(COMMIT_1)?.type).toBe("commit");
+      expect(cache.walker.hasLocalObject(COMMIT_1)).toBe(true);
+      expect(cache.walker.readLocalObject(COMMIT_1)?.type).toBe("commit");
       expect((await cache.readForGatekeeper(GATEKEEPER, COMMIT_1))?.type).toBe("commit");
       expect(await cache.readForGatekeeper(GATEKEEPER + 1, COMMIT_1)).toBeNull();
     });
@@ -75,8 +75,8 @@ describe("Git pull consumption through the Overseer delegate", () => {
     await inOverseer("missing-batch-object", transfer, async (cache, pull) => {
       await expect(pull([COMMIT_1, MISSING_OID], OPTIONS))
           .rejects.toThrow(`git fetch did not provide the requested objects: ${MISSING_OID}`);
-      expect(cache.hasLocalObject(COMMIT_1)).toBe(true);
-      expect(cache.hasLocalObject(MISSING_OID)).toBe(false);
+      expect(cache.walker.hasLocalObject(COMMIT_1)).toBe(true);
+      expect(cache.walker.hasLocalObject(MISSING_OID)).toBe(false);
     });
   });
 
@@ -98,7 +98,7 @@ describe("Git pull consumption through the Overseer delegate", () => {
     await inOverseer(`filtered-blob-${filterBlobSize}`, transfer, async (cache, pull) => {
       await expect(pull([MISSING_OID], {...OPTIONS, type: "blob", filterBlobSize}))
           .resolves.toBeUndefined();
-      expect(cache.hasLocalObject(MISSING_OID)).toBe(false);
+      expect(cache.walker.hasLocalObject(MISSING_OID)).toBe(false);
     });
   });
 
@@ -137,7 +137,7 @@ describe("Git pull consumption through the Overseer delegate", () => {
     await inOverseer(`incomplete-${state}`, transfer, async (cache, pull) => {
       await expect(pull([COMMIT_1], OPTIONS))
           .rejects.toThrow(`git fetch ended without a completed transfer (${state})`);
-      expect(cache.hasLocalObject(COMMIT_1)).toBe(true);
+      expect(cache.walker.hasLocalObject(COMMIT_1)).toBe(true);
     });
   });
 

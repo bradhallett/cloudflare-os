@@ -61,7 +61,7 @@ import diff3Merge from "diff3";
 import type { Collection } from "@gadgets/typed-storage";
 import type { AiChatAuthorInfo, CommitIdentity, CommitInfo } from "@gadgets/workshop-shared/api";
 import type { GitObjectRecord } from "./storage-schema/overseer-storage";
-import { decodeBlobText, MAX_GIT_OBJECT_SIZE } from "./git-cache";
+import { decodeBlobText, MAX_GIT_OBJECT_SIZE } from "./git-walker";
 import type { BytesRef, FileContent } from "@gadgets/workshop-shared/code-change";
 import {
   decodeLooseObject,
