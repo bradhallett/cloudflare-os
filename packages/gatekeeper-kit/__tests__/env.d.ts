@@ -5,18 +5,26 @@
 // wrangler.jsonc of its own, so there is no generated `worker-configuration.d.ts` to carry them.
 
 import type { TrackerHost } from "./workerd/worker.js";
+import type { BaseHooks, BaseTestCallback, FakeAccount } from "./workerd/account-base.js";
 import type { ConformanceAccount, ConformanceResource } from "./workerd/conformance/gatekeeper.js";
 
 declare global {
   namespace Cloudflare {
     interface GlobalProps {
       mainModule: typeof import("./workerd/worker.js");
-      durableNamespaces: "TrackerHost" | "ConformanceAccount" | "ConformanceResource";
+      durableNamespaces:
+        | "TrackerHost"
+        | "ConformanceAccount"
+        | "ConformanceResource"
+        | "FakeAccount"
+        | "BaseHooks";
     }
     interface Env {
       TRACKER_HOST: DurableObjectNamespace<TrackerHost>;
       CONFORMANCE_ACCOUNT: DurableObjectNamespace<ConformanceAccount>;
       CONFORMANCE_RESOURCE: DurableObjectNamespace<ConformanceResource>;
+      FAKE_ACCOUNT: DurableObjectNamespace<FakeAccount>;
+      BASE_HOOKS: DurableObjectNamespace<BaseHooks>;
     }
   }
 }

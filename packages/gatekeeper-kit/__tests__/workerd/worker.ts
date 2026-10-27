@@ -2,7 +2,9 @@
 
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { ObserverTracker } from "../../src/observers";
+import { BaseHooks, BaseTestCallback, FakeAccount } from "./account-base";
 export { ConformanceAccount, ConformanceResource, ConformanceVerifier } from "./conformance/gatekeeper";
+export { BaseHooks, BaseTestCallback, FakeAccount };
 
 type VerifierProps = { allowed: readonly string[]; dropVerdicts?: number };
 

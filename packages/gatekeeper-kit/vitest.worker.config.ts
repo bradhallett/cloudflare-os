@@ -13,6 +13,8 @@ export default defineConfig({
         TRACKER_HOST: { className: "TrackerHost", useSQLite: true },
         CONFORMANCE_ACCOUNT: { className: "ConformanceAccount", useSQLite: true },
         CONFORMANCE_RESOURCE: { className: "ConformanceResource", useSQLite: true },
+        FAKE_ACCOUNT: { className: "FakeAccount", useSQLite: true },
+        BASE_HOOKS: { className: "BaseHooks", useSQLite: true },
       },
     },
   })],

@@ -25,6 +25,7 @@
     "./hook-delivery-queue": "./src/hook-delivery-queue.ts",
     "./http-errors": "./src/http-errors.ts",
     "./observers": "./src/observers.ts",
+    "./oauth-account": "./src/oauth-account.ts",
     "./oauth-client": "./src/oauth-client.ts",
     "./outcome-unknown": "./src/outcome-unknown.ts",
     "./preview-oauth": "./src/preview-oauth.ts",
