@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CredentialCoordinator,
   CredentialsExpiredError,
@@ -12,6 +12,7 @@ import {
   OAuthClient,
   type OAuthClientOptions,
   type OAuthGrant,
+  type OAuthTokens,
   OAuthResponseError,
   oauthRefresh,
 } from "../src/oauth-client";
@@ -34,6 +35,13 @@ function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status, headers: { "Content-Type": "application/json" },
   });
+}
+
+/** The RFC 7636 §4.2 S256 derivation, recomputed independently of the code under test. */
+async function s256(verifier: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return btoa(String.fromCharCode(...new Uint8Array(digest)))
+    .replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
 }
 
 /** A fake provider endpoint recording every request it answers. */
@@ -272,12 +280,19 @@ describe("OAuthClient request shape", () => {
 });
 
 describe("PKCE", () => {
-  it("creates an S256 pair from 32 bytes by default", async () => {
+  it("creates an S256 pair from 32 bytes by default, pinned to the digest it must derive", async () => {
     const pkce = await createPkce();
     expect(pkce.codeVerifier).toMatch(/^[A-Za-z0-9_-]{43}$/);
-    expect(pkce.codeChallenge).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(pkce.codeChallenge).toBe(await s256(pkce.codeVerifier));
     expect(pkce.codeChallengeMethod).toBe("S256");
     expect((await createPkce()).codeVerifier).not.toBe(pkce.codeVerifier);
+  });
+
+  it("derives the RFC 7636 Appendix B known-answer vector", async () => {
+    // s256 above recomputes the derivation independently, so pinning it to the published
+    // vector pins createPkce's digest-and-encode glue end to end.
+    expect(await s256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"))
+      .toBe("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
   });
 
   it("bounds the verifier at 32 to 96 bytes", async () => {
@@ -285,6 +300,52 @@ describe("PKCE", () => {
     for (const verifierBytes of [31, 97, 32.5]) {
       await expect(createPkce({ verifierBytes })).rejects.toThrow(/32 to 96/);
     }
+  });
+});
+
+describe("token response parsing", () => {
+  // Every row goes through the public token path (exchangeCode), so the body meets the same
+  // parsing a live provider's answer does; the clock is frozen so requestedAt is known.
+  async function exchange(body: unknown, options: Partial<OAuthClientOptions> = {}): Promise<OAuthTokens> {
+    const { fetch } = provider(() => json(body));
+    const client = new OAuthClient({ ...BASE, ...options, fetch });
+    return client.exchangeCode({ code: "c", redirectUri: REDIRECT_URI, codeVerifier: "v" });
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers({ now: 1_000_000 });
+  });
+
+  it("accepts expires_in as a numeric string", async () => {
+    const tokens = await exchange({ access_token: "at", expires_in: "3600" });
+    expect(tokens.expiresAt).toBe(1_000_000 + 3_600_000);
+  });
+
+  it("falls back to defaultExpiresIn when expires_in is unusable, or reports no expiry", async () => {
+    for (const expires_in of ["1e3", 1e308, 0, -5, null]) {
+      const tokens = await exchange({ access_token: "at", expires_in }, { defaultExpiresIn: 60 });
+      expect(tokens.expiresAt).toBe(1_000_000 + 60_000);
+    }
+    expect((await exchange({ access_token: "at" })).expiresAt).toBeUndefined();
+  });
+
+  it("splits scope on the configured separator and drops empties", async () => {
+    expect((await exchange({ access_token: "at", scope: "read  write" })).scopes)
+      .toEqual(["read", "write"]);
+    expect((await exchange({ access_token: "at", scope: "read,write,," }, { scopeSeparator: "," })).scopes)
+      .toEqual(["read", "write"]);
+  });
+
+  it("carries the standard fields and the raw body through", async () => {
+    const tokens = await exchange({
+      access_token: "at", token_type: "Bearer", refresh_token: "", id_token: "id", vendor_field: 7,
+    });
+    expect(tokens.tokenType).toBe("Bearer");
+    expect(tokens.idToken).toBe("id");
+    expect(tokens.refreshToken).toBeUndefined();
+    expect(tokens.raw).toEqual({
+      access_token: "at", token_type: "Bearer", refresh_token: "", id_token: "id", vendor_field: 7,
+    });
   });
 });
 
