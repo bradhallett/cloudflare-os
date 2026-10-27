@@ -1,11 +1,12 @@
 import { cloudflareTest } from "@cloudflare/vitest-plugin";
+import { COMPATIBILITY_DATE } from "@gadgets/scripts/worker-config";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   plugins: [
     cloudflareTest({
       miniflare: {
-        compatibilityDate: "2026-09-04",
+        compatibilityDate: COMPATIBILITY_DATE,
         // nodejs_als enables observability context; experimental enables the Reporter stub below
         // and the streaming_tail_worker flag (which workerd refuses without experimental mode).
         compatibilityFlags: ["experimental", "nodejs_als", "streaming_tail_worker"],
@@ -18,7 +19,9 @@ export default defineConfig({
         workers: [{
           name: "span-sink",
           modules: true,
-          compatibilityDate: "2026-09-04",
+          compatibilityDate: COMPATIBILITY_DATE,
+          // The sink opts into the streaming tail path (workerd refuses tailStream without it;
+          // see tracing.test.ts's header) — the same experimental mode the main pool enables.
           compatibilityFlags: ["streaming_tail_worker"],
           // The no-op tail() silences workerd's legacy tail delivery, which it attempts alongside
           // the streaming path.

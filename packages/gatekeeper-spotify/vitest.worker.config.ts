@@ -1,6 +1,9 @@
 import { cloudflareTest } from "@cloudflare/vitest-plugin";
 import capnwebValidate from "capnweb-validate/vite";
 import { defineConfig } from "vitest/config";
+import deployed from "./cloudflare.config.ts";
+
+const { compatibilityDate, compatibilityFlags } = deployed.worker;
 
 /**
  * The workerd project: the account Durable Object's credentials and pinned subject, and the
@@ -14,9 +17,8 @@ export default defineConfig({
     cloudflareTest({
       main: "./__tests__/workerd/worker.ts",
       miniflare: {
-        // Kept in step with wrangler.jsonc; a drift here tests a runtime we do not deploy.
-        compatibilityDate: "2026-09-04",
-        compatibilityFlags: ["allow_irrevocable_stub_storage"],
+        compatibilityDate,
+        compatibilityFlags,
         modulesRules: [
           { type: "Text", include: ["**/*.txt", "**/*.svg"] },
         ],

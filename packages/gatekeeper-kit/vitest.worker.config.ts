@@ -1,4 +1,5 @@
 import { cloudflareTest } from "@cloudflare/vitest-plugin";
+import { COMPATIBILITY_DATE } from "@gadgets/scripts/worker-config";
 import { defineConfig } from "vitest/config";
 
 /** These suites require workerd-only APIs and persistent verifier-stub storage. */
@@ -6,7 +7,7 @@ export default defineConfig({
   plugins: [cloudflareTest({
     main: "./__tests__/workerd/worker.ts",
     miniflare: {
-      compatibilityDate: "2026-09-04",
+      compatibilityDate: COMPATIBILITY_DATE,
       compatibilityFlags: ["allow_irrevocable_stub_storage"],
       durableObjects: {
         TRACKER_HOST: { className: "TrackerHost", useSQLite: true },

@@ -49,10 +49,15 @@ export default {
 
     for (const key of Object.keys(env)) {
       if (!key.startsWith("GATEKEEPER_")) continue;
+      // A GATEKEEPER_* binding need not carry a fetch entrypoint — GATEKEEPER_EMAIL is an
+      // EmailEntrypoint with no fetch — so one without falls through to the routes below
+      // (an unknown path to the backend/assets) instead of throwing at the call.
+      const binding = env[key] as Partial<Fetcher> | undefined;
+      if (typeof binding?.fetch !== "function") continue;
       const suffix = key.slice("GATEKEEPER_".length).toLowerCase().replaceAll("_", "-");
       const prefix = `/gatekeeper/${suffix}`;
       if (url.pathname === prefix || url.pathname.startsWith(prefix + "/")) {
-        return (env[key] as Fetcher).fetch(req);
+        return binding.fetch(req);
       }
     }
 

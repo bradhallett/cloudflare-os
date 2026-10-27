@@ -19,6 +19,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { AwsClient } from "aws4fetch";
 import { assetR2Key, moduleR2Key, type ReleaseManifest } from "./manifest-lib.ts";
+import { mapConcurrent } from "../map-concurrent.ts";
 
 const UPLOAD_CONCURRENCY = 8;
 
@@ -66,33 +67,25 @@ async function main() {
     })),
   ];
 
-  let uploaded = 0;
-  let skipped = 0;
-  const queue = [...blobs];
-  async function worker() {
-    for (;;) {
-      const blob = queue.shift();
-      if (!blob) return;
-      const head = await client.fetch(keyUrl(blob.key), { method: "HEAD" });
-      if (head.status === 200) {
-        skipped++;
-        continue;
-      }
-      if (head.status !== 404) {
-        throw new Error(`HEAD ${blob.key}: unexpected status ${head.status}`);
-      }
-      const put = await client.fetch(keyUrl(blob.key), {
-        method: "PUT",
-        body: readFileSync(blob.path),
-      });
-      if (!put.ok) {
-        throw new Error(`PUT ${blob.key}: ${put.status} ${await put.text()}`);
-      }
-      uploaded++;
+  // The per-blob work (HEAD-skip, PUT) is the callback; the fan-out — bounded, every task awaited,
+  // every failure reported — is mapConcurrent's. True means uploaded this run, false already present.
+  const uploads = await mapConcurrent(blobs, UPLOAD_CONCURRENCY, async (blob) => {
+    const head = await client.fetch(keyUrl(blob.key), { method: "HEAD" });
+    if (head.status === 200) return false;
+    if (head.status !== 404) {
+      throw new Error(`HEAD ${blob.key}: unexpected status ${head.status}`);
     }
-  }
-  await Promise.all(Array.from({ length: UPLOAD_CONCURRENCY }, worker));
-  console.log(`blobs: ${uploaded} uploaded, ${skipped} already present`);
+    const put = await client.fetch(keyUrl(blob.key), {
+      method: "PUT",
+      body: readFileSync(blob.path),
+    });
+    if (!put.ok) {
+      throw new Error(`PUT ${blob.key}: ${put.status} ${await put.text()}`);
+    }
+    return true;
+  });
+  const uploaded = uploads.filter((result) => result).length;
+  console.log(`blobs: ${uploaded} uploaded, ${uploads.length - uploaded} already present`);
 
   const manifestKey =
     `${args.candidate ? "candidates" : "releases"}/${manifest.releaseId}/manifest.json`;
