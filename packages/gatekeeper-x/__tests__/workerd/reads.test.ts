@@ -436,7 +436,7 @@ describe("pending actions in reads", () => {
     unwrap(await hooks().run(name, props, [["createThread", [{ text: "Draft one" }, { text: "Draft two" }]]]));
     const later = new Date(Date.now() + 60_000);
     const ids = async (...steps: Step[]) =>
-      (unwrap(await hooks().run(name, props, steps, { pages: 1 })) as XPostInfo[][])[0].map(post => post.id);
+      (unwrap(await hooks().run(name, props, steps, { pages: 1 })) as XPostInfo[][]).flat().map(post => post.id);
     expect(await ids(["listMyPosts", { startTime: later }])).toEqual([]);
     expect(await ids(["listMyPosts", { endTime: later }])).toEqual(["~2", "~1"]);
     // A pending post's replies are all pending too, and the bounds hold for them as well.
@@ -448,8 +448,8 @@ describe("pending actions in reads", () => {
     const { x, props, name } = await setup();
     unwrap(await hooks().run(name, props, [["createPost", { text: "Draft one" }]]));
     const since = async (sinceId: string) =>
-      (unwrap(await hooks().run(name, props, [["listMyPosts", { sinceId }]], { pages: 1 })) as XPostInfo[][])[0]
-        .map(post => post.text);
+      (unwrap(await hooks().run(name, props, [["listMyPosts", { sinceId }]], { pages: 1 })) as XPostInfo[][])
+        .flat().map(post => post.text);
     expect(await since("~1")).toEqual([]);
     const [{ actionId }] = (await hooks().queueLog(name)).submitted;
     unwrap(await hooks().applyAction(name, props, actionId));
@@ -485,8 +485,8 @@ describe("pending actions in reads", () => {
     unwrap(await hooks().run(name, props, [["createPost", { text: "Second thoughts" }]]));
     unwrap(await hooks().run(name, props, [["getPost", "~1"], ["delete"]]));
     expect(failure(await hooks().run(name, props, [["getPost", "~1"], ["getInfo"]]))).toBe("This post has been deleted.");
-    const [page] = unwrap(await hooks().run(name, props, [["listMyPosts"]], { pages: 1 })) as XPostInfo[][];
-    expect(page).toEqual([]);
+    const pages = unwrap(await hooks().run(name, props, [["listMyPosts"]], { pages: 1 })) as XPostInfo[][];
+    expect(pages).toEqual([]);
   });
 
   it("shows a pending repost among the account's posts, unless reposts are excluded", async () => {
@@ -498,7 +498,7 @@ describe("pending actions in reads", () => {
       id: post.id, author: expect.objectContaining({ username: "alice" }),
       repostOf: expect.objectContaining({ id: post.id, text: "worth sharing", author: expect.objectContaining({ username: "bob" }) }),
     })]);
-    const [withoutReposts] = unwrap(await hooks().run(name, props, [["listMyPosts", { excludeReposts: true }]], { pages: 1 })) as XPostInfo[][];
+    const withoutReposts = unwrap(await hooks().run(name, props, [["listMyPosts", { excludeReposts: true }]], { pages: 1 })) as XPostInfo[][];
     expect(withoutReposts).toEqual([]);
   });
 
@@ -513,8 +513,8 @@ describe("pending actions in reads", () => {
     expect(all.map(item => item.createdAt)).toEqual([new Date(staged)]);
     // A post ID stands for the time it encodes; a Date can't cross into the faked clock's Durable Object.
     const since = { sinceId: snowflakeAt(staged + 1000) };
-    const [later] = unwrap(await hooks().run(name, props, [["listMyPosts", since]], { pages: 1 })) as XPostInfo[][];
-    expect(later).toEqual([]);
+    const laterPages = unwrap(await hooks().run(name, props, [["listMyPosts", since]], { pages: 1 })) as XPostInfo[][];
+    expect(laterPages).toEqual([]);
   });
 
   it("authorizes the profiles of a pending List's members, which were read from X", async () => {

@@ -10,6 +10,7 @@ import {
   ArrayCursor,
   OffsetCursor,
   PageHookCursor,
+  requestedPageSize,
   PageNumberCursor,
   TokenCursor,
   type TokenPage,
@@ -93,6 +94,20 @@ describe("ArrayCursor", () => {
   it("rejects a page size that would never terminate", () => {
     expect(() => new ArrayCursor([1], 0)).toThrow(/positive safe integer/);
     expect(() => new ArrayCursor([1], 1.5)).toThrow(/positive safe integer/);
+  });
+});
+
+describe("requestedPageSize", () => {
+  it("answers the fallback when the caller requested none, and clamps the rest to one remote page", () => {
+    expect(requestedPageSize(undefined)).toBe(50);
+    expect(requestedPageSize(undefined, 20)).toBe(20);
+    expect(requestedPageSize({ resultsPerPage: 7 })).toBe(7);
+    expect(requestedPageSize({ resultsPerPage: 500 })).toBe(100);
+  });
+
+  it("refuses a request a cursor could never terminate on", () => {
+    expect(() => requestedPageSize({ resultsPerPage: 0 })).toThrow(/resultsPerPage must be a positive integer/);
+    expect(() => requestedPageSize({ resultsPerPage: 2.5 })).toThrow(/resultsPerPage must be a positive integer/);
   });
 });
 

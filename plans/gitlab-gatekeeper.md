@@ -42,9 +42,11 @@ bump, stub removal, config, secrets). See [Commit sequence](#commit-sequence).
   `types.txt` symlink, `gitlab-configurators.ts`, `configurator/*`, `observability.ts`,
   `storage-schema.md`), same class structure (`GatekeeperVendor`, `UserAccount`,
   `GatekeeperUserImpl`, `GitLabVerifier`, `GitLabGatekeeperImpl`, `GitLabProjectSessionImpl`,
-  `GitLabIssueImpl`, `GitLabMergeRequestImpl`), same storage-key scheme (`counter:*`, `action:*`,
-  `retiredAction:*`, `provisional:*`, `diffAlias:*`, `cache:*` with a generation counter; GitHub's
-  incremental discussion sync state has no counterpart, as a thread is read whole), same cursor
+  `GitLabIssueImpl`, `GitLabMergeRequestImpl`), same storage-key scheme (`counter:*` for
+  provisional ids, the gatekeeper-kit `ActionJournal`'s `nextActionId`/`action:*`/
+  `retained:action:*`/`applied:action:*`, `provisional:*`, `diffAlias:*`, `cache:*` with a
+  generation counter; GitHub's incremental discussion sync state has no counterpart, as a thread
+  is read whole), same cursor
   classes, same test layout (node suite + workerd suite with a `TestHooks` DO). Diverge
   only where GitLab's API forces it, and record every divergence in §5's table. Rationale:
   reviewers already know the GitHub shape, a fix found in one port applies to the other, and
@@ -685,8 +687,8 @@ in `github.ts` is the checklist. Divergences:
   branches), the GitHub "approve the push first" guard kept for a `400`/`409` when the source
   branch has a queued push; `changeState` → `PUT {state_event}`; `addLabels`/`removeLabels` →
   `PUT {add_labels}` / `{remove_labels}` — atomic deltas, so a label a human added meanwhile is
-  never clobbered; `previousLabels` is captured for revert; `postComment` → `POST …/notes`,
-  revert info `{type: "note", kind, noteId}`;
+  never clobbered; `previousLabels` is captured for revert; `postComment` → `POST …/notes`, the
+  created note's id kept on the action (`createdNoteId`) for revert;
   `postReview` → the live head checked against `revision.headSha`, then `approve {sha:
   revision.headSha}` first for `"approve"` (the one step with a compare-and-swap and the one
   whose failure is expected — a 409 for a moved head — so it runs before anything is posted),
@@ -694,12 +696,13 @@ in `github.ts` is the checklist. Divergences:
   requested_changes}` — refused while the unpaginated `GET …/draft_notes` shows drafts of the
   user's own, checked before the drafts are created and again just before publishing — and for
   the other two a `PUT …/draft_notes/:id/publish` per draft; the summary goes last, as a plain
-  note (locked decision). Every step records itself on the action record (`ReviewProgress`: the
-  approval's provenance, each comment's draft, the bulk publish, the summary), and a step GitLab
-  could carry out without its answer arriving is recorded as under way first (`"approving"`,
-  `"creating"`): a retry asks GitLab what became of it — the approvals read, a held draft with the
-  same body and anchor — before repeating it, so a lost answer neither duplicates a comment nor
-  strands a draft that a later `requestChanges` would take for the user's. The summary alone is
+  note (locked decision). Every step records itself on the action, through the journal
+  (`ReviewProgress`: the approval's provenance, each comment's draft, the bulk publish, the
+  summary), and a step GitLab could carry out without its answer arriving is recorded as under
+  way first (`"approving"`, `"creating"`): a retry asks GitLab what became of it — the approvals
+  read, a held draft with the same body and anchor — before repeating it, so a lost answer
+  neither duplicates a comment nor strands a draft that a later `requestChanges` would take for
+  the user's. The summary alone is
   posted again after a lost answer: no search can tell its lost post from an earlier note in the
   same words, and taking one for the other would leave the summary silently unposted.
   A discard takes back what the review left unpublished: its parked
@@ -720,10 +723,14 @@ in `github.ts` is the checklist. Divergences:
   it" (`sha` mismatch) — or, when the bound `sha` is the head a queued push to the source branch
   will leave, "approve that push first", the same ordering guard as the create's —, `422` "the
   branch cannot be merged", `401` "no permission to merge";
-  `push` → §7. Every branch ends `#markActionApproved` + `#clearCaches()`. An action already
-  recorded as applied reports success — the overseer records completion only after the reply, so
-  a lost one re-delivers the apply (GitHub does this for `push` alone) — and one a reject cascade
-  retired explains that it, or something it depended on, was discarded.
+  `push` → §7. Every branch returns the action as dispatched — artifacts it created ride back
+  on it (a note's id as `createdNoteId`) — and the journal retains it applied, clears the
+  caches, and, before any provider call, claims the record: an activation that dies mid-dispatch
+  can never re-deliver an unbound effect (a 5xx or lost claim is terminal unknown-outcome;
+  pushes, merges, and reviews re-check what the attempt left, so they stay appliable). An action
+  already recorded as applied reports success — the overseer records completion only after the
+  reply, so a lost one re-delivers the apply (GitHub does this for `push` alone) — and one a
+  reject cascade retired explains that it, or something it depended on, was discarded.
 - **Revert**: `setTitle`/`setBody`/`changeState` → `PUT` with the previous value;
   `addLabels` → `PUT {remove_labels}` of only the labels the action *introduced* (those not in
   `previousLabels`), `removeLabels` → `PUT {add_labels}` of only those it *removed* (those in
@@ -829,6 +836,24 @@ in `github.ts` is the checklist. Divergences:
   incremental sync state: threads are read whole (locked decision), so GitHub's
   `discussionComments:*` and `pullReviewComments:*` have no counterpart. All documented in
   `storage-schema.md` from the code, not from GitHub's doc.
+
+- **Action store, label revert, page-size clamp — converged (were divergences)**: both
+  gatekeepers now keep their actions in the kit's `ActionJournal` (same keys, claim protocol,
+  capacity bound — the hand-rolled `action:`/`retiredAction:` state machines are deleted), both
+  revert label actions as deltas of what the action actually changed, and both clamp a caller's
+  `resultsPerPage` through the kit's `requestedPageSize`. A fix to any of these lands in the kit
+  or is ported same-day; neither side carries a private variant.
+- **Hooks — deliberate gap, not parity**: GitHub ships an event-hook surface GitLab does not
+  (`GitHubHookController`, `bindEventHook`, `subscribe()` on the project/issue/pull facets).
+  GitLab has server-side webhooks and pre-receive hooks of its own; porting GitHub's client-side
+  surface is a feature decision, not a porting step, and stays out of scope until asked for.
+- **Cursors**: `StreamingCursor` is unserialized and has no identity dedupe on GitHub, while
+  GitLab's is serialized and dedupes by `identity` with `revalidateInjected`. GitHub's adoption
+  of the kit cursor needs a per-provider-row overlay/drop hook the kit does not yet expose;
+  until then the implementations are siblings, not copies, and concurrency or dedupe fixes must
+  be checked against both.
+- **ETags**: GitHub caches with conditional GETs; GitLab's REST does not reliably answer
+  conditional requests, so its cache is TTL-only (see `storage-schema.md`).
 
 ### 7. Git operations — worktree support
 

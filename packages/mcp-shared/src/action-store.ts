@@ -2,6 +2,7 @@
 // database; claims are persisted before external I/O so an interrupted write is never replayed.
 
 import { callMayHaveTakenEffect, type McpClient, type McpToolCallResult } from "./client.js";
+import { APPLY_OUTCOME_UNKNOWN_MESSAGE } from "@gadgets/gatekeeper-kit/actions";
 import type { McpLog } from "./log.js";
 import type { StoredAction } from "./session.js";
 import { toCallResult } from "./tools.js";
@@ -40,12 +41,13 @@ function fromRow(row: ActionRow): StoredAction {
   };
 }
 
-/** Reported when a claim expired: the call was dispatched but its outcome was never observed. */
-export const APPLY_OUTCOME_UNKNOWN_MESSAGE =
-  "This call was interrupted after it had been sent, so it may or may not have taken effect. " +
-  "Check the server before trying it again.";
-
-/** Stores queued MCP actions in one facet-local SQLite table. */
+/**
+ * Stores queued MCP actions in one facet-local SQLite table. The gatekeeper-kit
+ * `ActionJournal` (`@gadgets/gatekeeper-kit/actions`) is the same lifecycle for git-style
+ * connectors -- same claim-before-dispatch discipline and unknown-outcome message -- over the
+ * KV storage those connectors keep; prefer it for new action stores that are not facet-local
+ * SQLite.
+ */
 export class ActionStore {
   #sql: SqlStorage;
 
@@ -156,9 +158,7 @@ export class ActionStore {
       const mayHaveLanded = callMayHaveTakenEffect(err);
       stored.state = "failed";
       stored.retryable = !mayHaveLanded;
-      stored.error = mayHaveLanded
-        ? "This call failed after it had been sent, so it may or may not have taken effect. " +
-          "Check the server before staging it again."
+      stored.error = mayHaveLanded ? APPLY_OUTCOME_UNKNOWN_MESSAGE
         : err instanceof Error ? err.message : String(err);
       this.#save(stored);
       this.#prune();

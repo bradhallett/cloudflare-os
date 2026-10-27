@@ -89,6 +89,10 @@ const PROJECTED: readonly JournalState[] = ["pending", "claimed"];
 
 const UNDECIDED: readonly JournalState[] = ["pending"];
 
+// Module-level so a scan view keeps one identity across calls -- a fresh literal per call would
+// defeat an identity-keyed cache of scan results.
+const FAILED: readonly JournalState[] = ["failed"];
+
 // The version distinguishes kit records from legacy rows that may have the same shape, so it skips
 // 1: a port whose own pre-kit rows carry `v: 1` would have them read as kit records, bypassing
 // `upgradeRecord`. Unmarked rows must go through it.
@@ -145,9 +149,10 @@ export class ActionJournal<A> {
   readonly #appliedIdsKey: string;
   readonly #upgradeRecord?: (raw: unknown) => A | undefined;
   readonly #maxPending: number;
-  // Pending projections, cached per states-view (the module's PROJECTED/UNDECIDED constants key
-  // it, so it holds at most two entries) until the next record mutation clears it: one activation
-  // may project the same set several times, and every projection is otherwise a full storage walk.
+  // Pending projections, cached per states-view (the module's PROJECTED/UNDECIDED/FAILED constants
+  // key it, so it holds at most three entries) until the next record mutation clears it: one
+  // activation may project the same set several times, and every projection is otherwise a full
+  // storage walk.
   readonly #pendingCache = new Map<readonly JournalState[], readonly JournalEntry<A>[]>();
 
   /**
@@ -203,19 +208,136 @@ export class ActionJournal<A> {
    */
   allocate(action: A, fence?: ActionFence): number {
     this.#requireCapacity();
+    const id = this.#reserve();
+    this.#write(this.#pendingKey(id),
+      { state: "staged", action, ...(fence ? { fence: { generation: fence.generation } } : {}) });
+    return id;
+  }
+
+  /**
+   * Reserves the next action ID without staging a record, for a connector whose action payload
+   * embeds its own ID and so is built after the ID exists. A reserved ID nothing stages is
+   * skipped by every later reservation; `stage` cannot tell it from one just reserved (both sit
+   * below the id counter, unoccupied), so a caller stages only IDs it reserved itself.
+   * @returns Reserved action ID.
+   */
+  reserveId(): number {
+    this.#requireCapacity();
+    return this.#reserve();
+  }
+
+  /**
+   * Issues every action ID up to and including `id`, for a connector whose caller numbered the
+   * action itself (a hand-built payload) instead of reserving first. Ids already issued are a
+   * no-op; `stage` still refuses one a record occupies.
+   * @param id The action ID the caller carried.
+   */
+  reserveThrough(id: number): void {
+    const next = this.#kv.get<number>(this.#nextIdKey) ?? 1;
+    if (id >= next) this.#kv.put(this.#nextIdKey, id + 1);
+  }
+
+  /**
+   * Stages an action at an ID `reserveId` returned or `reserveThrough` issued. The check is
+   * positional, not a reservation registry: any unoccupied ID below the counter passes, so the
+   * pairing is the caller's to keep -- one a record already occupies is refused outright.
+   * @param id Reserved action ID.
+   * @param action Payload to store.
+   * @param fence Connection generation the staging operation ran under.
+   */
+  stage(id: number, action: A, fence?: ActionFence): void {
+    this.#requireCapacity();
+    if (!Number.isInteger(id) || id < 1 || id >= (this.#kv.get<number>(this.#nextIdKey) ?? 1)) {
+      throw new Error(`Action ${id} was not reserved by this journal's id counter.`);
+    }
+    if (this.#occupied(id)) {
+      throw new Error(`Action ${id} was already issued; reserve a fresh id.`);
+    }
+    this.#write(this.#pendingKey(id),
+      { state: "staged", action, ...(fence ? { fence: { generation: fence.generation } } : {}) });
+  }
+
+  /**
+   * Adopts a record written by the storage this journal replaces, verbatim. For a one-time port
+   * only: it bypasses the capacity bound -- the records being adopted already hold their slots,
+   * so a port cannot be refused for a limit it is only about to start enforcing -- and the
+   * reserved-id rule, since the ids were issued by the store being replaced. Every other
+   * invariant holds: the ID must be free at both tiers and absent from retired memory, an
+   * `applied` record lands in the retained tier, and every other state in the pending one.
+   * @param id Adopted action ID.
+   * @param record Record as the previous store held it.
+   */
+  adopt(id: number, record: JournalRecord<A>): void {
+    if (!Number.isInteger(id) || id < 1) {
+      throw new Error(`Cannot adopt an action id of ${id}.`);
+    }
+    // Only a record this journal wrote (or retired memory) blocks the id: a raw legacy row at
+    // the target key is exactly what adoption replaces, and refusing it would force a port into
+    // delete-then-adopt -- a crash between the two loses the action. The adopt overwrites the
+    // legacy row in place.
+    if (this.hasRecord(id) || this.wasApplied(id)) {
+      throw new Error(`Action ${id} was already issued; cannot adopt over it.`);
+    }
+    this.#write(record.state === "applied" ? this.#retainedKey(id) : this.#pendingKey(id), record);
+  }
+
+  /**
+   * Whether this journal itself wrote a record at the id, at either tier. A one-time port
+   * resumed after a crash uses it to tell an id it already adopted from one still held as
+   * legacy storage: `get` cannot, because it reads convertible legacy rows as records too.
+   * @param id Action ID to check.
+   * @returns Whether a journal-written record holds the id.
+   */
+  hasRecord(id: number): boolean {
+    return this.#isJournalRow(this.#pendingKey(id)) || this.#isJournalRow(this.#retainedKey(id));
+  }
+
+  /** @returns Whether the row at a key is one this journal wrote, not legacy storage. */
+  #isJournalRow(key: string): boolean {
+    const raw: unknown = this.#kv.get<unknown>(key);
+    return typeof raw === "object" && raw !== null && "v" in raw && raw.v === JOURNAL_VERSION;
+  }
+
+  /**
+   * Replaces a pending-tier record's payload in place, keeping its state, fence, and failure
+   * reason. For a connector whose queue or dispatch mutates what a stored action carries --
+   * apply-time intermediates a retry resumes from, an edit rebased onto the text the provider
+   * stored -- where the record's lifecycle position must not move. No-op for an id with no
+   * pending-tier record: a retained one is `retain`'s to replace, alongside its promotion.
+   * @param id Action ID to update.
+   * @param action Replacement payload.
+   */
+  update(id: number, action: A): void {
+    const key = this.#pendingKey(id);
+    const record = this.#read(key);
+    if (record !== undefined) this.#write(key, { ...record, action });
+  }
+
+  /**
+   * Reserves the next id, refusing one the counter has already issued.
+   * @returns Reserved action ID.
+   */
+  #reserve(): number {
     const id = this.#kv.get<number>(this.#nextIdKey) ?? 1;
     // Occupancy or retired-id memory at this id means the counter is behind -- a port pointed
     // `nextIdKey` at a last-issued counter. Raw reads, not `get`: a legacy row `upgradeRecord`
     // cannot convert still occupies the id, and staging over it would corrupt a live or settled id.
-    if (this.#kv.get(this.#pendingKey(id)) !== undefined
-      || this.#kv.get(this.#retainedKey(id)) !== undefined || this.wasApplied(id)) {
+    if (this.#occupied(id) || this.wasApplied(id)) {
       throw new Error(`Action ${id} was already issued; `
         + `"${this.#nextIdKey}" must hold the next unused id, not the last issued one.`);
     }
     this.#kv.put(this.#nextIdKey, id + 1);
-    this.#write(this.#pendingKey(id),
-      { state: "staged", action, ...(fence ? { fence: { generation: fence.generation } } : {}) });
     return id;
+  }
+
+  /**
+   * Whether any record or retired memory occupies an id.
+   * @param id Action ID to check.
+   * @returns Whether the id is issued.
+   */
+  #occupied(id: number): boolean {
+    return this.#kv.get(this.#pendingKey(id)) !== undefined
+      || this.#kv.get(this.#retainedKey(id)) !== undefined;
   }
 
   /**
@@ -423,6 +545,16 @@ export class ActionJournal<A> {
    */
   listUndecided(): JournalEntry<A>[] {
     return this.#scan(UNDECIDED);
+  }
+
+  /**
+   * @returns Failed actions still held for the explanations they carry -- a discarded action
+   * awaiting its user-visible rejection, a dispatch whose outcome was never reported. Ordinary
+   * failures prunable under the capacity bound come and go; an `undispatched` or unknown-outcome
+   * one holds its slot until rejected, and `remove` on rejection is what releases it.
+   */
+  listFailed(): JournalEntry<A>[] {
+    return this.#scan(FAILED);
   }
 
   /**

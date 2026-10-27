@@ -7,7 +7,7 @@
 import { RpcStub, RpcTarget } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import type { ApprovalQueue, Cursor } from "@gadgets/workshop-shared/gatekeeper";
-import { SessionGitCache } from "@gadgets/gatekeeper-kit/cursors";
+import { SessionGitCache, requestedPageSize } from "@gadgets/gatekeeper-kit/cursors";
 import { commitIdsOfSummary, isCommitOid } from "@gadgets/gatekeeper-kit/git-objects";
 import { validateBranchName } from "@gadgets/gatekeeper-kit/git-transport";
 import type { EntityKind } from "./gitlab-action-types";
@@ -42,21 +42,6 @@ import type {
   GitLabProjectMetadata,
   GitLabTagSummary,
 } from "./types";
-
-/**
- * The page size a listing serves per `next()`: the caller's `resultsPerPage`, or the method's
- * default (50; 20 for the diff reads, whose rows are large). Checked once here, at the RPC
- * boundary -- every cursor-returning session method routes through it -- because the cursors
- * assume a positive integer: a zero page would make one cursor answer `[]` forever and another
- * `null` at once, hiding a non-empty result. Capped at one remote page (100), which is also the
- * most a `next()` buffers.
- */
-function pageSize(options: GitLabPageOptions | undefined, fallback = 50): number {
-  const requested = options?.resultsPerPage;
-  if (requested === undefined) return fallback;
-  if (!Number.isInteger(requested) || requested < 1) throw new Error("resultsPerPage must be a positive integer.");
-  return Math.min(requested, 100);
-}
 
 // Exported (like the impls below) for the workerd wiring tests, which instantiate sessions
 // directly against fake gatekeepers -- see __tests__/workerd/session-git.test.ts.
@@ -124,7 +109,7 @@ export class GitLabProjectSessionImpl extends RpcTarget implements GitLabProject
       title: `List issues`,
       description: `List issues in the GitLab project.`,
     });
-    return await this.#gatekeeper.listIssues(options, pageSize(options));
+    return await this.#gatekeeper.listIssues(options, requestedPageSize(options));
   }
 
   async searchIssues(query: GitLabIssueSearch): Promise<Cursor<GitLabIssueSummary>> {
@@ -132,7 +117,7 @@ export class GitLabProjectSessionImpl extends RpcTarget implements GitLabProject
       title: `Search issues for "${query.text}"`,
       description: `Search issues in the GitLab project for "${query.text}".`,
     });
-    return await this.#gatekeeper.searchIssues(query, pageSize(query));
+    return await this.#gatekeeper.searchIssues(query, requestedPageSize(query));
   }
 
   async listMergeRequests(options?: GitLabMergeRequestFilter): Promise<Cursor<GitLabMergeRequestSummary>> {
@@ -141,7 +126,7 @@ export class GitLabProjectSessionImpl extends RpcTarget implements GitLabProject
       description: `List merge requests in the GitLab project.`,
     });
     const cursor = await this.#gatekeeper.listMergeRequests(
-      options, pageSize(options), await this.#gitCache.stub());
+      options, requestedPageSize(options), await this.#gitCache.stub());
     return await this.#gitCache.wrap(cursor, commitIdsOfMergeRequestSummary);
   }
 
@@ -151,7 +136,7 @@ export class GitLabProjectSessionImpl extends RpcTarget implements GitLabProject
       description: `Search merge requests in the GitLab project for "${query.text}".`,
     });
     const cursor = await this.#gatekeeper.searchMergeRequests(
-      query, pageSize(query), await this.#gitCache.stub());
+      query, requestedPageSize(query), await this.#gitCache.stub());
     return await this.#gitCache.wrap(cursor, commitIdsOfMergeRequestSummary);
   }
 
@@ -160,7 +145,7 @@ export class GitLabProjectSessionImpl extends RpcTarget implements GitLabProject
       title: `List branches`,
       description: `List branches in the GitLab project.`,
     });
-    const cursor = await this.#gatekeeper.listBranches(options, pageSize(options));
+    const cursor = await this.#gatekeeper.listBranches(options, requestedPageSize(options));
     return await this.#gitCache.wrap(cursor, branch => [branch.headCommit]);
   }
 
@@ -169,7 +154,7 @@ export class GitLabProjectSessionImpl extends RpcTarget implements GitLabProject
       title: `List tags`,
       description: `List tags in the GitLab project.`,
     });
-    const cursor = await this.#gatekeeper.listTags(pageSize(options));
+    const cursor = await this.#gatekeeper.listTags(requestedPageSize(options));
     return await this.#gitCache.wrap(cursor, tag => [tag.commit]);
   }
 
@@ -226,7 +211,7 @@ export class GitLabProjectSessionImpl extends RpcTarget implements GitLabProject
       description: `List commits in the GitLab project.`,
     });
     const cursor = await this.#gatekeeper.listCommits(
-      options, pageSize(options), await this.#gitCache.stub());
+      options, requestedPageSize(options), await this.#gitCache.stub());
     return await this.#gitCache.wrap(cursor, commitIdsOfSummary);
   }
 }
@@ -316,7 +301,7 @@ export abstract class GitLabIssuableImpl extends RpcTarget implements GitLabIssu
       title: `Read discussion for ${this.#reference()}`,
       description: `Read the discussion thread for ${this.#reference()}.`,
     });
-    return await this.gatekeeper.issueDiscussion(this.kind, this.logicalId, pageSize(options));
+    return await this.gatekeeper.issueDiscussion(this.kind, this.logicalId, requestedPageSize(options));
   }
 
   async postComment(bodyMarkdown: string): Promise<void> {
@@ -375,7 +360,7 @@ export class GitLabMergeRequestImpl extends GitLabIssuableImpl implements GitLab
       description: `Read the diff for merge request !${this.logicalId}.`,
     });
     const diff = await this.gatekeeper.mergeRequestDiff(
-      this.logicalId, pageSize(options, 20), await this.#gitCache.stub());
+      this.logicalId, requestedPageSize(options, 20), await this.#gitCache.stub());
     await this.#gitCache.advertise([diff.revision.baseSha, diff.revision.headSha, diff.revision.mergeBaseSha ?? ""]);
     return diff;
   }
@@ -385,7 +370,7 @@ export class GitLabMergeRequestImpl extends GitLabIssuableImpl implements GitLab
       title: `Read diff threads for !${this.logicalId}`,
       description: `Read diff discussion threads for merge request !${this.logicalId}.`,
     });
-    return await this.gatekeeper.mergeRequestThreads(this.logicalId, pageSize(options, 20));
+    return await this.gatekeeper.mergeRequestThreads(this.logicalId, requestedPageSize(options, 20));
   }
 
   async postReview(review: GitLabMergeRequestReviewDraft): Promise<void> {
@@ -433,7 +418,7 @@ export class GitLabMergeRequestImpl extends GitLabIssuableImpl implements GitLab
       description: `List the commits of merge request !${this.logicalId}.`,
     });
     const cursor = await this.gatekeeper.mergeRequestCommits(
-      this.logicalId, pageSize(options), await this.#gitCache.stub());
+      this.logicalId, requestedPageSize(options), await this.#gitCache.stub());
     return await this.#gitCache.wrap(cursor, commitIdsOfSummary);
   }
 

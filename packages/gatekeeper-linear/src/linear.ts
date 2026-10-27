@@ -22,8 +22,8 @@ import {
   type ActionDescriptionBuilder, buildDescription, plainInline, type RenderedDescription,
 } from "@gadgets/gatekeeper-kit/action-description";
 import {
-  APPLY_OUTCOME_UNKNOWN_MESSAGE, ActionOutcomeUnknownError,
-} from "@gadgets/gatekeeper-kit/actions";
+  applyClaimedAction, markOutcomeUnknown, type ClaimedActionStore,
+} from "@gadgets/gatekeeper-kit/outcome-unknown";
 import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import {
   commitReconnectOrThrow, ConnectionSubject, pinForConnect, stageReconnect,
@@ -1636,24 +1636,8 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
   }
 
   async applyAction(actionId: number): Promise<void> {
-    const action = this.ctx.storage.kv.get<StoredAction>(`action:${actionId}`);
-    if (!action) throw new Error(`Unknown action: ${actionId}`);
-    // The Workshop marks its side approved only after this RPC returns, so a replayed apply
-    // (restart, retry, duplicate click) settles here instead of dispatching again.
-    if (action.status === "applied") return;
-    // A terminal failure answers every later attempt with the same message, no Linear call.
-    if (action.status === "failed") throw new Error(action.failure ?? "This action previously failed.");
-    // A claim left behind means a previous dispatch's outcome is unknown: the call may have
-    // reached Linear. Record it terminally and surface it — never silently re-run a write.
-    if (action.status === "claimed") throw this.#failUnknownOutcome(action);
-
-    // Claim before the first Linear call: the record durably says a dispatch began, so an
-    // interrupted apply can never be mistaken for never-run. The claim is written onto the same
-    // object the dispatch's own mid-flight puts reuse, so those carry it too.
-    action.status = "claimed";
-    this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, action);
-    this.#invalidatePendingActions();
-    try {
+    const store = this.#actionStore();
+    await applyClaimedAction(store, actionId, async action => {
       await this.#run(async api => {
         switch (action.kind) {
           case "createIssue": {
@@ -1663,7 +1647,7 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
             if (action.input.labelIds) action.input.labelIds = action.input.labelIds.map(id => this.#requireLabelId(id));
             const issue = await api.createIssue(action.input);
             action.createdIssueId = issue.id;
-            this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, action);
+            store.putAction(action);
             this.ctx.storage.kv.put<string>(`provisional:${action.provisionalId}`, issue.id);
             break;
           }
@@ -1694,7 +1678,7 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
           case "postComment": {
             const comment = await api.createComment(this.resolveIssueRef(action.issueRef), action.body);
             action.createdCommentId = comment.id;
-            this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, action);
+            store.putAction(action);
             break;
           }
           case "createLabel": {
@@ -1702,7 +1686,7 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
               teamId: action.teamId, name: action.name, color: action.color, description: action.description,
             });
             action.createdLabelId = label.id;
-            this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, action);
+            store.putAction(action);
             // Map the provisional label id to the real one, so dependent addLabels can resolve it.
             this.ctx.storage.kv.put<string>(`provisionalLabel:${action.synthetic.id}`, label.id);
             // The team's real label set changed; drop the cache so the new label shows promptly.
@@ -1714,38 +1698,29 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
             break;
         }
       });
-    } catch (error) {
-      if (isLinearOutcomeUnknown(error)) {
-        // No definitive answer arrived, so the write may have landed. Record the action terminally
-        // with the reason and surface it; a rejection clears the record after the user checks.
-        const message = `${APPLY_OUTCOME_UNKNOWN_MESSAGE} (${error instanceof Error ? error.message : String(error)})`;
-        this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, { ...action, status: "failed", failure: message });
-        this.#invalidatePendingActions();
-        throw new ActionOutcomeUnknownError(message);
-      }
-      // Linear answered with a refusal (or the failure is internal): the write did not land, so
-      // the record goes back to pending and the failure stays retryable, as before.
-      this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, { ...action, status: "pending" });
-      this.#invalidatePendingActions();
-      throw error;
-    }
-
-    // Mark applied and keep the record (so revert can find it). The change is now real, so the
-    // simulation overlay (which considers pending and claimed actions) stops applying it.
-    action.status = "applied";
-    this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, action);
-    this.#invalidatePendingActions();
+      // Mark applied and keep the record (so revert can find it). The change is now real, so the
+      // simulation overlay (which considers pending and claimed actions) stops applying it.
+      action.state = "applied";
+      store.putAction(action);
+    }, isLinearOutcomeUnknown);
   }
 
   /**
-   * Records that the outcome of a dispatched action cannot be known, and returns the error that
-   * surfaces it. Terminal: only a rejection clears the record.
+   * The Linear action records as the kit's claim loop drives them: `applyClaimedAction` speaks
+   * `state`, these rows speak `status`, and this adapter is the whole translation.
    */
-  #failUnknownOutcome(action: StoredAction): ActionOutcomeUnknownError {
-    this.ctx.storage.kv.put<StoredAction>(
-      `action:${action.id}`, { ...action, status: "failed", failure: APPLY_OUTCOME_UNKNOWN_MESSAGE });
-    this.#invalidatePendingActions();
-    return new ActionOutcomeUnknownError(APPLY_OUTCOME_UNKNOWN_MESSAGE);
+  #actionStore(): ClaimedActionStore<StoredAction & { state: ActionStatus }> {
+    return {
+      getAction: id => {
+        const action = this.ctx.storage.kv.get<StoredAction>(`action:${id}`);
+        return action === undefined ? undefined : { ...action, state: action.status };
+      },
+      putAction: record => {
+        const { state, ...action } = record;
+        this.ctx.storage.kv.put<StoredAction>(`action:${action.id}`, { ...action, status: state });
+        this.#invalidatePendingActions();
+      },
+    };
   }
 
   // Recursively drop every pending action that depends on a rejected provisional issue: edits and
@@ -1773,7 +1748,7 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
     if (action.status === "applied") throw new Error(`Linear action ${actionId} is no longer pending.`);
     // A claim left behind means a dispatched write whose outcome is unknown: settle it terminally
     // and say so, never silently discard a write that may have reached Linear.
-    if (action.status === "claimed") throw this.#failUnknownOutcome(action);
+    if (action.status === "claimed") throw markOutcomeUnknown(this.#actionStore(), { ...action, state: "claimed" });
     // Rejecting a terminal failure is the user clearing the settled record: its write already
     // concluded, so there is nothing to cascade and nothing to restart.
     if (action.status === "failed") {
