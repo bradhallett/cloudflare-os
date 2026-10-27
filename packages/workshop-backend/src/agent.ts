@@ -1,3 +1,9 @@
+// =======================================================================================
+// The agent loop (runAgent): drives one model conversation over a turn's session state —
+// prompting, running tool batches, persisting steps for replay, compacting, and retrying
+// transient failures. Prompt assembly lives in agent-prompt.ts, the tool surface in
+// agent-tools.ts, and the replay interpreter in agent-replay.ts.
+
 import { AiChatAuthorInfo, AiToolCall, type AiModelConfig } from "@gadgets/workshop-shared/api";
 
 import { createWorkshopLogger } from "./observability";
@@ -41,10 +47,6 @@ type AgentPassOutcome =
 
 // =======================================================================================
 
-// Locates `textToReplace` in `content`, enforcing editFile's exactly-one-match contract. The
-// returned position is also where the live tool anchors its exact-span change.
-
-/** The line window a readFile call asked for (see AiToolCall's readFile input). */
 
 /** How many times one agent turn retries a model request that failed transiently. */
 const TRANSIENT_FAILURE_RETRIES = 2;
@@ -147,11 +149,6 @@ async function runAgentPass(
            (sequence === lastMeasuredSequence && message.role === "toolResult"))))
     : estimateProjectionTokens(projection) +
         Math.ceil(getSystemMessageText(systemMessage).length / 4);
-
-  // Wraps a plain-text tool result (the exact text the model sees) with optional recorded notes
-  // (see AiToolCall: observedCodeVersion, recorded output) riding along as pi `details` for the
-  // turn_end persister to merge into the chat log. Success data rides details; error-path notes
-  // go through session.toolCallNotes instead, because pi drops `details` for thrown errors.
 
   // The built-in tools, closures over the turn session (see agent-tools.ts).
   let tools = buildTools({session, hooks, chatId, author, initiator});

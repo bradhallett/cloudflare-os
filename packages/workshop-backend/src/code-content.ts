@@ -16,7 +16,7 @@ import type { CodeChange, CodeContent, FileContent } from "@gadgets/workshop-sha
  * sequence.)
  *
  * Callers: the overseer's change ingestion (`seedWorktreeEditBases` and the prefetch/apply pair
- * in overseer-core.ts) and the agent's replay (agent.ts) -- the latter deliberately applies the
+ * in overseer-core.ts) and the agent's replay (agent-replay.ts) -- the latter deliberately applies the
  * identical rule so replay reconstructs byte-identical content.
  *
  * @param content The content map the change will apply to.
