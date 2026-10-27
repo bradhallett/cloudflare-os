@@ -55,9 +55,10 @@ The action store is gatekeeper-kit's `ActionJournal` over the keys this gatekeep
   provider call; a `failed` record carries why, and `outcome: "unknown"` marks one whose effect
   may exist at GitHub (an interrupted unbound dispatch).
 - `retained:action:<approvalId>` -> the record once applied: `{ action, state: "applied" }`, the
-  action as dispatched (a created comment's id, for revert, rides on it).
-- `applied:action:` -> ids of retired-but-pruned applied actions, remembered so a replayed
-  resolution settles; bounded to the journal's prunable allowance.
+  action as dispatched (a created comment's id, for revert, rides on it). Every apply sweeps the
+  tier: actions beyond the newest two hundred retire, so it stays bounded.
+- `applied:action:` -> ids of retired applied actions, remembered so a replayed resolution
+  settles; bounded to the journal's prunable allowance.
 - `actionRecordsV2` -> marker that the pre-journal `action:`/`retiredAction:` rows were adopted
   (pending verbatim, applied folded into the retained tier, rejected rewritten as the failure it
   already was); the legacy `retiredAction:` family and the `counter:action` id counter are gone.
