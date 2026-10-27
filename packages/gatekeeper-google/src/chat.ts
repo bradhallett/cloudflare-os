@@ -1418,6 +1418,11 @@ class ChatHookDeliveryImpl extends RpcTarget implements ChatHookDelivery {
 export class GoogleChatGatekeeperImpl
     extends DurableObject<Env, GoogleChatGatekeeperImplProps>
     implements Gatekeeper<ChatSession | ChatSpace | ChatThread> {
+  // One store for the whole object: the journal caches its pending projection per instance, and
+  // a store built per call would keep serving a projection another call's rejection or apply
+  // already changed.
+  #store = new ChatStore(this.ctx.storage);
+
   #self?: ChatUser;
   /** Actions whose apply or undo is in flight: a reject then could not stop a write already sent. */
   #inFlight = new Set<number>();
@@ -1563,7 +1568,7 @@ export class GoogleChatGatekeeperImpl
     return {
       api: this.#api(),
       queue,
-      store: new ChatStore(this.ctx.storage),
+      store: this.#store,
       self,
       ...(boundSpace !== undefined ? { boundSpace } : {}),
       subscribe: (spaceName, threadName, hook) => this.#subscribe(queue, self, spaceName, threadName, hook),
@@ -1595,7 +1600,7 @@ export class GoogleChatGatekeeperImpl
   }
 
   async applyAction(actionId: number): Promise<void> {
-    const store = new ChatStore(this.ctx.storage);
+    const store = this.#store;
     const action = store.get(actionId);
     if (!action) throw new Error(`Unknown pending Google Chat action: ${actionId}`);
     await this.#exclusively(actionId, async () => {
@@ -1627,7 +1632,7 @@ export class GoogleChatGatekeeperImpl
     const { spaceName, newConversation: conversation } = action;
     if (conversation && pendingSpaceRequestId(spaceName) !== undefined) {
       const people = recipients.toSorted().join(",");
-      const created = await this.#settingUp.run(people,
+        const created = await this.#settingUp.run(people,
         () => openConversation(api, store, actionId, people, conversation));
       store.setConversation(conversation.requestId, people, created);
       // A send that joined another's setup still carries any mark from its own earlier attempt.
@@ -1772,7 +1777,7 @@ export class GoogleChatGatekeeperImpl
   }
 
   async rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
-    const store = new ChatStore(this.ctx.storage);
+    const store = this.#store;
     const action = store.get(actionId);
     if (!action) throw new Error(`Unknown pending Google Chat action: ${actionId}`);
     if (this.#inFlight.has(actionId)) {
@@ -1791,7 +1796,7 @@ export class GoogleChatGatekeeperImpl
   }
 
   async revertAction(actionId: number): Promise<RevertResult> {
-    const store = new ChatStore(this.ctx.storage);
+    const store = this.#store;
     const info = store.getRevert(actionId);
     if (!info) {
       return {

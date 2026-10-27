@@ -580,11 +580,12 @@ const CREATED_DOC_TAB_KEY = "createdDocTab";
  * blank document's tab target the created document's first tab, and the cached reads of the blank
  * document are dropped.
  */
-function adoptBlankDocument(kv: DurableObjectStorage["kv"], tabId: string): void {
-  let pendingActions = new ActionJournal<GoogleDocAction>(
-    kv, { namespace: "pending", upgradeRecord: upgradePendingAction });
-  for (let { id, action } of pendingActions.listPending()) {
-    if (action.tabId === BLANK_DOC_TAB_ID) pendingActions.update(id, { ...action, tabId });
+function adoptBlankDocument(kv: DurableObjectStorage["kv"], journal: ActionJournal<GoogleDocAction>,
+    tabId: string): void {
+  // Adopts through the object's own journal: a second instance would leave its cached projection
+  // unaware that these records were retargeted.
+  for (let { id, action } of journal.listPending()) {
+    if (action.tabId === BLANK_DOC_TAB_ID) journal.update(id, { ...action, tabId });
   }
   kv.delete(DOC_SNAPSHOT_KEY);
   kv.delete(DOC_METADATA_REVISION_KEY);
@@ -625,7 +626,7 @@ export class GoogleDocGatekeeperImpl
     // The real class's first start after applyCreation(): take over what the blank document left.
     let tabId = ctx.storage.kv.get<string>(CREATED_DOC_TAB_KEY);
     if (tabId !== undefined && !isSimulated(ctx.props)) {
-      ctx.storage.transactionSync(() => adoptBlankDocument(ctx.storage.kv, tabId));
+      ctx.storage.transactionSync(() => adoptBlankDocument(ctx.storage.kv, this.#journal, tabId));
     }
   }
 

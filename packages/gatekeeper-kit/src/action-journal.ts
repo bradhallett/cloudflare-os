@@ -402,21 +402,6 @@ export class ActionJournal<A> {
   }
 
   /**
-   * Replaces a pending-tier record's payload in place, keeping its state, fence, and failure
-   * reason. For a connector whose queue or dispatch mutates what a stored action carries --
-   * apply-time intermediates a retry resumes from, an edit rebased onto the text the provider
-   * stored -- where the record's lifecycle position must not move. No-op for an id with no
-   * pending-tier record: a retained one is `retain`'s to replace, alongside its promotion.
-   * @param id Action ID to update.
-   * @param action Replacement payload.
-   */
-  update(id: number, action: A): void {
-    const key = this.#pendingKey(id);
-    const record = this.#read(key);
-    if (record !== undefined) this.#write(key, { ...record, action });
-  }
-
-  /**
    * Finds a record, preferring a retained copy after an interrupted move.
    * @param id Action ID to find.
    * @returns The stored record, or `undefined` when absent.
