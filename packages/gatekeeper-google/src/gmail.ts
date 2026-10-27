@@ -614,7 +614,8 @@ class GmailStore {
     const resolved = this.resolveDraftId(id);
     const resource = this.getDraft(resolved);
     this.#kv.delete(this.#draftKey(resolved));
-    for (const [key, target] of this.#kv.list<unknown>({prefix: "gmail:draftAlias:"})) {
+    // Listed up front, as this loop deletes from the listing.
+    for (const [key, target] of [...this.#kv.list<unknown>({prefix: "gmail:draftAlias:"})]) {
       if (target === resolved || key === this.#draftAliasKey(id)) this.#kv.delete(key);
     }
     if (resource) {
