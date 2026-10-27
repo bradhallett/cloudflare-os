@@ -16,28 +16,18 @@ import {
   type SupportedResource,
   type VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
-import { buildDescription, codeSpan } from "@gadgets/gatekeeper-kit/action-description";
 import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import {
   commitReconnectOrThrow, ConnectionSubject, pinForConnect, stageReconnect,
 } from "@gadgets/gatekeeper-kit/credential-stage";
 import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
+import { SupabaseApi, SupabaseApiError, exchangeAuthCode, fetchProfile, refreshAccessToken, revokeRefreshToken, type ProjectResponse, type SupabaseOAuthGrant, type SupabaseProfile } from "./supabase-api";
+import { SupabaseCache } from "./supabase-storage";
 import {
-  SupabaseApi,
-  SupabaseApiError,
-  exchangeAuthCode,
-  fetchProfile,
-  isSupabaseOutcomeUnknown,
-  refreshAccessToken,
-  revokeRefreshToken,
-  type ProjectResponse,
-  type SupabaseOAuthGrant,
-  type SupabaseProfile,
-} from "./supabase-api";
-import { PendingActionStore, SupabaseCache, type StoredExecuteAction } from "./supabase-storage";
-import {
-  APPLY_OUTCOME_UNKNOWN_MESSAGE, ActionOutcomeUnknownError, type ActionJournal,
-} from "@gadgets/gatekeeper-kit/actions";
+  supabaseActions,
+  type SupabaseKinds,
+} from "./supabase-actions";
+import type { BoundActionSet } from "@gadgets/gatekeeper-kit/actions";
 import { describeTable, listSchemas, listTables } from "./supabase-introspection";
 import {
   SupabaseOrganizationConfiguratorUI,
@@ -64,9 +54,7 @@ import TYPES_CODE from "./types.txt";
 import SUPABASE_LOGO_SVG from "./supabase-logo.svg";
 import SUPABASE_PROJECT_CONFIGURATOR_HTML from "./generated/supabase-project-configurator-ui.txt";
 import SUPABASE_ORGANIZATION_CONFIGURATOR_HTML from "./generated/supabase-organization-configurator-ui.txt";
-import { obsContext } from "./observability.js";
-
-const VENDOR_ID = "supabase";
+import { obsContext, VENDOR_ID } from "./observability.js";
 
 const logger = obsContext.createLogger({
   component: "gatekeeper.supabase", vendorId: VENDOR_ID,
@@ -874,7 +862,7 @@ class SupabaseSessionContext {
   readonly approvalQueue: RpcStub<ApprovalQueue>;
   #api: SupabaseApi;
   #cache: SupabaseCache;
-  #pending: PendingActionStore;
+  #actions: BoundActionSet<SupabaseKinds>;
   #noteExpired: () => Promise<void>;
   // Set only for organization bindings (data-set tracking). Given the project ref a project-scoped
   // observation is about to reveal, records it as an observed data set and returns the observer ids
@@ -886,14 +874,14 @@ class SupabaseSessionContext {
     api: SupabaseApi,
     approvalQueue: RpcStub<ApprovalQueue>,
     cache: SupabaseCache,
-    pending: PendingActionStore,
+    actions: BoundActionSet<SupabaseKinds>,
     noteExpired: () => Promise<void>,
     projectObservationHook?: (ref: string) => Promise<ProjectObservationCheck>,
   ) {
     this.#api = api;
     this.approvalQueue = approvalQueue;
     this.#cache = cache;
-    this.#pending = pending;
+    this.#actions = actions;
     this.#noteExpired = noteExpired;
     this.#projectObservationHook = projectObservationHook;
   }
@@ -945,47 +933,12 @@ class SupabaseSessionContext {
   // SupabaseGatekeeperImpl.applyAction() once approved. (The approval contract is between this
   // gatekeeper and the Workshop/approver and is intentionally invisible to the calling Gadget.)
   async submitExecute(ref: string, sql: string, params?: SupabaseValue[]): Promise<void> {
-    const action: StoredExecuteAction = { ref, sql, params, submittedAt: Date.now() };
-    const actionId = this.#pending.submit(action);
-    try {
-      await this.approvalQueue.submitAction(actionId, {
-        title: "Run SQL on Supabase",
-        // A field shows the statement literally, so nothing in it can escape into the prose.
-        ...buildDescription(`Execute a mutating SQL statement against Supabase project ${codeSpan(ref)}.`)
-          .verbatim("SQL", sql, "sql")
-          .json("Parameters", params ?? [])
-          .finish(),
-        // Arbitrary SQL cannot be automatically reverted.
-        implementsRevert: false,
-        // This gatekeeper doesn't simulate writes, so the agent shouldn't continue (and read back
-        // un-applied state) until the user decides on this statement.
-        awaitDecision: true,
-      });
-    } catch (error) {
-      // An auto-approval can apply the action mid-flight, which proves the overseer received it
-      // -- only the reply was lost, and deleting the record would discard a claim or a settled
-      // outcome. Only a still-pending record (or one never handed over) is safe to drop.
-      const record = this.#pending.record(actionId);
-      if (record === undefined || record.state === "pending") this.#pending.remove(actionId);
-      throw error;
-    }
+    await this.#actions.submit(this.approvalQueue, "execute", { ref, sql, params });
   }
 }
 
 // ---------------------------------------------------------------------------
 // GatekeeperImpl DO — per-resource instance, runs as a facet of the Overseer.
-
-/**
- * Records that the outcome of a dispatched SQL run cannot be known, and returns the error that
- * surfaces it. Terminal: only a rejection clears the record.
- */
-function failUnknownOutcome(
-  journal: ActionJournal<StoredExecuteAction>,
-  actionId: number,
-): ActionOutcomeUnknownError {
-  journal.markFailed(actionId, APPLY_OUTCOME_UNKNOWN_MESSAGE, { outcome: "unknown" });
-  return new ActionOutcomeUnknownError(APPLY_OUTCOME_UNKNOWN_MESSAGE);
-}
 
 @validateRpc()
 export class SupabaseGatekeeperImpl extends DurableObject<Env, SupabaseGatekeeperImplProps>
@@ -1026,6 +979,18 @@ export class SupabaseGatekeeperImpl extends DurableObject<Env, SupabaseGatekeepe
     return new SupabaseApi(this.#getAccessToken);
   }
 
+  /**
+   * The SQL lifecycle shared by this object's sessions and RPCs: one journal (and so one
+   * submission lane and one resolution queue) per object storage, from the kit's memo.
+   */
+  protected sqlActions() {
+    return supabaseActions(this.ctx.storage.kv, {
+      runQuery: (ref, sql, params) => this.#makeApi().runQuery(ref, sql, params),
+      noteExpired: async () => { await this.#userAccount().noteCredentialsExpired(); },
+      bumpGeneration: () => new SupabaseCache(this.ctx.storage.kv).bumpGeneration(),
+    });
+  }
+
   #makeContext(approvalQueue: RpcStub<ApprovalQueue>): SupabaseSessionContext {
     // Organization bindings track which projects' data has actually been observed and exclude
     // observers who lack access to them; project bindings are a single ACL unit with nothing to
@@ -1037,7 +1002,7 @@ export class SupabaseGatekeeperImpl extends DurableObject<Env, SupabaseGatekeepe
       this.#makeApi(),
       approvalQueue.dup(),
       new SupabaseCache(this.ctx.storage.kv),
-      new PendingActionStore(this.ctx.storage.kv),
+      this.sqlActions().set,
       async () => { await this.#userAccount().noteCredentialsExpired(); },
       projectObservationHook,
     );
@@ -1144,7 +1109,7 @@ export class SupabaseGatekeeperImpl extends DurableObject<Env, SupabaseGatekeepe
   }
 
   async getAutoApprovableActions() {
-    return [];
+    return this.sqlActions().set.autoApprovableKinds();
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<SupabaseProject | SupabaseOrganization> {
@@ -1162,74 +1127,12 @@ export class SupabaseGatekeeperImpl extends DurableObject<Env, SupabaseGatekeepe
    * known is recorded terminally and surfaced instead.
    */
   async applyAction(actionId: number): Promise<void> {
-    const pending = new PendingActionStore(this.ctx.storage.kv);
-    const journal = pending.journal();
-    // A retired id is remembered as applied, so a replayed approval settles instead of erroring.
-    if (journal.wasApplied(actionId)) return;
-    const record = pending.record(actionId);
-    if (!record) throw new Error(`Unknown pending Supabase action: ${actionId}`);
-    // A terminal failure answers every later attempt with the same message, no SQL.
-    if (record.state === "failed") throw new Error(record.error);
-    // A claim left behind means a previous run's outcome is unknown: the statement may have
-    // reached the database. Record it terminally and surface it — never silently re-run SQL.
-    if (record.state === "claimed") throw failUnknownOutcome(journal, actionId);
-    // Retained rows are settled applies an interrupted retire left behind; finish the removal.
-    if (record.state === "applied") {
-      journal.retire(actionId);
-      return;
-    }
-    // Staged means a submission whose reply was lost; this callback proves the overseer holds
-    // the id, so promote it rather than strand it.
-    journal.markSubmitted(actionId);
-
-    const action = record.action;
-    journal.markClaimed(actionId);
-    try {
-      await this.#makeApi().runQuery(action.ref, action.sql, action.params);
-    } catch (error) {
-      // On expired/revoked credentials, signal the account so the user is prompted to reconnect.
-      // The action stays queued (we don't remove it) so it can be retried after reconnecting.
-      if (error instanceof SupabaseApiError && error.isAuthError) {
-        await this.#userAccount().noteCredentialsExpired();
-        journal.restorePending(actionId);
-        throw new Error("Supabase credentials have expired or been revoked. Reconnect the account, then retry.", { cause: error });
-      }
-      if (isSupabaseOutcomeUnknown(error)) {
-        // No definitive answer arrived, so the statement may have landed. Record the action
-        // terminally with the reason and surface it; a rejection clears the record after the
-        // user checks the database.
-        const message = `${APPLY_OUTCOME_UNKNOWN_MESSAGE} (${error instanceof Error ? error.message : String(error)})`;
-        journal.markFailed(actionId, message, { outcome: "unknown" });
-        throw new ActionOutcomeUnknownError(message);
-      }
-      // Supabase answered with a refusal (or the failure is internal): the statement did not
-      // land, so the record goes back to pending and the failure stays retryable, as before.
-      journal.restorePending(actionId);
-      throw error;
-    }
-    // Settled: retire the record and remember the id, so replays settle rather than re-run.
-    journal.retire(actionId);
-    new SupabaseCache(this.ctx.storage.kv).bumpGeneration();
+    await this.sqlActions().set.apply(actionId);
   }
 
   /** Rejected: discard the queued statement. There is no simulation state to roll back. */
   async rejectAction(actionId: number): Promise<void> {
-    const pending = new PendingActionStore(this.ctx.storage.kv);
-    const journal = pending.journal();
-    const record = pending.record(actionId);
-    if (record?.state === "claimed") {
-      // The SQL may already have run; deleting the record would discard the only trace that it
-      // might have. The user checks the database, then rejects again to clear the failure this
-      // records.
-      throw failUnknownOutcome(journal, actionId);
-    }
-    // Rejecting a recorded failure is the user clearing it after checking; anything else simply
-    // goes. Retire (rather than remove) an applied row so a replayed approval still settles.
-    if (record?.state === "applied") {
-      journal.retire(actionId);
-      return;
-    }
-    journal.remove(actionId);
+    await this.sqlActions().set.reject(actionId);
   }
 
   /**

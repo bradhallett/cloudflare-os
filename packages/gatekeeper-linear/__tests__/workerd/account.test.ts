@@ -167,35 +167,42 @@ describe("the connect link", () => {
     expect(await callback.text()).toContain("That&#39;s a different Linear account");
   });
 });
-
 describe("claim-before-apply", () => {
   // Action records live on the gatekeeper Durable Object, not the account. A create-issue parked
   // mid-dispatch durably says `claimed`, so any later attempt knows the outcome is unknown rather
-  // than never-run. The record is seeded raw — no validated entry point can produce one on demand.
+  // than never-run. The record is seeded raw in the engine journal's shape — no validated entry
+  // point can produce one on demand.
   const claimedAction = {
-    id: 7, kind: "createIssue", provisionalId: "~p7", status: "claimed",
-    input: { teamId: "team-1", title: "Claimed" },
+    v: 2, state: "claimed",
+    action: {
+      kind: "createIssue",
+      payload: {
+        input: { teamId: "team-1", title: "Claimed" }, provisionalId: "~p7",
+        title: "Claimed",
+        presentation: { title: "Claimed", implementsRevert: true, description: "Seeded.", fields: [] },
+      },
+    },
   };
 
-  /** A gatekeeper facet on a fresh connected account, holding `action:7` as given. */
-  async function claimedFacet(facetName: string, action: unknown) {
+  /** A gatekeeper facet on a fresh connected account, holding the given entries verbatim. */
+  async function claimedFacet(facetName: string, entries: Record<string, unknown>) {
     const x = new FakeLinear().install();
     const userObjectId = await seedAccount(x);
     const props: LinearGatekeeperImplProps = {
       userObjectId, workspaceUrlKey: ACME.urlKey, resourceKind: "workspace",
     };
-    await hooks().seedGatekeeper(facetName, props, { "action:7": action });
+    await hooks().seedGatekeeper(facetName, props, entries);
     return { x, props };
   }
 
   it("settles a replayed apply against the claim, never re-running the write", async () => {
-    const { x, props } = await claimedFacet("claim-apply", claimedAction);
+    const { x, props } = await claimedFacet("claim-apply", { "action:7": claimedAction });
 
     const replay = await hooks().applyGatekeeperAction("claim-apply", props, 7);
 
     expect(failure(replay)).toBe(APPLY_OUTCOME_UNKNOWN_MESSAGE);
     expect(await hooks().gatekeeperEntry("claim-apply", props, "action:7"))
-      .toMatchObject({ status: "failed" });
+      .toMatchObject({ state: "failed" });
     // The terminal record answers every later attempt the same way, without a Linear call.
     expect(failure(await hooks().applyGatekeeperAction("claim-apply", props, 7)))
       .toBe(APPLY_OUTCOME_UNKNOWN_MESSAGE);
@@ -203,23 +210,61 @@ describe("claim-before-apply", () => {
   });
 
   it("refuses to reject a claimed action, settling it before an explicit second rejection", async () => {
-    const { props } = await claimedFacet("claim-reject", claimedAction);
+    const { props } = await claimedFacet("claim-reject", { "action:7": claimedAction });
 
     expect(failure(await hooks().rejectGatekeeperAction("claim-reject", props, 7)))
       .toBe(APPLY_OUTCOME_UNKNOWN_MESSAGE);
     expect(await hooks().gatekeeperEntry("claim-reject", props, "action:7"))
-      .toMatchObject({ status: "failed" });
+      .toMatchObject({ state: "failed" });
     // The operator's explicit second choice clears the settled record.
     unwrap(await hooks().rejectGatekeeperAction("claim-reject", props, 7));
     expect(await hooks().gatekeeperEntry("claim-reject", props, "action:7")).toBeUndefined();
   });
 
   it("answers a duplicate apply of an already-applied action with success, no second write", async () => {
-    const { x, props } = await claimedFacet(
-      "claim-applied", { ...claimedAction, status: "applied", createdIssueId: "issue-7" });
+    const applied = {
+      ...claimedAction, state: "applied",
+      action: { ...claimedAction.action, payload: { ...claimedAction.action.payload, createdIssueId: "issue-7" } },
+    };
+    const { x, props } = await claimedFacet("claim-applied", { "retained:action:7": applied });
 
     unwrap(await hooks().applyGatekeeperAction("claim-applied", props, 7));
 
     expect(x.requests.filter(r => (r.body ?? "").includes("issueCreate"))).toHaveLength(0);
+  });
+
+  it("strands dependents of a rejected provider create as failed, never applying them", async () => {
+    // A pending createIssue provides `~1`; a pending updateIssue depends on it. Rejecting the
+    // create must make the update unapplicable: the engine strands it as a failed record whose
+    // reason names the decision, instead of dispatching anything to Linear. (If the dependsOn
+    // wiring in linear-actions.ts were broken, the apply would instead fail with the resolver's
+    // "has not been created on Linear yet" error — a different message.)
+    const presentation = { title: "Seeded", implementsRevert: true, description: "Seeded.", fields: [] };
+    const create = {
+      v: 2, state: "pending",
+      action: {
+        kind: "createIssue",
+        payload: { input: { teamId: "team-1", title: "Parent" }, provisionalId: "~1", title: "Parent",
+          presentation },
+      },
+    };
+    const update = {
+      v: 2, state: "pending",
+      action: {
+        kind: "updateIssue",
+        payload: { issueRef: "~1", input: { title: "New" }, previous: {}, patch: {},
+          title: "Edit parent", presentation },
+      },
+    };
+    const { x, props } = await claimedFacet(
+      "strand-dependents", { "action:1": create, "action:2": update });
+
+    const rejected = unwrap(await hooks().rejectGatekeeperAction("strand-dependents", props, 1));
+    expect(rejected).toEqual({ restart: true });
+    expect(await hooks().gatekeeperEntry("strand-dependents", props, "action:2"))
+      .toMatchObject({ state: "failed", undispatched: true });
+    expect(failure(await hooks().applyGatekeeperAction("strand-dependents", props, 2)))
+      .toBe("This action needed action 1, which did not complete.");
+    expect(x.requests.filter(r => (r.body ?? "").includes("issueUpdate"))).toHaveLength(0);
   });
 });

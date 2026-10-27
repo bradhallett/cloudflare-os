@@ -7,7 +7,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { vi } from "vitest";
 import type { SupabaseGatekeeperImplProps } from "../../src/supabase";
-import type { StoredExecuteAction } from "../../src/supabase-storage";
+import type { ExecuteAction } from "../../src/supabase-actions";
 
 /** A forwarded call's result as plain data: an expected rejection crossing RPC reports as unhandled. */
 export type Outcome<T> = { ok: T } | { error: string };
@@ -142,7 +142,7 @@ export type HooksApi = {
   account(userObjectId: string, method: string, ...args: unknown[]): Promise<Outcome<unknown>>;
   user(userObjectId: string, method: string, ...args: unknown[]): Promise<Outcome<unknown>>;
   stageGatekeeperAction(
-    facetName: string, props: SupabaseGatekeeperImplProps, action: Omit<StoredExecuteAction, "submittedAt">,
+    facetName: string, props: SupabaseGatekeeperImplProps, action: ExecuteAction,
   ): Promise<number>;
   claimGatekeeperAction(
     facetName: string, props: SupabaseGatekeeperImplProps, actionId: number,

@@ -72,6 +72,12 @@ class FakeGitHub {
    */
   #issueReads: { promise: Promise<void>; resolve: () => void } | null = null;
   stalled = 0;
+  /**
+   * The first listing fetch, held by `holdListingFetches` and released on its own arrival: the
+   * concurrency tests need two `next()` calls in flight, and a self-releasing gate cannot
+   * deadlock a serialized cursor that only ever arrives once.
+   */
+  #listingReads: { promise: Promise<void>; resolve: () => void } | null = null;
 
   /** Holds every `GET /issues/{n}` (answering with what it read on arrival) until release. */
   holdIssueReads(): void {
@@ -82,6 +88,11 @@ class FakeGitHub {
   releaseIssueReads(): void {
     this.#issueReads?.resolve();
     this.#issueReads = null;
+  }
+
+  /** Holds the next listing fetch, releasing it as it arrives (see `#listingReads`). */
+  holdListingFetches(): void {
+    this.#listingReads ??= Promise.withResolvers<void>();
   }
 
   constructor() {
@@ -109,6 +120,12 @@ class FakeGitHub {
     }
     const listing = this.pages.get(path);
     if (listing !== undefined) {
+      const held = this.#listingReads;
+      if (held) {
+        this.#listingReads = null;
+        held.resolve();
+        await held.promise;
+      }
       const rows = listing[page - 1] ?? [];
       return Response.json(path === "/search/issues" ? { items: rows } : rows);
     }
@@ -173,6 +190,10 @@ async function repoGatekeeper() {
         .flatMap(page => page ?? []),
     queueEdit: (kind: "issue" | "pull", id: string, edit: { title: string } | { state: "open" | "closed" }) =>
       unwrap(hooks.queueEdit(scenario, props, new RpcStub(new TestApprovalQueue()) as never, kind, id, edit)),
+    queueCreateIssue: (options: { title: string }) =>
+      unwrap(hooks.queueCreateIssue(scenario, props, new RpcStub(new TestApprovalQueue()) as never, options)),
+    concurrent: async <T>(method: ListingMethod, query: unknown, pageSize: number, calls: number) =>
+      await unwrap(hooks.concurrentListingPages(scenario, props, method, query, pageSize, calls)) as (T[] | null)[],
     applyAction: (actionId: number) =>
       unwrap(hooks.applyAction(scenario, props, actionId, new RpcStub(new UnusedGitCache()) as never)),
     revertAction: (actionId: number) =>
@@ -226,6 +247,50 @@ describe("listing walks", () => {
     expect(pages[1]).toContain("Bad Gateway");
     expect(pages.flatMap(page => Array.isArray(page) ? page.map(item => item.id) : []))
       .toEqual(range(1, 200).map(String));
+  });
+
+  it("serves [] for a fetch window the overlay emptied, then walks on", async () => {
+    const github = new FakeGitHub();
+    // Ten full pages of pull requests: every row drops out of an issue listing, so the first
+    // call's window empties before it fills a page. `[]` asks again; the walk is not over.
+    github.pages.set("/issues", [
+      ...Array.from({ length: 10 }, () => range(1, 100).map(n => issue(n, { pull_request: {} }))),
+      [issue(1001)],
+    ]);
+    const gk = await repoGatekeeper();
+
+    const pages = await gk.pages<{ id: string }>("listIssues", undefined, 100);
+
+    expect(pages[0]).toEqual([]);
+    expect(Array.isArray(pages[1]) ? pages[1]?.map(item => item.id) : pages[1]).toEqual(["1001"]);
+    expect(pages[2]).toBeNull();
+  });
+
+  it("lists a queued create once, at its sort position, before the remote rows", async () => {
+    const github = new FakeGitHub();
+    github.pages.set("/issues", [[issue(2), issue(1)]]);
+    const gk = await repoGatekeeper();
+    await gk.queueCreateIssue({ title: "Fresh" });
+
+    const ids = (await gk.all<{ id: string }>("listIssues", undefined)).map(item => item.id);
+
+    // Newest first (the listing's default order), and exactly once.
+    expect(ids).toEqual(["~1", "2", "1"]);
+  });
+
+  it("serializes concurrent next() calls instead of duplicating a page", async () => {
+    const github = new FakeGitHub();
+    github.pages.set("/issues", [range(1, 100).map(n => issue(n)), [issue(101)]]);
+    github.holdListingFetches();
+    const gk = await repoGatekeeper();
+
+    const pages = await gk.concurrent<{ id: string }>("listIssues", undefined, 100, 2);
+
+    expect(pages.map(page => (page ?? []).map(item => item.id))).toEqual([
+      range(1, 100).map(String), ["101"],
+    ]);
+    // One fetch per page: a second caller re-entered the walk, not the fetch.
+    expect(github.requests.filter(request => request.startsWith("GET /issues p")).length).toBe(2);
   });
 });
 

@@ -13,10 +13,7 @@ import type {
   ObservationDescription,
   ResourceDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
-import {
-  applyClaimedAction, markOutcomeUnknown, type ClaimedActionStore,
-} from "@gadgets/gatekeeper-kit/outcome-unknown";
-import { isLinearOutcomeUnknown, LinearApi, LinearApiError } from "./linear-api";
+import { LinearApi, LinearApiError } from "./linear-api";
 import type {
   RawComment,
   RawConnection,
@@ -29,12 +26,8 @@ import type {
   RawUser,
   RawWorkflowState,
 } from "./linear-api";
-import type {
-  ActionDescriptionDraft,
-  ActionStatus,
-  StoredAction,
-  StoredActionDraft,
-} from "./linear-action-types";
+import type { StoredAction, StoredActionDraft } from "./linear-action-types";
+import { linearActions, type LinearActionHost } from "./linear-actions";
 import { type Env, type LinearGatekeeperImplProps, logger } from "./linear-env";
 import { buildIssueFilter, type IssuePageArgs } from "./linear-normalize";
 import {
@@ -235,49 +228,60 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
   async enqueue(
     approvalQueue: RpcStub<ApprovalQueue>,
     action: StoredActionDraft,
-    description: ActionDescriptionDraft,
   ): Promise<void> {
-    const id = this.#nextCounter("action");
-    this.ctx.storage.kv.put<StoredAction>(`action:${id}`, { ...action, id, status: "pending" } as StoredAction);
-    this.#invalidatePendingActions();
-    try {
-      await approvalQueue.submitAction(id, description);
-    } catch (err) {
-      // An auto-approval can apply the action mid-flight, which proves the overseer received it --
-      // only the reply was lost, and reporting failure would invite a repeated provider write. A
-      // missing record proves nothing: a dependency's rejection cascade deletes it too. Any
-      // non-pending status (applied, or claimed/failed by a racing approval's apply) proves the
-      // same: the overseer holds the id, so leave its record to its own lifecycle.
-      const current = this.ctx.storage.kv.get<StoredAction>(`action:${id}`);
-      if (current && current.status !== "pending") return;
-      if (current) {
-        // Drop the record so simulated reads don't show an action no approver can resolve.
-        this.ctx.storage.kv.delete(`action:${id}`);
-        this.#invalidatePendingActions();
-      }
-      throw err;
-    }
+    // The engine stages under the pending cap, renders the embedded presentation for the
+    // approver, and guards against a lost submit reply.
+    const { kind, ...payload } = action;
+    await this.#actions().set.submit(approvalQueue, kind, payload);
+  }
+
+  // The host the action engine drives: the provider calls and durable bindings apply/reject
+  // handlers need, as closures over this gatekeeper's storage and account.
+  #actionHost(): LinearActionHost {
+    return {
+      run: fn => this.#run(fn),
+      resolveIssueRef: ref => this.resolveIssueRef(ref),
+      requireLabelId: id => this.#requireLabelId(id),
+      resolveLabelId: id => this.#resolveLabelId(id),
+      provisionalRealId: ref => this.#provisionalRealId(ref),
+      putProvisionalIssue: (provisionalId, realId) => {
+        this.ctx.storage.kv.put<string>(`provisional:${provisionalId}`, realId);
+      },
+      putProvisionalLabel: (syntheticId, realId) => {
+        this.ctx.storage.kv.put<string>(`provisionalLabel:${syntheticId}`, realId);
+      },
+      deleteProvisionalIssue: provisionalId => {
+        this.ctx.storage.kv.delete(`provisional:${provisionalId}`);
+      },
+      deleteProvisionalLabel: syntheticId => {
+        this.ctx.storage.kv.delete(`provisionalLabel:${syntheticId}`);
+      },
+      invalidateTeamLabels: teamId => {
+        this.ctx.storage.kv.delete(`cache:labels:${teamId}`);
+      },
+    };
+  }
+
+  // One journal (and one bound action set) per storage; linearActions memoizes both.
+  #actions(): { journal: ReturnType<typeof linearActions>["journal"]; set: ReturnType<typeof linearActions>["set"] } {
+    return linearActions(this.ctx.storage.kv, this.#actionHost());
   }
 
   // ---- simulation: overlay pending (submitted-but-not-applied) actions onto reads ----
 
-  // Memoized within a DO instance; invalidated by #invalidatePendingActions() whenever any action
-  // record changes. Avoids re-scanning storage once per issue during a page overlay.
-  #pendingActionsCache?: StoredAction[];
-
+  // Pending and claimed actions as the StoredAction views the overlay machinery reads; the
+  // journal owns the projection cache, so no gatekeeper-side memo is needed.
   #pendingActions(): StoredAction[] {
-    if (!this.#pendingActionsCache) {
-      this.#pendingActionsCache = [...this.ctx.storage.kv.list<StoredAction>({ prefix: "action:" })]
-        .map(([, value]) => value)
-        .filter(a => a.status === "pending" || a.status === "claimed")
-        .toSorted((a, b) => a.id - b.id);
-    }
-    return this.#pendingActionsCache;
+    const { journal } = this.#actions();
+    return journal.listPending().map(({ id, action }) => {
+      const { kind, payload: { presentation: _presentation, ...fields } } = action;
+      return {
+        kind, ...fields, id,
+        status: journal.get(id)?.state === "claimed" ? "claimed" : "pending",
+      } as StoredAction;
+    });
   }
 
-  #invalidatePendingActions(): void {
-    this.#pendingActionsCache = undefined;
-  }
 
   // Real UUID for a provisional ref, if its create has been applied.
   #provisionalRealId(ref: string): string | undefined {
@@ -582,7 +586,7 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
   }
 
   async getAutoApprovableActions() {
-    return [];
+    return this.#actions().set.autoApprovableKinds();
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<LinearWorkspace | LinearTeam | LinearIssue> {
@@ -666,155 +670,26 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
   }
 
   async applyAction(actionId: number): Promise<void> {
-    const store = this.#actionStore();
-    await applyClaimedAction(store, actionId, async action => {
-      await this.#run(async api => {
-        switch (action.kind) {
-          case "createIssue": {
-            // A parent that was itself a pending create may now be real — resolve its provisional id.
-            if (action.input.parentId) action.input.parentId = this.resolveIssueRef(action.input.parentId);
-            // Resolve any provisional `~label:` ids (labels created earlier in the batch).
-            if (action.input.labelIds) action.input.labelIds = action.input.labelIds.map(id => this.#requireLabelId(id));
-            const issue = await api.createIssue(action.input);
-            action.createdIssueId = issue.id;
-            store.putAction(action);
-            this.ctx.storage.kv.put<string>(`provisional:${action.provisionalId}`, issue.id);
-            break;
-          }
-          case "updateIssue": {
-            // Resolve a provisional parent id (set via setParent against a pending-created issue).
-            if (action.input.parentId) action.input.parentId = this.resolveIssueRef(action.input.parentId);
-            await api.updateIssue(this.resolveIssueRef(action.issueRef), action.input);
-            break;
-          }
-          case "addLabels": {
-            const issue = await api.getIssue(this.resolveIssueRef(action.issueRef));
-            if (!issue) break;
-            // Resolve any provisional `~label:` ids to the real labels their create actions produced.
-            const add = action.labelIds.map(id => this.#requireLabelId(id));
-            const current = (issue.labels?.nodes ?? []).map(l => l.id);
-            await api.updateIssue(issue.id, { labelIds: [...new Set([...current, ...add])] });
-            break;
-          }
-          case "removeLabels": {
-            const issue = await api.getIssue(this.resolveIssueRef(action.issueRef));
-            if (!issue) break;
-            // Skip unresolved provisional labels: they were never really attached, so nothing to remove.
-            const remove = new Set(action.labelIds.map(id => this.#resolveLabelId(id)).filter((id): id is string => !!id));
-            const next = (issue.labels?.nodes ?? []).map(l => l.id).filter(id => !remove.has(id));
-            await api.updateIssue(issue.id, { labelIds: next });
-            break;
-          }
-          case "postComment": {
-            const comment = await api.createComment(this.resolveIssueRef(action.issueRef), action.body);
-            action.createdCommentId = comment.id;
-            store.putAction(action);
-            break;
-          }
-          case "createLabel": {
-            const label = await api.createLabel({
-              teamId: action.teamId, name: action.name, color: action.color, description: action.description,
-            });
-            action.createdLabelId = label.id;
-            store.putAction(action);
-            // Map the provisional label id to the real one, so dependent addLabels can resolve it.
-            this.ctx.storage.kv.put<string>(`provisionalLabel:${action.synthetic.id}`, label.id);
-            // The team's real label set changed; drop the cache so the new label shows promptly.
-            this.ctx.storage.kv.delete(`cache:labels:${action.teamId}`);
-            break;
-          }
-          case "archive":
-            await api.setIssueArchived(this.resolveIssueRef(action.issueRef), action.archived);
-            break;
-        }
-      });
-      // Mark applied and keep the record (so revert can find it). The change is now real, so the
-      // simulation overlay (which considers pending and claimed actions) stops applying it.
-      action.state = "applied";
-      store.putAction(action);
-    }, isLinearOutcomeUnknown);
-  }
-
-  /**
-   * The Linear action records as the kit's claim loop drives them: `applyClaimedAction` speaks
-   * `state`, these rows speak `status`, and this adapter is the whole translation.
-   */
-  #actionStore(): ClaimedActionStore<StoredAction & { state: ActionStatus }> {
-    return {
-      getAction: id => {
-        const action = this.ctx.storage.kv.get<StoredAction>(`action:${id}`);
-        return action === undefined ? undefined : { ...action, state: action.status };
-      },
-      putAction: record => {
-        const { state, ...action } = record;
-        this.ctx.storage.kv.put<StoredAction>(`action:${action.id}`, { ...action, status: state });
-        this.#invalidatePendingActions();
-      },
-    };
-  }
-
-  // Recursively drop every pending action that depends on a rejected provisional issue: edits and
-  // comments targeting it (issueRef), and sub-issues / re-parents pointing at it (input.parentId).
-  // Sub-issues are themselves creates, so recurse into their provisional ids.
-  #cascadeRejectProvisional(provisionalId: string): void {
-    this.#invalidatePendingActions();
-    this.ctx.storage.kv.delete(`provisional:${provisionalId}`);
-    for (const dep of this.#pendingActions()) {
-      const targetsRef = "issueRef" in dep && dep.issueRef === provisionalId;
-      const targetsParent =
-        (dep.kind === "createIssue" || dep.kind === "updateIssue") && dep.input.parentId === provisionalId;
-      if (!targetsRef && !targetsParent) continue;
-      this.ctx.storage.kv.delete(`action:${dep.id}`);
-      if (dep.kind === "createIssue") this.#cascadeRejectProvisional(dep.provisionalId);
-    }
-    this.#invalidatePendingActions();
+    // The engine (linear-actions.ts) claims before dispatch, resolves provisional refs, classifies
+    // unknown outcomes, and retains the applied record for revert.
+    await this.#actions().set.apply(actionId);
   }
 
   async rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
-    const action = this.ctx.storage.kv.get<StoredAction>(`action:${actionId}`);
-    if (!action) return;
-    // Undoing an applied action is `revertAction`'s job; a stray reject must not report an
-    // effect that landed as discarded.
-    if (action.status === "applied") throw new Error(`Linear action ${actionId} is no longer pending.`);
-    // A claim left behind means a dispatched write whose outcome is unknown: settle it terminally
-    // and say so, never silently discard a write that may have reached Linear.
-    if (action.status === "claimed") throw markOutcomeUnknown(this.#actionStore(), { ...action, state: "claimed" });
-    // Rejecting a terminal failure is the user clearing the settled record: its write already
-    // concluded, so there is nothing to cascade and nothing to restart.
-    if (action.status === "failed") {
-      this.ctx.storage.kv.delete(`action:${actionId}`);
-      this.#invalidatePendingActions();
-      return;
-    }
-    this.ctx.storage.kv.delete(`action:${actionId}`);
-    this.#invalidatePendingActions();
-
-    // Rejecting a create invalidates every action queued against its provisional id, which can
-    // never be applied. Drop them all and ask the Overseer to restart the gadget.
-    if (action.kind === "createIssue") {
-      this.#cascadeRejectProvisional(action.provisionalId);
-      return { restart: true };
-    }
-
-    // Rejecting a label create invalidates any pending addLabels/removeLabels that referenced its
-    // provisional id (they could never resolve to a real label). Drop them. No restart needed —
-    // createLabel returns no handle the gadget holds.
-    if (action.kind === "createLabel") {
-      const provisionalLabelId = action.synthetic.id;
-      for (const dep of this.#pendingActions()) {
-        if ((dep.kind === "addLabels" || dep.kind === "removeLabels") &&
-            dep.labelIds.includes(provisionalLabelId)) {
-          this.ctx.storage.kv.delete(`action:${dep.id}`);
-        }
-      }
-      this.#invalidatePendingActions();
-    }
+    // Only a rejected issue create leaves the agent holding a provisional id nothing can resolve,
+    // so only it asks the Overseer to restart the gadget. The engine releases the provisional
+    // bindings (reject hooks) and strands dependents as failed records rather than deleting them.
+    const kind = this.#actions().journal.get(actionId)?.action.kind;
+    await this.#actions().set.reject(actionId);
+    return kind === "createIssue" ? { restart: true } : undefined;
   }
 
   async revertAction(actionId: number):
       Promise<void | { message?: string; canRetry?: boolean; restart?: boolean }> {
-    const action = this.ctx.storage.kv.get<StoredAction>(`action:${actionId}`);
-    if (!action) throw new Error(`Unknown action: ${actionId}`);
+    const record = this.#actions().journal.get(actionId);
+    if (!record) throw new Error(`Unknown action: ${actionId}`);
+    const { kind, payload: { presentation: _presentation, ...fields } } = record.action;
+    const action = { kind, ...fields, id: actionId, status: "applied" } as StoredAction;
 
     await this.#run(async api => {
       switch (action.kind) {
@@ -857,9 +732,7 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
       }
     });
 
-    // The action has been undone; drop its record so it can't be reverted twice. (Reverting an
-    // applied action doesn't affect the pending set, but keep the cache honest regardless.)
-    this.ctx.storage.kv.delete(`action:${actionId}`);
-    this.#invalidatePendingActions();
+    // The action has been undone; drop its record so it can't be reverted twice.
+    this.#actions().journal.remove(actionId);
   }
 }

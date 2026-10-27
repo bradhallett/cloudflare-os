@@ -1,5 +1,8 @@
 import {describe, expect, it} from "vitest";
-import {MAX_TOOL_RESULT_CHARS, readFileWindow} from "../src/agent-tools";
+import {buildTools, MAX_TOOL_RESULT_CHARS, readFileWindow} from "../src/agent-tools";
+import type {TurnSession} from "../src/agent-session";
+import type {AgentHooks} from "../src/agent-hooks";
+import type {AiChatAuthorInfo, AiToolCall} from "@gadgets/workshop-shared/api";
 import {formatGrep, matchLines, scanWorkpieceForGrep, type GrepScan} from "../src/grep";
 
 describe("grep", () => {
@@ -114,5 +117,28 @@ describe("readFile windows", () => {
     expect(note).toMatchObject({first: 5, total: bigLines, next: note.last + 1});
     expect(note.last).toBeLessThan(bigLines);
     expect(note.body).toBe(Array.from({length: note.last - 4}, () => bigLine).join("\n"));
+  });
+});
+
+describe("tool error notes", () => {
+  it("records a thrown tool error as the call's note, then rethrows", async () => {
+    // Only the session surface readFile's execute touches on the missing-file path; the
+    // read returns nothing, which readFile turns into its thrown "File does not exist."
+    let notes = new Map<string, Partial<AiToolCall>>();
+    let session = {
+      agentContext: {},
+      toolCallNotes: notes,
+      toolErrorText: (error: unknown) => error instanceof Error ? error.message : String(error),
+      resolveToolWorkpieceId: () => ({type: "workpiece" as const, id: 1}),
+      readToolFile: async () => undefined,
+    } as unknown as TurnSession;
+    let hooks = {
+      resolveWorkpieceRoot: () => ({workpieceId: 1}),
+    } as unknown as AgentHooks;
+    let author: AiChatAuthorInfo = {type: "user", id: "u1", name: "User"};
+    let tools = buildTools({session, hooks, chatId: 1, author, initiator: author});
+    await expect(tools.readFile.execute("call-1", {filename: "gone.js"} as never))
+        .rejects.toThrow("File does not exist.");
+    expect(notes.get("call-1")).toEqual({error: "File does not exist."});
   });
 });

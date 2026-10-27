@@ -11,8 +11,7 @@ export * from "../../src/supabase";
 import {
   GatekeeperUserImpl, SupabaseGatekeeperImpl, type SupabaseGatekeeperImplProps,
 } from "../../src/supabase";
-import { PendingActionStore } from "../../src/supabase-storage";
-import type { StoredExecuteAction } from "../../src/supabase-storage";
+import type { ExecuteAction } from "../../src/supabase-actions";
 
 type UserProps = { userObjectId: string };
 
@@ -32,18 +31,21 @@ export class TestUser extends GatekeeperUserImpl {}
  */
 export class SeededSupabaseGatekeeper extends SupabaseGatekeeperImpl {
   /** Queues a mutating statement as submitted, returning its action id. */
-  stageAction(action: Omit<StoredExecuteAction, "submittedAt">): number {
-    return new PendingActionStore(this.ctx.storage.kv).submit({ ...action, submittedAt: Date.now() });
+  stageAction(action: ExecuteAction): number {
+    const { journal } = this.sqlActions();
+    const id = journal.allocate({ kind: "execute", payload: action });
+    journal.markSubmitted(id);
+    return id;
   }
 
   /** Leaves the claim a dispatch that died after taking it would have. */
   claimAction(actionId: number): void {
-    new PendingActionStore(this.ctx.storage.kv).journal().markClaimed(actionId);
+    this.sqlActions().journal.markClaimed(actionId);
   }
 
   /** The journal record for an id, for asserting the settled state. */
   actionRecord(actionId: number): unknown {
-    return new PendingActionStore(this.ctx.storage.kv).record(actionId);
+    return this.sqlActions().journal.get(actionId);
   }
 }
 
@@ -104,7 +106,7 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
 
   /** Stages a mutating statement on the gatekeeper, returning its action id. */
   async stageGatekeeperAction(
-    facetName: string, props: SupabaseGatekeeperImplProps, action: Omit<StoredExecuteAction, "submittedAt">,
+    facetName: string, props: SupabaseGatekeeperImplProps, action: ExecuteAction,
   ): Promise<number> {
     return await this.#gatekeeper(facetName, props).stageAction(action);
   }

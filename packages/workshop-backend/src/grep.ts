@@ -1,7 +1,8 @@
 // File search for the agent's grep tool and the Worktree binding's grep()/structuredGrep(): resolve
 // a path argument to the searchable files in a workpiece's overlay-over-base view, pulling missing
 // base blobs in one batch, then match lines and render `grep -n` output. Kept apart from
-// worktree-session.ts so agent.ts can call it without importing the RpcTarget.
+// worktree-session.ts so callers outside the binding (the grep tool's hook, tests) can use
+// it without importing the RpcTarget.
 
 import type { GrepFileError } from "./worktree-binding";
 import type { WorkpieceId } from "@gadgets/workshop-shared/api";

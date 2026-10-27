@@ -4,7 +4,7 @@
 // A session is minted per executeCode run by the overseer's binding-loopback dispatch
 // (startGatekeeperSession, target type "worktree") and lives exactly as long as the execution:
 // every operation resolves against the running turn's state through WorktreeTurnAccess
-// (agent.ts), so binding operations and file-tool operations see one consistent worktree, and
+// (agent-session.ts), so binding operations and file-tool operations see one consistent worktree, and
 // writes and commits buffer into the same step and become durable at the same barrier. The git
 // side -- base-tree walks, blob reads, commit writes -- goes through the host's WorkspaceGitCache
 // and GitStore, the same plumbing the file tools' lazy reads use.

@@ -49,6 +49,21 @@ describe("the daily read limit", () => {
     expect(await storedReads(id)).toEqual({ day: new Date().toISOString().slice(0, 10), used: 1 });
   });
 
+  it("keeps the read counted when ZoomInfo answered 5xx — the request reached it", async () => {
+    const zi = new FakeZoomInfo().install();
+    zi.failEnrich = 503;
+    const id = await seedAccount(zi, ALICE);
+    const submitted = await hooks().run(`reads-5xx`, props(id), [
+      ["enrichCompanies", [{ companyId: "1001" }], ["id", "name"]],
+    ]);
+    const ticket = unwrap(submitted) as { id: number };
+    const applied = await hooks().applyAction(`reads-5xx`, props(id), ticket.id);
+    expect(failure(applied)).toContain("may or may not have taken effect");
+    // A 5xx answer proves ZoomInfo received (and counted) the request, so the budget settles it
+    // as spent exactly like a lost answer.
+    expect(await storedReads(id)).toEqual({ day: new Date().toISOString().slice(0, 10), used: 1 });
+  });
+
   it("returns an unspent reservation's budget", async () => {
     const id = await seedAccount(new FakeZoomInfo(), ALICE);
     const day = new Date().toISOString().slice(0, 10);

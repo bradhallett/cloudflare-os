@@ -1,8 +1,9 @@
-// The enrichment action queue. Each enrich* call stores a PendingEnrichment and submits it for
-// approval. When the user approves, ZoomInfoGatekeeperImpl.applyAction() replays it against the API
-// (spending credits) and stores the result; the Gadget reads it back via getEnrichmentResult().
-// Rejection stores a "rejected" outcome and spends nothing. Everything lives in the GatekeeperImpl
-// DO's KV, shared by the session (which submits/reads) and the apply/reject callbacks.
+// The enrichment outcome window. The submit/apply/reject lifecycle itself is the kit's
+// `defineActions` engine over an `ActionJournal` (zoominfo-actions.ts); this module keeps only the
+// decided-outcome log a Gadget reads back via getEnrichmentResult(): each enrich* call's ready,
+// rejected, failed, or unknown outcome is stored under the ticket id and evicted once
+// MAX_RETAINED_ENRICHMENTS newer outcomes have landed. Everything lives in the GatekeeperImpl DO's
+// KV, shared by the session (which reads) and the apply/reject callbacks (which decide).
 
 import type { ZoomInfoApi } from "./zoominfo-api";
 import {
@@ -41,9 +42,9 @@ export type PendingEnrichment = {
 
 /**
  * The stored outcome once the user has decided (mirrors EnrichmentOutcome minus the "pending" state,
- * which is represented by the absence of a stored outcome while the request is still pending). The
- * "unknown" outcome is claimed before an approved enrichment is dispatched, so an activation that
- * dies past the claim leaves a record that blocks the enrichment from being replayed blind.
+ * which the journal's live record represents). The "unknown" outcome is recorded when a dispatch's
+ * outcome cannot be known, so the ticket keeps warning that credits may have been spent even after
+ * the user rejects the action.
  */
 export type StoredEnrichmentOutcome =
   | { status: "ready"; result: unknown }
@@ -51,60 +52,33 @@ export type StoredEnrichmentOutcome =
   | { status: "failed"; message: string }
   | { status: "unknown"; message: string };
 
-export class EnrichmentStore {
+/** The decided-outcome log behind `getEnrichmentResult`, bounded to a recent window per account. */
+export class EnrichmentOutcomes {
   #kv: DurableObjectStorage["kv"];
 
   constructor(kv: DurableObjectStorage["kv"]) {
     this.#kv = kv;
   }
 
-  #pendingKey(id: number): string {
-    return `enrich:pending:${id}`;
-  }
-
-  #resultKey(id: number): string {
+  #key(id: number): string {
     return `enrich:result:${id}`;
   }
 
-  submit(pending: PendingEnrichment): number {
-    const id = this.#kv.get<number>("enrich:nextId") ?? 1;
-    this.#kv.put("enrich:nextId", id + 1);
-    this.#kv.put(this.#pendingKey(id), pending);
-    return id;
+  get(id: number): StoredEnrichmentOutcome | undefined {
+    return this.#kv.get<StoredEnrichmentOutcome>(this.#key(id));
   }
 
-  getPending(id: number): PendingEnrichment | undefined {
-    return this.#kv.get<PendingEnrichment>(this.#pendingKey(id));
-  }
-
-  removePending(id: number): void {
-    this.#kv.delete(this.#pendingKey(id));
-  }
-
-  /** Restores a pending enrichment an apply claimed but never dispatched (budget refusal). */
-  putPending(id: number, pending: PendingEnrichment): void {
-    this.#kv.put(this.#pendingKey(id), pending);
-  }
-
-  getResult(id: number): StoredEnrichmentOutcome | undefined {
-    return this.#kv.get<StoredEnrichmentOutcome>(this.#resultKey(id));
-  }
-
-  putResult(id: number, outcome: StoredEnrichmentOutcome): void {
-    this.#kv.put(this.#resultKey(id), outcome);
-    // Bound storage: evict the enrichment that has fallen out of the retention window. IDs are
-    // dense and monotonic (see submit), so this keeps at most MAX_RETAINED_ENRICHMENTS recent
-    // outcomes readable while preventing unbounded growth over the account's lifetime. Dropping the
-    // pending key too sweeps up any never-decided request that aged out.
+  put(id: number, outcome: StoredEnrichmentOutcome): void {
+    this.#kv.put(this.#key(id), outcome);
+    // Bound storage: evict the outcome that has fallen out of the retention window. Ticket ids are
+    // dense and monotonic (the journal's id counter), so this keeps at most MAX_RETAINED_ENRICHMENTS
+    // recent outcomes readable while preventing unbounded growth over the account's lifetime.
     const evictId = id - MAX_RETAINED_ENRICHMENTS;
-    if (evictId >= 1) {
-      this.#kv.delete(this.#resultKey(evictId));
-      this.#kv.delete(this.#pendingKey(evictId));
-    }
+    if (evictId >= 1) this.#kv.delete(this.#key(evictId));
   }
 
-  removeResult(id: number): void {
-    this.#kv.delete(this.#resultKey(id));
+  remove(id: number): void {
+    this.#kv.delete(this.#key(id));
   }
 }
 

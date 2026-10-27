@@ -288,16 +288,15 @@ export class LinearTeamSessionImpl extends RpcTarget implements LinearTeam {
       throw new Error(`A label named "${name}" already exists in team ${team.key}.`);
     }
     const synthetic: RawLabel = { id: `~label:${name}`, name, color: options?.color ?? null };
-    await this.#gk.enqueue(
-      this.#queue,
-      { kind: "createLabel", teamId: team.id, name, color: options?.color, description: options?.description,
-        synthetic, title: `Create label "${name}"` },
-      {
+    await this.#gk.enqueue(this.#queue, {
+      kind: "createLabel", teamId: team.id, name, color: options?.color, description: options?.description,
+      synthetic, title: `Create label "${name}"`,
+      presentation: {
         title: `Create label "${name}" in ${team.key}`,
         ...describeCreateLabel(team, name, options),
         implementsRevert: true,
       },
-    );
+    });
     // Pending approval — return the same provisional descriptor that listLabels will show.
     return normLabel(synthetic);
   }
@@ -401,32 +400,35 @@ export class LinearIssueImpl extends RpcTarget implements LinearIssue {
 
   async setTitle(title: string): Promise<void> {
     const issue = await this.#requireIssueForAction();
-    await this.#gk.enqueue(
-      this.#queue,
-      { kind: "updateIssue", issueRef: issue.id, input: { title },
-        previous: { title: issue.title }, patch: { title }, title: `Set title of ${issue.identifier}` },
-      { title: `Rename ${issue.identifier}`,
+    await this.#gk.enqueue(this.#queue, {
+      kind: "updateIssue", issueRef: issue.id, input: { title },
+      previous: { title: issue.title }, patch: { title },
+      title: `Set title of ${issue.identifier}`,
+      presentation: {
+        title: `Rename ${issue.identifier}`,
         ...onIssue(issue, label => `Change the title of ${label}.`)
           .inline("Current title", issue.title)
           .inline("New title", title)
           .finish(),
-        implementsRevert: true },
-    );
+        implementsRevert: true,
+      },
+    });
   }
 
   async setDescription(descriptionMarkdown: string): Promise<void> {
     const issue = await this.#requireIssueForAction();
-    await this.#gk.enqueue(
-      this.#queue,
-      { kind: "updateIssue", issueRef: issue.id, input: { description: descriptionMarkdown },
-        previous: { description: issue.description ?? "" }, patch: { description: descriptionMarkdown },
-        title: `Edit description of ${issue.identifier}` },
-      { title: `Edit description of ${issue.identifier}`,
+    await this.#gk.enqueue(this.#queue, {
+      kind: "updateIssue", issueRef: issue.id, input: { description: descriptionMarkdown },
+      previous: { description: issue.description ?? "" }, patch: { description: descriptionMarkdown },
+      title: `Edit description of ${issue.identifier}`,
+      presentation: {
+        title: `Edit description of ${issue.identifier}`,
         ...onIssue(issue, label => `Replace the description of ${label}.`)
           .verbatim("New description", descriptionMarkdown, "markdown")
           .finish(),
-        implementsRevert: true },
-    );
+        implementsRevert: true,
+      },
+    });
   }
 
   async setState(state: string): Promise<void> {
@@ -436,19 +438,20 @@ export class LinearIssueImpl extends RpcTarget implements LinearIssue {
     if (!target) {
       throw new Error(`No workflow state named "${state}" in team ${issue.team.key}.`);
     }
-    await this.#gk.enqueue(
-      this.#queue,
-      { kind: "updateIssue", issueRef: issue.id, input: { stateId: target.id },
-        previous: { stateId: issue.state?.id }, patch: { state: target },
-        title: `Move ${issue.identifier} to ${target.name}` },
-      { title: `Move ${issue.identifier} to ${target.name}`,
+    await this.#gk.enqueue(this.#queue, {
+      kind: "updateIssue", issueRef: issue.id, input: { stateId: target.id },
+      previous: { stateId: issue.state?.id }, patch: { state: target },
+      title: `Move ${issue.identifier} to ${target.name}`,
+      presentation: {
+        title: `Move ${issue.identifier} to ${target.name}`,
         ...onIssue(issue, label => `Change the state of ${label}.`)
           .inline("Current state", issue.state?.name ?? "Unknown")
           .inline("New state", target.name)
           .inline("New state ID", target.id)
           .finish(),
-        implementsRevert: true },
-    );
+        implementsRevert: true,
+      },
+    });
   }
 
   async setAssignee(assignee: string | null): Promise<void> {
@@ -461,32 +464,33 @@ export class LinearIssueImpl extends RpcTarget implements LinearIssue {
       assigneeId = assigneeUser.id;
       label = `Assign to ${plainInline(assigneeUser.displayName ?? assigneeUser.name)}`;
     }
-    await this.#gk.enqueue(
-      this.#queue,
-      { kind: "updateIssue", issueRef: issue.id, input: { assigneeId },
-        previous: { assigneeId: issue.assignee?.id ?? null }, patch: { assignee: assigneeUser },
-        title: `${label} (${issue.identifier})` },
-      { title: `${label}: ${issue.identifier}`,
+    await this.#gk.enqueue(this.#queue, {
+      kind: "updateIssue", issueRef: issue.id, input: { assigneeId },
+      previous: { assigneeId: issue.assignee?.id ?? null }, patch: { assignee: assigneeUser },
+      title: `${label} (${issue.identifier})`,
+      presentation: {
+        title: `${label}: ${issue.identifier}`,
         ...(assigneeUser
           ? describeAssignee(onIssue(issue, name => `Assign issue ${name}.`), assigneeUser)
           : onIssue(issue, name => `Unassign issue ${name}.`)).finish(),
-        implementsRevert: true },
-    );
+        implementsRevert: true,
+      },
+    });
   }
-
   async setPriority(priority: LinearPriority): Promise<void> {
     const issue = await this.#requireIssueForAction();
-    await this.#gk.enqueue(
-      this.#queue,
-      { kind: "updateIssue", issueRef: issue.id, input: { priority: PRIORITY_TO_NUM[priority] },
-        previous: { priority: issue.priority }, patch: { priority: PRIORITY_TO_NUM[priority] },
-        title: `Set priority of ${issue.identifier}` },
-      { title: `Set priority of ${issue.identifier} to ${priority}`,
+    await this.#gk.enqueue(this.#queue, {
+      kind: "updateIssue", issueRef: issue.id, input: { priority: PRIORITY_TO_NUM[priority] },
+      previous: { priority: issue.priority }, patch: { priority: PRIORITY_TO_NUM[priority] },
+      title: `Set priority of ${issue.identifier}`,
+      presentation: {
+        title: `Set priority of ${issue.identifier} to ${priority}`,
         ...onIssue(issue, label => `Change the priority of ${label}.`)
           .inline("Priority", priority)
           .finish(),
-        implementsRevert: true },
-    );
+        implementsRevert: true,
+      },
+    });
   }
 
   async addLabels(labels: string[]): Promise<void> {
@@ -505,15 +509,16 @@ export class LinearIssueImpl extends RpcTarget implements LinearIssue {
       }
       resolved.push(found);
     }
-    await this.#gk.enqueue(
-      this.#queue,
-      { kind: "addLabels", issueRef: issue.id, labelIds: resolved.map(l => l.id), labels: resolved,
-        title: `Add labels to ${issue.identifier}` },
-      { title: `Add labels to ${issue.identifier}`,
+    await this.#gk.enqueue(this.#queue, {
+      kind: "addLabels", issueRef: issue.id, labelIds: resolved.map(l => l.id), labels: resolved,
+      title: `Add labels to ${issue.identifier}`,
+      presentation: {
+        title: `Add labels to ${issue.identifier}`,
         ...describeLabels(onIssue(issue, label => `Add labels to ${label}.`), resolved)
           .finish(),
-        implementsRevert: true },
-    );
+        implementsRevert: true,
+      },
+    });
   }
 
   async removeLabels(labels: string[]): Promise<void> {
@@ -522,57 +527,60 @@ export class LinearIssueImpl extends RpcTarget implements LinearIssue {
     // Map the requested names to the label ids currently on the issue; ignore names not present.
     const removed = (issue.labels?.nodes ?? []).filter(l => removeNames.has(l.name.toLowerCase()));
     const removeIds = removed.map(l => l.id);
-    await this.#gk.enqueue(
-      this.#queue,
-      { kind: "removeLabels", issueRef: issue.id, labelIds: removeIds, title: `Remove labels from ${issue.identifier}` },
-      { title: `Remove labels from ${issue.identifier}`,
+    await this.#gk.enqueue(this.#queue, {
+      kind: "removeLabels", issueRef: issue.id, labelIds: removeIds,
+      title: `Remove labels from ${issue.identifier}`,
+      presentation: {
+        title: `Remove labels from ${issue.identifier}`,
         ...(removed.length > 0
           ? describeLabels(onIssue(issue, label => `Remove labels from ${label}.`), removed)
           : onIssue(issue, label =>
             `Remove labels from ${label}. None of the named labels is on this issue, so its labels stay as they are.`))
           .finish(),
-        implementsRevert: true },
-    );
+        implementsRevert: true,
+      },
+    });
   }
-
   async setProject(projectId: string | null): Promise<void> {
     // An empty id means no project, as the description says.
     projectId = projectId || null;
     const issue = await this.#requireIssueForAction();
     const project = projectId ? await this.#gk.getProjectRaw(projectId) : null;
     if (projectId && !project) throw new Error(`Project not found: ${projectId}`);
-    await this.#gk.enqueue(
-      this.#queue,
-      { kind: "updateIssue", issueRef: issue.id, input: { projectId },
-        previous: { projectId: issue.project?.id ?? null }, patch: { project },
-        title: `Set project of ${issue.identifier}` },
-      { title: `${projectId ? "Move" : "Remove"} ${issue.identifier} ${projectId ? "into a project" : "from its project"}`,
+    await this.#gk.enqueue(this.#queue, {
+      kind: "updateIssue", issueRef: issue.id, input: { projectId },
+      previous: { projectId: issue.project?.id ?? null }, patch: { project },
+      title: `Set project of ${issue.identifier}`,
+      presentation: {
+        title: `${projectId ? "Move" : "Remove"} ${issue.identifier} ${projectId ? "into a project" : "from its project"}`,
         ...(projectId
           ? onIssue(issue, label => `Move ${label} into a project.`)
             .inline("Project ID", projectId).finish()
           : onIssue(issue, label => `Remove ${label} from its project.`)
             .finish()),
-        implementsRevert: true },
-    );
+        implementsRevert: true,
+      },
+    });
   }
 
   async setDueDate(date: string | null): Promise<void> {
     // An empty date clears it, as the description says.
     date = date || null;
     const issue = await this.#requireIssueForAction();
-    await this.#gk.enqueue(
-      this.#queue,
-      { kind: "updateIssue", issueRef: issue.id, input: { dueDate: date },
-        previous: { dueDate: issue.dueDate ?? null }, patch: { dueDate: date },
-        title: `Set due date of ${issue.identifier}` },
-      { title: `Set due date of ${issue.identifier}`,
+    await this.#gk.enqueue(this.#queue, {
+      kind: "updateIssue", issueRef: issue.id, input: { dueDate: date },
+      previous: { dueDate: issue.dueDate ?? null }, patch: { dueDate: date },
+      title: `Set due date of ${issue.identifier}`,
+      presentation: {
+        title: `Set due date of ${issue.identifier}`,
         ...(date
           ? onIssue(issue, label => `Set the due date of ${label}.`)
             .inline("Due date", date).finish()
           : onIssue(issue, label => `Clear the due date of ${label}.`)
             .finish()),
-        implementsRevert: true },
-    );
+        implementsRevert: true,
+      },
+    });
   }
 
   async setParent(parentId: string | null): Promise<void> {
@@ -589,18 +597,19 @@ export class LinearIssueImpl extends RpcTarget implements LinearIssue {
       parentTeamIds.push(parent.team.id);
     }
     const issue = await this.#requireIssueForAction(parentTeamIds);
-    await this.#gk.enqueue(
-      this.#queue,
-      { kind: "updateIssue", issueRef: issue.id, input: { parentId: resolvedParentId },
-        previous: { parentId: issue.parent?.id ?? null }, patch: { parent: parentOverlay },
-        title: `Set parent of ${issue.identifier}` },
-      { title: `${parentId ? "Set" : "Clear"} parent of ${issue.identifier}`,
+    await this.#gk.enqueue(this.#queue, {
+      kind: "updateIssue", issueRef: issue.id, input: { parentId: resolvedParentId },
+      previous: { parentId: issue.parent?.id ?? null }, patch: { parent: parentOverlay },
+      title: `Set parent of ${issue.identifier}`,
+      presentation: {
+        title: `${parentId ? "Set" : "Clear"} parent of ${issue.identifier}`,
         ...(parentOverlay
           ? describeParent(onIssue(issue, label => `Make ${label} a sub-issue.`), parentOverlay).finish()
           : onIssue(issue, label => `Detach ${label} from its parent.`)
             .finish()),
-        implementsRevert: true },
-    );
+        implementsRevert: true,
+      },
+    });
   }
 
   async readComments(options?: LinearPageOptions): Promise<Cursor<LinearComment>> {
@@ -629,15 +638,17 @@ export class LinearIssueImpl extends RpcTarget implements LinearIssue {
       createdAt: new Date().toISOString(),
       user: null,
     };
-    await this.#gk.enqueue(
-      this.#queue,
-      { kind: "postComment", issueRef: issue.id, body: bodyMarkdown, synthetic, title: `Comment on ${issue.identifier}` },
-      { title: `Comment on ${issue.identifier}`,
+    await this.#gk.enqueue(this.#queue, {
+      kind: "postComment", issueRef: issue.id, body: bodyMarkdown, synthetic,
+      title: `Comment on ${issue.identifier}`,
+      presentation: {
+        title: `Comment on ${issue.identifier}`,
         ...onIssue(issue, label => `Post a comment on ${label}.`)
           .verbatim("Comment", bodyMarkdown, "markdown")
           .finish(),
-        implementsRevert: true },
-    );
+        implementsRevert: true,
+      },
+    });
   }
 
   async createSubIssue(options: LinearCreateIssueOptions): Promise<LinearIssue> {
@@ -653,24 +664,26 @@ export class LinearIssueImpl extends RpcTarget implements LinearIssue {
 
   async archive(): Promise<void> {
     const issue = await this.#requireIssueForAction();
-    await this.#gk.enqueue(
-      this.#queue,
-      { kind: "archive", issueRef: issue.id, archived: true, title: `Archive ${issue.identifier}` },
-      { title: `Archive ${issue.identifier}`,
+    await this.#gk.enqueue(this.#queue, {
+      kind: "archive", issueRef: issue.id, archived: true, title: `Archive ${issue.identifier}`,
+      presentation: {
+        title: `Archive ${issue.identifier}`,
         ...onIssue(issue, label => `Archive issue ${label}.`).finish(),
-        implementsRevert: true },
-    );
+        implementsRevert: true,
+      },
+    });
   }
 
   async unarchive(): Promise<void> {
     const issue = await this.#requireIssueForAction();
-    await this.#gk.enqueue(
-      this.#queue,
-      { kind: "archive", issueRef: issue.id, archived: false, title: `Unarchive ${issue.identifier}` },
-      { title: `Unarchive ${issue.identifier}`,
+    await this.#gk.enqueue(this.#queue, {
+      kind: "archive", issueRef: issue.id, archived: false, title: `Unarchive ${issue.identifier}`,
+      presentation: {
+        title: `Unarchive ${issue.identifier}`,
         ...onIssue(issue, label => `Restore archived issue ${label}.`).finish(),
-        implementsRevert: true },
-    );
+        implementsRevert: true,
+      },
+    });
   }
 }
 
@@ -877,13 +890,14 @@ async function createIssueViaQueue(
     cycle: null,
   };
 
-  await gk.enqueue(
-    queue,
-    { kind: "createIssue", input, provisionalId, synthetic, title: `Create issue "${options.title}"` },
-    { title: `Create issue "${options.title}"`,
+  await gk.enqueue(queue, {
+    kind: "createIssue", input, provisionalId, synthetic, title: `Create issue "${options.title}"`,
+    presentation: {
+      title: `Create issue "${options.title}"`,
       ...describeCreateIssue(team, options, provisionalId, { stateObj, assigneeObj, labelObjs, parentObj }),
-      implementsRevert: true },
-  );
+      implementsRevert: true,
+    },
+  });
 
   return new LinearIssueImpl(gk, queue.dup(), provisionalId, teamScope);
 }

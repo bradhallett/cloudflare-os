@@ -402,7 +402,7 @@ export type AiChatMessageBody = {
    * The agent requested that the user connect a gatekeeper (e.g. "I need ClickHouse cluster X").
    * Rendered inline in the chat as an accept/deny card. State is mutated in-place when the user
    * accepts or denies; the message is re-delivered to subscribers so the card updates. On accept the
-   * agent is resumed with the outcome (see the history builder in agent.ts); on deny the agent is
+   * agent is resumed with the outcome (see the history builder in agent-replay.ts); on deny the agent is
    * not resumed (the user drives what happens next).
    */
   type: "connectionRequest";

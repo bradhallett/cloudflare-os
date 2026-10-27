@@ -8,9 +8,11 @@ import type {
 import { RpcStub, RpcTarget } from "cloudflare:workers";
 import {
   ArrayCursor,
+  PageCursor,
   PageHookCursor,
   requestedPageSize,
   TokenCursor,
+  type ProviderPage,
   type TokenPage,
 } from "../../src/cursors";
 import { ObservationGate, trackedCollectionObservers } from "../../src/observers";
@@ -643,6 +645,146 @@ describe("TokenCursor", () => {
     expect(ids(await quiet.next())).toEqual([2]);
     quiet[Symbol.dispose]();
     expect(disposed).toBeNull();
+  });
+});
+
+describe("PageCursor", () => {
+  const issue = (id: number, open = true): Issue => ({ id, open });
+  const byId = (a: Issue, b: Issue) => a.id - b.id;
+
+  /** Serves a scripted sequence of numbered pages; past the end the provider reports exhaustion. */
+  function pageApi(pages: ProviderPage<Issue>[]) {
+    let index = 0;
+    return vi.fn(async (_page: number, _perPage: number) => pages[index++] ?? { items: [] });
+  }
+
+  it("walks numbered pages until nextPage is null, not until a page is short", async () => {
+    // GitLab's shape: pages can come back short mid-listing, so only the absent continuation
+    // ends the walk.
+    const fetchPage = pageApi([
+      { items: [issue(1), issue(2)], nextPage: 2 },
+      { items: [issue(3)], nextPage: 3 },
+      { items: [issue(4), issue(5)], nextPage: null },
+    ]);
+    const cursor = new PageCursor<Issue>(
+      { fetchPage, pageSize: 10, remotePageSize: 2, maxProviderPagesPerCall: 3 });
+
+    expect(ids(await cursor.next())).toEqual([1, 2, 3, 4, 5]);
+    expect(await cursor.next()).toBeNull();
+    expect(fetchPage.mock.calls).toEqual([[1, 2], [2, 2], [3, 2]]);
+  });
+
+  it("serves pages unchanged when no retain or authorization is given", async () => {
+    // A listing whose observation was authorized once, up front, names neither hook.
+    const cursor = new PageCursor<Issue>({
+      fetchPage: pageApi([
+        { items: [issue(1), issue(2)], nextPage: 2 },
+        { items: [issue(3)], nextPage: null },
+      ]),
+      pageSize: 2,
+      remotePageSize: 2,
+    });
+
+    expect(ids(await cursor.next())).toEqual([1, 2]);
+    expect(ids(await cursor.next())).toEqual([3]);
+    expect(await cursor.next()).toBeNull();
+  });
+
+  it("keeps a page's continuation when retain drops placeholder rows from it", async () => {
+    // GitHub's shape: pull rows arrive as null placeholders so the raw page keeps its upstream
+    // length -- what ends the walk -- and retain drops them afterwards.
+    const rawPages: ProviderPage<Issue | null>[] = [
+      { items: [null, issue(1), null], nextPage: 2 },
+      { items: [issue(2)], nextPage: null },
+    ];
+    const fetchPage = vi.fn(async (page: number): Promise<ProviderPage<Issue | null>> =>
+      rawPages[page - 1]);
+    const cursor = new PageCursor<Issue, Issue | null>({
+      fetchPage,
+      retain: rows => rows.flatMap(row => (row === null ? [] : [row])),
+      pageSize: 1,
+      remotePageSize: 3,
+    });
+
+    expect(ids(await cursor.next())).toEqual([1]);
+    expect(ids(await cursor.next())).toEqual([2]);
+    expect(await cursor.next()).toBeNull();
+  });
+
+  it("keeps walking when an overlay drops every row of a page", async () => {
+    // A selective overlay can drop page after page: the window bounds the reads, the spent
+    // window returns [] ("ask again"), and exhaustion still comes only from nextPage.
+    let calls = 0;
+    const cursor = new PageCursor<Issue>({
+      fetchPage: async page => {
+        calls++;
+        if (page <= 2) return { items: [issue(page * 100)], nextPage: page + 1 };
+        return { items: [issue(3)], nextPage: null };
+      },
+      retain: rows => (calls <= 2 ? [] : [...rows]),
+      pageSize: 1,
+      maxProviderPagesPerCall: 2,
+    });
+
+    expect(await cursor.next()).toEqual([]);
+    expect(calls).toBe(2);
+    expect(ids(await cursor.next())).toEqual([3]);
+    expect(await cursor.next()).toBeNull();
+  });
+
+  it("merges injected rows at their sort positions around the retained rows", async () => {
+    const cursor = new PageCursor<Issue>({
+      fetchPage: pageApi([
+        { items: [issue(2), issue(4)], nextPage: 2 },
+        { items: [issue(6)], nextPage: null },
+      ]),
+      retain: rows => rows.filter(row => row.open),
+      inject: { items: [issue(1, false), issue(4, false), issue(5, false), issue(7, false)], compare: byId },
+      pageSize: 10,
+      remotePageSize: 2,
+    });
+
+    expect(await cursor.next()).toEqual([
+      issue(1, false), issue(2), issue(4, false), issue(4), issue(5, false), issue(6), issue(7, false),
+    ]);
+    expect(await cursor.next()).toBeNull();
+  });
+
+  it("refuses a provider that continues with the page it was asked to continue from", async () => {
+    const fetchPage = vi.fn(async (page: number): Promise<ProviderPage<Issue>> =>
+      page === 1
+        ? { items: [issue(1)], nextPage: 1 }
+        : { items: [issue(2)], nextPage: null });
+    const cursor = new PageCursor<Issue>({ fetchPage, pageSize: 10 });
+
+    await expect(cursor.next()).rejects.toThrow(/returned page 1 to continue a listing that asked for page 1/);
+    await expect(cursor.next()).rejects.toThrow(/returned page 1 to continue a listing that asked for page 1/);
+    expect(fetchPage.mock.calls.map(([page]) => page)).toEqual([1, 1]);
+  });
+
+  it("refuses a provider that restarts a listing at page 1", async () => {
+    const fetchPage = vi.fn(async (page: number): Promise<ProviderPage<Issue>> =>
+      page === 1
+        ? { items: [issue(1)], nextPage: 2 }
+        : { items: [issue(2)], nextPage: 1 });
+    const cursor = new PageCursor<Issue>({ fetchPage, pageSize: 10 });
+
+    await expect(cursor.next()).rejects.toThrow(/returned page 1 to continue a listing that asked for page 2/);
+    expect(fetchPage.mock.calls.map(([page]) => page)).toEqual([1, 2]);
+  });
+
+  it("serializes concurrent callers instead of duplicating and skipping pages", async () => {
+    const fetchPage = pageApi([
+      { items: [issue(1), issue(2)], nextPage: 2 },
+      { items: [issue(3), issue(4)], nextPage: 3 },
+      { items: [issue(5)], nextPage: null },
+    ]);
+    const cursor = new PageCursor<Issue>({ fetchPage, pageSize: 2, remotePageSize: 2 });
+
+    const pages = await Promise.all([cursor.next(), cursor.next(), cursor.next()]);
+
+    expect(pages.map(page => ids(page))).toEqual([[1, 2], [3, 4], [5]]);
+    expect(fetchPage.mock.calls.map(([page]) => page)).toEqual([1, 2, 3]);
   });
 });
 

@@ -5,7 +5,7 @@ import type { Api } from "@earendil-works/pi-ai";
 // pi-ai has no document/file content part -- a UserMessage carries only text and images -- but
 // its API adapters copy an ImageContent's mimeType into the provider payload verbatim. So a PDF
 // attachment travels the agent pipeline disguised as an ImageContent with mimeType
-// application/pdf (see the history replay in agent.ts), and the disguise is fixed up per API at
+// application/pdf (see the history replay in agent-replay.ts), and the disguise is fixed up per API at
 // the last moment, in the onPayload hook that ai-models.ts installs on every model handle:
 //
 // - google-generative-ai: nothing to fix. Gemini natively accepts application/pdf inlineData,
