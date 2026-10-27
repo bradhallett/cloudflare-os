@@ -62,7 +62,6 @@ export type GatekeeperRecord = {
   resourceUrl?: string;     // denormalized to avoid gatekeeper query
   hasSlashCommands?: true;  // denormalized from ResourceDescription
   class: GatekeeperClass,
-  hook?: string,  // export name to which the gatekeeper's hook is connected
 
   /** Records how this gatekeeper was originally created, enabling blueprint metadata derivation. */
   creationSpec?: GatekeeperCreationSpec;
@@ -1236,6 +1235,13 @@ export type BlueprintGadgetRecord = {
    * If persistently true, the UI should show a retry indicator.
    */
   dirty?: boolean;
+
+  /**
+   * Set when the blueprint's deletion failed partway: the blueprint is going away, so every
+   * publish path refuses (deleting it again completes the removal) rather than resurrecting
+   * what the partial delete already removed. Cleared only by the record's own deletion.
+   */
+  deleting?: true;
 };
 
 // =======================================================================================

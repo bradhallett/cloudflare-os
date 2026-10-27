@@ -330,15 +330,9 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     // caller retries. The lease deliberately starts only after authorizeCollaborator returns:
     // verification itself is covered by that call's own internal lease, and a caller it turns
     // away must never have counted at all -- a stranger racing an addGatekeeper would otherwise
-    // cause a needless workspace reset. The handoff between the two leases is microtask-only,
-    // the same argument as open()'s.
-    //
-    // KNOWN GAP, tolerable only while nothing calls this endpoint: this call's lease does not
-    // cover the fire-and-forget turn's initial run. A scope widening after this call returns can
-    // find no session to sever, and the reply can egress under stale verification. #resumeAgent
-    // already re-authorizes the original non-owner person and holds a build lease through a
-    // resumed run; its existing ActiveAgentRecord carries that identity. Before wiring this
-    // endpoint to real callers, give the initial run its own per-turn build lease too.
+    // cause a needless workspace reset. The fire-and-forget turn then takes its own build lease
+    // for its whole run (see startAgent), so the handoff between the two leases is
+    // microtask-only, the same argument as open()'s.
     let leaveSession = () => {};
     using _sessionLease = {[Symbol.dispose]: () => leaveSession()};
 
@@ -528,13 +522,6 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   async startGatekeeperSession(
       target: BindingLoopbackTarget, caller: GatekeeperCaller): Promise<any> {
     return this.impl.startGatekeeperSession(target, caller);
-  }
-
-  startGatekeeperHook(id: number): NativeRpcStub<RpcTarget> {
-    // TODO: There's a bug in workerd, if we return the RpcTarget directly here, because it is a
-    //   Proxy, serializeJsValueWithPipeline() decides it is non-pipelineable, which is incorrect.
-    //   Manually wrapping in a stub works around the problem for now.
-    return new NativeRpcStub(this.impl.getGadgetHookEntrypoint(id));
   }
 
   async startHook(hookId: number): Promise<{

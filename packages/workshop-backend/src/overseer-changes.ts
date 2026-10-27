@@ -114,31 +114,48 @@ export abstract class OverseerChanges extends OverseerPublishing {
     }
 
     let sequence = this.nextChatSequencePeek(chatId);
-    this.addChatMessages(chatId, author!, [{
-      type: "changes",
-      ...(change !== undefined ? {change} : {}),
-      ...(rows.length > 0
-          ? {watermark: {changesGeneration: codeBase.generation,
-                         throughRevision: rows[rows.length - 1].revision}}
-          : {}),
-      ...(pins.length > 0 ? {pins} : {}),
-      ...(options?.createdGadgets?.length
-          ? {createdGadgets: options.createdGadgets} : {}),
-      ...(options?.createdWorktrees?.length
-          ? {createdWorktrees: options.createdWorktrees} : {}),
-      ...(options?.addedBindings?.length
-          ? {addedBindings: options.addedBindings} : {}),
-      ...(options?.worktreeCommits?.length
-          ? {worktreeCommits: options.worktreeCommits} : {}),
-      ...(options?.mainlineMerge !== undefined
-          ? {mainlineMerge: options.mainlineMerge} : {}),
-      ...(options?.blueprintMerges?.length
-          ? {blueprintMerges: options.blueprintMerges} : {}),
-    }]);
+    // One transaction for the whole barrier: the watermark message, the row retirements, and
+    // the pruning commit or roll back together. A crash between them must never leave live
+    // rows already covered by a watermark (the next flush would materialize them a second
+    // time) nor retired rows with no message (their changes would silently vanish).
+    // commitAgentStep already wraps its call in a storage.transaction; transactionSync nests
+    // as a savepoint, so the step barrier stays one unit too.
+    try {
+      return this.storage.transaction(() => {
+        this.addChatMessages(chatId, author!, [{
+          type: "changes",
+          ...(change !== undefined ? {change} : {}),
+          ...(rows.length > 0
+              ? {watermark: {changesGeneration: codeBase.generation,
+                             throughRevision: rows[rows.length - 1].revision}}
+              : {}),
+          ...(pins.length > 0 ? {pins} : {}),
+          ...(options?.createdGadgets?.length
+              ? {createdGadgets: options.createdGadgets} : {}),
+          ...(options?.createdWorktrees?.length
+              ? {createdWorktrees: options.createdWorktrees} : {}),
+          ...(options?.addedBindings?.length
+              ? {addedBindings: options.addedBindings} : {}),
+          ...(options?.worktreeCommits?.length
+              ? {worktreeCommits: options.worktreeCommits} : {}),
+          ...(options?.mainlineMerge !== undefined
+              ? {mainlineMerge: options.mainlineMerge} : {}),
+          ...(options?.blueprintMerges?.length
+              ? {blueprintMerges: options.blueprintMerges} : {}),
+        }]);
 
-    this.retireChatChanges(rows);
-    this.pruneRetiredChatChanges(chatId);
-    return {sequence, meta: this.getChatMetaOrThrow(chatId)};
+        this.retireChatChanges(rows);
+        this.pruneRetiredChatChanges(chatId);
+        return {sequence, meta: this.getChatMetaOrThrow(chatId)};
+      });
+    } catch (err) {
+      // The appends advance the in-memory caches even when the transaction rolls back (the
+      // same recovery commitAgentStep's catch does); drop them so later reads rebuild from
+      // storage.
+      this.chatContentCache.delete(chatId);
+      this.liveWindowCache.delete(chatId);
+      throw err;
+    }
   }
 
   // All publication paths validate durable sources before ACK; text-only gadgets cannot

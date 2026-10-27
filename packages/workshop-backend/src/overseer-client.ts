@@ -1191,6 +1191,7 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
         codeVersionDate: await this.#blueprintCodeDate(record),
         screenshotUrl: blueprintScreenshotUrl(record.id, record.metadata),
         dirty: record.dirty,
+        ...(record.deleting ? {deleting: true} : {}),
         ...(await this.#hasUnpublishedChanges(record) ? {unpublishedChanges: true} : {}),
       });
     }
@@ -1238,6 +1239,9 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
   }): Promise<void> {
     let record = this.impl.storage.blueprints.get(blueprintId);
     if (!record) throw new Error("No such blueprint.");
+    // Refuse before any edits or release-minting: a half-deleted blueprint must be deleted
+    // again, not published back to life (see assertBlueprintPublishable).
+    this.impl.assertBlueprintPublishable(record);
 
     if (options.title === undefined && options.description === undefined && !options.updateCode && !options.updateBindings && options.screenshot === undefined) {
       throw new Error("At least one update option must be provided.");
@@ -1279,8 +1283,10 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
     try {
       await this.impl.deleteBlueprintPropagation(record);
     } catch (err) {
-      // If deletion fails partway through, mark as dirty so the user can retry.
-      record.dirty = true;
+      // If deletion fails partway, mark the record deleting: publish paths then refuse (see
+      // assertBlueprintPublishable) instead of resurrecting what the delete removed, and the
+      // retry is to delete again.
+      record.deleting = true;
       this.impl.storage.blueprints.put(record);
       throw err;
     }
@@ -1289,6 +1295,11 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
   async retryBlueprintPublish(blueprintId: string): Promise<void> {
     let record = this.impl.storage.blueprints.get(blueprintId);
     if (!record) throw new Error("No such blueprint.");
+
+    // Checked before the nothing-to-retry return and the legacy-format message, so a blueprint
+    // whose deletion failed partway says so whatever its publish state was.
+    this.impl.assertBlueprintPublishable(record);
+
     if (!record.dirty) return;  // nothing to retry
 
     if (record.releases === undefined) {

@@ -204,19 +204,14 @@ const logger = createWorkshopLogger("workshop.agent");
 
 const traced = createTracer(obsContext.get);
 
-/**
- * Builds the mutable state one runAgentPass turn works on: gadget/workspace snapshots, worktree
- * pin bases and bases-fault handling, replay application, and the file-read ledger. Everything
- * the loop and the tool implementations share lives on the returned object.
- */
-/**
- * Builds the mutable state one runAgentPass turn works on: gadget/workspace snapshots, worktree
- * pin bases and bases-fault handling, replay application, and the file-read ledger. Everything
- * the loop and the tool implementations share lives on the returned object.
- */
 /** The turn state surface createTurnSession returns. */
 export type TurnSession = Awaited<ReturnType<typeof createTurnSession>>;
 
+/**
+ * Builds the mutable state one runAgentPass turn works on: gadget/workspace snapshots, worktree
+ * pin bases and bases-fault handling, replay application, and the file-read ledger. Everything
+ * the loop and the tool implementations share lives on the returned object.
+ */
 export async function createTurnSession(deps: {
   hooks: AgentHooks;
   handle: ModelHandle;

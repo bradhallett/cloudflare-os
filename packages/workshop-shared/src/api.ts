@@ -4538,6 +4538,7 @@ export type BlueprintGadgetSummary = {
   codeVersionDate: Date;  // timestamp of the exported code version
   screenshotUrl?: string;
   dirty?: boolean;        // true if last publish failed and needs retry
+  deleting?: true;        // present if the blueprint's deletion failed partway; retry the delete
 
   /**
    * Present if the gadget the blueprint is published from has committed files other than the

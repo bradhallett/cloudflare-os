@@ -292,7 +292,7 @@ export function makeUserStorage(storage: DurableObjectStorage) {
       profileRev: 0,
       // Profile revision the deployment-wide user directory last acknowledged
       // (-1 = never, which also lazily backfills users created before the
-      // directory existed). See #syncDirectory().
+      // directory existed). See UserDirectoryScopeStore.sync().
       directoryRev: -1,
 
       // Set by deprovision(): the account is closed. Every authentication path refuses while

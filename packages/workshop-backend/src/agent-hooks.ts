@@ -174,37 +174,7 @@ export interface ChatLogHooks {
    * Takes the messages sent to the chat since the agent last asked, recording each in the chat
    * log as a steered message. The agent reads them before its next model request.
    */
-
-  /**
-   * Takes the messages sent to the chat since the agent last asked, recording each in the chat
-   * log as a steered message. The agent reads them before its next model request.
-   */
   takeSteers(chatId: number): string[];
-
-  /**
-   * The step's persistence barrier: in one storage transaction, persist the step's chat
-   * messages (`msgs`, the tool-call record among them), validate and append each buffered
-   * change as a chat change row -- one row per tool call, in call order, with the same
-   * pin/codeBase bookkeeping the appends always had -- materialize the rows into the step's
-   * single "changes" message carrying the step's gadget creations (with the blueprint release
-   * each was created from, if any), binding additions, and worktree head advancements (stamping
-   * pending gadget and binding records, making created worktrees permanent, and advancing
-   * worktree heads), and retire the rows. The step's effects
-   * are thus durable iff its transcript record is; a crash mid-step loses both, and the resumed
-   * model re-runs the step against unmodified content. Returns whether a "changes" message was
-   * written (change-ID numbering counts messages).
-   *
-   * Rows and messages broadcast from inside the transaction, as every append always has: the
-   * transaction protects server-side storage, not what subscribers saw before a rollback (a
-   * mid-barrier exception is itself a bug; see the design note on materializeChatChanges'
-   * caller in overseer.ts). The rows' `changeApplied` broadcasts supersede the tool calls'
-   * streamed edit previews.
-   *
-   * The accounting parameters match the overseer's addChatMessages. `usage` is pi's report for
-   * the step: it sets the chat's token counts, and its catalog-priced `cost.total` is the cost
-   * fallback. When both `aiGatewayLogId` and `aiGatewayLogRoute` are present, the authoritative
-   * cost is fetched asynchronously from the AI Gateway log; otherwise the estimate is applied.
-   */
 
   /**
    * The step's persistence barrier: in one storage transaction, persist the step's chat
@@ -247,22 +217,10 @@ export interface ChatLogHooks {
    * The history one agent pass replays (see ChatHistory). Read fresh before each pass, since a
    * pass can compact or persist steps.
    */
-
-  /**
-   * The history one agent pass replays (see ChatHistory). Read fresh before each pass, since a
-   * pass can compact or persist steps.
-   */
   loadChatHistory(chatId: number): ChatHistory;
 
   /** Publish a compaction checkpoint: later history loads start from it. */
   commitChatCompaction(chatId: number, checkpoint: CompactionCheckpoint): void;
-
-  /**
-   * The gadget's current head commit (WorkpieceSummary.commitId), or undefined if it has none:
-   * still pending in a chat, created outside chats and never accepted, or deleted. An unpinned
-   * gadget with a head is read at that head; one without a head lives only in the session doc.
-   * Undefined for worktrees, whose counterpart is getWorktreePinBase.
-   */
 
   /**
    * Fetch the model-facing snapshot persisted for an agent step's "message" record, if any (see
@@ -272,17 +230,20 @@ export interface ChatLogHooks {
   getChatModelData(chatId: number, sequence: number): StoredAssistantMessage | undefined;
 
   /**
-   * Record an observation in the Overseer audit log on behalf of a built-in agent tool
-   * (i.e. one that isn't backed by a gatekeeper, like `webFetch`). Used to track which
-   * external influencers may have tainted the agent's session.
+   * Broadcast a live stream event (a text or tool-output delta, compaction progress, and the
+   * like) to the chat's connected subscribers. Presentational only: nothing is queued or
+   * persisted -- an event with no subscriber is dropped, and the durable record of the same
+   * work is whatever the step's barrier commits to the chat log.
    */
 
   emitChatStreamEvent(chatId: number, event: AiChatStreamEvent): void;
 
   /**
-   * Fetch the model-facing snapshot persisted for an agent step's "message" record, if any (see
-   * StoredAssistantMessage). Absent for messages persisted before snapshots existed; replay then
-   * falls back to reconstructing the message from the client-visible record.
+   * Take what the current step's gatekeeper tool calls captured -- the ids of the actions they
+   * staged, and the flags the turn's control flow reads off them: `accessedGadget`, whether any
+   * facet call touched a gadget, and `awaitDecision`, re-checked here against the actions' live
+   * state so only an awaited action still pending (or rejected, which ends the turn) keeps the
+   * agent waiting. Consuming clears the capture for the next step.
    */
 
   consumeCapturedActions(chatId: number)
@@ -294,21 +255,8 @@ export interface ChatLogHooks {
    */
   consumeCapturedConnectionRequests(chatId: number): AiChatMessageBody[];
 
-  /**
-   * Mint a gatekeeper simulating a new resource of a creatable type, and queue the creation for
-   * the user's approval. Unlike requestConnection, nothing waits on the user: the gatekeeper
-   * simulates the resource until the creation applies. Throws an agent-readable message when the
-   * request can't be met.
-   */
-
   /** Returns the bytes of a committed attachment owned by this chat for inclusion in model input. */
   getChatAttachmentData(chatId: number, id: string): Promise<Uint8Array>;
-
-  /**
-   * Returns the resources needed by `webFetch` to delegate document-to-Markdown conversion
-   * to Workers AI. Exposed as a narrow interface (rather than handing over the whole `env`)
-   * so the dependency surface stays explicit.
-   */
 
   /**
    * Prepare (seeding/naming lazily as needed) and return the chat's seed binding layer, including
@@ -321,12 +269,6 @@ export interface ChatLogHooks {
    * caller's replay blind to the new names until the next turn.
    */
   prepareChatBindings(chatId: number, chatMessages: AiChatMessage[]): Promise<SeedBindingInfo[]>;
-
-  /**
-   * Run one executeCode tool call. `worktreeTurn` is the turn's worktree state (see
-   * WorktreeTurnAccess): the overseer registers it for the duration of the execution so the
-   * chat's worktree env bindings can resolve against the running turn.
-   */
 
 }
 
@@ -352,19 +294,7 @@ export interface WorkspaceReadHooks {
    * worktree analog of getGadgetHead. Only an accept moves it, and none can run mid-turn.
    * Undefined for anything that is not a live worktree.
    */
-
-  /**
-   * A worktree's accepted commit (WorktreeRecord.pinBase in overseer-storage.ts): what an unpinned
-   * worktree reads at, lazily by path, and what its first modification pins it at -- the
-   * worktree analog of getGadgetHead. Only an accept moves it, and none can run mid-turn.
-   * Undefined for anything that is not a live worktree.
-   */
   getWorktreePinBase(id: WorkpieceId): string | undefined;
-
-  /**
-   * Read a commit's full file map from the workspace's git object store. Commits are immutable,
-   * so results are cacheable by oid (and the store's parse cache makes repeats cheap).
-   */
 
   /**
    * Read a commit's full file map from the workspace's git object store. Commits are immutable,
@@ -377,19 +307,7 @@ export interface WorkspaceReadHooks {
    * ones included, in sorted order. Compares tree objects by id, so no file is read, and a
    * subtree that is the same on both sides is not read either.
    */
-
-  /**
-   * The paths of the files whose entry differs between two commits' trees, added and removed
-   * ones included, in sorted order. Compares tree objects by id, so no file is read, and a
-   * subtree that is the same on both sides is not read either.
-   */
   listChangedPaths(fromCommit: string, toCommit: string): Promise<string[]>;
-
-  /**
-   * Summarize the workspace's gadgets for the system prompt and for describeBinding's `gadget`
-   * lookups (see AgentGadgetInfo). Gadgets still provisional to a chat other than `forChatId` are
-   * omitted.
-   */
 
   /**
    * Summarize the workspace's gadgets for the system prompt and for describeBinding's `gadget`
@@ -405,40 +323,14 @@ export interface WorkspaceReadHooks {
    * other than `forChatId` -- (used by live file tools; history replay omits it so old edits to
    * since-deleted gadgets still resolve).
    */
-
-  /**
-   * Resolve an agent tool's optional workpiece reference. Absent means the workspace's default
-   * gadget; throws an agent-readable error if there is none. When `mustExist` is set,
-   * additionally throws if the gadget isn't currently registered -- or is provisional to a chat
-   * other than `forChatId` -- (used by live file tools; history replay omits it so old edits to
-   * since-deleted gadgets still resolve).
-   */
   resolveWorkpieceRoot(workpieceId?: WorkpieceId, mustExist?: boolean, forChatId?: number)
       : {workpieceId: WorkpieceId};
-
-  /**
-   * Create a new, empty gadget workpiece with the given title and binding name, provisional to
-   * the given chat: it becomes permanent only when the user accepts the chat's changes through
-   * the "changes" message that records the creation (GadgetRecord.pending in overseer-storage.ts).
-   * Throws if the binding name is invalid or already claimed by another gadget (including one
-   * still pending in another chat). Returns the id and the (trimmed) title as created.
-   * `blueprint` is the blueprint being instantiated, if any, and `output` the format it declares
-   * (see fetchBlueprint). A gadget created from none is recorded as made from scratch.
-   */
 
   /**
    * Whether the workpiece is a worktree: chat-private, git-rooted, read lazily by path. False
    * for gadgets and for ids that no longer resolve.
    */
   isWorktree(id: WorkpieceId): boolean;
-
-  /**
-   * Read one file of a commit's tree by path, walking (and fault-pulling) only the objects along
-   * the path -- never a whole tree -- the lazy base resolver behind worktree session content and
-   * the way every unpinned read is served, gadget or worktree. Returns undefined for an absent
-   * path; throws descriptive, agent-visible errors for a symlink or submodule path (naming the
-   * target), oversized or binary content, and pull failures.
-   */
 
   /**
    * Read one file of a commit's tree by path, walking (and fault-pulling) only the objects along
@@ -454,19 +346,8 @@ export interface WorkspaceReadHooks {
    * unpinned read stamps (AiToolCall.observedOid, and the agent's filesRead) so a later edit can
    * ask whether the committed file is still byte-identical (fileOidAtCommit).
    */
-
-  /**
-   * readFileAtCommit that also reports the blob's oid: the file's content address, which an
-   * unpinned read stamps (AiToolCall.observedOid, and the agent's filesRead) so a later edit can
-   * ask whether the committed file is still byte-identical (fileOidAtCommit).
-   */
   readFileAtCommitWithOid(commit: string, path: string)
       : Promise<{text: string, oid: string} | undefined>;
-
-  /**
-   * The blob oid of the regular file at `path` in a commit's tree, or undefined for an absent
-   * path or one naming anything else. A tree walk along the path; never reads the blob.
-   */
 
   /**
    * The blob oid of the regular file at `path` in a commit's tree, or undefined for an absent
@@ -479,20 +360,7 @@ export interface WorkspaceReadHooks {
    * errors). How replay reproduces exactly the text a stamped read returned, whatever the
    * commit holds now.
    */
-
-  /**
-   * Read a blob by oid as text, under readFileAtCommit's content rules (`path` names the file in
-   * errors). How replay reproduces exactly the text a stamped read returned, whatever the
-   * commit holds now.
-   */
   readBlobText(oid: string, path: string): Promise<string>;
-
-  /**
-   * Throws the same descriptive errors readFileAtCommit does when `path` names a symlink or
-   * submodule in the commit's tree -- the write side of the tree-entry modes rules. Absent
-   * paths (new files) and regular files pass, including ones whose content is unreadable
-   * (a whole-file write is coherent against any base).
-   */
 
   /**
    * Throws the same descriptive errors readFileAtCommit does when `path` names a symlink or
@@ -508,21 +376,8 @@ export interface WorkspaceReadHooks {
    * commit the workpiece's untouched files are read from, or undefined for a gadget with no
    * committed code.
    */
-
-  /**
-   * The grep tool's scan: the searchable files under `path` in a workpiece's overlay-over-base
-   * view, with missing base blobs pulled in one batch (see scanWorkpieceForGrep). `base` is the
-   * commit the workpiece's untouched files are read from, or undefined for a gadget with no
-   * committed code.
-   */
   grepWorkpiece(turn: WorktreeTurnAccess, workpieceId: WorkpieceId, base: string | undefined,
                 path?: string): Promise<GrepScan>;
-
-  /**
-   * Describe a workpiece (a gadget or a gatekeeper) reachable as `envName` in chat `chatId`'s
-   * env, for the agent's describeBinding tool. (`envName` is provided here only so that it can
-   * be incorporated into the returned description.)
-   */
 
   /**
    * Describe a workpiece (a gadget or a gatekeeper) reachable as `envName` in chat `chatId`'s
@@ -533,13 +388,6 @@ export interface WorkspaceReadHooks {
 
   /** Describe the env.GIT binding (see GIT_BINDING_NAME), for the describeBinding tool. */
   describeGitBinding(envName: string): string;
-
-  /**
-   * Add a binding to the given gadget or agent spawner, pointing at the given workpiece. The
-   * binding is provisional to the chat. The caller is responsible for getting the addition
-   * recorded in the chat log (see `addedBindings` on the "changes" message) so the pending edge
-   * gets sequence-stamped.
-   */
 
   /**
    * Deployment-wide, admin-authored instructions to append to the agent's system prompt. Returns
@@ -557,35 +405,13 @@ export interface WorkspaceReadHooks {
    * system prompt so the agent knows what it can request; resource patterns are fetched on demand
    * via listConnectableResources().
    */
-
-  /**
-   * Connection-request hooks for the agent.
-   *
-   * List the gatekeeper vendors the user could connect (id + display name). Used to populate the
-   * system prompt so the agent knows what it can request; resource patterns are fetched on demand
-   * via listConnectableResources().
-   */
   listConnectableVendors(): Promise<{id: string, displayName: string}[]>;
 
   /**
    * Describe the resource types a given vendor offers (urlPattern + title + description), so the
    * agent can construct a resourceUrl for requestConnection. Returns formatted text.
    */
-
-  /**
-   * Describe the resource types a given vendor offers (urlPattern + title + description), so the
-   * agent can construct a resourceUrl for requestConnection. Returns formatted text.
-   */
   listConnectableResources(vendorId: string): Promise<string>;
-
-  /**
-   * Record a pending connection request for the given chat. `message` is the tool output text; when
-   * `requested` is true a request was created (captured and spliced into the chat as a
-   * "connectionRequest" message by the agent loop, see consumeCapturedConnectionRequests) and the
-   * turn should end so the agent waits for the user. When `requested` is false the request was
-   * rejected (e.g. it wouldn't resolve to a connectable resource); `message` explains what to fix
-   * and the agent should be allowed to retry within the same turn.
-   */
 
   /**
    * Blueprint hooks for the agent.
@@ -597,12 +423,6 @@ export interface WorkspaceReadHooks {
    * scan directly.
    */
   listAvailableBlueprints(initiator: AiChatAuthorInfo): Promise<string>;
-
-  /**
-   * A short standing note naming the deployment's standard output formats, or "" if it has none.
-   * Carried in the system prompt rather than left to `listBlueprints`, because a request phrased as
-   * "make me a doc" may not prompt an agent to go looking for blueprints at all.
-   */
 
   /**
    * A short standing note naming the deployment's standard output formats, or "" if it has none.
@@ -621,27 +441,10 @@ export interface WorkspaceReadHooks {
    * member of the org owning an org-owned blueprint to read it. Throws an agent-readable error if
    * the blueprint doesn't exist.
    */
-
-  /**
-   * Fetch a blueprint's decoded files, plus formatted notes describing the copied files and the
-   * bindings the blueprint's code expects the agent to wire up. Used by the createGadget tool to
-   * instantiate the blueprint as a new gadget, along with the output format the blueprint declares
-   * (if any), which the created gadget inherits. `merge` is the record of the release the files
-   * are, for the creation's "changes" message once the gadget has an id (see
-   * AiChatMessageBody.blueprintMerges). `initiator` is the user the turn runs for, who must be a
-   * member of the org owning an org-owned blueprint to read it. Throws an agent-readable error if
-   * the blueprint doesn't exist.
-   */
   fetchBlueprint(initiator: AiChatAuthorInfo, blueprintId: string): Promise<{
     files: Record<string, string>, notes: string, output?: BlueprintOutput,
     merge: Omit<BlueprintMerge, "gadgetId">,
   }>;
-
-  /**
-   * Activate one of this chat's bot skills (agentContext.botSkills) by commandId or unique
-   * title, invoking it against the workspace and returning its agent-visible result text.
-   * Throws an agent-readable error when the skill is unknown, ambiguous, or no longer usable.
-   */
 
   /**
    * The bots the turn's initiator may delegate to or message (merged user + deployment bots,
@@ -649,13 +452,6 @@ export interface WorkspaceReadHooks {
    * delegateToBot/messageBot tools are omitted -- when there are none (or no initiator).
    */
   listDelegatableBots(chatId: number): Promise<{key: string, name: string, description?: string}[]>;
-
-  /**
-   * Run (or continue) a bot's thread as this chat's subagent and await its reply: idempotent by
-   * `toolCallId` (a re-executed tool call returns the existing child, never a duplicate), and
-   * returning the child's last reply or an honest status string when it ended without one.
-   * Refuses cycles, self-delegation, and over-deep chains with agent-readable errors.
-   */
 
 }
 
@@ -688,23 +484,8 @@ export interface ToolEffectHooks {
    * reconciliation reaps. The new worktree is unpinned: it reads as its base commit until the
    * first modification pins it. Returns the base commit alongside the id.
    */
-
-  /**
-   * Create a new worktree workpiece rooted at the given commit id (a full oid, resolved against
-   * the workspace's local git knowledge -- never a remote lookup), provisional to and permanently
-   * private to the given chat. Performs the initial pull when the commit is known only from a
-   * gatekeeper. Like createGadget, the creation becomes durable via the step's "changes" message
-   * (`createdWorktrees`); a step that dies before its barrier leaves an unstamped record that
-   * reconciliation reaps. The new worktree is unpinned: it reads as its base commit until the
-   * first modification pins it. Returns the base commit alongside the id.
-   */
   createWorktree(title: string, chatId: number, commitId: string)
       : Promise<{id: WorkpieceId, title: string, baseCommit: string}>;
-
-  /**
-   * Whether the workpiece is a worktree: chat-private, git-rooted, read lazily by path. False
-   * for gadgets and for ids that no longer resolve.
-   */
 
   /**
    * Add a binding to the given gadget or agent spawner, pointing at the given workpiece. The
@@ -713,17 +494,6 @@ export interface ToolEffectHooks {
    * gets sequence-stamped.
    */
   addGadgetBinding(gadgetId: WorkpieceId, name: string, target: WorkpieceId, chatId: number): void;
-
-  /**
-   * Prepare (seeding/naming lazily as needed) and return the chat's seed binding layer, including
-   * the always-available (ambient) resources with their discovery catalogs. Called at turn start,
-   * before history replay; this is also the chokepoint that stamps binding names onto any
-   * persisted messages that introduced resources but don't carry a name yet (pasted resources,
-   * plus connection requests from before agents named their own). `chatMessages` is the caller's
-   * in-memory copy of the chat log, which is both scanned and stamped in place -- storage reads
-   * return fresh deserialized objects, so stamping a separately-listed copy would leave the
-   * caller's replay blind to the new names until the next turn.
-   */
 
   /**
    * Run one executeCode tool call. `worktreeTurn` is the turn's worktree state (see
@@ -747,19 +517,12 @@ export interface ToolEffectHooks {
       resourceUrl: string | undefined,
       description: ObservationDescription): Promise<void>;
 
-  /** Returns the bytes of a committed attachment owned by this chat for inclusion in model input. */
-
   /**
    * Returns the resources needed by `webFetch` to delegate document-to-Markdown conversion
    * to Workers AI. Exposed as a narrow interface (rather than handing over the whole `env`)
    * so the dependency surface stays explicit.
    */
   getWebFetchEnv(): WebFetchEnv;
-
-  /**
-   * Deployment-wide, admin-authored instructions to append to the agent's system prompt. Returns
-   * "" when none are set. Read on each turn so admin edits take effect promptly.
-   */
 
   /**
    * Record a pending connection request for the given chat. `message` is the tool output text; when
@@ -777,11 +540,6 @@ export interface ToolEffectHooks {
   }): Promise<{ requested: boolean; message: string }>;
 
   /**
-   * Drain connection requests captured during the current step so they can be appended to the chat
-   * (analogous to consumeCapturedActions).
-   */
-
-  /**
    * Mint a gatekeeper simulating a new resource of a creatable type, and queue the creation for
    * the user's approval. Unlike requestConnection, nothing waits on the user: the gatekeeper
    * simulates the resource until the creation applies. Throws an agent-readable message when the
@@ -792,27 +550,11 @@ export interface ToolEffectHooks {
       : Promise<{gatekeeperId: WorkpieceId}>;
 
   /**
-   * Blueprint hooks for the agent.
-   *
-   * List the blueprints available to the turn's initiator (their own published blueprints, their
-   * library, and the deployment's featured set) as formatted text. The initiator -- not the
-   * workspace owner -- because blueprint libraries are per-user: a collaborator driving the agent
-   * should see their own. There is no search index; the corpora are small enough for the model to
-   * scan directly.
-   */
-
-  /**
    * Activate one of this chat's bot skills (agentContext.botSkills) by commandId or unique
    * title, invoking it against the workspace and returning its agent-visible result text.
    * Throws an agent-readable error when the skill is unknown, ambiguous, or no longer usable.
    */
   invokeBotSkill(chatId: number, skill: string): Promise<string>;
-
-  /**
-   * The bots the turn's initiator may delegate to or message (merged user + deployment bots,
-   * only the available ones), as the bot tools' descriptions list them. Empty -- and the
-   * delegateToBot/messageBot tools are omitted -- when there are none (or no initiator).
-   */
 
   /**
    * Run (or continue) a bot's thread as this chat's subagent and await its reply: idempotent by
@@ -822,13 +564,6 @@ export interface ToolEffectHooks {
    */
   runBotSubagent(chatId: number, bot: string, message: string, threadId: number | undefined,
       toolCallId: string, signal: AbortSignal): Promise<{threadId: number, response: string}>;
-
-  /**
-   * Deliver a direct message to another bot's thread in this chat's delegation tree (waking an
-   * idle one, auto-spawning a missing one, steering a mid-turn one) or to "orchestrator" (the
-   * chat's parent). Returns confirmation text for the sender; throws an agent-readable error
-   * when the target can't be resolved or the tree's DM budget is exhausted.
-   */
 
   /**
    * Deliver a direct message to another bot's thread in this chat's delegation tree (waking an

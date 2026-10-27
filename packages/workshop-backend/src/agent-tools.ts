@@ -130,10 +130,6 @@ async function describeBinding(
 }
 
 /**
- * Builds the built-in tool set for one agent turn: every tool closure shares the turn's
- * session state and the chat's identity; bot-only tools are attached by the caller.
- */
-/**
  * Renders a JSON-structured tool result as the exact text the model sees. Used by both the live
  * tools and history replay so the two can never drift.
  */
@@ -141,17 +137,21 @@ export function jsonToolResultText(value: unknown): string {
   return JSON.stringify(value);
 }
 
-  // Schema fragment for the file tools' workpiece reference. Note that although historical logs
-  // allow these tool calls to omit this param, is is required in all new tool calls, hence we do
-  // not describe it as optional here.
-  let workpieceParam = Type.String({
-    description:
-        "Env binding name of the workpiece (gadget or worktree) that owns the file, as listed " +
-        "in the system prompt or chosen when creating it.",
-  });
+// Schema fragment for the file tools' workpiece reference. Optional in the schema exactly as it
+// is at runtime (resolveWorkpieceRoot): omitted means the workspace's default gadget when it has
+// one, and an agent-readable error when it does not -- the same contract the system prompt
+// states, so provider-side validation never rejects the fallback the prompt advertises.
+let workpieceParam = Type.Optional(Type.String({
+  description:
+      "Env binding name of the workpiece (gadget or worktree) that owns the file, as listed " +
+      "in the system prompt or chosen when creating it. May be omitted when the workspace has " +
+      "a default gadget, which the file tools then operate on.",
+}));
 
-
-/** Builds the built-in tool set for one agent turn. */
+/**
+ * Builds the built-in tool set for one agent turn: every tool closure shares the turn's
+ * session state and the chat's identity; bot-only tools are attached by the caller.
+ */
 export function buildTools(deps: {
   session: TurnSession;
   hooks: AgentHooks;
