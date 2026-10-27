@@ -12,7 +12,7 @@ import { releaseMergeHeader } from "./blueprint-release";
 import { encodeGitTree, gitObjectOid } from "./git-codec";
 import { resolveBlueprintForUser } from "./blueprint-access";
 import { retryOnDoReset } from "./do-retry";
-import type { UserChatContext } from "./user";
+import type { UserChatContext } from "./user-models";
 import { OverseerBindings } from "./overseer-bindings";
 import { acceptWriteError } from "./overseer-support";
 
