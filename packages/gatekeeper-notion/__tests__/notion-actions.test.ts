@@ -163,8 +163,7 @@ describe("applyStoredAction", () => {
 });
 
 // Minimal in-memory storage matching the slice of the DO storage API NotionStore uses.
-function makeKv(): DurableObjectStorage["kv"] {
-  const map = new Map<string, unknown>();
+function makeKv(map: Map<string, unknown> = new Map()): DurableObjectStorage["kv"] {
   return {
     get: <T>(k: string) => {
       const value = map.get(k);
@@ -336,5 +335,36 @@ describe("claim-before-apply", () => {
     expect(calls.createComment).toHaveLength(0);
     await rejectStoredAction(store, dependentsId);
     expect(store.lifecycle.journal.get(dependentsId)).toBeUndefined();
+  });
+});
+
+describe("legacy upgrade", () => {
+  it("upgrades only rows still awaiting a decision", async () => {
+    const map = new Map<string, unknown>();
+    const kv = makeKv(map);
+    // Pre-journal bytes as the bespoke store left them: a pending edit, a comment whose dispatch
+    // died mid-flight (claimed), an applied comment, and the next-unused counter.
+    kv.put("seq:action", 5);
+    kv.put("action:2", {
+      action: { type: "setTitle", pageId: "page-1", title: "New", previousTitle: "Old" }, state: "pending",
+    });
+    kv.put("action:3", { action: { type: "addComment", pageId: "page-1", text: "died mid-dispatch" }, state: "claimed" });
+    kv.put("action:4", { action: { type: "addComment", pageId: "page-1", text: "done" }, state: "applied" });
+    const { api, calls } = makeApi();
+    const store = new NotionStore(kv, api);
+
+    // The pending row upgrades in place and applies through the engine.
+    await applyStoredAction(store, 2);
+    expect(calls.updatePage).toHaveLength(1);
+    expect(store.lifecycle.journal.get(2)).toMatchObject({ state: "applied" });
+
+    // The claimed row's outcome is unknowable: it must NOT reappear as re-dispatchable pending —
+    // blindly re-issuing its comment would duplicate a write that may already have landed.
+    await expect(applyStoredAction(store, 3)).rejects.toThrow("Unknown pending action: 3");
+    expect(calls.createComment).toHaveLength(0);
+
+    // The applied row is settled and drops from the pending view.
+    await expect(applyStoredAction(store, 4)).rejects.toThrow("Unknown pending action: 4");
+    expect(store.pendingActions()).toHaveLength(0);
   });
 });

@@ -542,6 +542,9 @@ function adoptLegacyActionRows(
     if (typeof raw === "object" && raw !== null && "v" in raw) continue;
     const id = Number(key.slice("action:".length));
     if (!Number.isInteger(id) || id < 1) continue;
+    // A prior activation already adopted this id (journal row or retained memory): re-adopting
+    // would throw "already issued" and brick every later activation. Adoption is one-time per id.
+    if (journal.hasRecord(id) || journal.wasApplied(id)) continue;
     const state = (raw as { state?: unknown }).state;
     if (state === "reverted") {
       deletions.push(key);

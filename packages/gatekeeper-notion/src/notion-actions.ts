@@ -1045,15 +1045,17 @@ type NotionDefinitions = {
 
 /**
  * Converts a legacy pre-journal row. Only records still awaiting a decision upgrade: the kit
- * coerces every converted row to pending, so anything else (applied, reverted, failed) would come
- * back as a re-appliable ghost and must drop — applied pages stay reachable through their
- * `prov:` bindings, and reverted rows are inert.
+ * coerces every converted row to pending, so anything else would come back as a re-appliable
+ * ghost and must drop — a `claimed` row's dispatch was in flight when the store swapped and its
+ * outcome is unknowable, so it drops like the other settled states rather than blindly
+ * re-dispatching (applied pages stay reachable through their `prov:` bindings; failed and
+ * reverted rows are inert).
  */
 function upgradeLegacyRecord(raw: unknown): TaggedAction<NotionKinds> | undefined {
   if (typeof raw !== "object" || raw === null) return undefined;
   const { action, state } = raw as { action?: unknown; state?: unknown };
   if (typeof action !== "object" || action === null) return undefined;
-  if (state !== "pending" && state !== "claimed") return undefined;
+  if (state !== "pending") return undefined;
   const { type, ...payload } = action as { type?: unknown };
   if (typeof type !== "string" || !(type in NOTION_DEFS)) return undefined;
   return { kind: type as keyof NotionKinds, payload } as TaggedAction<NotionKinds>;

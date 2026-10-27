@@ -15,8 +15,7 @@ import { ConfluenceApiError, ConfluenceTransportError, type ConfluenceApi } from
 type Storage = ConstructorParameters<typeof ConfluenceStore>[0];
 
 // Minimal in-memory storage matching the slice of the DO storage API the store uses.
-function makeStorage(): Storage {
-  const map = new Map<string, unknown>();
+function makeStorage(map: Map<string, unknown> = new Map()): Storage {
   const kv = {
     get: <T>(k: string) => {
       const value = map.get(k);
@@ -209,6 +208,32 @@ describe("claim-before-apply", () => {
     expect(store.pendingActions()).toHaveLength(0);
     await rejectStoredAction(store, id);
     expect(store.getAction(id)).toBeUndefined();
+  });
+
+  it("survives re-activation over adopted legacy rows (adoption is one-time per id)", () => {
+    const map = new Map<string, unknown>();
+    const { api } = makeApi();
+    // Pre-engine bytes as the bespoke store left them: an applied update (revert trail), a
+    // claimed comment (dispatch died mid-flight), a failed comment, and the next-unused counter.
+    const seed = makeStorage(map);
+    seed.kv.put("seq:action", 5);
+    seed.kv.put("action:2", {
+      action: { type: "setTitle", contentId: "123", title: "New", previousTitle: "Old" }, state: "applied",
+    });
+    seed.kv.put("action:3", { action: { type: "addComment", contentId: "123", text: "hi" }, state: "claimed" });
+    seed.kv.put("action:4", { action: { type: "addComment", contentId: "123", text: "bye" }, state: "failed", failure: "boom" });
+
+    const first = new ConfluenceStore(seed, api);
+    expect(first.getAction(2)).toMatchObject({ state: "applied" });
+    expect(first.getAction(3)).toMatchObject({ state: "failed" });
+    expect(first.getAction(4)).toMatchObject({ state: "failed" });
+
+    // A DO restart builds a fresh store (and fresh storage wrapper) over the same bytes: the
+    // adoption pass must recognize its own rows instead of throwing "already issued".
+    const second = new ConfluenceStore(makeStorage(map), api);
+    expect(second.getAction(2)).toMatchObject({ state: "applied" });
+    expect(second.getAction(3)).toMatchObject({ state: "failed" });
+    expect(second.getAction(4)).toMatchObject({ state: "failed" });
   });
 
   it("treats a transport failure as an unknown outcome and stops retrying", async () => {

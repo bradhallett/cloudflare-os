@@ -107,4 +107,15 @@ describe("claim-before-apply", () => {
     expect(sb.queries).toHaveLength(1);
     expect(await hooks().gatekeeperActionRecord("claim-applied", props, actionId)).toBeUndefined();
   });
+
+  it("refuses to reject an action that already applied", async () => {
+    const { props, actionId } = await stagedAction("reject-applied");
+
+    unwrap(await hooks().applyGatekeeperAction("reject-applied", props, actionId));
+
+    // The record retired on apply; rejecting the stale id would erase a revert trail (or worse,
+    // answer for a write that landed), so the engine refuses instead of settling silently.
+    expect(failure(await hooks().rejectGatekeeperAction("reject-applied", props, actionId)))
+      .toBe(`Action ${actionId} is no longer pending.`);
+  });
 });
