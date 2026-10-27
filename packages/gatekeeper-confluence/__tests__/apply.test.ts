@@ -342,3 +342,63 @@ describe("revertStoredAction", () => {
     expect(store.getAction(id)?.state).toBe("applied");
   });
 });
+
+describe("stageAction", () => {
+  type Queue = Parameters<typeof stageAction>[1];
+
+  // An approval queue whose submitAction rejects after `midFlight` runs — the shape of an
+  // auto-approval that applied the action while the submit's reply was lost.
+  function queueLosingReply(midFlight?: (id: number) => Promise<void>): Queue {
+    return {
+      submitAction: async (id: number, _description: unknown) => {
+        if (midFlight) await midFlight(id);
+        throw new Error("reply lost");
+      },
+    } as unknown as Queue;
+  }
+
+  it("keeps the record an auto-approval applied before the submit's reply was lost", async () => {
+    const { api, calls } = makeApi();
+    const store = storeWith(api);
+    const action: ConfluenceAction = { type: "setTitle", contentId: "123", title: "New", previousTitle: "Title" };
+
+    // The overseer received the action and applied it; only the reply was lost (CF-1).
+    await expect(
+      stageAction(store, queueLosingReply(id => applyStoredAction(store, id)), action),
+    ).rejects.toThrow("reply lost");
+    expect(calls.updateContent).toHaveLength(1);
+
+    // The applied record survives with its revert trail intact.
+    const record = store.allActions().find(r => r.action.type === "setTitle");
+    expect(record?.state).toBe("applied");
+    await revertStoredAction(store, record!.id);
+    expect(store.getAction(record!.id)?.state).toBe("reverted");
+  });
+
+  it("keeps a claimed record a racing approval left mid-dispatch", async () => {
+    const { api } = makeApi();
+    const store = storeWith(api);
+    const action: ConfluenceAction = { type: "setTitle", contentId: "123", title: "New", previousTitle: "Title" };
+
+    // The racing apply took the claim but has not settled: its record is not the submit's to delete.
+    await expect(
+      stageAction(store, queueLosingReply(id => {
+        const record = store.getAction(id)!;
+        store.putAction({ ...record, state: "claimed" });
+        return Promise.resolve();
+      }), action),
+    ).rejects.toThrow("reply lost");
+
+    expect(store.allActions().find(r => r.action.type === "setTitle")?.state).toBe("claimed");
+  });
+
+  it("drops the record when the submit failed without a handover", async () => {
+    const { api } = makeApi();
+    const store = storeWith(api);
+    const action: ConfluenceAction = { type: "setTitle", contentId: "123", title: "New", previousTitle: "Title" };
+
+    await expect(stageAction(store, queueLosingReply(), action)).rejects.toThrow("reply lost");
+
+    expect(store.allActions()).toEqual([]);
+  });
+});

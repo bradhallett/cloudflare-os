@@ -81,6 +81,11 @@ export class EnrichmentStore {
     this.#kv.delete(this.#pendingKey(id));
   }
 
+  /** Restores a pending enrichment an apply claimed but never dispatched (budget refusal). */
+  putPending(id: number, pending: PendingEnrichment): void {
+    this.#kv.put(this.#pendingKey(id), pending);
+  }
+
   getResult(id: number): StoredEnrichmentOutcome | undefined {
     return this.#kv.get<StoredEnrichmentOutcome>(this.#resultKey(id));
   }

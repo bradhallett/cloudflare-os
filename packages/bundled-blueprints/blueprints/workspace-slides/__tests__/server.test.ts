@@ -6,18 +6,28 @@ import { Gadget } from "../files/server.ts";
 // blocks. A real instance, since the class keeps private methods, over a state that is only the
 // storage the gadget reads and writes -- the `cloudflare:workers` stub vitest.config.ts aliases in
 // accepts it, where the runtime's base would refuse a state that is not a real DurableObjectState.
-function inMemoryGadget(deck: unknown) {
+// Real DO storage structured-clones on every get, so a mutator never aliases the stored object
+// (two unfenced mutators would then edit one shared deck and the queue tests would pass vacuously).
+// The fake clones too, for the same semantics.
+function inMemoryState(deck: unknown) {
   const stored = new Map<string, unknown>([["deck", deck]]);
   const state = {
     storage: {
-      get: async (key: string) => stored.get(key),
+      get: async (key: string) => {
+        const value = stored.get(key);
+        return value === undefined ? undefined : structuredClone(value);
+      },
       put: async (key: string, value: unknown) => { stored.set(key, value); },
     },
   } as unknown as DurableObjectState;
-  return new Gadget(state, {});
+  return { state, stored };
 }
 
-// The stored shape getDeck() accepts as current; anything else is wiped and reseeded.
+function inMemoryGadget(deck: unknown) {
+  return new Gadget(inMemoryState(deck).state, {});
+}
+
+// The stored shape getDeck() accepts as current; older shapes convert in place (below).
 const deck = () => ({ themeVersion: "workspace.1", slides: [{ id: "s1", background: {}, blocks: [] }] });
 
 describe("Workspace Slides blocks", () => {
@@ -63,5 +73,62 @@ describe("Workspace Slides blocks", () => {
     const gadget = inMemoryGadget(deck());
     expect(await gadget.addBlock("gone", { type: "text", x: 0, y: 0, props: {} })).toBeNull();
     expect((await gadget.getDeck()).slides[0]!.blocks).toEqual([]);
+  });
+});
+
+describe("Workspace Slides mutation queue", () => {
+  // Two mutators whose RPCs interleave at the first await: without the sync library's queue
+  // both would read the same stored deck and the second store would silently drop the first
+  // mutation's block (BP-1).
+  it("keeps both of two concurrent block adds", async () => {
+    const gadget = inMemoryGadget(deck());
+    await Promise.all([
+      gadget.addBlock("s1", { type: "text", x: 0, y: 0, props: { text: "first" } }),
+      gadget.addBlock("s1", { type: "text", x: 0, y: 1, props: { text: "second" } }),
+    ]);
+    const saved = await gadget.getDeck();
+    expect(saved.slides[0]!.blocks.map(b => b.props)).toEqual([{ text: "first" }, { text: "second" }]);
+  });
+
+  it("keeps a mutation that races a whole-deck replace", async () => {
+    const gadget = inMemoryGadget(deck());
+    await Promise.all([
+      gadget.setDeck(deck()),
+      gadget.addBlock("s1", { type: "text", x: 0, y: 0, props: { text: "kept" } }),
+    ]);
+    const saved = await gadget.getDeck();
+    // Queue order is call order: the add landed on the deck the replace wrote, not on the
+    // pre-replace snapshot an unfenced pair of RPCs would both have read.
+    expect(saved.slides[0]!.blocks.map(b => b.props)).toEqual([{ text: "kept" }]);
+  });
+});
+
+describe("Workspace Slides deck migration", () => {
+  it("converts an older deck in place instead of wiping it (BP-2)", async () => {
+    // A `slides` deck that predates the version marker: same shape, no stamp.
+    const older = { slides: [{ id: "kept", background: {}, blocks: [] }] };
+    const { state, stored } = inMemoryState(older);
+    const gadget = new Gadget(state, {});
+
+    const loaded = await gadget.getDeck();
+
+    expect(loaded.slides.map(slide => slide.id)).toEqual(["kept"]);  // content kept, not seeded
+    expect(loaded.themeVersion).toBe("workspace.1");                 // stamped current
+    const persisted = stored.get("deck") as { slides: { id: string }[] };
+    expect(persisted.slides.map(slide => slide.id)).toEqual(["kept"]);
+  });
+
+  it("preserves an uninterpretable legacy deck under a side key while seeding a fresh one", async () => {
+    // The pre-`slides` schema (field overrides under numeric keys) predates this source tree;
+    // it cannot be converted, but it must not be destroyed either.
+    const legacy = { "1": { title: "old" }, "2": { title: "older" } };
+    const { state, stored } = inMemoryState(legacy);
+    const gadget = new Gadget(state, {});
+
+    const loaded = await gadget.getDeck();
+
+    expect(loaded.slides.length).toBeGreaterThan(0);        // a usable current deck
+    expect(loaded.themeVersion).toBe("workspace.1");
+    expect(stored.get("deck:legacy-v0")).toEqual(legacy);   // the old bytes survive
   });
 });

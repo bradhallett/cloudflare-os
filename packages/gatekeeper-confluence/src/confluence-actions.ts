@@ -518,7 +518,10 @@ function describeAction(action: ConfluenceAction): ActionDescription {
 // ---------------------------------------------------------------------------------------------
 // Staging
 
-/** Record a pending action and submit it for approval. Rolls back the record if submit fails. */
+/**
+ * Record a pending action and submit it for approval. A submit that fails deletes the record —
+ * unless the record proves the overseer received the action anyway.
+ */
 export async function stageAction(
   store: ConfluenceStore, approvalQueue: RpcStub<ApprovalQueue>, action: ConfluenceAction,
 ): Promise<number> {
@@ -527,7 +530,13 @@ export async function stageAction(
   try {
     await approvalQueue.submitAction(id, describeAction(action));
   } catch (err) {
-    store.deleteAction(id);
+    // An auto-approval can apply the action mid-flight, which proves the overseer received it —
+    // only the reply was lost, and deleting the record would discard its revert trail (or release
+    // staged attachment bytes out from under the in-flight dispatch). Only an absent record (a
+    // rejection cascade deletes those too) or one still pending was never handed over: those
+    // alone are safe to drop.
+    const current = store.getAction(id);
+    if (current === undefined || current.state === "pending") store.deleteAction(id);
     throw err;
   }
   return id;

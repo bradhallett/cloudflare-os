@@ -468,6 +468,8 @@ export interface ChatSpace extends RpcTarget {
    * conversation, including thread replies; the connected account's own posts are never
    * delivered. The hook starts disabled, and nothing is delivered until the user enables it.
    * Every call creates a distinct hook, so subscribe once per conversation or thread to watch.
+   * Deliveries are at-least-once: key any side effects on `entry.info.id`, as
+   * `ChatMessageHook.receiveMessage` describes.
    *
    * `hook` must be a persistent stub that restores through a Gadget's `[restore]()` method: inside
    * the Gadget, create it with `this.ctx.restore(params)`; from `executeCode`, through the Gadget's

@@ -79,4 +79,34 @@ describe("enrichment outcomes", () => {
     expect(stored.status).toBe("failed");
     expect(zi.enrichRequests).toBe(1);
   });
+
+  it("takes its claim before the read reservation, so a mid-reservation rejection cannot supersede it (ZC-1)", async () => {
+    const zi = new FakeZoomInfo().install();
+    const id = await seedAccount(zi);
+    // Spend the day's single read (the limit is 1 in this suite) so the apply stops inside its
+    // read reservation -- exactly the await window where a rejection used to land between the
+    // pending check and a claim that only the reservation's callback would write.
+    const spent = await hooks().run("claim-budget", props(id), [["searchCompanies", {}]]);
+    expect(unwrap(spent)).toBeTruthy();
+
+    const ticket = await submit("claim-race", id);
+    const raced = unwrap(await hooks().rejectDuringApply("claim-race", props(id), ticket.id)) as {
+      apply: { error?: string };
+      rejection: unknown;
+    };
+
+    // The refusal answers the apply: nothing was dispatched, so no credits were spent.
+    expect(raced.apply.error).toContain("used today's 1 ZoomInfo reads");
+    expect(zi.enrichRequests).toBe(0);
+
+    // The claim outran the rejection, so the refused apply restored the enrichment to pending:
+    // it stays retryable (the retry hits the same budget refusal), and the Gadget reads the
+    // ticket as pending rather than "rejected" over a dispatch that never ran.
+    const retry = await hooks().applyAction("claim-race", props(id), ticket.id);
+    expect(failure(retry)).toContain("used today's 1 ZoomInfo reads");
+    const stored = unwrap(await hooks().run("claim-race", props(id), [
+      ["getEnrichmentResult", ticket],
+    ])) as StoredOutcome;
+    expect(stored.status).toBe("pending");
+  });
 });
