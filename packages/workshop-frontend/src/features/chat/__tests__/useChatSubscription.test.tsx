@@ -5,9 +5,9 @@
 // unsubscribe lifecycle, message patching, metadata folds, and the invalidation triggers the
 // transcript depends on. The assertions pin the kernel-verified wire invariants -- at-least-once
 // delivery with idempotent folds, per-stream ordering, generation-keyed provisional state, and
-// revision-gap/watermark handling -- at one level below the UI, so the FE-3 store rewrite can
-// migrate the machinery underneath them. `probeState` is the only seam that knows the hook's
-// return shape; everything else observes rendered data or the fake server's calls.
+// revision-gap/watermark handling -- at one level below the UI. `probeState` is the only seam
+// that knows the store's selector surface; everything else observes rendered data or the fake
+// server's calls.
 
 import { act } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -23,7 +23,17 @@ import type {
 } from "@gadgets/workshop-shared/api";
 import type { CodeChange } from "@gadgets/workshop-shared/code-change";
 import { flushFrames, makeTestRoot } from "../../../action-test-harness";
-import { useChatSubscription } from "../useChatSubscription";
+import {
+  useChatCompactions,
+  useChatIsLoadingHistory,
+  useChatList,
+  useChatListReady,
+  useChatMessages,
+  useChatProvisionalState,
+  useChatRowBuffer,
+  useChatStoreConnection,
+  type UseChatStoreConnectionArgs,
+} from "../store/useChatStore";
 
 const AGENT: AiChatAuthorInfo = { type: "agent", id: "m", name: "Model" };
 const CHAT_ID = 1;
@@ -122,67 +132,63 @@ interface Observed {
   loading: boolean;
 }
 
-// The migration seam (see the file comment): how the hook's latest state is read. The FE-3
-// rewrite swaps this function's body for store selectors; every assertion above it stays.
-function probeState(
-  subscription: ReturnType<typeof useChatSubscription>,
-  selectedChatId: number | null,
-): Observed {
-  const cache = subscription.cacheRef.current;
-  const chats = [...cache.chats.entries()].toSorted((a, b) => a[0] - b[0])
-    .map(([id, chat]) => `${id}:${chat.title}${chat.activeAgent ? "+active" : ""}`)
-    .join(",");
-  const chat = <T, >(read: (id: number) => T, or: T): T =>
-    selectedChatId === null ? or : read(selectedChatId);
+// The migration seam (see the file comment): how the store's latest state is read, as a hook so
+// the probe re-renders when any observed slice changes. Every assertion below it stays.
+function probeState(workspaceId: string, selectedChatId: number | null): Observed {
+  const list = useChatList(workspaceId);
+  const ready = useChatListReady(workspaceId);
+  const loading = useChatIsLoadingHistory(workspaceId, selectedChatId);
+  const messages = useChatMessages(workspaceId, selectedChatId);
+  const provisional = useChatProvisionalState(workspaceId, selectedChatId);
+  const rows = useChatRowBuffer(workspaceId, selectedChatId);
+  const compactions = useChatCompactions(workspaceId, selectedChatId);
   return {
-    chats,
-    messages: chat(
-      (id) => (cache.messages.get(id) ?? []).filter(Boolean)
-        .map((m) => `${m.sequence}:${m.type}`).join(","),
-      ""),
-    provisional: chat(
-      (id) => subscription.provisionalRef.current.get(id)?.text ?? "",
-      ""),
-    rows: chat(
-      (id) => (subscription.chatChangeRowsRef.current.get(id)?.rows ?? [])
-        .map((row) => `${row.generation}.${row.revision}${row.submission ? "*" : ""}`)
-        .join(","),
-      ""),
-    boundaries: chat(
-      (id) => (cache.compacted.get(id) ?? []).map((b) => `@${b.to}`).join(","),
-      ""),
-    ready: subscription.chatListReady,
-    loading: subscription.isLoading,
+    chats: [...list].sort((a, b) => a.id - b.id)
+      .map((chat) => `${chat.id}:${chat.title}${chat.activeAgent ? "+active" : ""}`)
+      .join(","),
+    messages: messages.map((m) => `${m.sequence}:${m.type}`).join(","),
+    provisional: provisional?.text ?? "",
+    rows: rows?.rows.map((row) => `${row.generation}.${row.revision}${row.submission ? "*" : ""}`)
+      .join(",") ?? "",
+    boundaries: compactions.map((b) => `@${b.to}`).join(","),
+    ready,
+    loading,
   };
 }
 
-type NavigateToChat = NonNullable<Parameters<typeof useChatSubscription>[0]["onNavigateToChat"]>;
+type NavigateToChat = UseChatStoreConnectionArgs["onNavigateToChat"];
 
 type MountOptions = {
   selectedChatId?: number | null;
   onNavigateToChat?: ReturnType<typeof vi.fn<NavigateToChat>>;
 };
 
+/** Unique workspace ids keep each mount's registry store (and cache) isolated. */
+let workspaceCounter = 0;
+
 async function mountChat(server: ChatServer, options: MountOptions = {}) {
   const root = makeTestRoot();
-  const toasts = { add: vi.fn() } as unknown as Parameters<
-    typeof useChatSubscription
-  >[0]["toasts"];
+  const toasts = { add: vi.fn() } as unknown as UseChatStoreConnectionArgs["toasts"];
   const onNavigateToChat = (options.onNavigateToChat ?? vi.fn()) as unknown as NavigateToChat & {
     mock: ReturnType<typeof vi.fn<NavigateToChat>>["mock"];
   };
   let selectedChatId = options.selectedChatId ?? null;
   let currentServer = server;
+  // One workspace per mount: the store registry is module-level and durable, so sharing an id
+  // would leak one test's cache into the next.
+  const workspaceId = `test-ws-${++workspaceCounter}`;
 
   const Probe = () => {
-    const subscription = useChatSubscription({
+    useChatStoreConnection({
+      workspaceId,
       overseer: currentServer.overseer,
       selectedChatId,
       toasts,
       onNavigateToChat,
     });
-    return <pre data-testid="state">{JSON.stringify(probeState(subscription, selectedChatId))}</pre>;
+    return <pre data-testid="state">{JSON.stringify(probeState(workspaceId, selectedChatId))}</pre>;
   };
+
 
   const state = (): Observed => {
     const el = document.querySelector('[data-testid="state"]');
