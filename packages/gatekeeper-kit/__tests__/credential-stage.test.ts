@@ -1,14 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
-  clearConnectionSubject,
   commitReconnect,
   commitStagedCredentials,
   CONNECTION_SUBJECT_KEY,
   ConnectionSubject,
   discardStagedCredentials,
-  peekStagedCredentials,
   pinnedConnectionSubject,
-  pinConnectionSubject,
   stageCredentials,
   stageReconnect,
   STAGED_CREDENTIALS_KEY,
@@ -45,9 +42,6 @@ describe("credential stage", () => {
 
     expect(commitStagedCredentials<Grant>(kv, 1_500, first)).toBeNull();
     expect(kv.keys()).toEqual([STAGED_CREDENTIALS_KEY]);
-    expect(peekStagedCredentials<Grant>(kv, 1_500)).toEqual({
-      creds: { ...GRANT, accessToken: "second" }, stageId: second,
-    });
     expect(commitStagedCredentials<Grant>(kv, 1_500, second)).toEqual({ ...GRANT, accessToken: "second" });
     expect(kv.keys()).toEqual([]);
   });
@@ -67,8 +61,7 @@ describe("credential stage", () => {
     // A cleanup an earlier flow scheduled must not drop the stage that replaced it.
     expect(discardStagedCredentials<Grant>(kv, "wrong-stage")).toBeNull();
     expect(kv.keys()).toEqual([STAGED_CREDENTIALS_KEY]);
-    // Past its TTL nothing can commit or read it, but its own flow can still dispose of it.
-    expect(peekStagedCredentials<Grant>(kv, 1_200)).toBeNull();
+    // Past its TTL nothing can commit it, but its own flow can still dispose of it.
     expect(discardStagedCredentials<Grant>(kv, stageId)).toEqual(GRANT);
     expect(kv.keys()).toEqual([]);
   });
@@ -77,20 +70,19 @@ describe("credential stage", () => {
     const kv = fakeKv();
     const stageId = stageCredentials(kv, GRANT, 1_200, 500);
 
-    expect(peekStagedCredentials<Grant>(kv, 1_600)?.creds).toEqual(GRANT);
-    expect(peekStagedCredentials<Grant>(kv, 1_700)).toBeNull();
-    expect(commitStagedCredentials<Grant>(kv, 1_600, stageId)).toEqual(GRANT);
+    expect(commitStagedCredentials<Grant>(kv, 1_700, stageId)).toBeNull();
+    expect(kv.keys()).toEqual([]);
+    const live = stageCredentials(kv, GRANT, 1_200, 500);
+    expect(commitStagedCredentials<Grant>(kv, 1_600, live)).toEqual(GRANT);
   });
 
-  it("peeks without consuming and fails closed on a corrupt or unusable clock", () => {
+  it("fails closed on a corrupt record or unusable clock, deleting what no one can use", () => {
     const kv = fakeKv();
-    expect(peekStagedCredentials<Grant>(kv, 1_000)).toBeNull();
     const stageId = stageCredentials(kv, GRANT, 1_000);
 
-    expect(peekStagedCredentials<Grant>(kv, 1_500)).toEqual({ creds: GRANT, stageId });
-    expect(peekStagedCredentials<Grant>(kv, 1_500)).toEqual({ creds: GRANT, stageId });
-    expect(peekStagedCredentials<Grant>(kv, Number.NaN)).toBeNull();
-    expect(kv.keys()).toEqual([STAGED_CREDENTIALS_KEY]);
+    // An unusable clock expires the stage rather than committing it blind.
+    expect(commitStagedCredentials<Grant>(kv, Number.NaN, stageId)).toBeNull();
+    expect(kv.keys()).toEqual([]);
 
     kv.put(STAGED_CREDENTIALS_KEY, { creds: GRANT, stageId, expiresAt: "soon" });
     expect(commitStagedCredentials<Grant>(kv, 1_000, stageId)).toBeNull();
@@ -98,8 +90,11 @@ describe("credential stage", () => {
 
     // A record written before stages carried an id is unusable, not committable by anyone.
     kv.put(STAGED_CREDENTIALS_KEY, { creds: GRANT, expiresAt: 5_000 });
-    expect(peekStagedCredentials<Grant>(kv, 1_000)).toBeNull();
     expect(commitStagedCredentials<Grant>(kv, 1_000, "")).toBeNull();
+    expect(kv.keys()).toEqual([]);
+
+    kv.put(STAGED_CREDENTIALS_KEY, "garbage");
+    expect(commitStagedCredentials<Grant>(kv, 1_000, "abc")).toBeNull();
     expect(kv.keys()).toEqual([]);
   });
 
@@ -108,10 +103,6 @@ describe("credential stage", () => {
     kv.put(STAGED_CREDENTIALS_KEY, null);
 
     expect(discardStagedCredentials<Grant>(kv)).toBeNull();
-    expect(kv.keys()).toEqual([]);
-
-    kv.put(STAGED_CREDENTIALS_KEY, "garbage");
-    expect(peekStagedCredentials<Grant>(kv, 1_000)).toBeNull();
     expect(kv.keys()).toEqual([]);
 
     kv.put(STAGED_CREDENTIALS_KEY, { stageId: "abc", expiresAt: 5_000 });
@@ -124,7 +115,6 @@ describe("credential stage", () => {
     kv.put("tokens", { access_token: "live" });
     stageCredentials(kv, GRANT, 1_000, 0);
 
-    expect(peekStagedCredentials<Grant>(kv, 1_000)).toBeNull();
     expect(discardStagedCredentials<Grant>(kv)).toEqual(GRANT);
     expect(kv.keys()).toEqual(["tokens"]);
     expect(discardStagedCredentials<Grant>(kv)).toBeNull();
@@ -136,6 +126,13 @@ type User = ConnectionSubject & { login: string };
 const ALICE: User = { id: "1", login: "alice" };
 const BOB: User = { id: "2", login: "bob" };
 
+/** Stages and commits `subject`'s grant, leaving the pin on that subject — the public way to pin. */
+function pinViaCommit(kv: ReturnType<typeof fakeKv>, subject: User, now = 1_000): void {
+  const staged = stageReconnect(kv, GRANT, subject, now, () => ({ title: "", detail: "" }));
+  if (!("stageId" in staged)) throw new Error("expected the pin setup to stage");
+  expect(commitReconnect<Grant>(kv, now + 100, staged.stageId)).toEqual(GRANT);
+}
+
 describe("connection subject pin", () => {
   it("pins the durable key", () => {
     expect(CONNECTION_SUBJECT_KEY).toBe("connectionSubject");
@@ -143,7 +140,7 @@ describe("connection subject pin", () => {
 
   it("refuses a reconnect verified as a different subject than the pin, staging nothing", () => {
     const kv = fakeKv();
-    pinConnectionSubject(kv, ALICE);
+    pinViaCommit(kv, ALICE);
     // An overlapping flow's stage: the refusal must leave it for its own ticket to commit.
     const earlier = stageCredentials(kv, GRANT, 1_000);
 
@@ -156,7 +153,7 @@ describe("connection subject pin", () => {
     expect(outcome).toEqual({
       refused: { title: "That's a different account", detail: "for @alice, not @bob" },
     });
-    expect(peekStagedCredentials<Grant>(kv, 1_200)).toEqual({ creds: GRANT, stageId: earlier });
+    expect(commitReconnect<Grant>(kv, 1_200, earlier)).toEqual(GRANT);
   });
 
   it("stages the pinned subject's own reconnect, and one for a connection nothing pins", () => {
@@ -183,13 +180,11 @@ describe("connection subject pin", () => {
     const followed = stageReconnect(kv, GRANT, renamed, 1_200, () => ({ title: "", detail: "" }));
     if ("stageId" in followed) commitReconnect<Grant>(kv, 1_300, followed.stageId);
     expect(pinnedConnectionSubject<User>(kv)).toEqual(renamed);
-    clearConnectionSubject(kv);
-    expect(kv.keys()).toEqual([]);
   });
 
   it("drops at commit a stage whose subject contradicts the pin", () => {
     const kv = fakeKv();
-    pinConnectionSubject(kv, ALICE);
+    pinViaCommit(kv, ALICE);
     // A stage slipped past the pin — say, hand-written while a rename raced — must not commit.
     const stageId = stageCredentials(kv, GRANT, 1_000);
     const record = kv.get<{ creds: Grant; stageId: string; expiresAt: number }>(STAGED_CREDENTIALS_KEY);
@@ -202,7 +197,7 @@ describe("connection subject pin", () => {
 
   it("commits a subjectless stage without touching the pin", () => {
     const kv = fakeKv();
-    pinConnectionSubject(kv, ALICE);
+    pinViaCommit(kv, ALICE);
     const stageId = stageCredentials(kv, GRANT, 1_000);
 
     expect(commitReconnect<Grant>(kv, 1_100, stageId)).toEqual(GRANT);
@@ -211,7 +206,7 @@ describe("connection subject pin", () => {
 
   it("stages a reconnect with no subject rather than refusing it, pin or no pin", () => {
     const kv = fakeKv();
-    pinConnectionSubject(kv, ALICE);
+    pinViaCommit(kv, ALICE);
     // A grant the connector could not read a subject from cannot be pinned to anyone, so it is
     // neither refused nor allowed to move the pin.
     const staged = stageReconnect(kv, GRANT, undefined, 1_000, () => ({ title: "", detail: "" }));
@@ -233,8 +228,7 @@ describe("connection subject pin", () => {
 
   it("reads the connector's own subject shape back", () => {
     const kv = fakeKv();
-    pinConnectionSubject(kv, ALICE);
+    pinViaCommit(kv, ALICE);
     expect(pinnedConnectionSubject<User>(kv)?.login).toBe("alice");
   });
 });
-

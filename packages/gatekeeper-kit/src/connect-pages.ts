@@ -40,46 +40,6 @@ export function htmlResponse(body: string, status = 200): Response {
 }
 
 /**
- * Normalizes a media type for exact comparison; substring checks would accept values such as
- * `application/jsonp`.
- * @param value Raw `Content-Type` header.
- * @returns Lowercase media type without parameters.
- */
-function mediaType(value: string | null): string {
-  return (value ?? "").split(";", 1)[0]!.trim().toLowerCase();
-}
-
-/**
- * Classifies a browser mutation request. The expected origin is explicit rather than derived from
- * `req.url`, which a fronting proxy may rewrite; the browser's `Origin` names the configured base
- * URL the form was served under. A browser sends `Origin: null` when the submitting page has
- * `Referrer-Policy: no-referrer`, as `htmlResponse` pages do, so serve a guarded HTML form with
- * `Referrer-Policy: same-origin` instead.
- * @param req Mutation request.
- * @param options Expected origin (a base URL is accepted) and media type.
- * @returns An error code, or `undefined` when accepted.
- *
- * @example
- * ```ts
- * const error = connectMutationError(req, { origin: baseUrl, contentType: "application/json" });
- * if (error) {
- *   const status = error === "cross-origin" ? 403 : 415;
- *   return htmlResponse(errorPageHtml("Connection failed", "Start again."), status);
- * }
- * ```
- */
-export function connectMutationError(
-  req: Request,
-  options: { origin: string; contentType: string },
-): "cross-origin" | "unsupported-content-type" | undefined {
-  if (req.headers.get("origin") !== new URL(options.origin).origin) return "cross-origin";
-  if (mediaType(req.headers.get("content-type")) !== mediaType(options.contentType)) {
-    return "unsupported-content-type";
-  }
-  return undefined;
-}
-
-/**
  * Shared connect-page layout. Connect pages cannot load Workshop CSS, so this mirrors its palette.
  */
 export const PAGE_STYLE = `

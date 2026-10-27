@@ -30,9 +30,6 @@ export const STAGED_CREDENTIALS_KEY = "stagedCredentials";
 /** The stored record: the consumer's credentials, the subject the flow verified them as, and the stage's own id and expiry. */
 type StagedCredentials<T> = { creds: T; subject?: ConnectionSubject; stageId: string; expiresAt: number };
 
-/** A stage's credentials together with the id a commit must name to take them. */
-export type StagedCredentialsView<T> = { creds: T; stageId: string };
-
 /**
  * The stable identity of the account a connection belongs to, as its provider spells it: a
  * GitHub user id, a Google `sub` claim, an Atlassian account id. Only `id` is compared, so a
@@ -46,8 +43,8 @@ export const CONNECTION_SUBJECT_KEY = "connectionSubject";
 
 /**
  * Stages credentials for a later `commitStagedCredentials`, replacing any earlier stage. A caller
- * that can safely dispose the previous live stage must `peekStagedCredentials` immediately before
- * this call, with no await between them, then dispose it after this call.
+ * that can safely dispose the previous live stage must capture it immediately before this call,
+ * with no await between them, then dispose it after this call.
  * @param kv Durable Object storage.
  * @param creds Whatever the connector needs to write its live keys on commit.
  * @param now Current Unix time in milliseconds.
@@ -104,19 +101,6 @@ function liveStage<T>(kv: KvMutable, now: number): StagedCredentials<T> | undefi
   return staged !== undefined && Number.isFinite(now) && now < staged.expiresAt
     ? staged
     : undefined;
-}
-
-/**
- * Reads the staged credentials without consuming them, for a connector that needs the id of a stage
- * it wrote earlier in the same flow, or must *use* the credentials once before commit. Every other
- * reader waits for `commitStagedCredentials`.
- * @param kv Durable Object storage.
- * @param now Current Unix time in milliseconds.
- * @returns The staged credentials and their stage id, or `null` when nothing live is staged.
- */
-export function peekStagedCredentials<T>(kv: KvMutable, now: number): StagedCredentialsView<T> | null {
-  const staged = liveStage<T>(kv, now);
-  return staged ? { creds: staged.creds, stageId: staged.stageId } : null;
 }
 
 /**
@@ -191,7 +175,7 @@ export function pinnedConnectionSubject<S extends ConnectionSubject>(kv: KvMutab
  * @param kv Durable Object storage.
  * @param subject The subject the connect flow verified the grant as.
  */
-export function pinConnectionSubject<S extends ConnectionSubject>(kv: KvMutable, subject: S): void {
+function pinConnectionSubject<S extends ConnectionSubject>(kv: KvMutable, subject: S): void {
   kv.put<S>(CONNECTION_SUBJECT_KEY, subject);
 }
 
@@ -199,7 +183,7 @@ export function pinConnectionSubject<S extends ConnectionSubject>(kv: KvMutable,
  * Drops the pin, for a connector clearing the credentials the pin fenced.
  * @param kv Durable Object storage.
  */
-export function clearConnectionSubject(kv: KvMutable): void {
+function clearConnectionSubject(kv: KvMutable): void {
   kv.delete(CONNECTION_SUBJECT_KEY);
 }
 
