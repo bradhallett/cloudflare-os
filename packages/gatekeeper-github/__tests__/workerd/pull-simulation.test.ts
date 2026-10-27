@@ -645,6 +645,11 @@ describe("push rejection cascade", () => {
       await expect(gk.applyAction(approvalId, cache))
         .rejects.toThrow(/was discarded, or something it depended on was/);
       expect(await gk.rejectAction(approvalId)).toBeUndefined();
+      // The kit never prunes a discarded action's record -- only its rejection releases the
+      // slot it holds against the capacity bound -- so that discard removed it, and a second
+      // reports the action unknown rather than no-op against a permanent squatter.
+      await expect(gk.rejectAction(approvalId))
+        .rejects.toThrow(`No queued GitHub action exists with id ${approvalId}.`);
     }
   });
 

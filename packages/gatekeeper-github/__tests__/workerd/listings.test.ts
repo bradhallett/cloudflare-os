@@ -162,6 +162,8 @@ async function repoGatekeeper() {
       unwrap(hooks.queueEdit(scenario, props, new RpcStub(new TestApprovalQueue()) as never, kind, id, edit)),
     applyAction: (actionId: number) =>
       unwrap(hooks.applyAction(scenario, props, actionId, new RpcStub(new UnusedGitCache()) as never)),
+    revertAction: (actionId: number) =>
+      unwrap(hooks.revertAction(scenario, props, actionId)),
     openIssue: (id: string) => unwrap(hooks.openIssue(scenario, props, id)),
   };
 }
@@ -277,6 +279,34 @@ describe("read cache", () => {
     expect((await straddling).title).toBe("Old");
 
     expect((await gk.openIssue("5")).title).toBe("New");
+  });
+});
+
+describe("applied-action retention", () => {
+  it("retires applied actions beyond the retention limit from apply, so revert covers the newest only", async () => {
+    // The retained tier would grow without bound otherwise, exactly as the hand-kept
+    // `retiredAction:` rows did. Every apply sweeps: applied actions beyond the retention
+    // limit retire, and a revert of a retired id reports the action unknown.
+    const github = new FakeGitHub();
+    github.issues.set(5, issue(5, { title: "Old" }));
+    const gk = await repoGatekeeper();
+
+    let firstId = 0;
+    let lastId = 0;
+    const applies = 205;  // five past the retention limit
+    for (let n = 1; n <= applies; n++) {
+      const actionId = await gk.queueEdit("issue", "5", { title: `Title ${n}` });
+      if (n === 1) firstId = actionId;
+      lastId = actionId;
+      await gk.applyAction(actionId);
+    }
+    expect(github.issues.get(5)!.title).toBe(`Title ${applies}`);
+
+    // The newest stays revertible; the oldest was retired by the sweep.
+    await gk.revertAction(lastId);
+    expect(github.issues.get(5)!.title).toBe(`Title ${applies - 1}`);
+    await expect(gk.revertAction(firstId))
+      .rejects.toThrow(`No queued GitHub action exists with id ${firstId}.`);
   });
 });
 
