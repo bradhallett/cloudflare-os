@@ -36,7 +36,7 @@ import { DriveApi, DriveApiRequestError } from "./drive-api";
 import { driveModifiedTime } from "./drive-session";
 import type { GoogleVerifierApi } from "./google-verifier-types";
 import { AccessTokenCache, type AccessTokenRequest } from "./auth-retry";
-import { Mutex } from "./mutex";
+import { SerialTaskQueue } from "@gadgets/gatekeeper-kit/serial-queue";
 import { nativeFileUrl } from "./resources";
 import { explainUnopenedFile, officeFileError, officeLabel } from "./office-conversion";
 import { obsContext } from "./observability.js";
@@ -614,7 +614,7 @@ export class GoogleDocGatekeeperImpl
   // of it both see it pending. Interleaved, both fetch the document and the loser writes content the
   // winner already committed; the write marker is no defence, since the winner's cleanup deletes it
   // before the loser looks. Two approvals of a creation would likewise create two documents.
-  #actions = new Mutex();
+  #actions = new SerialTaskQueue();
   #tokens = new AccessTokenCache(opts => {
     let account = this.ctx.exports.UserAccount.get(
         this.ctx.exports.UserAccount.idFromString(this.#bound.userObjectId));

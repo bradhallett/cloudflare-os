@@ -71,7 +71,7 @@ import DRIVE_CONFIGURATOR_HTML from "./generated/drive-configurator-ui.txt";
 import GOOGLE_LOGO_SVG from "./google-logo.svg";
 import { obsContext } from "./observability.js";
 import { AccessTokenRequest, ACCESS_TOKEN_EXPIRY_SAFETY_MS } from "./auth-retry";
-import { Mutex } from "./mutex";
+import { SerialTaskQueue } from "@gadgets/gatekeeper-kit/serial-queue";
 import {
   BIGQUERY_RESOURCE,
   GMAIL_RESOURCE,
@@ -458,7 +458,7 @@ export class UserAccount extends DurableObject<Env> {
   // without this a single invalidated token has every concurrent caller mint its own — a burst
   // against Google's token endpoint that may get rate-limited, turning a recoverable 401 into a hard
   // failure. It also keeps a mint from interleaving with credentials being replaced or wiped.
-  #credentials = new Mutex();
+  #credentials = new SerialTaskQueue();
 
   // The last mint that failed permanently — revoked credentials, or a scope an admin has blocked.
   #mintFailure: { error: Error; at: number } | undefined;
