@@ -12,6 +12,15 @@ import {
 import { useComposerEditorLayout } from "./useComposerEditorLayout";
 import styles from "./ChatComposer.module.css";
 
+// The textarea's classic-scrollbar gutter is what the mirror must subtract, but macOS overlay
+// scrollbars reserve no gutter at all, which would make the scrollbar assertion below vacuous
+// on this platform. A custom webkit scrollbar always takes layout space, so force one — the
+// suite then measures real reserved-gutter geometry on every platform it runs on.
+const classicScrollbarStyle = document.createElement("style");
+classicScrollbarStyle.textContent =
+  "textarea::-webkit-scrollbar { -webkit-appearance: none; width: 12px; }";
+document.head.appendChild(classicScrollbarStyle);
+
 const SHORT_TEXT = "The quick brown fox jumps over the lazy dog.";
 // Past the four rows the textarea grows to, so it scrolls.
 const LONG_TEXT = `${SHORT_TEXT} `.repeat(20);
