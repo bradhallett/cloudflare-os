@@ -14,6 +14,7 @@ import { WorkshopButton, WorkshopIconButton } from '../../components/WorkshopCon
 import { PersonAvatar } from '../../components/PersonAvatar'
 import { copyToClipboard } from '../../clipboard'
 import { isImeComposing } from '../../keyboardEvent'
+import { rpcFailureDescription } from '../../rpcErrors'
 import { useServerConfig } from '../../ServerConfigContext'
 import { useUserDirectorySearch } from '../user-directory/useUserDirectorySearch'
 import { DependentKeepList, InlineConfirm, RoleBadge, RoleMenu } from './ShareDialogControls'
@@ -267,7 +268,7 @@ export default function MembersSection({
           const { reason } = outcome
           failed.push({
             ...recipient,
-            error: reason instanceof Error ? reason.message : 'Failed to add collaborator.',
+            error: rpcFailureDescription(reason) ?? 'Failed to add collaborator.',
           })
         } else if (outcome.value === null) {
           failed.push({ ...recipient, error: 'No account found for that username or email.' })
