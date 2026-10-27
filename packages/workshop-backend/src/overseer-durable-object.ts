@@ -8,8 +8,7 @@ import type { ExternalChatRecord, GatekeeperCaller } from "./storage-schema/over
 import type { WorkspaceOutputEntry } from "./storage-schema/user-storage";
 import { commitIdentityForAuthor } from "./git-store";
 import { OVERSEER_STORAGE_VERSION } from "./storage-schema/overseer-migrations";
-import { readAdminConfig } from "./admin-config";
-import { ambientGatekeeperMode } from "./provisioning-policy";
+import { gatekeeperAccessPolicy, readAdminConfig } from "./admin-config";
 import { releaseMergeHeader } from "./blueprint-release";
 import { retryOnDoReset } from "./do-retry";
 import type { SubmitExternalMessageResult } from "@gadgets/workshop-shared/external-message-gateway";
@@ -534,9 +533,8 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
         gatekeeperVendorId(this.impl.storage.gatekeepers.get(record.gatekeeperId));
     if (!vendorId) throw new Error("Hook vendor is unavailable.");
 
-    let config = await readAdminConfig(this.env);
-    if (config.disabledGatekeepers.includes(vendorId) ||
-        ambientGatekeeperMode(config, vendorId) === "disabled") {
+    let policy = await gatekeeperAccessPolicy(this.env, this.impl.ownerId!);
+    if (policy.vendorDisabled(vendorId)) {
       throw new Error("Gatekeeper is disabled.");
     }
 

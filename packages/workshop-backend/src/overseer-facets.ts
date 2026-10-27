@@ -7,7 +7,7 @@ import { chatKeyPrefix } from "./storage-schema/overseer-storage";
 import type { AiChatAgentContext } from "./storage-schema/overseer-storage";
 import { formatBotSection } from "./bot-config";
 import type { ResolvedBotSkill, UnavailableBotSkill } from "./bot-config";
-import type { UserChatContext } from "./user";
+import type { UserChatContext } from "./user-models";
 import type { ActionRecord, ChatBindingEntry, GatekeeperClass, GatekeeperRecord } from "./storage-schema/overseer-storage";
 import { GIT_BINDING_NAME } from "./agent-session";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";

@@ -15,7 +15,6 @@ import type { Entitlements } from "@gadgets/workshop-shared/entitlements";
 import { DecisionModelGatekeeper, LanguageModelGatekeeper } from "../src/ai-models.js";
 import { getPlanRefusalCode, type AiChatAuthorInfo } from "@gadgets/workshop-shared/api";
 import { serializeAdminConfig } from "../src/admin-config.js";
-import { OrgDurableObject } from "../src/org.js";
 import type { OverseerDurableObject } from "../src/overseer.js";
 import {
   DEFAULT_ADMIN_CONFIG, type AdminConfig,
@@ -26,7 +25,6 @@ import { UserDurableObject } from "../src/user.js";
 declare module "cloudflare:workers" {
   interface ProvidedEnv {
     TEST_USER: DurableObjectNamespace<UserDurableObject>;
-    TEST_ORG: DurableObjectNamespace<OrgDurableObject>;
     TEST_OVERSEER: DurableObjectNamespace<OverseerDurableObject>;
   }
 }
@@ -37,8 +35,14 @@ declare module "cloudflare:workers" {
 type UserInternals = UserDurableObject & {
   storage: {
     gadgets: { put(record: GadgetRecord): void };
-    connectedAccounts: { list(): Array<{ id: number; vendorId: string }> };
+    connectedAccounts: {
+      list(): Array<{ id: number; vendorId: string }>;
+      put(record: unknown): void;
+    };
+    created: { get(): boolean; put(value: boolean): void };
+    nextAccountId: { get(): number; put(next: number): void };
   };
+  accounts: { uiAccountRecord(accountId: number): Promise<unknown> };
 };
 
 let counter = 0;
@@ -335,21 +339,21 @@ describe("plan-enforced connectors", () => {
   });
 });
 
-describe("plan-enforced ambient gatekeepers", () => {
-  // A second, ambient vendor — the shape scheduler/context have: it auto-provisions an account
-  // (no OAuth) whose description declares an agent singleton. The account is a real
-  // FakeGatekeeperAccount facet: the only account shape the user DO can persist, since a plain
-  // object with methods cannot cross Durable Object storage.
-  const ambientVendor = (state: DurableObjectState) => ({
-    describe: async () => ({ vendorId: "ambientkee", autoProvisionsAccount: true }),
-    createAccount: () =>
-        (state.exports as unknown as {
-          FakeGatekeeperAccount(props: { props: unknown }): unknown;
-        }).FakeGatekeeperAccount({
-          props: { name: "Ambient", singleton: { tsType: "FakeSession" } },
-        }),
-  } as unknown as Cloudflare.Env["GATEKEEPER_CONTEXT"]);
+// An ambient vendor — the shape scheduler/context have: it auto-provisions an account (no
+// OAuth) whose description declares an agent singleton. The account is a real
+// FakeGatekeeperAccount facet: the only account shape the user DO can persist, since a plain
+// object with methods cannot cross Durable Object storage.
+const ambientVendor = (state: DurableObjectState) => ({
+  describe: async () => ({ vendorId: "ambientkee", autoProvisionsAccount: true }),
+  createAccount: () =>
+      (state.exports as unknown as {
+        FakeGatekeeperAccount(props: { props: unknown }): unknown;
+      }).FakeGatekeeperAccount({
+        props: { name: "Ambient", singleton: { tsType: "FakeSession" } },
+      }),
+} as unknown as Cloudflare.Env["GATEKEEPER_CONTEXT"]);
 
+describe("plan-enforced ambient gatekeepers", () => {
   it("unbound: the ambient vendor provisions, lists, and mints its singleton", async () => {
     const { inDo } = planUser(null, {}, state => ({ GATEKEEPER_AMBIENTKEE: ambientVendor(state) }));
     await inDo(user => user.provisionAmbientAccount("ambientkee"));
@@ -589,5 +593,179 @@ describe("plan-enforced external messages", () => {
     expect(h.registered).toEqual([]);  // never re-registered through the capped path
     expect(h.ensured).toEqual([h.doId]);
     expect(h.pending).toBe(false);
+  });
+});
+
+describe("admin-disabled and dormant accounts", () => {
+  // The mint-side half of the dormancy invariant (GatekeeperAccessPolicy.accountUsable):
+  // whatever put an account to sleep — an administrator's disable or a plan downgrade — the
+  // capability mints refuse it, the listings drop it, and its record survives for the
+  // re-enable. Both knobs swap between calls on one Durable Object: every call constructs the
+  // DO with a fresh BLUEPRINTS binding serving the admin config as it stands (readAdminConfig
+  // re-reads per call) and a fresh entitlements port (see swappablePlan's note on the memo).
+  function dormantUser(initialAdmin: Partial<AdminConfig>, initialPlan: Entitlements) {
+    const knobs = { admin: initialAdmin, plan: initialPlan };
+    const stub = env.TEST_USER.getByName(`plan-enforcement-${++counter}`);
+    const inDo = <T>(f: (user: UserDurableObject, state: DurableObjectState) => T | Promise<T>):
+        Promise<T> =>
+        runInDurableObject(stub, (_host: UserDurableObject, state: DurableObjectState) => f(
+            new UserDurableObject(state, {
+              CF_AI_GATEWAY: "platform-gateway",
+              CF_AI_GATEWAY_ACCOUNT_ID: "account-id",
+              CF_AI_GATEWAY_API_TOKEN: "gateway-token",
+              CF_AI_GATEWAY_PROVIDERS: "anthropic",
+              BLUEPRINTS: {
+                get: async () =>
+                    serializeAdminConfig({ ...DEFAULT_ADMIN_CONFIG, ...knobs.admin }),
+              } as unknown as KVNamespace,
+              GATEKEEPER_AMBIENTKEE: ambientVendor(state),
+              SAAS_ENTITLEMENTS: {
+                getEntitlements: async () => knobs.plan,
+              } as unknown as NonNullable<Cloudflare.Env["SAAS_ENTITLEMENTS"]>,
+            } as unknown as Cloudflare.Env), state));
+    return { knobs, inDo };
+  }
+
+  const ON_PLAN = plan({ allowedGatekeepers: ["fakekee", "ambientkee"] });
+  const DOWNGRADED = plan({ allowedGatekeepers: ["fakekee"] });  // ambientkee off the plan
+
+  // Seed an OAuth-style connected account for the ambient vendor — no autoProvisioned, the
+  // register's "non-ambient" case — declaring a singleton, the way a real connect persists one.
+  function seedConnectedAccount(user: UserDurableObject, state: DurableObjectState) {
+    const account = (state.exports as unknown as {
+      FakeGatekeeperAccount(props: { props: { name: string; singleton: { tsType: string } } }):
+          unknown;
+    }).FakeGatekeeperAccount({
+      props: { name: "Ambient", singleton: { tsType: "FakeSession" } },
+    });
+    const internals = user as UserInternals;
+    const id = internals.storage.nextAccountId.get();
+    internals.storage.nextAccountId.put(id + 1);
+    internals.storage.connectedAccounts.put({
+      id, account, vendorId: "ambientkee",
+      description: { displayName: "Ambient", singleton: { tsType: "FakeSession" } },
+    });
+    return id;
+  }
+
+  it("an admin-disabled ambient account mints nothing and lists nothing, its record surviving", async () => {
+    const { knobs, inDo } = dormantUser({}, ON_PLAN);
+    await inDo(user => user.provisionAmbientAccount("ambientkee"));
+    const accountId = (await inDo(user =>
+        [...(user as UserInternals).storage.connectedAccounts.list()]))[0].id;
+    expect(await inDo(user => user.getSingletonGatekeeperClass(accountId)))
+        .not.toBeNull();  // sanity: it mints before the disable
+
+    knobs.admin = { disabledGatekeepers: ["ambientkee"] };
+    expect(await inDo(user => user.getSingletonGatekeeperClass(accountId))).toBeNull();
+    expect(await inDo(user => user.listProvidedAccounts())).toEqual([]);
+    expect(await inDo(user => (user as UserInternals).accounts.uiAccountRecord(accountId))).toBeUndefined();
+    // The record survives the disable, so re-enabling restores the account.
+    knobs.admin = {};
+    expect(await inDo(user => user.getSingletonGatekeeperClass(accountId))).not.toBeNull();
+  });
+
+  it("an admin-disabled OAuth account mints nothing either", async () => {
+    const { knobs, inDo } = dormantUser({}, ON_PLAN);
+    const accountId = await inDo((user, state) => seedConnectedAccount(user, state));
+    expect(await inDo(user => user.getSingletonGatekeeperClass(accountId)))
+        .not.toBeNull();  // sanity
+
+    knobs.admin = { disabledGatekeepers: ["ambientkee"] };
+    expect(await inDo(user => user.getSingletonGatekeeperClass(accountId))).toBeNull();
+    expect(await inDo(user => user.listProvidedAccounts())).toEqual([]);
+    expect(await inDo(user => (user as UserInternals).accounts.uiAccountRecord(accountId))).toBeUndefined();
+  });
+
+  it("a plan downgrade dorms an OAuth account at the mint, and the record survives it", async () => {
+    const { knobs, inDo } = dormantUser({}, ON_PLAN);
+    const accountId = await inDo((user, state) => seedConnectedAccount(user, state));
+
+    knobs.plan = DOWNGRADED;
+    expect(await inDo(user => user.getSingletonGatekeeperClass(accountId))).toBeNull();
+    expect(await inDo(user => (user as UserInternals).accounts.uiAccountRecord(accountId))).toBeUndefined();
+    expect(await inDo(user => user.listProvidedAccounts())).toEqual([]);
+    expect((await inDo(user =>
+        [...(user as UserInternals).storage.connectedAccounts.list()]))
+        .map(rec => rec.vendorId)).toEqual(["ambientkee"]);  // not stranded
+
+    knobs.plan = ON_PLAN;  // re-upgraded
+    expect(await inDo(user => user.getSingletonGatekeeperClass(accountId))).not.toBeNull();
+  });
+
+  it("connectAccount refuses an admin-disabled vendor, and an ambient-disabled one the same way", async () => {
+    const disabled = planUser(ON_PLAN, { disabledGatekeepers: ["fakekee"] });
+    expect(await disabled.inDo(user => attempt(() => user.connectAccount("fakekee"))))
+        .toEqual({ error: 'The "fakekee" gatekeeper is disabled on this deployment.' });
+
+    const modeOff = planUser(ON_PLAN, { ambientGatekeeperModes: { fakekee: "disabled" } });
+    expect(await modeOff.inDo(user => attempt(() => user.connectAccount("fakekee"))))
+        .toEqual({ error: 'The "fakekee" gatekeeper is disabled on this deployment.' });
+  });
+
+  it("a resource mint refuses a vendor the admin ambient-disabled", async () => {
+    const { inDo } = planUser(
+        ON_PLAN, { ambientGatekeeperModes: { fakekee: "disabled" } });
+    expect(await inDo(user => attempt(() =>
+        user.createResourceGatekeeper("fakekee", FAKE_RESOURCE.urlPattern, "Widgets"))))
+        .toEqual({
+          error: 'The "fakekee" gatekeeper is disabled on this deployment by an administrator.',
+        });
+  });
+  // A recording stand-in for the browser's account-list subscription stub: dup() keeps the
+  // stub alive past the RPC return, exactly the shape the store calls.
+  function recordingSubscriber() {
+    const added: Array<{ id: number; vendorId: string }> = [];
+    const stub = {
+      dup: () => stub,
+      add: async (id: number, _description: unknown, _vendorDescription: unknown,
+                  _resources: unknown, _credentialsValid: boolean, vendorId: string) => {
+        added.push({ id, vendorId });
+      },
+      remove: (_id: number) => {},
+      ready: async () => {},
+      [Symbol.dispose]: () => {},
+    };
+    return { added, stub: stub as unknown as Parameters<
+        UserDurableObject["subscribeConnectedAccounts"]>[0] };
+  }
+
+  it("listAddable hides an admin-disabled ambient vendor the user hasn't added", async () => {
+    // Control: the optional ambient vendor is offered for opt-in...
+    const offered = planUser(null, {}, state => ({ GATEKEEPER_AMBIENTKEE: ambientVendor(state) }));
+    expect((await offered.inDo(user => user.listAddableGatekeepers())).map(rec => rec.id))
+        .toEqual(["ambientkee"]);
+    // ...but an administrator's disable hides it from the same listing.
+    const hidden = planUser(
+        null, { disabledGatekeepers: ["ambientkee"] },
+        state => ({ GATEKEEPER_AMBIENTKEE: ambientVendor(state) }));
+    expect(await hidden.inDo(user => user.listAddableGatekeepers())).toEqual([]);
+  });
+
+  it("a subscription pushes an on-plan account but not the same account off-plan", async () => {
+    const { knobs, inDo } = dormantUser({}, ON_PLAN);
+    await inDo((user, state) => seedConnectedAccount(user, state));
+    const onPlan = recordingSubscriber();
+    await inDo(user => user.subscribeConnectedAccounts(onPlan.stub));
+    expect(onPlan.added.map(rec => rec.vendorId)).toEqual(["ambientkee"]);
+
+    knobs.plan = DOWNGRADED;
+    const offPlan = recordingSubscriber();
+    await inDo(user => user.subscribeConnectedAccounts(offPlan.stub));
+    expect(offPlan.added).toEqual([]);  // the Connectors list can't show what the picker omits
+  });
+
+  it("an off-plan vendor offers no selectable gatekeeper users", async () => {
+    const { knobs, inDo } = dormantUser({}, ON_PLAN);
+    await inDo((user, state) => {
+      seedConnectedAccount(user, state);
+      (user as UserInternals).storage.created.put(true);  // a created user, past first login
+    });
+    expect(await inDo(user => user.selectableGatekeeperUsers("ambientkee")))
+        .toHaveLength(1);  // control: the account is selectable while on-plan
+
+    knobs.plan = DOWNGRADED;
+    expect(await inDo(user => user.selectableGatekeeperUsers("ambientkee")))
+        .toEqual([]);
   });
 });
