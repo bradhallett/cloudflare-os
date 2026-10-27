@@ -1,7 +1,7 @@
 import { WorkerEntrypoint, RpcStub as NativeRpcStub, RpcTarget as NativeRpcTarget } from "cloudflare:workers";
 import type { ChatBindingEntry } from "./storage-schema/overseer-storage";
 import { OverseerImpl } from "./overseer-impl";
-import { COMPATIBILITY_DATE } from "@gadgets/scripts/worker-config";
+import { COMPATIBILITY_DATE } from "@gadgets/scripts/compatibility-date";
 
 /** Split out of the former overseer.ts (internal). */
 export const CODE_MODE_HARNESS =

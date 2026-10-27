@@ -23,7 +23,7 @@ import type { CodeModeEntrypoint } from "./overseer-harness";
 import { CODE_MODE_HARNESS, RestoreForgerImpl } from "./overseer-harness";
 import { OverseerCore } from "./overseer-core";
 import { emitUsageEvent, usageTokens } from "./usage-events";
-import { COMPATIBILITY_DATE } from "@gadgets/scripts/worker-config";
+import { COMPATIBILITY_DATE } from "@gadgets/scripts/compatibility-date";
 
 /**
  * OverseerPublishing: binding metadata, blueprint releases and propagation, agent chat messages and costs, code mode, and vendor listings.

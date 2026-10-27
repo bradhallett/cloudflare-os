@@ -8,8 +8,9 @@ import type { DurableObjectMigration, WranglerBuild } from "./release/manifest-l
 export { bindings } from "@cloudflare/config";
 export type { DurableObjectMigration };
 
-/** Workers runtime compatibility date of every Worker here, and of the vitest pools that model them. */
-export const COMPATIBILITY_DATE = "2026-09-04";
+import { COMPATIBILITY_DATE } from "./compatibility-date.ts";
+
+export { COMPATIBILITY_DATE };
 
 /** Observability settings shared by the deployed Workers; workshop-backend extends them with traces. */
 export const OBSERVABILITY = {
