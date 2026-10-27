@@ -1,13 +1,11 @@
 import {
-  CAPNWEB_VALIDATE_BUILD, OBSERVABILITY, bindings, defineGadgetsWorker, textModules,
+  CAPNWEB_VALIDATE_BUILD, bindings, defineGadgetsWorker, textModules,
   type DurableObjectMigration, type WranglerExtras,
 } from "@gadgets/scripts/worker-config";
 
 export default defineGadgetsWorker({
   name: "gatekeeper-websearch",
-  compatibilityFlags: ["allow_irrevocable_stub_storage"],
   entrypoint: ".wrangler/validate/src/worker.ts",
-  observability: OBSERVABILITY,
   env: {
     // Workers AI's `websearch()`. It always runs remotely, so `pnpm dev-server` keeps it only with
     // --use-workers-ai-binding.

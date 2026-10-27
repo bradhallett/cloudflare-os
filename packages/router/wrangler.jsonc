@@ -4,6 +4,9 @@
   "name": "router",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-04",
+  "compatibility_flags": [
+    "allow_irrevocable_stub_storage"
+  ],
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1,

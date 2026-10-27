@@ -1,12 +1,12 @@
 import {
-  CAPNWEB_VALIDATE_BUILD, OBSERVABILITY, bindings, defineGadgetsWorker,
+  CAPNWEB_VALIDATE_BUILD, bindings, defineGadgetsWorker,
   type DurableObjectMigration, type WranglerExtras,
 } from "@gadgets/scripts/worker-config";
 
 export default defineGadgetsWorker({
   name: "gatekeeper-context",
   entrypoint: ".wrangler/validate/src/index.ts",
-  compatibilityFlags: ["nodejs_compat", "allow_irrevocable_stub_storage"],
+  compatibilityFlags: ["nodejs_compat"],
 
   env: {
     // Public-collections snapshot KV. The preview id in `wrangler` preserves existing dev data.
@@ -14,7 +14,6 @@ export default defineGadgetsWorker({
     // Optional: add an Artifacts binding named ARTIFACTS to enable Git-backed collections.
   },
 
-  observability: OBSERVABILITY,
 });
 
 export const wrangler = {

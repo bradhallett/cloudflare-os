@@ -65,7 +65,23 @@ export const DEFAULT_GATEKEEPER_WRANGLER = {
   rules: textModules(["**/*.txt", "**/*.svg"]),
 } satisfies WranglerExtras;
 
-/** `defineConfig` for one Worker, with the repo-wide compatibility date filled in. */
+/**
+ * `defineConfig` for one Worker, with the repo-wide defaults filled in: the compatibility date,
+ * the `allow_irrevocable_stub_storage` flag (this repo's gatekeepers durably store capnweb stubs,
+ * such as trigger-hook initiators, so every Worker compiles under it and a migration can never
+ * change that), and the {@link OBSERVABILITY} preset (slack shipped without observability the
+ * one release its config forgot the line). A config declares only its deltas: extra
+ * `compatibilityFlags` ride after the default flag, and an explicit `observability` replaces the
+ * preset (workshop-backend adds traces).
+ */
 export function defineGadgetsWorker(worker: Omit<WorkerConfig, "compatibilityDate">) {
-  return defineConfig({ worker: { compatibilityDate: COMPATIBILITY_DATE, ...worker } });
+  const { compatibilityFlags, observability, ...rest } = worker;
+  return defineConfig({
+    worker: {
+      compatibilityDate: COMPATIBILITY_DATE,
+      compatibilityFlags: [...new Set(["allow_irrevocable_stub_storage", ...(compatibilityFlags ?? [])])],
+      observability: observability ?? OBSERVABILITY,
+      ...rest,
+    },
+  });
 }

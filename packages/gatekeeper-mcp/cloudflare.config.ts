@@ -1,5 +1,5 @@
 import {
-  DEFAULT_GATEKEEPER_WRANGLER, OBSERVABILITY, bindings, defineGadgetsWorker,
+  DEFAULT_GATEKEEPER_WRANGLER, bindings, defineGadgetsWorker,
   type DurableObjectMigration,
 } from "@gadgets/scripts/worker-config";
 
@@ -15,14 +15,13 @@ export default defineGadgetsWorker({
   //
   // `wrangler dev` reconfigures its global outbound to permit any address, so this takes effect in
   // production only; that is what keeps `MCP_ALLOW_INSECURE` usable against a localhost server.
-  compatibilityFlags: ["allow_irrevocable_stub_storage", "global_fetch_strictly_public"],
+  compatibilityFlags: ["global_fetch_strictly_public"],
 
   env: {
     // Set to "true" to permit http:// and private-network endpoints. Local development only.
     MCP_ALLOW_INSECURE: bindings.text("false"),
   },
 
-  observability: OBSERVABILITY,
 });
 
 export const wrangler = DEFAULT_GATEKEEPER_WRANGLER;

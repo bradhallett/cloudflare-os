@@ -5,7 +5,6 @@ import {
 export default defineGadgetsWorker({
   name: "gatekeeper-slack",
   entrypoint: ".wrangler/validate/src/slack.ts",
-  compatibilityFlags: ["allow_irrevocable_stub_storage"],
 });
 
 export const wrangler = DEFAULT_GATEKEEPER_WRANGLER;

@@ -9,7 +9,7 @@ export default defineGadgetsWorker({
   // `build:test-gatekeeper` applies the same RPC validation used by production gatekeepers.
   entrypoint: ".wrangler/validate/src/test-gatekeeper.ts",
 
-  compatibilityFlags: ["experimental", "allow_irrevocable_stub_storage"],
+  compatibilityFlags: ["experimental"],
 
   env: {
     // Lets the control surface submit external chat messages through the Workshop's gateway
