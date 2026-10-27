@@ -130,6 +130,36 @@ describe("ActionJournal", () => {
     expect(ids.map(id => journal.wasApplied(id))).toEqual([false, true, true]);
   });
 
+  it("updates a pending record's payload without moving its lifecycle position", () => {
+    const journal = new ActionJournal<Sql>(makeKv(), { namespace: "pending" });
+    const id = journal.allocate({ sql: "original" });
+    journal.markSubmitted(id);
+
+    journal.update(id, { sql: "rebased" });
+
+    expect(journal.get(id)).toEqual({ state: "pending", action: { sql: "rebased" } });
+
+    // A claimed record keeps its claim; a failure keeps its reason and unknown-outcome marker.
+    journal.markClaimed(id);
+    journal.update(id, { sql: "claimed-edit" });
+    expect(journal.get(id)).toEqual({ state: "claimed", action: { sql: "claimed-edit" } });
+    journal.markFailed(id, "interrupted", { outcome: "unknown" });
+    journal.update(id, { sql: "failed-edit" });
+    expect(journal.get(id)).toMatchObject({
+      state: "failed", action: { sql: "failed-edit" }, error: "interrupted", outcome: "unknown",
+    });
+
+    // A staged record shares the pending keyspace, so its payload updates in place too; only an
+    // id with no pending-tier record at all is a no-op.
+    const staged = journal.allocate({ sql: "staged" });
+    journal.update(staged, { sql: "replaced" });
+    expect(journal.get(staged)).toEqual({ state: "staged", action: { sql: "replaced" } });
+    const missing = journal.allocate({ sql: "gone" });
+    journal.remove(missing);
+    journal.update(missing, { sql: "replaced" });
+    expect(journal.get(missing)).toBeUndefined();
+  });
+
   it("resolves a staged record, and keeps its id counter out of the record keyspace", () => {
     const kv = makeKv();
     const journal = new ActionJournal<Sql>(kv, { namespace: "pending" });

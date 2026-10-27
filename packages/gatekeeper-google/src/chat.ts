@@ -24,6 +24,8 @@ import { validateRpc } from "capnweb-validate";
 import {
   buildDescription, codeSpan, plainInline, sanitizeTitle,
 } from "@gadgets/gatekeeper-kit/action-description";
+import { ActionJournal, stageAction } from "@gadgets/gatekeeper-kit/actions";
+import { AttemptJournal } from "@gadgets/gatekeeper-kit/outcome-unknown";
 import { SingleFlight } from "@gadgets/gatekeeper-kit/single-flight";
 import type {
   ActionDescription, ActionKind, ApprovalQueue, Gatekeeper, GatekeeperUserVerifier,
@@ -116,30 +118,67 @@ function userLabel(user: ChatUser | undefined): string {
   return user?.name ? plainInline(user.name) : user?.id ?? "an unknown user";
 }
 
-// ── Storage ─────────────────────────────────────────────────────────
+/** Set once the attempt markers keyed by bare action id have been rewritten for the journal. */
+const ATTEMPT_MARKERS_ADOPTED = "chat:attemptMarkersAdopted";
+
+/**
+ * Recognizes a queued send the private store wrote as a bare payload, for the journal's legacy
+ * upgrade path. That store kept only unresolved records, so anything recognizable here was
+ * pending; everything else at its keys is not ours to resurrect.
+ */
+function isChatAction(raw: unknown): raw is ChatAction {
+  if (typeof raw !== "object" || raw === null) return false;
+  const { type, submittedAt } = raw as Partial<ChatAction>;
+  return (type === "sendMessage" || type === "updateMessage" || type === "addReaction"
+    || type === "removeReaction") && typeof submittedAt === "number";
+}
+
+/** Coerces a legacy bare send row for the journal; `undefined` leaves anything else invisible. */
+function upgradeChatAction(raw: unknown): ChatAction | undefined {
+  return isChatAction(raw) ? raw : undefined;
+}
 
 class ChatStore {
   #kv: DurableObjectStorage["kv"];
+  /** Actions queue through the kit journal under the `chat:` keys the private store wrote. */
+  readonly actions: ActionJournal<ChatAction>;
+  #attempts: AttemptJournal<true>;
 
   constructor(storage: DurableObjectStorage) {
     this.#kv = storage.kv;
+    this.actions = new ActionJournal<ChatAction>(
+      storage.kv, { namespace: "chat", upgradeRecord: upgradeChatAction });
+    this.#attempts = new AttemptJournal<true>(storage.kv, { markerPrefix: "chat:attempted:" });
+    this.#adoptAttemptMarkers();
   }
 
-  submit(action: ChatAction): number {
-    const id = this.#kv.get<number>("chat:nextActionId") ?? 1;
-    this.#kv.put("chat:nextActionId", id + 1);
-    this.#kv.put(`chat:action:${id}`, action);
-    return id;
+  /**
+   * Rewrites the attempt markers the private store keyed by bare action id into the attempt
+   * journal's keys, which end in their (empty) step. One flag makes the rewrite idempotent, so
+   * constructing the store per call rescans nothing once it has run.
+   */
+  #adoptAttemptMarkers(): void {
+    if (this.#kv.get(ATTEMPT_MARKERS_ADOPTED) !== undefined) return;
+    for (const [key, marker] of this.#kv.list<true>({ prefix: "chat:attempted:" })) {
+      if (/^[1-9]\d*$/.test(key.slice("chat:attempted:".length))) {
+        this.#kv.put(`${key}:`, marker);
+        this.#kv.delete(key);
+      }
+    }
+    // Flagged only once every marker has landed: a crash mid-sweep rescans and rewrites the
+    // remainder, while a flag written first would orphan them as unattempted forever.
+    this.#kv.put(ATTEMPT_MARKERS_ADOPTED, true);
   }
+
 
   get(id: number): ChatAction | undefined {
-    const action = this.#kv.get<ChatAction>(`chat:action:${id}`);
+    const action = this.actions.get(id)?.action;
     return action && this.#resolved(action);
   }
 
   list(): PendingChatAction[] {
-    return [...this.#kv.list<ChatAction>({ prefix: "chat:action:" })]
-      .map(([key, action]) => ({ id: Number(key.slice("chat:action:".length)), action: this.#resolved(action) }))
+    return this.actions.listPending()
+      .map(({ id, action }) => ({ id, action: this.#resolved(action) }))
       .toSorted((left, right) => left.id - right.id);
   }
 
@@ -177,13 +216,14 @@ class ChatStore {
   }
 
   remove(id: number): void {
-    this.#kv.delete(`chat:action:${id}`);
-    this.clearAttempt(id);
+    this.actions.remove(id);
+    this.#attempts.clear(id);
   }
 
   clearAttempt(id: number): void {
-    this.#kv.delete(`chat:attempted:${id}`);
+    this.#attempts.clear(id);
   }
+
 
   /**
    * Run one write to Google, first marking the action uncertain so rejectAction refuses it until
@@ -191,7 +231,7 @@ class ChatStore {
    */
   async attemptWrite<T>(id: number, write: () => Promise<T>): Promise<T> {
     const first = !this.wasAttempted(id);
-    this.#kv.put(`chat:attempted:${id}`, true);
+    this.#attempts.begin(id, "", true);
     try {
       return await write();
     } catch (error) {
@@ -206,15 +246,16 @@ class ChatStore {
   }
 
   wasAttempted(id: number): boolean {
-    return this.#kv.get(`chat:attempted:${id}`) !== undefined;
+    return this.#attempts.possiblyApplied(id);
   }
+
 
   /** Later edits queued against `from` now expect `to`, the form Chat stored it in. */
   rebaseEdits(spaceName: string, messageName: string, from: string, to: string): void {
     if (from === to) return;
     for (const { id, action } of this.listForSpace(spaceName)) {
       if (action.type === "updateMessage" && action.messageName === messageName && action.previousText === from) {
-        this.#kv.put(`chat:action:${id}`, { ...this.get(id), previousText: to });
+        this.actions.update(id, { ...this.get(id), previousText: to } as ChatAction);
       }
     }
   }
@@ -324,20 +365,13 @@ async function observe(ctx: ChatContext, title: string, description: string): Pr
   await ctx.queue.authorizeObservation({ title, description });
 }
 
-/** Queue one action for approval, dropping the local record if the queue refuses it. */
+/** Queue one action for approval; the journal rolls the record back if the queue refuses it. */
 async function submitChatAction(
   ctx: ChatContext,
   action: ChatAction,
   description: ActionDescription,
 ): Promise<number> {
-  const actionId = ctx.store.submit(action);
-  try {
-    await ctx.queue.submitAction(actionId, description);
-    return actionId;
-  } catch (error) {
-    ctx.store.remove(actionId);
-    throw error;
-  }
+  return await stageAction(ctx.store.actions, ctx.queue, action, description);
 }
 
 /** Manual approval can run out of order, and an older change applied later would undo this one. */
@@ -1384,6 +1418,11 @@ class ChatHookDeliveryImpl extends RpcTarget implements ChatHookDelivery {
 export class GoogleChatGatekeeperImpl
     extends DurableObject<Env, GoogleChatGatekeeperImplProps>
     implements Gatekeeper<ChatSession | ChatSpace | ChatThread> {
+  // One store for the whole object: the journal caches its pending projection per instance, and
+  // a store built per call would keep serving a projection another call's rejection or apply
+  // already changed.
+  #store = new ChatStore(this.ctx.storage);
+
   #self?: ChatUser;
   /** Actions whose apply or undo is in flight: a reject then could not stop a write already sent. */
   #inFlight = new Set<number>();
@@ -1529,7 +1568,7 @@ export class GoogleChatGatekeeperImpl
     return {
       api: this.#api(),
       queue,
-      store: new ChatStore(this.ctx.storage),
+      store: this.#store,
       self,
       ...(boundSpace !== undefined ? { boundSpace } : {}),
       subscribe: (spaceName, threadName, hook) => this.#subscribe(queue, self, spaceName, threadName, hook),
@@ -1561,7 +1600,7 @@ export class GoogleChatGatekeeperImpl
   }
 
   async applyAction(actionId: number): Promise<void> {
-    const store = new ChatStore(this.ctx.storage);
+    const store = this.#store;
     const action = store.get(actionId);
     if (!action) throw new Error(`Unknown pending Google Chat action: ${actionId}`);
     await this.#exclusively(actionId, async () => {
@@ -1593,7 +1632,7 @@ export class GoogleChatGatekeeperImpl
     const { spaceName, newConversation: conversation } = action;
     if (conversation && pendingSpaceRequestId(spaceName) !== undefined) {
       const people = recipients.toSorted().join(",");
-      const created = await this.#settingUp.run(people,
+        const created = await this.#settingUp.run(people,
         () => openConversation(api, store, actionId, people, conversation));
       store.setConversation(conversation.requestId, people, created);
       // A send that joined another's setup still carries any mark from its own earlier attempt.
@@ -1738,7 +1777,7 @@ export class GoogleChatGatekeeperImpl
   }
 
   async rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
-    const store = new ChatStore(this.ctx.storage);
+    const store = this.#store;
     const action = store.get(actionId);
     if (!action) throw new Error(`Unknown pending Google Chat action: ${actionId}`);
     if (this.#inFlight.has(actionId)) {
@@ -1757,7 +1796,7 @@ export class GoogleChatGatekeeperImpl
   }
 
   async revertAction(actionId: number): Promise<RevertResult> {
-    const store = new ChatStore(this.ctx.storage);
+    const store = this.#store;
     const info = store.getRevert(actionId);
     if (!info) {
       return {

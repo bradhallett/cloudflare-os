@@ -3295,3 +3295,8 @@ export class GmailApi {
     };
   }
 }
+
+/** Normalizes any thrown value into a printable message for logs and action records. */
+export function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
