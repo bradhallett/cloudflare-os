@@ -161,16 +161,10 @@ export interface ChatLogHooks {
   getChatAgentContext(chatId: number): AiChatAgentContext;
 
   /** Records the chat's AiChatAgentContext.workspacePrompt. */
-
-  /** Records the chat's AiChatAgentContext.workspacePrompt. */
   setChatWorkspacePrompt(chatId: number, workspacePrompt: string): void;
 
   /** The sequence the chat's next message will get. */
-
-  /** The sequence the chat's next message will get. */
   nextChatSequencePeek(chatId: number): number;
-
-  /** Appends messages to the chat log, unless the chat has been deleted. */
 
   /** Appends messages to the chat log, unless the chat has been deleted. */
   addChatMessages(chatId: number, author: AiChatAuthorInfo,
@@ -259,8 +253,6 @@ export interface ChatLogHooks {
    * pass can compact or persist steps.
    */
   loadChatHistory(chatId: number): ChatHistory;
-
-  /** Publish a compaction checkpoint: later history loads start from it. */
 
   /** Publish a compaction checkpoint: later history loads start from it. */
   commitChatCompaction(chatId: number, checkpoint: CompactionCheckpoint): void;
@@ -540,8 +532,6 @@ export interface WorkspaceReadHooks {
   describeBinding(envName: string, id: WorkpieceId, chatId: number): Promise<string>;
 
   /** Describe the env.GIT binding (see GIT_BINDING_NAME), for the describeBinding tool. */
-
-  /** Describe the env.GIT binding (see GIT_BINDING_NAME), for the describeBinding tool. */
   describeGitBinding(envName: string): string;
 
   /**
@@ -556,8 +546,6 @@ export interface WorkspaceReadHooks {
    * "" when none are set. Read on each turn so admin edits take effect promptly.
    */
   getInstanceInstructions(): Promise<string>;
-
-  /** A random string that belongs to this workspace and never changes. */
 
   /** A random string that belongs to this workspace and never changes. */
   getPromptCacheSalt(): string;

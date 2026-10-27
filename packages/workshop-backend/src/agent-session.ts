@@ -51,7 +51,6 @@ import { formatAlwaysAvailableResourcesPrompt, formatCatalogChange, seenAlwaysAv
 import type { ChatHistory } from "./agent-hooks";
 
 /** The always-available entries of a chat's seed binding layer. */
-/** */
 export function alwaysAvailableResources(seeds: SeedBindingInfo[]): AlwaysAvailableResource[] {
   return seeds.flatMap(({name, title, catalog}) =>
       catalog === undefined ? [] : [{name, title, catalog}]);
@@ -97,7 +96,6 @@ export function findEditPos(content: string, textToReplace: string): number {
   return pos;
 }
 
-/** */
 export function applyPendingEditToText(content: string | null, edit: ReplayPendingEdit): string | null {
   switch (edit.toolName) {
     case "writeFile":
@@ -145,7 +143,6 @@ export function makeReplayAssistantMessage(
   };
 }
 
-/** */
 export function makeReplayObservation(
     sequence: number, text: string, model: ModelHandle["model"], timestamp: number)
     : [AssistantMessage, ToolResultMessage] {
@@ -218,10 +215,8 @@ const traced = createTracer(obsContext.get);
  * the loop and the tool implementations share lives on the returned object.
  */
 /** The turn state surface createTurnSession returns. */
-/** */
 export type TurnSession = Awaited<ReturnType<typeof createTurnSession>>;
 
-/** */
 export async function createTurnSession(deps: {
   hooks: AgentHooks;
   handle: ModelHandle;
@@ -975,25 +970,11 @@ export async function createTurnSession(deps: {
     details: notes,
   });
   return {
-    stepBuffer, toolCallNotes, toolErrorText, toolResult,
-    get connectionRequested() { return connectionRequested; },
-    set connectionRequested(v) { connectionRequested = v; },
-    get awaitingActionDecision() { return awaitingActionDecision; },
-    set awaitingActionDecision(v) { awaitingActionDecision = v; },
-    persistStep, appendAgentEdit,
-    get pendingWorktreeCommits() { return pendingWorktreeCommits; },
-    set pendingWorktreeCommits(v) { pendingWorktreeCommits = v; },
-    worktreeTurnAccess, emitStreamEvent, codePreviewManager, executeCodeStreamManager,
     get gadgetInfos() { return gadgetInfos; },
-    set gadgetInfos(v) { gadgetInfos = v; },
     get sessionContent() { return sessionContent; },
-    set sessionContent(v) { sessionContent = v; },
     get pinnedGadgets() { return pinnedGadgets; },
-    set pinnedGadgets(v) { pinnedGadgets = v; },
     get observedHeads() { return observedHeads; },
-    set observedHeads(v) { observedHeads = v; },
     get observeHead() { return observeHead; },
-    set observeHead(v) { observeHead = v; },
     get pendingCreatedGadgets() { return pendingCreatedGadgets; },
     set pendingCreatedGadgets(v) { pendingCreatedGadgets = v; },
     get pendingBlueprintMerges() { return pendingBlueprintMerges; },
@@ -1003,84 +984,62 @@ export async function createTurnSession(deps: {
     get pendingAddedBindings() { return pendingAddedBindings; },
     set pendingAddedBindings(v) { pendingAddedBindings = v; },
     get worktreePinBases() { return worktreePinBases; },
-    set worktreePinBases(v) { worktreePinBases = v; },
     get worktreeBase() { return worktreeBase; },
-    set worktreeBase(v) { worktreeBase = v; },
     get unpinnedBase() { return unpinnedBase; },
-    set unpinnedBase(v) { unpinnedBase = v; },
     get pinWorktreeInSession() { return pinWorktreeInSession; },
-    set pinWorktreeInSession(v) { pinWorktreeInSession = v; },
     get worktreeRemovedPaths() { return worktreeRemovedPaths; },
-    set worktreeRemovedPaths(v) { worktreeRemovedPaths = v; },
     get noteWorktreeRemovals() { return noteWorktreeRemovals; },
-    set noteWorktreeRemovals(v) { noteWorktreeRemovals = v; },
     get faultWorktreeBase() { return faultWorktreeBase; },
-    set faultWorktreeBase(v) { faultWorktreeBase = v; },
     get readWorktreeBase() { return readWorktreeBase; },
-    set readWorktreeBase(v) { readWorktreeBase = v; },
     get readSessionText() { return readSessionText; },
-    set readSessionText(v) { readSessionText = v; },
     get readToolFile() { return readToolFile; },
-    set readToolFile(v) { readToolFile = v; },
     get seedWorktreeBasesForChange() { return seedWorktreeBasesForChange; },
-    set seedWorktreeBasesForChange(v) { seedWorktreeBasesForChange = v; },
     get chatScope() { return chatScope; },
-    set chatScope(v) { chatScope = v; },
     get chatBindings() { return chatBindings; },
-    set chatBindings(v) { chatBindings = v; },
     get isNameInScope() { return isNameInScope; },
-    set isNameInScope(v) { isNameInScope = v; },
     get chatNameFor() { return chatNameFor; },
-    set chatNameFor(v) { chatNameFor = v; },
     get applyReplayedChange() { return applyReplayedChange; },
-    set applyReplayedChange(v) { applyReplayedChange = v; },
     get pendingReplayEdits() { return pendingReplayEdits; },
     set pendingReplayEdits(v) { pendingReplayEdits = v; },
     get filesRead() { return filesRead; },
-    set filesRead(v) { filesRead = v; },
     get markFileRead() { return markFileRead; },
-    set markFileRead(v) { markFileRead = v; },
     get knowledgeAtPin() { return knowledgeAtPin; },
-    set knowledgeAtPin(v) { knowledgeAtPin = v; },
     get resolveToolWorkpieceId() { return resolveToolWorkpieceId; },
-    set resolveToolWorkpieceId(v) { resolveToolWorkpieceId = v; },
     get modelMessages() { return modelMessages; },
-    set modelMessages(v) { modelMessages = v; },
     get modelMessageSources() { return modelMessageSources; },
-    set modelMessageSources(v) { modelMessageSources = v; },
     get priorConversation() { return priorConversation; },
-    set priorConversation(v) { priorConversation = v; },
     get chatMessageStatus() { return chatMessageStatus; },
-    set chatMessageStatus(v) { chatMessageStatus = v; },
     get resetSessionEpoch() { return resetSessionEpoch; },
-    set resetSessionEpoch(v) { resetSessionEpoch = v; },
     get applyReplayedPin() { return applyReplayedPin; },
-    set applyReplayedPin(v) { applyReplayedPin = v; },
     get ensureReplayContentForWrite() { return ensureReplayContentForWrite; },
-    set ensureReplayContentForWrite(v) { ensureReplayContentForWrite = v; },
     get sawRevertedContent() { return sawRevertedContent; },
-    set sawRevertedContent(v) { sawRevertedContent = v; },
     get nextChangeId() { return nextChangeId; },
     set nextChangeId(v) { nextChangeId = v; },
     get changeIdMap() { return changeIdMap; },
-    set changeIdMap(v) { changeIdMap = v; },
     get seedBindings() { return seedBindings; },
-    set seedBindings(v) { seedBindings = v; },
     get agentContext() { return agentContext; },
-    set agentContext(v) { agentContext = v; },
     get assertMayModifyWorkpiece() { return assertMayModifyWorkpiece; },
-    set assertMayModifyWorkpiece(v) { assertMayModifyWorkpiece = v; },
     get seedTargets() { return seedTargets; },
-    set seedTargets(v) { seedTargets = v; },
     get currentResources() { return currentResources; },
-    set currentResources(v) { currentResources = v; },
     get listedResources() { return listedResources; },
-    set listedResources(v) { listedResources = v; },
     get alwaysAvailable() { return alwaysAvailable; },
-    set alwaysAvailable(v) { alwaysAvailable = v; },
     get alwaysAvailableResourcesPrompt() { return alwaysAvailableResourcesPrompt; },
-    set alwaysAvailableResourcesPrompt(v) { alwaysAvailableResourcesPrompt = v; },
     get replayCatalogChange() { return replayCatalogChange; },
-    set replayCatalogChange(v) { replayCatalogChange = v; },
+    get stepBuffer() { return stepBuffer; },
+    get toolCallNotes() { return toolCallNotes; },
+    get connectionRequested() { return connectionRequested; },
+    set connectionRequested(v) { connectionRequested = v; },
+    get awaitingActionDecision() { return awaitingActionDecision; },
+    set awaitingActionDecision(v) { awaitingActionDecision = v; },
+    get persistStep() { return persistStep; },
+    get appendAgentEdit() { return appendAgentEdit; },
+    get pendingWorktreeCommits() { return pendingWorktreeCommits; },
+    set pendingWorktreeCommits(v) { pendingWorktreeCommits = v; },
+    get worktreeTurnAccess() { return worktreeTurnAccess; },
+    get emitStreamEvent() { return emitStreamEvent; },
+    get codePreviewManager() { return codePreviewManager; },
+    get executeCodeStreamManager() { return executeCodeStreamManager; },
+    get toolErrorText() { return toolErrorText; },
+    get toolResult() { return toolResult; },
   };
 }

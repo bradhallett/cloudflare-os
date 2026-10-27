@@ -1379,7 +1379,7 @@ async function runAgentPass(
           .join("\n");
   // The built-in tools, closures over the turn session (see agent-tools.ts).
   let tools = buildTools({session, hooks, chatId, author, initiator});
-  if (session.agentContext.spawnerConfig) {
+
   if (session.agentContext.botConfig) {
     tools.activateSkill = defineTool({
       name: "activateSkill",
@@ -1468,6 +1468,7 @@ async function runAgentPass(
     });
   }
 
+  if (session.agentContext.spawnerConfig) {
     // Restrict sub-agents to a narrower set of tools. No user is present to approve changes, so
     // they get nothing that modifies gadgets or requests connections; they can inspect and call
     // bindings, fetch the web, and work on worktrees (writes to gadgets are refused by

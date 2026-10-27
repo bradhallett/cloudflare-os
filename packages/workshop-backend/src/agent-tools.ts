@@ -35,6 +35,18 @@ import type { AgentHooks } from "./agent-hooks";
 export const MAX_TOOL_RESULT_CHARS = 32 * 1024;
 
 /**
+ * Builds an AgentTool while keeping `execute`'s params typed by its TypeBox schema; the cast to
+ * the untyped AgentTool erases the parameter type (pi validates tool-call arguments against the
+ * schema before calling execute, so the runtime types are guaranteed).
+ */
+export function defineTool<TParameters extends TSchema>(def: AgentTool<TParameters>): AgentTool {
+  return def as unknown as AgentTool;
+}
+
+/** A window into a file's lines, as readFileWindow renders it. */
+export type ReadFileWindow = {startLine?: number, lineCount?: number};
+
+/**
  * Renders a readFile result as the exact text the model sees, for both the live tool and history
  * replay. A read with no window returns the file verbatim when it fits MAX_TOOL_RESULT_CHARS;
  * otherwise, and for any windowed read, the result is the selected lines, a blank line, and
@@ -44,19 +56,6 @@ export const MAX_TOOL_RESULT_CHARS = 32 * 1024;
  * longer than the cap is the one result that exceeds it. Lines are 1-based; a final newline does
  * not start a line. The tool schema already requires positive integers. Exported for tests.
  */
-/**
- * Builds an AgentTool while keeping `execute`'s params typed by its TypeBox schema; the cast to
- * the untyped AgentTool erases the parameter type (pi validates tool-call arguments against the
- * schema before calling execute, so the runtime types are guaranteed).
- */
-export function defineTool<TParameters extends TSchema>(def: AgentTool<TParameters>): AgentTool {
-  return def as unknown as AgentTool;
-}
-
-/** ReadFileWindow: see declaration context in agent history. */
-export type ReadFileWindow = {startLine?: number, lineCount?: number};
-
-/** readFileWindow: see declaration context in agent history. */
 export function readFileWindow(text: string, {startLine, lineCount}: ReadFileWindow): string {
   if (startLine === undefined && lineCount === undefined &&
       text.length <= MAX_TOOL_RESULT_CHARS) {
