@@ -35,42 +35,27 @@ const logger = createWorkshopLogger("workshop.overseer");
 export abstract class OverseerCore {
   #logger: WorkshopLogger;
 
-  /** This workspace's owning org; undefined on user-owned workspaces (see `ownerSubject`). */
-  #owningOrgId?: string;
-
   constructor(public ctx: DurableObjectState, public env: Cloudflare.Env) {
     this.#logger = logger.with({ gadgetId: ctx.id.toString() });
     this.storage = makeOverseerStorage(ctx.storage);
     this.gitStore = new GitStore(this.storage.gitObjects);
     this.users = this.ctx.exports.UserDurableObject;
     this.ownerId = this.storage.ownerId.get();
-    const owner = this.workspaceOwner();
-    if (owner?.type === "org") this.adoptOwningOrg(owner.id);
   }
   public storage: OverseerStorage;
 
   /**
-   * The workspace's logger: its id always, plus its owning org's id once the workspace is
-   * org-owned -- the org observability convention, `logger.with({orgId})` on org-owned surfaces.
+   * The workspace's logger, tagged with the workspace's id.
    */
   get logger(): WorkshopLogger {
     return this.#logger;
   }
 
   /**
-   * Adopts `orgId` as this workspace's owning org: folds it into the logger and stamps it on the
-   * workspace's later activity events. Ownership is one-way (see transferToOrg), so never un-set.
-   */
-  adoptOwningOrg(orgId: string): void {
-    this.#owningOrgId = orgId;
-    this.#logger = logger.with({ gadgetId: this.ctx.id.toString(), orgId });
-  }
-
-  /**
-   * Who owns this workspace: the owning org once transferred (transferToOrg), otherwise the
-   * creating user while the workspace still has one (`ownerId` goes at deletion). The durable
-   * owner subject is written only by transferToOrg — it holds either nothing or an org subject —
-   * so this accessor is the one home of that dual representation: read sites ask it instead of
+   * Who owns this workspace: the owning org if it holds a durable org owner subject (written only
+   * by the removed org-transfer flow, so present only on historic org-owned workspaces),
+   * otherwise the creating user while the workspace still has one (`ownerId` goes at deletion).
+   * This accessor is the one home of that dual representation: read sites ask it instead of
    * re-deriving "which org, if any, owns this workspace" from the raw record.
    */
   workspaceOwner(): WorkspaceOwnerSubject | undefined {
@@ -740,8 +725,6 @@ export abstract class OverseerCore {
       ...event,
       gadget_id: this.ctx.id.toString(),
       gadget_owner_user_id: this.ownerId,
-      // Org context exists only on org-owned workspaces; a user-owned one records no org.
-      ...(this.#owningOrgId !== undefined ? { gadget_org_id: this.#owningOrgId } : {}),
     });
   }
 

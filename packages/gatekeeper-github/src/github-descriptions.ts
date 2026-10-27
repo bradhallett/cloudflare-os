@@ -9,25 +9,30 @@ import {
   type RenderedDescription,
 } from "@gadgets/gatekeeper-kit/action-description";
 import { ZERO_OID } from "@gadgets/gatekeeper-kit/git-transport";
-import type {
-  GitHubAction,
-  RemoveLabelsAction,
+import {
+  escapeQuickActions,
+  PROVISIONAL_REFERENCE,
+  referenceBearingTexts,
+  type GitHubAction,
+  type RemoveLabelsAction,
 } from "./github-action-types";
 
-/**
- * Apply replaces `#~N` in a Markdown body with the GitHub number of the issue or pull request
- * created in this workspace as `~N`. Both name the same thing, so the body shown stays the body
- * sent, but the approver is told the number will change.
- */
-export const PROVISIONAL_REFERENCE = /#~\d+/;
-
-export function noteReferenceRewrite(builder: ActionDescriptionBuilder, ...bodies: (string | undefined)[]):
-    ActionDescriptionBuilder {
-  return bodies.some(body => body !== undefined && PROVISIONAL_REFERENCE.test(body))
-    ? builder.prose(
+// Apply posts every text `referenceBearingTexts` names with `#~N` replaced by the GitHub number
+// of the issue or pull request created in this workspace as `~N`, and with slash-command lines
+// escaped. The card shows the text as the agent wrote it and tells the approver of each.
+function noteTextRewrites(builder: ActionDescriptionBuilder, action: GitHubAction): ActionDescriptionBuilder {
+  const texts = referenceBearingTexts(action);
+  if (texts.some(text => text.replace(PROVISIONAL_REFERENCE, "") !== text)) {
+    builder.prose(
       "References like #~N to issues or pull requests created in this workspace are replaced " +
-      "with their GitHub numbers when applied.")
-    : builder;
+      "with their GitHub numbers when applied.");
+  }
+  if (texts.some(text => escapeQuickActions(text) !== text)) {
+    builder.prose(
+      "Lines like /close are posted with a backslash before the slash, so GitHub does not run them " +
+      "as slash commands; the backslash shows inside code blocks.");
+  }
+  return builder;
 }
 
 /**
@@ -51,23 +56,23 @@ export function describeGitHubAction(action: GitHubAction): RenderedDescription 
   switch (action.type) {
     case "createIssue": {
       const { options } = action;
-      return noteReferenceRewrite(buildDescription(`Create a new issue in ${repo}.`)
+      return noteTextRewrites(buildDescription(`Create a new issue in ${repo}.`)
         .inline("Provisional ID", action.provisionalId)
         .inline("Title", options.title)
         .verbatim("Body", options.bodyMarkdown ?? "", "markdown")
         .list("Labels", options.labels ?? [])
-        .list("Assignees", options.assignees ?? []), options.bodyMarkdown)
+        .list("Assignees", options.assignees ?? []), action)
         .finish();
     }
     case "createPullRequest": {
       const { options } = action;
-      return noteReferenceRewrite(buildDescription(
+      return noteTextRewrites(buildDescription(
         `Create a new ${options.draft ? "draft " : ""}pull request in ${repo}.`)
         .inline("Provisional ID", action.provisionalId)
         .inline("Title", options.title)
         .inline("Head branch", options.head)
         .inline("Base branch", options.base)
-        .verbatim("Body", options.bodyMarkdown ?? "", "markdown"), options.bodyMarkdown)
+        .verbatim("Body", options.bodyMarkdown ?? "", "markdown"), action)
         .finish();
     }
     case "setTitle":
@@ -76,9 +81,9 @@ export function describeGitHubAction(action: GitHubAction): RenderedDescription 
         .inline("New title", action.title)
         .finish();
     case "setBody":
-      return noteReferenceRewrite(
+      return noteTextRewrites(
         buildDescription(`Replace the Markdown body of #${action.targetId}.`)
-          .verbatim("New body", action.bodyMarkdown, "markdown"), action.bodyMarkdown)
+          .verbatim("New body", action.bodyMarkdown, "markdown"), action)
         .finish();
     case "addLabels":
       return buildDescription(`Add labels to #${action.targetId}.`)
@@ -101,9 +106,9 @@ export function describeGitHubAction(action: GitHubAction): RenderedDescription 
       return builder.finish();
     }
     case "postComment":
-      return noteReferenceRewrite(
+      return noteTextRewrites(
         buildDescription(`Post a new Markdown comment on #${action.targetId}.`)
-          .verbatim("Comment", action.bodyMarkdown, "markdown"), action.bodyMarkdown)
+          .verbatim("Comment", action.bodyMarkdown, "markdown"), action)
         .finish();
     case "postReview": {
       const { review } = action;
@@ -124,15 +129,14 @@ export function describeGitHubAction(action: GitHubAction): RenderedDescription 
           .inline(`Diff comment ${index + 1} provisional ID`, comment.provisionalCommentId)
           .verbatim(`Diff comment ${index + 1}`, comment.bodyMarkdown, "markdown");
       }
-      return noteReferenceRewrite(builder, review.bodyMarkdown,
-        ...(review.diffComments ?? []).map(comment => comment.bodyMarkdown)).finish();
+      return noteTextRewrites(builder, action).finish();
     }
     case "replyToDiffComment":
-      return noteReferenceRewrite(
+      return noteTextRewrites(
         buildDescription(`Reply to a diff discussion thread on pull request #${action.pullId}.`)
           .inline("Thread", action.commentId)
           .inline("Provisional ID", action.provisionalCommentId)
-          .verbatim("Reply", action.bodyMarkdown, "markdown"), action.bodyMarkdown)
+          .verbatim("Reply", action.bodyMarkdown, "markdown"), action)
         .finish();
     case "mergePullRequest": {
       const options = action.options ?? {};

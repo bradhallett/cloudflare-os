@@ -44,11 +44,12 @@ import type { BlueprintOwnerSubject } from "./blueprints-kv";
 export type GatekeeperClass = DurableObjectClass<Gatekeeper<any>>;
 
 /**
- * Who owns a workspace: the user DO it runs as, or the organization it was transferred to (see
- * `transferToOrg`). Aliased to the blueprint owner subject, whose {type, id} grammar and org
- * scoping (storage-schema/blueprints-kv.ts) a workspace and its published blueprints share: the
- * org's Durable Object is the authority on its membership, and an org-owned workspace's sharing
- * graph roots itself there (sharing.ts).
+ * Who owns a workspace: the user DO it runs as, or the organization it was transferred to by the
+ * removed org-transfer flow (historic org-owned workspaces keep their org subject). Aliased to
+ * the blueprint owner subject, whose {type, id} grammar and org scoping
+ * (storage-schema/blueprints-kv.ts) a workspace and its published blueprints share: the org's
+ * Durable Object is the authority on its membership, and an org-owned workspace's sharing graph
+ * roots itself there (sharing.ts).
  */
 export type WorkspaceOwnerSubject = BlueprintOwnerSubject;
 
@@ -1260,7 +1261,8 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
 
       // The workspace's owner subject. Absent on every workspace created before orgs, and on
       // every user-owned one since: read it as {type: 'user', id: ownerId}. Set to
-      // {type: 'org', id} by transferToOrg, one-way (an org-owned workspace never goes back).
+      // {type: 'org', id} only by the removed org-transfer flow, one-way; historic org-owned
+      // workspaces keep theirs (an org-owned workspace never goes back).
       ownerSubject: <WorkspaceOwnerSubject | undefined>undefined,
 
       // Version of this DO's storage schema, gating lazy migrations. Used to trigger migrations
