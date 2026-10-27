@@ -15,13 +15,10 @@ import {
 import AddModelModal, { type ModelModalMode } from '../features/ai-models/AddModelModal'
 import { useDocumentTitle } from '../useDocumentTitle'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER } from '../components/menuStyles'
+import { PRIMARY_BTN } from '../components/controlStyles'
 
 export const Route = createFileRoute('/providers')({ component: ProvidersPage })
 
-// ─── constants ────────────────────────────────────────────────────────────────
-
-const PRIMARY_BTN =
-  'press inline-flex h-9 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-lg bg-kumo-brand px-3.5 text-[13px] font-medium tracking-[-0.25px] text-white transition-colors hover:bg-kumo-brand-hover'
 
 // ─── model row ─────────────────────────────────────────────────────────────────
 
@@ -277,7 +274,7 @@ function ProvidersPage() {
             onClick={openAdd}
             // Until the deployment's configuration loads, nothing says whether adding is allowed.
             disabled={aiConfig === null}
-            className={`${PRIMARY_BTN} h-11 justify-center text-[14px] disabled:cursor-not-allowed disabled:opacity-60 sm:h-9 sm:text-[13px]`}
+            className={`${PRIMARY_BTN} h-11 justify-center text-[14px] sm:h-9 sm:text-[13px]`}
           >
             <Plus size={14} weight="bold" />
             Add provider
