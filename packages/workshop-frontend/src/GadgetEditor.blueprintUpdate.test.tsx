@@ -42,6 +42,11 @@ const mocks = vi.hoisted(() => {
             await subscriber.ready()
             return disposable
           },
+          // Surfaces the workspace's chat store opens with (see useChatStoreConnection).
+          listChats: async () => [],
+          listModels: async () => [],
+          subscribeToChat: () => disposable,
+          onRpcBroken: () => {},
           getGadget: () => disposable,
           listHooks: async () => [],
           subscribeToConsoleLogs: async () => disposable,
@@ -91,19 +96,35 @@ vi.mock('./AuthContext', () => ({
 }))
 vi.mock('./RpcContext', () => ({ useConnectionLost: () => false, useRpcStub: () => ({}) }))
 vi.mock('./useWorkspaceOpen', () => ({ useWorkspaceOpen: () => mocks.workspace }))
-vi.mock('./useActions', () => ({ useActions: () => ({ pending: [] }), useActionEntries: () => {} }))
+vi.mock('./useActions', () => ({
+  useActions: () => ({ pending: [] }),
+  useActionEntries: () => {},
+  actionLogResumed: () => true,
+}))
 vi.mock('./errorReporting', () => ({ reportIssue: () => {} }))
 vi.mock('./features/blueprint-updates/useBlueprintUpdateAvailable', () => ({
   useBlueprintUpdateAvailable: () => false,
 }))
 
-// The two children whose reports decide when the editor's layout is ready.
-vi.mock('./features/chat/ChatInterface', () => ({
-  default: ({ onChatCountChange }: { onChatCountChange: (count: number, hasChatZero: boolean) => void }) => {
-    useEffect(() => { onChatCountChange(0, false) }, [onChatCountChange])
-    return <div>chat pane</div>
-  },
-}))
+// The real chat pane is stubbed down to its store connection: the editor reads its list-level
+// state (chat count, chat 0) from the workspace's chat store instead of child callbacks, so the
+// stub mounts the connection the real pane would own.
+vi.mock('./features/chat/ChatInterface', async () => {
+  const { useChatStoreConnection } = await import('./features/chat/store/useChatStore')
+  type UseChatStoreConnectionArgs = import('./features/chat/store/useChatStore').UseChatStoreConnectionArgs
+  return {
+    default: ({ workspaceId, overseer }: { workspaceId: string, overseer: never }) => {
+      useChatStoreConnection({
+        workspaceId,
+        overseer,
+        selectedChatId: null,
+        toasts: { add: () => '' } as unknown as UseChatStoreConnectionArgs['toasts'],
+        onNavigateToChat: () => {},
+      })
+      return <div>chat pane</div>
+    },
+  }
+})
 vi.mock('./features/code/WorkpieceCodeInterface', () => ({
   default: ({ onHasCodeChange }: { onHasCodeChange: (hasCode: boolean) => void }) => {
     useEffect(() => { onHasCodeChange(true) }, [onHasCodeChange])

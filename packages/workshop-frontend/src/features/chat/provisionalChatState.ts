@@ -23,7 +23,7 @@ export type ProvisionalToolCallState = {
 /**
  * A chat's still-streaming turn: the text and reasoning deltas, in-flight tool calls, and the
  * file the agent is actively editing, held outside React state because events arrive far faster
- * than renders (the subscription coalesces them; see useChatSubscription).
+ * than renders (the chat store coalesces them; see store/chatStore).
  */
 export type ProvisionalChatState = {
   text: string;

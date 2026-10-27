@@ -89,7 +89,7 @@ function formatChatRowTime(date: Date, bucket: ChatTimeBucket, now: Date): strin
 
 /** Props {@link ChatListPanel} reads from its host. */
 export interface ChatListPanelProps {
-  chatList: AiChatMetadata[];
+  chatList: readonly AiChatMetadata[];
   chatListScope: ChatListScope;
   setChatListScope: (scope: ChatListScope) => void;
   chatListReady: boolean;
@@ -111,7 +111,7 @@ export interface ChatListPanelProps {
   overseer: RpcStub<Overseer>;
   getOverseer: () => RpcStub<Overseer>;
   currentUser: ReturnType<typeof useAuthenticatedApi>["currentUser"];
-  availableModels: AiChatAuthorInfo[];
+  availableModels: readonly AiChatAuthorInfo[];
   selectedModel: string | null;
   handleModelChange: (modelId: string | null) => void;
   /** Declared bots offered in the intake composer's agent picker (see ComposerModelSelector). */

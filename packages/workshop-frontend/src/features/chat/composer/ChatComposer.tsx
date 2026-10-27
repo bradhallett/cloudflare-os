@@ -130,7 +130,7 @@ export const ChatComposer = ({
     bot?: BotSelection | "none",
   ) => Promise<void> | void;
   isAgentActive: boolean;
-  models: AiChatAuthorInfo[];
+  models: readonly AiChatAuthorInfo[];
   selectedModel: SelectedModel;
   onModelChange: (modelId: string | null) => void;
   /** Bots offered in the composer's agent picker (see ComposerModelSelector). */

@@ -8,12 +8,8 @@ import { IncompleteDescriptionNotice, isDescriptionIncomplete } from './componen
 import { ActionFields, entryFields, fieldCountLabel } from './components/ActionFields'
 import { ResolveButton } from './components/ResolveButton'
 import { RestrictedApprovalNotice } from './components/RestrictedApprovalNotice'
-import {
-  formatRelativeTime,
-  PENDING_CHECKING_COPY,
-  PENDING_ERROR_COPY,
-  type ActivityView,
-} from './Activity'
+import { PENDING_CHECKING_COPY, PENDING_ERROR_COPY, type ActivityView } from './Activity'
+import { formatRelativeTime } from './utils/formatRelativeTime'
 import { useActions } from './useActions'
 import { useResolveAction } from './useResolveAction'
 import { reportActivityDropdown } from './features/notifications/activityDropdown'

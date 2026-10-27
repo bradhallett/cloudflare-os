@@ -13,6 +13,7 @@ import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER } from './menuStyles'
 import { BlueprintPreviewImage } from './BlueprintPreviewImage'
 import DeleteConfirmationDialog from './DeleteConfirmationDialog'
 import { isImeComposing } from '../keyboardEvent'
+import { formatRelativeTime } from '../utils/formatRelativeTime'
 
 // Neutral monogram for a workspace — matches the sidebar treatment (no per-item color noise).
 function initials(title: string | undefined): string {
@@ -22,16 +23,6 @@ function initials(title: string | undefined): string {
   return parts.map((p) => p[0]?.toUpperCase() ?? '').join('') || t.slice(0, 2).toUpperCase()
 }
 
-function formatRelativeTime(date: Date): string {
-  const diff = Date.now() - date.getTime()
-  const minutes = Math.floor(diff / 60000)
-  if (minutes < 1) return 'just now'
-  if (minutes < 60) return `${minutes}m ago`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours}h ago`
-  const days = Math.floor(hours / 24)
-  return `${days}d ago`
-}
 
 function formatCost(cost: number): string {
   return `$${cost.toFixed(4)}`
@@ -129,7 +120,7 @@ function AppRow({
       {/* Time */}
       <span className="hidden lg:flex items-center gap-1 text-xs text-kumo-inactive flex-shrink-0">
         <Clock size={10} />
-        {formatRelativeTime(gadget.lastActive)}
+        {formatRelativeTime(gadget.lastActive, { precision: 'second', beyondCutoffDate: true })}
       </span>
 
       {/* Overflow menu — wrapper stops clicks from reaching the parent Link */}

@@ -42,6 +42,11 @@ const mocks = vi.hoisted(() => {
             await subscriber.ready()
             return disposable
           },
+          // Surfaces the workspace's chat store opens with (see useChatStoreConnection).
+          listChats: async () => [],
+          listModels: async () => [],
+          subscribeToChat: () => disposable,
+          onRpcBroken: () => {},
           getGadget: () => disposable,
           listHooks: async () => [],
           subscribeToConsoleLogs: async () => disposable,
@@ -91,23 +96,36 @@ vi.mock('./AuthContext', () => ({
 }))
 vi.mock('./RpcContext', () => ({ useConnectionLost: () => false, useRpcStub: () => ({}) }))
 vi.mock('./useWorkspaceOpen', () => ({ useWorkspaceOpen: () => mocks.workspace }))
-vi.mock('./useActions', () => ({ useActions: () => ({ pending: [] }), useActionEntries: () => {} }))
+vi.mock('./useActions', () => ({
+  useActions: () => ({ pending: [] }),
+  useActionEntries: () => {},
+  actionLogResumed: () => true,
+}))
 vi.mock('./errorReporting', () => ({ reportIssue: () => {} }))
 vi.mock('./features/blueprint-updates/useBlueprintUpdateAvailable', () => ({
   useBlueprintUpdateAvailable: () => false,
 }))
 
 // The two children whose reports decide when the editor's layout is ready. The chat mock counts
-// mounts: it must climb to 2 when navigation remounts the workspace body.
-vi.mock('./features/chat/ChatInterface', () => ({
-  default: ({ onChatCountChange }: { onChatCountChange: (count: number, hasChatZero: boolean) => void }) => {
-    useEffect(() => {
-      mocks.mounts.push('chat')
-      onChatCountChange(0, false)
-    }, [onChatCountChange])
-    return <div>chat pane</div>
-  },
-}))
+// mounts — it must climb to 2 when navigation remounts the workspace body — and mounts the
+// workspace's real chat-store connection, since the editor reads its list-level state (chat
+// count, chat 0) from the store instead of child callbacks.
+vi.mock('./features/chat/ChatInterface', async () => {
+  const { useChatStoreConnection } = await import('./features/chat/store/useChatStore')
+  return {
+    default: ({ workspaceId, overseer }: { workspaceId: string, overseer: never }) => {
+      useEffect(() => { mocks.mounts.push('chat') }, [])
+      useChatStoreConnection({
+        workspaceId,
+        overseer,
+        selectedChatId: null,
+        toasts: { add: () => '' } as never,
+        onNavigateToChat: () => {},
+      })
+      return <div>chat pane</div>
+    },
+  }
+})
 vi.mock('./features/code/WorkpieceCodeInterface', () => ({
   default: ({ onHasCodeChange }: { onHasCodeChange: (hasCode: boolean) => void }) => {
     useEffect(() => { onHasCodeChange(true) }, [onHasCodeChange])

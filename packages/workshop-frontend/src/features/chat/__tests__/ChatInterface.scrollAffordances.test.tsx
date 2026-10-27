@@ -64,6 +64,9 @@ import { makeOverseer, makeTestRoot } from '../../../action-test-harness'
 import ChatInterface from '../ChatInterface'
 
 const testRoot = makeTestRoot()
+// The chat store registry is module-global and keyed by workspace id, so each mount takes a
+// fresh id to keep tests' chats isolated from each other.
+let mountSeq = 0
 
 function withChatApi(server: { overseer: RpcStub<Overseer> }, chats: AiChatMetadata[]) {
   let subscriber: AiChatSubscriber | undefined
@@ -93,7 +96,7 @@ function withChatApi(server: { overseer: RpcStub<Overseer> }, chats: AiChatMetad
 async function renderChat(overseer: RpcStub<Overseer>, selectedChatId: number) {
   await testRoot.render(
     <ChatInterface
-      workspaceId="workspace"
+      workspaceId={`ChatInterface-scrollAffordances-${++mountSeq}`}
       overseer={overseer}
       selectedChatId={selectedChatId}
       onNavigateToChat={() => {}}

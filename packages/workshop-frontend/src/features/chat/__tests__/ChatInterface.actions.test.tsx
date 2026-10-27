@@ -55,6 +55,9 @@ import { RESTRICTED_APPROVAL_COPY } from '../../../components/RestrictedApproval
 import { linkActionLog } from '../../../useActions'
 
 const testRoot = makeTestRoot()
+// The chat store registry is module-global and keyed by workspace id, so each mount takes a
+// fresh id to keep tests' chats isolated from each other.
+let mountSeq = 0
 
 afterEach(() => {
   testRoot.cleanup()
@@ -94,7 +97,7 @@ function renderChat(
 ) {
   return testRoot.render(
     <ChatInterface
-      workspaceId="workspace"
+      workspaceId={`ChatInterface-actions-${++mountSeq}`}
       overseer={overseer}
       restricted={props.restricted}
       selectedChatId={props.selectedChatId ?? null}

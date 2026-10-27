@@ -29,7 +29,7 @@ export interface ChatComposerBarProps {
   getOverseer: OverseerSource;
   handleSend: ComposerSend;
   isAgentActive: boolean;
-  availableModels: AiChatAuthorInfo[];
+  availableModels: readonly AiChatAuthorInfo[];
   selectedModel: string | null;
   /** The chat's own agent, so the picker can name a model it no longer offers. */
   chatAgent: AiChatAuthorInfo | null;

@@ -1,4 +1,5 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
+import { formatRelativeTime } from '../utils/formatRelativeTime'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Dialog, DropdownMenu, useKumoToastManager } from '@cloudflare/kumo'
 import {
@@ -36,16 +37,6 @@ export const Route = createFileRoute('/outputs')({
   component: OutputsPage,
 })
 
-function formatRelativeTime(date: Date): string {
-  const diff = Date.now() - date.getTime()
-  const minutes = Math.floor(diff / 60000)
-  if (minutes < 1) return 'just now'
-  if (minutes < 60) return `${minutes}m ago`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours}h ago`
-  const days = Math.floor(hours / 24)
-  return `${days}d ago`
-}
 
 function outputKey(output: OutputSummary): string {
   return `${output.workspaceId}:${output.workpieceId}`
@@ -121,7 +112,7 @@ function OutputMenu({
 function subtitle(output: OutputSummary): string {
   const parts = [output.workspaceTitle || 'Untitled workspace']
   if (output.owner) parts.push(`Shared by ${output.owner.name}`)
-  parts.push(`Workspace active ${formatRelativeTime(output.lastActive)}`)
+  parts.push(`Workspace active ${formatRelativeTime(output.lastActive, { precision: 'second', beyondCutoffDate: true })}`)
   return parts.join(' · ')
 }
 
@@ -201,7 +192,7 @@ function OutputRow({
         <OutputProvenance owner={output.owner} />
         <span className="flex w-40 items-center justify-end gap-1 whitespace-nowrap">
           <Clock size={10} />
-          Workspace active {formatRelativeTime(output.lastActive)}
+          Workspace active {formatRelativeTime(output.lastActive, { precision: 'second', beyondCutoffDate: true })}
         </span>
       </div>
       <OutputMenu onOpen={onOpen} onOpenWorkspace={onOpenWorkspace}

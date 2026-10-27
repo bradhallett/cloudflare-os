@@ -146,7 +146,7 @@ export interface ChatTranscriptProps {
   showThinkingTraces: boolean;
   restricted: boolean | undefined;
   lastMessageSequence: number | undefined;
-  currentMessages: AiChatMessage[];
+  currentMessages: readonly AiChatMessage[];
   queuedSteers: { text: string; author: AiChatAuthorInfo }[] | undefined;
   turnChanges: TranscriptTurnChanges;
   expansion: TranscriptExpansion;
@@ -166,12 +166,6 @@ export interface ChatTranscriptProps {
   currentProvisionalState: ProvisionalChatState | null;
   provisionalToolCalls: ProvisionalToolCallState[];
   isCompacting: boolean;
-  /**
-   * The rAF-coalesced stream tick: the provisional state objects are mutated in place with
-   * stable identity, so this counter is what re-renders the live turn's placeholder while a
-   * response streams. Every other prop holds steady across ticks.
-   */
-  provisionalTick: number;
 }
 
 /**
@@ -214,7 +208,6 @@ export function ChatTranscript({
   currentProvisionalState,
   provisionalToolCalls,
   isCompacting,
-  provisionalTick,
 }: ChatTranscriptProps) {
   // Consecutive messages from one user read as one group, so their bubbles are rendered
   // without per-message meta; the row that ends the group carries name and time.
@@ -367,7 +360,6 @@ export function ChatTranscript({
               provisionalState={currentProvisionalState}
               toolCalls={provisionalToolCalls}
               isCompacting={isCompacting}
-              provisionalTick={provisionalTick}
               showThinkingTraces={showThinkingTraces}
               currentMessages={currentMessages}
               previousEntry={lastEntry}

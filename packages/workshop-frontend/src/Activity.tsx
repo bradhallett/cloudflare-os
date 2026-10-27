@@ -18,6 +18,7 @@ import { useAvatar } from './useAvatar'
 import { useVendorBranding } from './useVendorBranding'
 import { useResolveAction } from './useResolveAction'
 import { safeExternalUrl } from './utils/safeExternalUrl'
+import { formatRelativeTime } from './utils/formatRelativeTime'
 import AutoApproveConfirmDialog from './components/AutoApproveConfirmDialog'
 import { IncompleteDescriptionNotice, isDescriptionIncomplete } from './components/IncompleteDescriptionNotice'
 import { ActionFields, entryFields, fieldCountLabel } from './components/ActionFields'
@@ -66,14 +67,6 @@ function formatFullDate(date: Date): string {
   })
 }
 
-export function formatRelativeTime(date: Date): string {
-  const minutes = Math.floor(Math.max(0, Date.now() - new Date(date).getTime()) / 60_000)
-  if (minutes < 1) return 'just now'
-  if (minutes < 60) return `${minutes}m ago`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours}h ago`
-  return `${Math.floor(hours / 24)}d ago`
-}
 
 function startOfDay(date: Date): number {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime()

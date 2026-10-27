@@ -9,6 +9,7 @@ import {
   Trash,
   UploadSimple,
 } from '@phosphor-icons/react'
+import { formatRelativeTime } from '../utils/formatRelativeTime'
 import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react'
 import { DropdownMenu, useKumoToastManager } from '@cloudflare/kumo'
 import { useAuthenticatedApi } from '../AuthContext'
@@ -31,17 +32,6 @@ type BlueprintItem = {
 // these sit in a 2-column grid and come out the same width whatever their labels say.
 const ACTION_BUTTON =
   'press inline-flex h-9 w-full cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-kumo-line bg-kumo-base px-3.5 text-[13px] font-medium tracking-[-0.25px] text-kumo-default transition-colors hover:bg-kumo-tint disabled:cursor-default disabled:opacity-50'
-
-function formatRelativeTime(date: Date): string {
-  const diff = Date.now() - date.getTime()
-  const minutes = Math.floor(diff / 60000)
-  if (minutes < 1) return 'just now'
-  if (minutes < 60) return `${minutes}m ago`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours}h ago`
-  const days = Math.floor(hours / 24)
-  return `${days}d ago`
-}
 
 function sortItems(items: BlueprintItem[]): BlueprintItem[] {
   return items.toSorted((a, b) => {
@@ -85,7 +75,7 @@ function BlueprintRow({
 
       <span className="hidden flex-shrink-0 items-center gap-1 text-xs text-kumo-inactive lg:flex">
         <Clock size={10} />
-        {formatRelativeTime(new Date(item.recency))}
+        {formatRelativeTime(new Date(item.recency), { precision: 'second', beyondCutoffDate: true })}
       </span>
 
       {/* Inside the row's <Link>: stopPropagation blocks the Link's SPA handler, so preventDefault

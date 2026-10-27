@@ -44,11 +44,18 @@ import { useAlwaysApproveTag } from "../../useAlwaysApproveTag";
 import { useResolveAction } from "../../useResolveAction";
 import { useAuthenticatedApi } from "../../AuthContext";
 import {
-  type ActiveFileTarget,
-  type ChatCodeChanges,
-  type ChatLiveChangeRows,
-  type ChatLiveEditPreviews,
-} from "./liveCodeStreams";
+  useChatCompactions,
+  useChatIsLoadingHistory,
+  useChatList,
+  useChatListReady,
+  useChatMessages,
+  useChatMetadata,
+  useChatModels,
+  useChatProvisionalState,
+  useChatRowBuffer,
+  useChatStoreConnection,
+  useSelectedChatModel,
+} from "./store/useChatStore";
 import {
   getStoredShowThinkingTraces,
   persistShowThinkingTraces,
@@ -67,11 +74,10 @@ import { useMessageScroller } from "./transcript/useMessageScroller";
 import { JumpToLatestPill } from "./transcript/JumpToLatestPill";
 import { MissedMessagesStatus } from "./transcript/MissedMessagesStatus";
 import { type AutoApproveTarget } from "./transcript/ActionCard";
-import { useChatSubscription } from "./useChatSubscription";
 
 function fallbackToStoredModelSelection(
   modelId: string | null,
-  availableModels: AiChatAuthorInfo[],
+  availableModels: readonly AiChatAuthorInfo[],
 ): string | null {
   if (modelId !== null || availableModels.length > 0) {
     return modelId;
@@ -94,7 +100,7 @@ function staleChatBotName(meta: AiChatMetadata, bots: BotInfo[]): string | undef
 }
 
 interface ChatInterfaceProps {
-  workspaceId: string | undefined;
+  workspaceId: string;
   overseer: RpcStub<Overseer>;
   // True once the workspace has read restricted data (GadgetMetadata.containsRestrictedData).
   // Latched actions are never auto-approved, so the always-approve affordance is hidden.
@@ -104,17 +110,6 @@ interface ChatInterfaceProps {
     chatId: number | null,
     options?: { replace?: boolean },
   ) => void;
-  // The selected chat's code-branch snapshot (see ChatCodeChanges): its code base and the
-  // current epoch's recorded changes, delivered together so the code view always layers a
-  // consistent pair.
-  onChatChangesChange?: (changes: ChatCodeChanges | undefined) => void;
-  // The selected chat's live (unmaterialized) change rows, delivered separately from the durable
-  // snapshot so per-keystroke row arrivals don't churn it (see ChatLiveChangeRows).
-  onLiveRowsChange?: (rows: ChatLiveChangeRows | undefined) => void;
-  // The selected chat's live edit-preview stream, stable per chat like the row stream (see
-  // ChatLiveEditPreviews).
-  onLiveEditPreviewsChange?: (previews: ChatLiveEditPreviews | undefined) => void;
-  onStreamingActiveFileChange?: (chatId: number, file: ActiveFileTarget | null | undefined) => void;
   // The selected chat's uncommitted content, which accepting its changes first checks for merge
   // conflicts nobody resolved. Without it the changes are accepted unchecked.
   chatContent?: ChatContentReader;
@@ -123,8 +118,6 @@ interface ChatInterfaceProps {
   consoleLogSeverity: "error" | "warn" | "info";
   onConsumeConsoleLogs: () => string;
   onDiscardConsoleLogs: () => void;
-  onChatCountChange?: (count: number, hasChatZero: boolean) => void;
-  onAgentActiveChange?: (chatId: number, isActive: boolean) => void;
   // Called after an auto-approval rule is enabled from the chat thread, so the Activity pane's
   // Auto-approval list reflects it without a reload.
   onAutoApproveChange?: () => void;
@@ -132,11 +125,6 @@ interface ChatInterfaceProps {
   sidebarWidth?: number;
   onSidebarResize?: (width: number) => void;
   renderExtraTab?: () => React.ReactNode;
-  // The workpieces any chat proposes changes to (see AiChatMetadata.proposedChangeWorkpieces).
-  onAnyChatProposedChangesChange?: (workpieceIds: readonly WorkpieceId[]) => void;
-  // The workpieces the selected chat proposes changes to (empty when none is selected or it
-  // proposes nothing); see AiChatMetadata.proposedChangeWorkpieces.
-  onSelectedChatProposedChangesChange?: (workpieceIds: readonly WorkpieceId[]) => void;
   constrainChatWidth?: boolean;
   // Opens a workpiece the transcript offers (a created gadget's app, a created worktree's code).
   onOpenGadget: (workpieceId: WorkpieceId) => void;
@@ -153,64 +141,54 @@ function ChatInterface({
   restricted,
   selectedChatId,
   onNavigateToChat,
-  onChatChangesChange,
-  onLiveRowsChange,
-  onLiveEditPreviewsChange,
-  onStreamingActiveFileChange,
   chatContent,
   pendingConsoleLogCount,
   consoleLogPreview,
   consoleLogSeverity,
   onConsumeConsoleLogs,
   onDiscardConsoleLogs,
-  onChatCountChange,
-  onAgentActiveChange,
   onAutoApproveChange,
   sidebarMode,
   sidebarWidth = 280,
   onSidebarResize,
   renderExtraTab,
-  onAnyChatProposedChangesChange,
-  onSelectedChatProposedChangesChange,
   constrainChatWidth,
   onOpenGadget,
   outputOfWorkpiece,
 }: ChatInterfaceProps) {
-  // Persistent cache that survives reconnects
   const toasts = useKumoToastManager();
   const { currentUser, authenticatedApi } = useAuthenticatedApi();
   const getOverseer = useCallback(() => overseer, [overseer]);
-  const {
-    cacheRef,
-    provisionalRef,
-    chatChangeRowsRef,
-    selectedChatIdRef,
-    onNavigateToChatRef,
-    chatListVersion,
-    chatListReady,
-    isLoading,
-    messagesVersion,
-    provisionalTick,
-    availableModels,
-    selectedModel,
-    setSelectedModel,
-    setProposedChangesVersion,
-    forceUpdate,
-    bumpChatListVersion,
-    cacheHistoryPage,
-    applyOptimisticActionState,
-    applyOptimisticHookEnabled,
-  } = useChatSubscription({
+  // This component owns the workspace's chat store: it opens the subscription (reopening on
+  // reconnects) and feeds the selector hooks below, which every other reader in the tree goes
+  // through. The store lives in a session registry, so navigating away and back is instant.
+  const store = useChatStoreConnection({
+    workspaceId,
     overseer,
     selectedChatId,
     toasts,
     onNavigateToChat,
-    onChatChangesChange,
-    onLiveRowsChange,
-    onLiveEditPreviewsChange,
-    onStreamingActiveFileChange,
   });
+  // The current selection as a ref, for awaits that must not act on a chat the user has left.
+  const selectedChatIdRef = useRef(selectedChatId);
+  selectedChatIdRef.current = selectedChatId;
 
+  // Chat state, each slice a stable identity until it changes: components re-render only for
+  // what they read (see store/useChatStore.ts).
+  const chatList = useChatList(workspaceId);
+  const chatListReady = useChatListReady(workspaceId);
+  const currentMessages = useChatMessages(workspaceId, selectedChatId);
+  const currentCompactions = useChatCompactions(workspaceId, selectedChatId);
+  const currentChatMetadata = useChatMetadata(workspaceId, selectedChatId);
+  const currentProvisionalState = useChatProvisionalState(workspaceId, selectedChatId);
+  const currentRowBuffer = useChatRowBuffer(workspaceId, selectedChatId);
+  const isLoading = useChatIsLoadingHistory(workspaceId, selectedChatId);
+  const availableModels = useChatModels(workspaceId);
+  const selectedModel = useSelectedChatModel(workspaceId);
+  const setSelectedModel = useCallback(
+    (model: string | null) => store.setSelectedModel(model),
+    [store],
+  );
   // UI state
   // Out-of-credits modal (free-tier limit reached). `usageModalShownFor` tracks the error sequence
   // we've already auto-opened for, so dismissing it doesn't immediately reopen.
@@ -286,41 +264,6 @@ function ChatInterface({
   // back-off, missed-row pill, turn anchoring) live in useMessageScroller.
   const messagesContainerRef = useRef<HTMLDivElement>(null);
 
-  // Get sorted list of chats from cache
-  const chatList = useMemo(
-    () => Array.from(cacheRef.current.chats.values()).toSorted(
-      (a, b) => b.lastActive.getTime() - a.lastActive.getTime(),
-    ),
-    [chatListVersion],
-  );
-
-
-  // Notify parent when chat list changes. Gated on chatListReady so that we
-  // don't report 0 from the empty initial cache before listChats() has completed.
-  const onChatCountChangeRef = useRef(onChatCountChange);
-  onChatCountChangeRef.current = onChatCountChange;
-  const hasChatZero = cacheRef.current.chats.has(0);
-  useEffect(() => {
-    if (chatListReady) {
-      onChatCountChangeRef.current?.(chatList.length, hasChatZero);
-    }
-  }, [chatList.length, chatListReady, hasChatZero]);
-
-  // Notify parent which workpieces any chat proposes changes to (code written but not merged).
-  // Keyed on the set's content, since chat metadata is redelivered wholesale on every lastActive
-  // bump.
-  const onAnyChatProposedChangesChangeRef = useRef(onAnyChatProposedChangesChange);
-  onAnyChatProposedChangesChangeRef.current = onAnyChatProposedChangesChange;
-  const anyProposedWorkpieces = [
-    ...new Set(chatList.flatMap((meta) => meta.proposedChangeWorkpieces ?? [])),
-  ].toSorted((a, b) => a - b);
-  const anyProposedWorkpiecesKey = anyProposedWorkpieces.join(",");
-  useEffect(() => {
-    if (chatListReady) {
-      onAnyChatProposedChangesChangeRef.current?.(anyProposedWorkpieces);
-    }
-    // oxlint-disable-next-line exhaustive-deps -- anyProposedWorkpieces is covered by its key.
-  }, [anyProposedWorkpiecesKey, chatListReady]);
 
   // In sidebar mode, auto-select the most recent chat when none is selected.
   useEffect(() => {
@@ -330,33 +273,16 @@ function ChatInterface({
       chatListReady &&
       chatList.length > 0
     ) {
-      onNavigateToChatRef.current(chatList[0].id, { replace: true });
+      onNavigateToChat(chatList[0].id, { replace: true });
     }
-  }, [sidebarMode, selectedChatId, chatListReady, chatList]);
+  }, [sidebarMode, selectedChatId, chatListReady, chatList, onNavigateToChat]);
 
-  // Get messages for selected chat (filter out any undefined slots in sparse array)
-  // Memoized on `messagesVersion` alone: stream ticks (provisionalTick) never touch the
-  // durable caches, so streaming must not churn these memos or anything derived from them
-  // (message states, display entries).
-  const currentMessages = useMemo(() => {
-    if (selectedChatId === null) return [];
-    return (cacheRef.current.messages.get(selectedChatId) || []).filter(
-      (msg) => msg !== undefined,
-    );
-  }, [selectedChatId, messagesVersion]);
-  const currentCompactions = useMemo(() => {
-    if (selectedChatId === null) return [];
-    return cacheRef.current.compacted.get(selectedChatId) ?? [];
-  }, [selectedChatId, messagesVersion]);
   const messageStates = useMemo(() => computeMessageStates(currentMessages), [currentMessages]);
   // Declared bots for the composer's agent picker, plus its pick (a chat's own bot wins while
   // that chat is open; Home's stored pick covers the no-chat case).
   const [bots, setBots] = useState<BotInfo[]>([]);
   const [selectedBot, setSelectedBot] = useState<BotSelection | null>(null);
 
-  // The selected chat's metadata, undefined while it has not loaded.
-  const currentChatMetadata =
-    selectedChatId !== null ? cacheRef.current.chats.get(selectedChatId) : null;
 
   // ─── action hooks ──────────────────────────────────────────────────────────
   // Each flow owns its own state; ChatInterface orchestrates the results.
@@ -383,9 +309,8 @@ function ChatInterface({
     bots,
     selectedBot,
     setSelectedBot,
-    onNavigateToChatRef,
-    forceUpdate,
-    applyOptimisticHookEnabled,
+    onNavigateToChat,
+    store,
     toasts,
     currentChatMetadata,
   });
@@ -412,9 +337,7 @@ function ChatInterface({
     overseer,
     selectedChatId,
     currentChatMetadata,
-    cacheRef,
-    forceUpdate,
-    bumpChatListVersion,
+    store,
     toasts,
   });
 
@@ -551,30 +474,7 @@ function ChatInterface({
     }
   }, [overseer, toasts]);
 
-  const onSelectedChatProposedChangesChangeRef = useRef(onSelectedChatProposedChangesChange);
-  onSelectedChatProposedChangesChangeRef.current = onSelectedChatProposedChangesChange;
-  // Keyed on the list's *content*: metadata is redelivered wholesale on every lastActive bump,
-  // and pushing a fresh (but equal) array into the parent's state each time would re-render it
-  // for nothing.
-  const currentProposedWorkpieces = currentChatMetadata?.proposedChangeWorkpieces;
-  const currentProposedWorkpiecesKey = currentProposedWorkpieces?.join(",") ?? "";
-  const metadataLoaded = currentChatMetadata !== undefined;
-  useEffect(() => {
-    if (selectedChatId !== null && !metadataLoaded) {
-      return;
-    }
 
-    onSelectedChatProposedChangesChangeRef.current?.(currentProposedWorkpieces ?? []);
-    // oxlint-disable-next-line exhaustive-deps -- currentProposedWorkpieces is covered by its key.
-  }, [currentProposedWorkpiecesKey, metadataLoaded, selectedChatId]);
-
-  const currentProvisionalState =
-    selectedChatId !== null
-      ? (provisionalRef.current.get(selectedChatId) ?? null)
-      : null;
-
-  const currentRowBuffer =
-    selectedChatId !== null ? (chatChangeRowsRef.current.get(selectedChatId) ?? null) : null;
   // Whether the live window holds *human* draft edits -- the rows the draft banner describes.
   // Server-authored rows (agent edits, mainline merges) share the same stream but must not
   // raise the banner: the agent's activity has its own streaming UI. Derived from the rows
@@ -610,18 +510,6 @@ function ChatInterface({
     isTurnActive: isAgentActive,
   });
 
-  // Notify parent when agent active state changes
-  const onAgentActiveChangeRef = useRef(onAgentActiveChange);
-  onAgentActiveChangeRef.current = onAgentActiveChange;
-  const previousAgentStateRef = useRef({chatId: selectedChatId, active: isAgentActive});
-  useEffect(() => {
-    let previous = previousAgentStateRef.current;
-    if (selectedChatId !== null &&
-        (selectedChatId !== previous.chatId || isAgentActive !== previous.active)) {
-      onAgentActiveChangeRef.current?.(selectedChatId, isAgentActive);
-    }
-    previousAgentStateRef.current = {chatId: selectedChatId, active: isAgentActive};
-  }, [isAgentActive, selectedChatId]);
 
   // Loads the page before the oldest message on screen. Held in a ref because the scroll handler is
   // built once, while the loader closes over state that changes each render.
@@ -653,15 +541,15 @@ function ChatInterface({
   });
 
   // Auto-scroll to the live edge when messages change, but only while the reader still follows it.
-  // `provisionalTick` rides along so growing stream text keeps following too: the durable deps
-  // (currentMessages, hasVisibleProvisionalContent) hold steady while a turn streams.
+  // The provisional state's identity rides along so growing stream text keeps following too: the
+  // durable deps (currentMessages, hasVisibleProvisionalContent) hold steady while a turn streams.
   useLayoutEffect(() => {
     scroller.followContent();
   }, [
     currentMessages,
     hasVisibleProvisionalContent,
     isAgentActive,
-    provisionalTick,
+    currentProvisionalState,
     queuedSteers?.length,
     scroller.followContent,
   ]);
@@ -755,16 +643,10 @@ function ChatInterface({
 
     setIsLoadingEarlier(true);
     try {
-      const page = await overseer.getChatHistory(selectedChatId, oldestLoadedSequence);
+      // Capture the anchor before the load: the store ingests the page (and re-renders the
+      // transcript) the moment it resolves, before this await returns control here.
       prependAnchorRef.current = messagesContainerRef.current?.scrollHeight;
-      cacheHistoryPage(selectedChatId, page);
-
-      // The page's own change-affecting messages now stand in for the boundary's merged update.
-      setProposedChangesVersion((prev) => prev + 1);
-      forceUpdate();
-    } catch (err) {
-      console.error("Failed to load earlier messages:", err);
-      toasts.add({ title: "Failed to load earlier messages", variant: "error" });
+      await store.loadHistoryPage(selectedChatId, oldestLoadedSequence);
     } finally {
       setIsLoadingEarlier(false);
     }
@@ -784,7 +666,7 @@ function ChatInterface({
 
   const { resolveAction, creationAccountModal } =
     useResolveAction(overseer, setProcessingActions, (actionId, state) => {
-      if (applyOptimisticActionState(actionId, state)) forceUpdate();
+      store.applyOptimisticActionState(actionId, state);
     });
 
 
@@ -1016,7 +898,6 @@ function ChatInterface({
                     currentProvisionalState={currentProvisionalState}
                     provisionalToolCalls={provisionalToolCalls}
                     isCompacting={isCompacting}
-                    provisionalTick={provisionalTick}
                   />
                 </div>
                 <MissedMessagesStatus

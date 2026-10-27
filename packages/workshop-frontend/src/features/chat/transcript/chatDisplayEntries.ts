@@ -184,7 +184,7 @@ function transcriptToolCalls(toolCalls: AiToolCall[]): AiToolCall[] {
  * than the attempt (most sends are the newest thing in a solo chat, so they land at the end).
  */
 export function buildChatDisplayEntries(
-  messages: AiChatMessage[],
+  messages: readonly AiChatMessage[],
   changeStatus: ReadonlyMap<number, "pending" | "merged" | "reverted">,
   // Loaded compaction boundaries, oldest first.
   boundaries: readonly CompactionBoundary[] = [],
@@ -576,7 +576,7 @@ export function rhythmTopClassForLiveRow(prev: ChatDisplayEntry | null): string 
 /**
  * Computes each message's merged/reverted status and the timestamps merge/revert rows reference.
  */
-export function computeMessageStates(messages: AiChatMessage[]): MessageState {
+export function computeMessageStates(messages: readonly AiChatMessage[]): MessageState {
   const changeStatus = new Map<number, "pending" | "merged" | "reverted">();
   const mergeTimestamps = new Map<number, Date>();
   const revertTimestamps = new Map<number, Date>();
@@ -637,7 +637,7 @@ export function computeMessageStates(messages: AiChatMessage[]): MessageState {
  * content.
  */
 export function computeChatEpochChanges(
-  messages: AiChatMessage[],
+  messages: readonly AiChatMessage[],
   compacted?: CompactionBoundary,
   codeBase?: ChatCodeBase,
 ): { epochChange?: CodeChange; rowsThrough: number } {
@@ -670,7 +670,7 @@ export function computeChatEpochChanges(
  * The agent that last spoke in the chat: the author of the most recent agent message or agent error.
  * A steer was addressed to a running agent, so it never means the chat went on without one.
  */
-export function inferChatAgentFromMessages(messages: AiChatMessage[]): AiChatAuthorInfo | null {
+export function inferChatAgentFromMessages(messages: readonly AiChatMessage[]): AiChatAuthorInfo | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
 

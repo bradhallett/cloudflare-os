@@ -8,7 +8,7 @@ export const LAST_SELECTED_BOT_KEY = "lastSelectedBot";
 export const NO_AGENT_OPTION_VALUE = "__gadgets_no_agent__";
 
 export function getStoredSelectedModel(
-  models: AiChatAuthorInfo[],
+  models: readonly AiChatAuthorInfo[],
 ): string | null {
   const storedModel = localStorage.getItem(LAST_SELECTED_MODEL_KEY);
 
@@ -57,7 +57,7 @@ export function sameBotSelection(
  * there is no fallback: a bot is chosen deliberately, so a stored choice that no longer resolves
  * starts intake on the default model rather than guessing another bot.
  */
-export function getStoredSelectedBot(bots: BotInfo[]): BotSelection | null {
+export function getStoredSelectedBot(bots: readonly BotInfo[]): BotSelection | null {
   const storedKey = localStorage.getItem(LAST_SELECTED_BOT_KEY);
   if (!storedKey) return null;
   return bots.find((bot) => botSelectionKey(bot.selection) === storedKey)
