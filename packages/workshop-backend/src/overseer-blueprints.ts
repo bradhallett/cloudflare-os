@@ -150,7 +150,7 @@ export abstract class OverseerBlueprints extends OverseerBindings {
     });
 
     // The turn has no message to answer. What prompts it is the record of the proposal, which
-    // replay renders as the agent's task (see the "changes" case of runAgentPass in agent.ts).
+    // replay renders as the agent's task (see the "changes" case of runAgentPass in agent-replay.ts).
     // Starting it here, with the chat, is what makes it one turn per proposal however many
     // clients are watching.
     if (reviewer) this.startAgent(chatId, reviewer, author, clientUserId);

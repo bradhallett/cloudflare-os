@@ -188,7 +188,7 @@ export abstract class OverseerGatekeepers extends OverseerBlueprints {
     this.refoldChatCompactions(chatId, revertFrom, [...messages, revertMessage]);
     this.storage.chatMeta.put(meta);
     this.proposedChangesChanged(chatId);
-    // Replay hides the results of reads of reverted content (see agent.ts), so the next request
+    // Replay hides the results of reads of reverted content (see agent-replay.ts), so the next request
     // no longer starts with the one being kept warm.
     this.cacheWarmer.end(chatId, "revert");
 
@@ -656,7 +656,7 @@ export abstract class OverseerGatekeepers extends OverseerBlueprints {
    * Records a pending connection request. `requested` is true only when a request was actually
    * created (and an accept/deny card will appear); when false, the request was rejected for the
    * reason in `message` and the agent should fix it and retry — the turn must NOT end (see the
-   * `connectionRequested` flag in agent.ts).
+   * `connectionRequested` flag in agent-session.ts).
    */
   async requestConnection(chatId: number, input: {
     vendorId: string;

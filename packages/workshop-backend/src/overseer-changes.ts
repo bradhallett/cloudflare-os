@@ -217,7 +217,7 @@ export abstract class OverseerChanges extends OverseerPublishing {
     // can have, since only an accept moves it and none can run mid-turn -- so unlike a gadget's
     // head pin there is nothing for the agent to declare or the barrier to validate: the barrier
     // derives the pin from the record (the agent mirrors it in its turn state; see
-    // pinWorktreeInSession in agent.ts).
+    // pinWorktreeInSession in agent-session.ts).
     let codeBasePins = this.chatCodeBase(meta).pins;
     let worktreePins = new Map<WorkpieceId, string>();
     for (let id of [...step.changes.flatMap(({change}) => changedGadgets(change)),
