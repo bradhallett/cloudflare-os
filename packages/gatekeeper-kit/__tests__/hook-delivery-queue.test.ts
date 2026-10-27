@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  DELIVERED_RETENTION_MS, HookDeliveryQueue, MAX_DELIVERIES_PER_RUN, MAX_DELIVERY_ATTEMPTS, disposeStubs,
+  DELIVERED_RETENTION_MS, HookDeliveryQueue, MAX_DELIVERIES_PER_RUN, MAX_DELIVERY_ATTEMPTS,
+  MAX_PENDING_DELIVERIES, disposeStubs,
 } from "../src/hook-delivery-queue";
 import { fakeKv, type FakeKv } from "./fake-kv";
 
@@ -21,15 +22,37 @@ describe("HookDeliveryQueue", () => {
 
   it("delivers each queued message once, and collapses a duplicate push", async () => {
     const queue = new HookDeliveryQueue<string>(fakeKv(), () => {});
-    queue.enqueue("hook", "m1", "first", Date.now());
-    queue.enqueue("hook", "m1", "duplicate", Date.now());
+    expect(queue.enqueue("hook", "m1", "first", Date.now())).toBe(true);
+    expect(queue.enqueue("hook", "m1", "duplicate", Date.now())).toBe(true);
     const deliver = vi.fn(async () => {});
 
     await queue.run(Date.now(), deliver);
-    queue.enqueue("hook", "m1", "redelivered", Date.now());
+    // A push repeating a message finished within its dedupe window is refused, not queued.
+    expect(queue.enqueue("hook", "m1", "redelivered", Date.now())).toBe(false);
     await queue.run(Date.now(), deliver);
 
     expect(deliver.mock.calls).toEqual([["hook", "first"]]);
+  });
+
+  it("refuses an enqueue past the pending high-water, and recovers as the backlog drains", async () => {
+    const kv = fakeKv();
+    const queue = new HookDeliveryQueue<string>(kv, () => {});
+    for (let n = 0; n < MAX_PENDING_DELIVERIES; n++) {
+      expect(queue.enqueue("hook", `m${n}`, `message ${n}`, Date.now())).toBe(true);
+    }
+    expect(queue.enqueue("hook", "over", "refused", Date.now())).toBe(false);
+    expect(kv.keys().filter(key => key.startsWith("msg:"))).toHaveLength(MAX_PENDING_DELIVERIES);
+
+    // Draining the backlog makes room; the refused message queues on a later push.
+    await queue.run(Date.now(), async () => {});
+    expect(queue.enqueue("hook", "over", "accepted", Date.now())).toBe(true);
+  });
+
+  it("answers false for a duplicate of a message already finished within its window", async () => {
+    const queue = new HookDeliveryQueue<string>(fakeKv(), () => {});
+    queue.enqueue("hook", "m1", "first", Date.now());
+    await queue.run(Date.now(), async () => {});
+    expect(queue.enqueue("hook", "m1", "duplicate", Date.now())).toBe(false);
   });
 
   it("retries a failed delivery with backoff, then drops it after the last attempt", async () => {

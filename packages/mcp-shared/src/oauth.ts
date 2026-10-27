@@ -9,7 +9,7 @@ import {
 import { redactSecrets, safeServerText } from "./util.js";
 
 /** SDK tokens plus the absolute expiry used by the account's hot path. */
-export type OAuthTokens = StoredOAuthTokens & { expiresAt?: number };
+export type McpOAuthTokens = StoredOAuthTokens & { expiresAt?: number };
 
 /**
  * Assumed access-token lifetime when the server states none. `expires_in` is optional per RFC 6749,
