@@ -205,19 +205,35 @@ export class UserAccountStore {
       }
       promises.push((async () => {
         try {
-          // One getSupportedResources() call is both the filter input and the listed payload (the
-          // old shape fetched it twice: once inside the filter check, once for the listing).
-          let supportedResources = await vendor.getSupportedResources(options);
-          if (filter?.resourceUrl &&
-              !matchesResourceUrlFilter(supportedResources, filter.resourceUrl)) {
-            return null;
+          // One getSupportedResources() call is both the filter input and the listed payload
+          // (the old shape fetched it twice: once inside the filter check, once for the
+          // listing). A filtered listing fetches the resources first and describes only a
+          // vendor whose enabled resources match -- a non-match costs one RPC, not two --
+          // while an unfiltered one runs the two fetches in parallel, as it always has.
+          let supportedResources: SupportedResource[];
+          let description: VendorDescription | undefined;
+          if (filter?.resourceUrl) {
+            supportedResources = await vendor.getSupportedResources(options);
+          } else {
+            [description, supportedResources] = await Promise.all([
+              vendor.describe(),
+              vendor.getSupportedResources(options),
+            ]);
           }
-          let description = await vendor.describe();
           let enabledResources =
               filterEnabledResources(config, id, supportedResources);
+          // The filter matches what would be pushed (the same enabled basis notifyAdd applies):
+          // a URL that matches only an admin-disabled resource hides the vendor entirely.
+          if (filter?.resourceUrl &&
+              !matchesResourceUrlFilter(enabledResources, filter.resourceUrl)) {
+            return null;
+          }
           if (enabledResources.length == 0) {
             // Every resource for this vendor is disabled (or it advertised none) — hide the vendor.
             return null;
+          }
+          if (description === undefined) {
+            description = await vendor.describe();
           }
 
           return {id, description, supportedResources: enabledResources};

@@ -541,8 +541,20 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
     // Independent teardowns of what the account leaves behind — shared workspaces' collaborator
     // edges, org memberships — run concurrently (each is already best-effort per item), so one
-    // slow cross-DO hop doesn't serialize the whole deprovision behind it.
-    await Promise.allSettled([this.#severSharedWorkspaceAccess(), this.#leaveOrgsOnDeprovision()]);
+    // slow cross-DO hop doesn't serialize the whole deprovision behind it. Each helper never
+    // rejects per item, but a throw from either's prolog (a storage read) is logged like the
+    // revocations above rather than vanishing into the allSettled.
+    let teardowns = [this.#severSharedWorkspaceAccess(), this.#leaveOrgsOnDeprovision()];
+    let teardownResults = await Promise.allSettled(teardowns);
+    for (let [index, result] of teardownResults.entries()) {
+      if (result.status === "rejected") {
+        logger.error("teardown step failed during deprovision", {
+          event: "user.deprovision.teardown.failed",
+          operation: index === 0 ? "severSharedWorkspaceAccess" : "leaveOrgsOnDeprovision",
+          error: result.reason,
+        });
+      }
+    }
     logger.info("user deprovisioned", { event: "user.deprovisioned" });
   }
 
@@ -1622,7 +1634,13 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       }
       return gate;
     };
-    for (let record of this.storage.libraryBlueprints.list()) {
+    // Snapshot the records first (the #sweepExpiredInvitations pattern): a storage list()
+    // iterator is invalidated by writes, and the gates below must be kicked before any await.
+    let records = Array.from(this.storage.libraryBlueprints.list());
+    for (let orgId of new Set(records.map(r => r.orgOwner).filter(o => o !== undefined))) {
+      askOrg(orgId!);
+    }
+    for (let record of records) {
       if (record.orgOwner !== undefined && !(await askOrg(record.orgOwner))) continue;
       result.push({
         id: record.id,
