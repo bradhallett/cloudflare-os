@@ -208,6 +208,82 @@ export function autoApprovalOf(action: GitHubAction): Pick<ActionDescription, "a
   };
 }
 
+/** The issue or pull request an action is queued against; none for creates and pushes. */
+export function actionTarget(action: GitHubAction): { kind: EntityKind; id: string } | undefined {
+  switch (action.type) {
+    case "createIssue": case "createPullRequest": case "push":
+      return undefined;
+    case "postReview": case "replyToDiffComment": case "mergePullRequest":
+      return { kind: "pull", id: action.pullId };
+    default:
+      return { kind: action.targetKind, id: action.targetId };
+  }
+}
+
+/**
+ * A provisional reference, `#~N`, as a whole token: the digits must end it, so `#~1` is in
+ * neither `#~10` nor `#~1a`. GitHub numbers issues and pull requests alike with `#`, so one
+ * sigil serves both kinds and the id itself names the resource (provisional ids share one
+ * sequence, so no two resources ever hold the same one).
+ */
+export const PROVISIONAL_REFERENCE = /#(~\d+)(?!\w)/g;
+
+/**
+ * A line GitHub may run as a slash command: `/` in the first column, a name, then whitespace or
+ * the line's end. GitHub documents `/close`, `/lock`, `/assign`... for the comment box its web
+ * UI posts from and does not promise either behavior for API-posted comments (the contract
+ * suite checks the live site); matching any name everywhere escapes some lines GitHub would
+ * leave alone, never one it would run. `\r*` keeps the escape ahead of any carriage-return
+ * normalization between the writer and the extractor.
+ */
+const QUICK_ACTION_LINE = /^\/(?=\r*\w+(?:\s|$))/gm;
+
+/**
+ * Escape every line of `text` that GitHub might run as a slash command -- `/close`, `/lock` --
+ * on the issue or pull request it is posted to, with the account's full authority and whatever
+ * the approved action said. The added backslash renders as nothing in Markdown text; in code
+ * and raw HTML, where it is literal, it shows.
+ */
+export function escapeQuickActions(text: string): string {
+  return text.replace(QUICK_ACTION_LINE, "\\/");
+}
+
+/**
+ * The Markdown fields apply posts, rewriting `#~N` provisional references to real numbers and
+ * escaping slash-command lines (see `#postedText`). Apply rewrites each as it builds its
+ * request rather than reading this list, so the list must name every field apply posts: the
+ * reject cascade reads it -- a text that would be rewritten is a dependency, so rejecting the
+ * referenced resource retires the action that names it -- and so do the approval card's notes.
+ */
+export function referenceBearingTexts(action: GitHubAction): string[] {
+  switch (action.type) {
+    case "createIssue":
+    case "createPullRequest":
+      return action.options.bodyMarkdown ? [action.options.bodyMarkdown] : [];
+    case "setBody":
+    case "postComment":
+    case "replyToDiffComment":
+      return [action.bodyMarkdown];
+    case "postReview":
+      return [
+        ...(action.review.bodyMarkdown ? [action.review.bodyMarkdown] : []),
+        ...(action.review.diffComments ?? []).map(comment => comment.bodyMarkdown),
+      ];
+    case "setTitle": case "addLabels": case "removeLabels": case "changeState":
+    case "mergePullRequest": case "push":
+      return [];
+  }
+}
+
+/**
+ * Whether `text` names the provisional `~N`, as the rewrite reads references: whole tokens
+ * only, so `~1` is not named by `~10`. The sigil carries no kind on GitHub (see
+ * `PROVISIONAL_REFERENCE`), so a reference names the provisional whatever kind it is.
+ */
+export function textReferences(text: string, provisionalId: string): boolean {
+  return [...text.matchAll(PROVISIONAL_REFERENCE)].some(([, found]) => found === provisionalId);
+}
+
 /**
  * Whether a dispatch failure leaves GitHub's outcome unknown. Transport failures and server
  * errors might have committed; client errors, git compare-and-swap refusals, and validation

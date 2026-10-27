@@ -80,8 +80,13 @@ import {
   ACTION_KINDS,
   BINDING_ACTIONS,
   autoApprovalOf,
+  actionTarget,
+  escapeQuickActions,
   isCasBound,
   isGitHubOutcomeUnknown,
+  PROVISIONAL_REFERENCE,
+  referenceBearingTexts,
+  textReferences,
   type AddLabelsAction,
   type Cached,
   type ChangeStateAction,
@@ -900,19 +905,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       case "createIssue":
       case "createPullRequest":
         return action.provisionalId === provisionalId;
-      case "setTitle":
-      case "setBody":
-      case "addLabels":
-      case "removeLabels":
-      case "changeState":
-      case "postComment":
-        return action.targetKind === kind && action.targetId === provisionalId;
-      case "postReview":
-      case "replyToDiffComment":
-      case "mergePullRequest":
-        return kind === "pull" && action.pullId === provisionalId;
-      case "push":
-        return false;  // pushes target a branch, never an issue/PR
+      default: {
+        const target = actionTarget(action);
+        return target?.kind === kind && target.id === provisionalId;
+      }
     }
   }
 
@@ -998,26 +994,27 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     return provisional?.realId;
   }
 
+  #realIdOf(targetId: string): string | undefined {
+    return targetId.startsWith("~") ? this.#resolveProvisionalId(targetId) : targetId;
+  }
+
+  #requireRealId(targetId: string, what = "Target"): string {
+    const realId = this.#realIdOf(targetId);
+    if (!realId) throw new Error(`${what} ${targetId} has not been created on GitHub yet.`);
+    return realId;
+  }
+
   #entityIdMatches(targetId: string, logicalId: string): boolean {
     if (targetId === logicalId) return true;
-    const targetResolved = targetId.startsWith("~") ? this.#resolveProvisionalId(targetId) : targetId;
-    const logicalResolved = logicalId.startsWith("~") ? this.#resolveProvisionalId(logicalId) : logicalId;
+    const targetResolved = this.#realIdOf(targetId);
+    const logicalResolved = this.#realIdOf(logicalId);
     return !!targetResolved && !!logicalResolved && targetResolved === logicalResolved;
   }
 
   #pendingActionsForEntity(kind: EntityKind, logicalId: string): GitHubAction[] {
     return this.#listPendingActions().filter(action => {
-      if (action.type === "createIssue" || action.type === "createPullRequest" ||
-          action.type === "push") {
-        return false;
-      }
-
-      if (action.type === "postReview" || action.type === "replyToDiffComment" || action.type === "mergePullRequest") {
-        if (kind !== "pull") return false;
-        return this.#entityIdMatches(action.pullId, logicalId);
-      }
-
-      return action.targetKind === kind && this.#entityIdMatches(action.targetId, logicalId);
+      const target = actionTarget(action);
+      return target?.kind === kind && this.#entityIdMatches(target.id, logicalId);
     });
   }
 
@@ -1033,8 +1030,12 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }) as CreateIssueAction | CreatePullRequestAction | undefined;
   }
 
-  #rewriteKnownReferences(text: string, requireAll: boolean): string {
-    return text.replace(/#(~\d+)/g, (_, provisionalId: string) => {
+  // The text apply posts: `#~N` provisional references rewritten to the GitHub numbers of the
+  // issues or pull requests they name, and slash-command lines escaped so GitHub does not run
+  // them (see escapeQuickActions). `requireAll` demands every reference resolve -- a dispatching
+  // action must never post a stale provisional reference -- while a read may show one as written.
+  #postedText(text: string, requireAll: boolean): string {
+    const rewritten = text.replace(PROVISIONAL_REFERENCE, (match, provisionalId: string) => {
       const realId = this.#resolveProvisionalId(provisionalId);
       if (!realId && requireAll) {
         throw new Error(
@@ -1042,8 +1043,9 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         );
       }
 
-      return realId ? `#${realId}` : `#${provisionalId}`;
+      return realId ? `#${realId}` : match;
     });
+    return escapeQuickActions(rewritten);
   }
 
   async #getViewerActor(): Promise<GitHubActor> {
@@ -1077,34 +1079,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   #pendingExistingEntityIds(kind: EntityKind): Set<string> {
     const ids = new Set<string>();
     for (const action of this.#listPendingActions()) {
-      let targetId: string | undefined;
-      switch (action.type) {
-        case "setTitle":
-        case "setBody":
-        case "addLabels":
-        case "removeLabels":
-        case "changeState":
-        case "postComment":
-          if (action.targetKind === kind) {
-            targetId = action.targetId;
-          }
-          break;
-        case "postReview":
-        case "replyToDiffComment":
-        case "mergePullRequest":
-          if (kind === "pull") {
-            targetId = action.pullId;
-          }
-          break;
-        default:
-          break;
-      }
-
-      if (!targetId) continue;
-      const realId = targetId.startsWith("~") ? this.#resolveProvisionalId(targetId) : targetId;
-      if (realId) {
-        ids.add(realId);
-      }
+      const target = actionTarget(action);
+      if (target?.kind !== kind) continue;
+      const realId = this.#realIdOf(target.id);
+      if (realId) ids.add(realId);
     }
     return ids;
   }
@@ -1172,11 +1150,9 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       };
     }
 
-    const realId = targetId.startsWith("~") ? this.#resolveProvisionalId(targetId) : targetId;
+    const realId = this.#realIdOf(targetId);
     if (!realId) {
-      const details = targetKind === "issue"
-        ? await this.#getIssueDetails(targetId)
-        : await this.#getPullRequestDetails(targetId);
+      const details = await this.#detailsOf(targetKind, targetId);
       return {
         state: details.state,
         reason: undefined,
@@ -1239,6 +1215,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     return await this.#overlaySimulatedPullHead(
       this.#overlayIssueLike(await this.#getRemotePullRequestDetails(logicalId), "pull", logicalId),
       gitCache);
+  }
+
+  #detailsOf(targetKind: EntityKind, targetId: string): Promise<GitHubIssueDetails | GitHubPullRequestDetails> {
+    return targetKind === "issue" ? this.#getIssueDetails(targetId) : this.#getPullRequestDetails(targetId);
   }
 
   /**
@@ -1465,7 +1445,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           break;
         case "setBody":
           if ("bodyMarkdown" in result) {
-            result.bodyMarkdown = this.#rewriteKnownReferences(action.bodyMarkdown, false);
+            result.bodyMarkdown = this.#postedText(action.bodyMarkdown, false);
             result.updatedAt = new Date(action.submittedAt);
           }
           break;
@@ -1835,7 +1815,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           kind: "comment",
           id: action.provisionalCommentId,
           author: viewer,
-          bodyMarkdown: this.#rewriteKnownReferences(action.bodyMarkdown, false),
+          bodyMarkdown: this.#postedText(action.bodyMarkdown, false),
           createdAt: new Date(action.submittedAt),
           url: `${kind === "issue" ? issueUrl(this.ctx.props.owner, this.ctx.props.repo, logicalId) : pullUrl(this.ctx.props.owner, this.ctx.props.repo, logicalId)}#comment-${action.provisionalCommentId}`,
         });
@@ -1844,7 +1824,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           kind: "review",
           id: action.provisionalReviewId,
           author: viewer,
-          bodyMarkdown: this.#rewriteKnownReferences(action.review.bodyMarkdown ?? "", false),
+          bodyMarkdown: this.#postedText(action.review.bodyMarkdown ?? "", false),
           createdAt: new Date(action.submittedAt),
           url: `${pullUrl(this.ctx.props.owner, this.ctx.props.repo, logicalId)}#review-${action.provisionalReviewId}`,
           decision: action.review.decision,
@@ -1853,7 +1833,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
             threadId: comment.provisionalCommentId,
             target: comment.target,
             author: viewer,
-            bodyMarkdown: this.#rewriteKnownReferences(comment.bodyMarkdown, false),
+            bodyMarkdown: this.#postedText(comment.bodyMarkdown, false),
             createdAt: new Date(action.submittedAt),
             url: `${pullUrl(this.ctx.props.owner, this.ctx.props.repo, logicalId)}#discussion-${comment.provisionalCommentId}`,
           })),
@@ -2077,7 +2057,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
               id: comment.provisionalCommentId,
               reviewId: action.provisionalReviewId,
               author: viewer,
-              bodyMarkdown: this.#rewriteKnownReferences(comment.bodyMarkdown, false),
+              bodyMarkdown: this.#postedText(comment.bodyMarkdown, false),
               createdAt: new Date(action.submittedAt),
               url: `${pullUrl(this.ctx.props.owner, this.ctx.props.repo, logicalId)}#discussion-${comment.provisionalCommentId}`,
             }],
@@ -2091,7 +2071,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           thread.comments.push({
             id: action.provisionalCommentId,
             author: viewer,
-            bodyMarkdown: this.#rewriteKnownReferences(action.bodyMarkdown, false),
+            bodyMarkdown: this.#postedText(action.bodyMarkdown, false),
             createdAt: new Date(action.submittedAt),
             url: `${pullUrl(this.ctx.props.owner, this.ctx.props.repo, logicalId)}#discussion-${action.provisionalCommentId}`,
           });
@@ -2564,7 +2544,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       case "createIssue": {
         const response = await this.#withApi(api => api.createIssue(action.owner, action.repo, {
           title: action.options.title,
-          body: action.options.bodyMarkdown ? this.#rewriteKnownReferences(action.options.bodyMarkdown, true) : undefined,
+          body: action.options.bodyMarkdown ? this.#postedText(action.options.bodyMarkdown, true) : undefined,
           labels: action.options.labels,
           assignees: action.options.assignees,
         }));
@@ -2576,7 +2556,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         try {
           response = await this.#withApi(api => api.createPullRequest(action.owner, action.repo, {
             title: action.options.title,
-            body: action.options.bodyMarkdown ? this.#rewriteKnownReferences(action.options.bodyMarkdown, true) : undefined,
+            body: action.options.bodyMarkdown ? this.#postedText(action.options.bodyMarkdown, true) : undefined,
             head: action.options.head,
             base: action.options.base,
             draft: action.options.draft,
@@ -2599,35 +2579,30 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         return action;
       }
       case "setTitle": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
-        if (!realId) throw new Error(`Target ${action.targetId} has not been created on GitHub yet.`);
+        const realId = this.#requireRealId(action.targetId);
         await this.#withApi(api => api.updateIssue(action.owner, action.repo, Number(realId), { title: action.title }));
         return action;
       }
       case "setBody": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
-        if (!realId) throw new Error(`Target ${action.targetId} has not been created on GitHub yet.`);
+        const realId = this.#requireRealId(action.targetId);
         await this.#withApi(api => api.updateIssue(action.owner, action.repo, Number(realId), {
-          body: this.#rewriteKnownReferences(action.bodyMarkdown, true),
+          body: this.#postedText(action.bodyMarkdown, true),
         }));
         return action;
       }
       case "addLabels": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
-        if (!realId) throw new Error(`Target ${action.targetId} has not been created on GitHub yet.`);
+        const realId = this.#requireRealId(action.targetId);
         await this.#withApi(api => api.addLabels(action.owner, action.repo, Number(realId), action.labels));
         return action;
       }
       case "removeLabels": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
-        if (!realId) throw new Error(`Target ${action.targetId} has not been created on GitHub yet.`);
+        const realId = this.#requireRealId(action.targetId);
         await this.#withApi(api =>
           api.setLabels(action.owner, action.repo, Number(realId), remainingLabels(action)));
         return action;
       }
       case "changeState": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
-        if (!realId) throw new Error(`Target ${action.targetId} has not been created on GitHub yet.`);
+        const realId = this.#requireRealId(action.targetId);
         await this.#withApi(api => api.updateIssue(action.owner, action.repo, Number(realId), {
           state: action.state,
           state_reason: denormalizeStateReason(action.reason),
@@ -2635,22 +2610,20 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         return action;
       }
       case "postComment": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
-        if (!realId) throw new Error(`Target ${action.targetId} has not been created on GitHub yet.`);
+        const realId = this.#requireRealId(action.targetId);
         const response = await this.#withApi(api => api.createIssueComment(
           action.owner,
           action.repo,
           Number(realId),
-          this.#rewriteKnownReferences(action.bodyMarkdown, true),
+          this.#postedText(action.bodyMarkdown, true),
         ));
         return { ...action, createdCommentId: response.id };
       }
       case "postReview": {
-        const realId = action.pullId.startsWith("~") ? this.#resolveProvisionalId(action.pullId) : action.pullId;
-        if (!realId) throw new Error(`Pull request ${action.pullId} has not been created on GitHub yet.`);
+        const realId = this.#requireRealId(action.pullId, "Pull request");
         await this.#withApi(api => api.createPullRequestReview(action.owner, action.repo, Number(realId), {
           commit_id: action.review.revision.headSha,
-          body: action.review.bodyMarkdown ? this.#rewriteKnownReferences(action.review.bodyMarkdown, true) : undefined,
+          body: action.review.bodyMarkdown ? this.#postedText(action.review.bodyMarkdown, true) : undefined,
           event: action.review.decision === "approve"
             ? "APPROVE"
             : action.review.decision === "requestChanges"
@@ -2658,7 +2631,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
               : "COMMENT",
           comments: action.review.diffComments?.map(comment => ({
             path: comment.target.path,
-            body: this.#rewriteKnownReferences(comment.bodyMarkdown, true),
+            body: this.#postedText(comment.bodyMarkdown, true),
             line: comment.target.subjectType === "file" ? undefined : comment.target.line,
             side: comment.target.subjectType === "file" ? undefined : comment.target.side === "old" ? "LEFT" : "RIGHT",
             start_line: comment.target.subjectType === "file" ? undefined : comment.target.startLine,
@@ -2671,22 +2644,20 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         return action;
       }
       case "replyToDiffComment": {
-        const pullId = action.pullId.startsWith("~") ? this.#resolveProvisionalId(action.pullId) : action.pullId;
-        if (!pullId) throw new Error(`Pull request ${action.pullId} has not been created on GitHub yet.`);
+        const pullId = this.#requireRealId(action.pullId, "Pull request");
         const replyTargetId = await this.#resolveReplyTarget(action.commentId);
         const response = await this.#withApi(api => api.replyToPullRequestReviewComment(
           action.owner,
           action.repo,
           Number(pullId),
           replyTargetId,
-          this.#rewriteKnownReferences(action.bodyMarkdown, true),
+          this.#postedText(action.bodyMarkdown, true),
         ));
         this.ctx.storage.kv.put(`diffAlias:${action.provisionalCommentId}`, String(response.id));
         return { ...action, createdCommentId: response.id };
       }
       case "mergePullRequest": {
-        const pullId = action.pullId.startsWith("~") ? this.#resolveProvisionalId(action.pullId) : action.pullId;
-        if (!pullId) throw new Error(`Pull request ${action.pullId} has not been created on GitHub yet.`);
+        const pullId = this.#requireRealId(action.pullId, "Pull request");
         await this.#mergePullRequest(Number(pullId), action);
         return action;
       }
@@ -2888,21 +2859,21 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const action = record.action;
     switch (action.type) {
       case "setTitle": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
+        const realId = this.#realIdOf(action.targetId);
         if (!realId) return { message: "The target resource no longer exists on GitHub.", canRetry: false };
         await this.#withApi(api => api.updateIssue(action.owner, action.repo, Number(realId), { title: action.previousTitle }));
         this.#clearCaches();
         return;
       }
       case "setBody": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
+        const realId = this.#realIdOf(action.targetId);
         if (!realId) return { message: "The target resource no longer exists on GitHub.", canRetry: false };
         await this.#withApi(api => api.updateIssue(action.owner, action.repo, Number(realId), { body: action.previousBodyMarkdown }));
         this.#clearCaches();
         return;
       }
       case "addLabels": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
+        const realId = this.#realIdOf(action.targetId);
         if (!realId) return { message: "The target resource no longer exists on GitHub.", canRetry: false };
         // Only the labels the action introduced: one that was already there stays.
         const introduced = action.labels.filter(label => !action.previousLabels.includes(label));
@@ -2913,7 +2884,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         return;
       }
       case "removeLabels": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
+        const realId = this.#realIdOf(action.targetId);
         if (!realId) return { message: "The target resource no longer exists on GitHub.", canRetry: false };
         // Only the labels the action removed: one that was never there is not added.
         const removed = action.labels.filter(label => action.previousLabels.includes(label));
@@ -2924,7 +2895,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         return;
       }
       case "changeState": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
+        const realId = this.#realIdOf(action.targetId);
         if (!realId) return { message: "The target resource no longer exists on GitHub.", canRetry: false };
         await this.#withApi(api => api.updateIssue(action.owner, action.repo, Number(realId), {
           state: action.previousState,
@@ -3888,12 +3859,18 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async prepareCreateIssue(options: GitHubCreateIssueOptions): Promise<CreateIssueAction> {
     return {
       type: "createIssue",
+      ...this.#base(),
+      provisionalId: this.#nextProvisionalResourceId(),
+      options,
+    };
+  }
+
+  #base() {
+    return {
       approvalId: this.#actions.reserveId(),
       submittedAt: Date.now(),
       owner: this.ctx.props.owner,
       repo: this.ctx.props.repo,
-      provisionalId: this.#nextProvisionalResourceId(),
-      options,
     };
   }
 
@@ -3915,23 +3892,17 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
     return {
       type: "createPullRequest",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       provisionalId: this.#nextProvisionalResourceId(),
       options,
     };
   }
 
   async prepareSetTitle(targetKind: EntityKind, targetId: string, title: string): Promise<SetTitleAction> {
-    const details = targetKind === "issue" ? await this.#getIssueDetails(targetId) : await this.#getPullRequestDetails(targetId);
+    const details = await this.#detailsOf(targetKind, targetId);
     return {
       type: "setTitle",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       targetKind,
       targetId,
       title,
@@ -3940,13 +3911,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   }
 
   async prepareSetBody(targetKind: EntityKind, targetId: string, bodyMarkdown: string): Promise<SetBodyAction> {
-    const details = targetKind === "issue" ? await this.#getIssueDetails(targetId) : await this.#getPullRequestDetails(targetId);
+    const details = await this.#detailsOf(targetKind, targetId);
     return {
       type: "setBody",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       targetKind,
       targetId,
       bodyMarkdown,
@@ -3955,13 +3923,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   }
 
   async prepareAddLabels(targetKind: EntityKind, targetId: string, labels: string[]): Promise<AddLabelsAction> {
-    const details = targetKind === "issue" ? await this.#getIssueDetails(targetId) : await this.#getPullRequestDetails(targetId);
+    const details = await this.#detailsOf(targetKind, targetId);
     return {
       type: "addLabels",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       targetKind,
       targetId,
       labels,
@@ -3970,13 +3935,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   }
 
   async prepareRemoveLabels(targetKind: EntityKind, targetId: string, labels: string[]): Promise<RemoveLabelsAction> {
-    const details = targetKind === "issue" ? await this.#getIssueDetails(targetId) : await this.#getPullRequestDetails(targetId);
+    const details = await this.#detailsOf(targetKind, targetId);
     return {
       type: "removeLabels",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       targetKind,
       targetId,
       labels,
@@ -3993,10 +3955,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const current = await this.#getCurrentStateInfo(targetKind, targetId);
     return {
       type: "changeState",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       targetKind,
       targetId,
       state,
@@ -4009,10 +3968,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async preparePostComment(targetKind: EntityKind, targetId: string, bodyMarkdown: string): Promise<PostCommentAction> {
     return {
       type: "postComment",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       targetKind,
       targetId,
       bodyMarkdown,
@@ -4023,10 +3979,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async preparePostReview(pullId: string, review: GitHubPullRequestReviewDraft): Promise<PostReviewAction> {
     return {
       type: "postReview",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       pullId,
       provisionalReviewId: this.#nextProvisionalCommentId("review"),
       review: {
@@ -4042,10 +3995,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async prepareReplyToDiffComment(pullId: string, commentId: string, bodyMarkdown: string): Promise<ReplyToDiffCommentAction> {
     return {
       type: "replyToDiffComment",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       pullId,
       commentId,
       bodyMarkdown,
@@ -4062,7 +4012,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
    * provisional pull request's at its head branch's simulated head.
    */
   async prepareMergePullRequest(pullId: string, options?: GitHubPullRequestMergeOptions): Promise<MergePullRequestAction> {
-    const realId = pullId.startsWith("~") ? this.#resolveProvisionalId(pullId) : pullId;
+    const realId = this.#realIdOf(pullId);
     let headBranch: string | null;
     let headSha: string | null;
     if (realId === undefined) {
@@ -4088,10 +4038,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
     return {
       type: "mergePullRequest",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       pullId,
       options,
       expectedHeadSha: headSha,
@@ -4131,10 +4078,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
     return {
       type: "push",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       branch,
       expectedOldSha,
       newSha: commitId,
