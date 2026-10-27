@@ -8,7 +8,13 @@ import type { DurableObjectMigration, WranglerBuild } from "./release/manifest-l
 export { bindings } from "@cloudflare/config";
 export type { DurableObjectMigration };
 
-import { COMPATIBILITY_DATE } from "./compatibility-date.ts";
+// The package specifier (not "./compatibility-date.ts") is load-bearing: this is a VALUE
+// import, and TS5097 forbids .ts-suffixed value-import specifiers in every downstream tsc
+// graph that compiles this file without allowImportingTsExtensions (workshop-frontend's
+// tsconfig.vite.json, others) — only `import type` lines are exempt, which is why the
+// manifest-lib import below may keep its .ts suffix. Node resolves the specifier through
+// the exports map's self-reference entry; extensionless relative paths would not resolve.
+import { COMPATIBILITY_DATE } from "@gadgets/scripts/compatibility-date";
 
 export { COMPATIBILITY_DATE };
 
