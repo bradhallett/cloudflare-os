@@ -20,9 +20,15 @@ import {
   type VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import {
+  ACCESS_TOKEN_SAFETY_MS,
+  generateNonce,
+  NONCE_BYTES,
+} from "@gadgets/gatekeeper-kit/connect-nonce";
+import {
   connectHandoffPageHtml,
   errorPageHtml,
   htmlResponse,
+  INVALID_LINK_HTML,
 } from "@gadgets/gatekeeper-kit/connect-pages";
 import {
   fetchSubject,
@@ -66,8 +72,6 @@ type StoredCredentials = {
   scopes: string[];
 };
 
-const NONCE_BYTES = 32;
-const ACCESS_TOKEN_SAFETY_MS = 60 * 1000;
 
 // Scopes requested during connect — broad enough to cover both resource granularities.
 const OAUTH_SCOPES = [
@@ -108,39 +112,9 @@ const PLAYLIST_RESOURCE: SupportedResource = {
 
 const SUPPORTED_RESOURCES: SupportedResource[] = [ACCOUNT_RESOURCE, PLAYLIST_RESOURCE];
 
-const INVALID_LINK_HTML = `<!DOCTYPE html>
-<html lang="en">
-  <head><meta charset="UTF-8"><title>Authorization Link Expired</title></head>
-  <body style="font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #f5f5f5;">
-    <div style="max-width: 520px; padding: 2rem; background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center;">
-      <h1 style="color: #1DB954; font-size: 1.5rem; margin: 0 0 1rem 0;">Authorization Link Expired</h1>
-      <p style="color: #555; line-height: 1.6; margin: 0 0 1.5rem 0;">This authorization link is invalid or has expired. Please return to Cloudflare OS and try again.</p>
-      <button onclick="window.close()" style="padding: 0.5rem 1.5rem; background: #1DB954; color: white; border: none; border-radius: 4px; font-size: 1rem; cursor: pointer;">Close</button>
-    </div>
-  </body>
-</html>`;
-
-const NOT_CONFIGURED_HTML = `<!DOCTYPE html>
-<html lang="en">
-  <head><meta charset="UTF-8"><title>Configuration Required</title></head>
-  <body style="font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #f5f5f5;">
-    <div style="max-width: 520px; padding: 2rem; background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center;">
-      <h1 style="color: #1DB954; font-size: 1.5rem; margin: 0 0 1rem 0;">Spotify Gatekeeper Not Configured</h1>
-      <p style="color: #555; line-height: 1.6; margin: 0;">Please configure a Spotify OAuth app client ID and secret for this gatekeeper.</p>
-    </div>
-  </body>
-</html>`;
-
-// ---------------------------------------------------------------------------
-// Small helpers
-
-function hexEncode(bytes: Uint8Array): string {
-  return [...bytes].map(byte => byte.toString(16).padStart(2, "0")).join("");
-}
-
-function generateNonce(): string {
-  return hexEncode(crypto.getRandomValues(new Uint8Array(NONCE_BYTES)));
-}
+const NOT_CONFIGURED_HTML = errorPageHtml(
+  "Spotify gatekeeper not configured",
+  "Please configure a Spotify OAuth app client ID and secret for this gatekeeper.");
 
 // ---------------------------------------------------------------------------
 // HTTP handler — serves the OAuth flow.
@@ -159,7 +133,7 @@ export default {
     // Auth initiation: /<doId>/<initiationNonce>
     if (path.length === 2 && path[0].length === 64 && path[1].length === NONCE_BYTES * 2) {
       if (!env.CLIENT_ID || !env.CLIENT_SECRET) {
-        return new Response(NOT_CONFIGURED_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+        return htmlResponse(NOT_CONFIGURED_HTML);
       }
 
       const doId = path[0];
@@ -167,7 +141,7 @@ export default {
       const stub = ctx.exports.UserAccount.get(ctx.exports.UserAccount.idFromString(doId));
       const begun = await stub.beginOAuthFlow(initiationNonce);
       if (begun === null) {
-        return new Response(INVALID_LINK_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+        return htmlResponse(INVALID_LINK_HTML);
       }
 
       const redirectUrl = new URL("https://accounts.spotify.com/authorize");
@@ -204,7 +178,7 @@ export default {
       );
       const result = await stub.acceptAuthCode(code, oauthNonce);
       if (!result) {
-        return new Response(INVALID_LINK_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+        return htmlResponse(INVALID_LINK_HTML);
       }
       if ("refused" in result) {
         return htmlResponse(errorPageHtml(result.refused.title, result.refused.detail), 409);

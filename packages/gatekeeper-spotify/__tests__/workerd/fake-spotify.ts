@@ -40,6 +40,7 @@ export class FakeSpotify {
   #writeHold: { promise: Promise<number>; resolve: (status: number) => void } | null = null;
   #writeArrived: { promise: Promise<void>; resolve: () => void } | null = null;
   #refreshHold: { promise: Promise<void>; resolve: () => void } | null = null;
+  #failNextRefresh: number | null = null;
 
   install(): this {
     vi.stubGlobal("fetch", (input: string | URL | Request, init?: RequestInit) => this.#handle(input, init));
@@ -71,6 +72,11 @@ export class FakeSpotify {
     this.#writeArrived ??= Promise.withResolvers<void>();
     return this.#writeArrived.promise;
   }
+  /** Makes the next token-endpoint refresh answer `status` once, then serves normally again. */
+  failNextRefresh(status: number): void {
+    this.#failNextRefresh = status;
+  }
+
 
   async #handle(input: string | URL | Request, init?: RequestInit): Promise<Response> {
     const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
@@ -85,6 +91,11 @@ export class FakeSpotify {
         const user = this.refreshTokens.get(form.get("refresh_token") ?? "");
         if (!user) {
           return json({ error: "invalid_grant", error_description: "Unknown refresh token." }, { status: 400 });
+        }
+        if (this.#failNextRefresh !== null) {
+          const status = this.#failNextRefresh;
+          this.#failNextRefresh = null;
+          return json({ error: "server_error", error_description: "Transiently unavailable." }, { status });
         }
         if (this.#refreshHold) await this.#refreshHold.promise;
         const n = this.#nextGrant++;

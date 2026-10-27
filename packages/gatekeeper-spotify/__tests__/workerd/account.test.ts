@@ -193,6 +193,45 @@ describe("refreshing", () => {
     expect(await first).toMatch(/^access-alice-user-\d+$/);
     expect(refreshRequests(x)).toBe(1);
   });
+
+  it("expires the connection on a proven-dead grant and stops calling the provider", async () => {
+    const x = new FakeSpotify().install();
+    const id = await seedAccount(x);
+    await expireToken(id);
+    // A refresh token the provider does not know answers 400 invalid_grant: a proven death.
+    await runInDurableObject(accountStub(id), (_instance, state) => {
+      const creds = state.storage.kv.get<{ refreshToken: string }>("credentials")!;
+      state.storage.kv.put("credentials", { ...creds, refreshToken: "revoked-refresh-token" });
+    });
+    const message = "Spotify credentials have expired or been revoked. Please reconnect the account.";
+    await expect(accountStub(id).getAccessToken()).rejects.toThrow(message);
+    // The expiry latch is set, so a retry must neither hit the provider nor change its answer.
+    const refreshes = refreshRequests(x);
+    await expect(accountStub(id).getAccessToken()).rejects.toThrow(message);
+    expect(refreshRequests(x)).toBe(refreshes);
+    const latched = await runInDurableObject(accountStub(id), (_instance, state) =>
+      state.storage.kv.get("credentials:expired"));
+    expect(latched).toBeTruthy();
+  });
+
+  it("rides out a transient token-endpoint failure without expiring the connection", async () => {
+    const x = new FakeSpotify().install();
+    const id = await seedAccount(x);
+    await expireToken(id);
+    x.failNextRefresh(503);
+    const failure = await accountStub(id).getAccessToken().then(() => null, (error: Error) => error.message);
+    // The provider's own failure surfaces raw — not the connection-expired wording.
+    expect(failure).toBeTruthy();
+    expect(failure).not.toContain("expired or been revoked");
+    // Nothing latched: the same call heals on retry and rotates.
+    const latched = await runInDurableObject(accountStub(id), (_instance, state) =>
+      state.storage.kv.get("credentials:expired"));
+    expect(latched).toBeFalsy();
+    expect(await accountStub(id).getAccessToken()).toMatch(/^access-alice-user-\d+$/);
+    expect(await storedCredentials(id)).toMatchObject({
+      refreshToken: expect.stringMatching(/^refresh-alice-user-\d+$/),
+    });
+  });
 });
 
 describe("the connect link", () => {
