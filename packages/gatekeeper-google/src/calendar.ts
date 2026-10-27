@@ -57,6 +57,22 @@ type GoogleCalendarUpdateAction = GoogleCalendarActionBase & {
 
 type GoogleCalendarAction = GoogleCalendarCreateAction | GoogleCalendarUpdateAction;
 
+/**
+ * Recognizes a queued event write the private store wrote as a bare payload, for the journal's
+ * legacy upgrade path. That store kept only unresolved records, so anything recognizable here was
+ * pending; everything else at its keys is not ours to resurrect.
+ */
+function isGoogleCalendarAction(raw: unknown): raw is GoogleCalendarAction {
+  if (typeof raw !== "object" || raw === null) return false;
+  const { type, submittedAt } = raw as Partial<GoogleCalendarAction>;
+  return (type === "createEvent" || type === "updateEvent") && typeof submittedAt === "number";
+}
+
+/** Coerces a legacy bare event-write row for the journal; `undefined` leaves anything else invisible. */
+function upgradeCalendarAction(raw: unknown): GoogleCalendarAction | undefined {
+  return isGoogleCalendarAction(raw) ? raw : undefined;
+}
+
 type GoogleCalendarRevertInfo =
   | {
       type: "createdEvent";
@@ -207,7 +223,8 @@ export class GoogleCalendarGatekeeperImpl
   // Actions queue through the kit journal under the same `pending:` keys the private store wrote,
   // so records a connector already holds stay live, now with the journal's capacity bound and the
   // claim protocol a write that emails attendees needs.
-  #journal = new ActionJournal<GoogleCalendarAction>(this.ctx.storage.kv, { namespace: "pending" });
+  #journal = new ActionJournal<GoogleCalendarAction>(
+      this.ctx.storage.kv, { namespace: "pending", upgradeRecord: upgradeCalendarAction });
 
   // Revert data for actions applied before the journal, keyed by action id. The journal's retained
   // records carry it from here on.

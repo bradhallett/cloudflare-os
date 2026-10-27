@@ -121,6 +121,23 @@ function userLabel(user: ChatUser | undefined): string {
 /** Set once the attempt markers keyed by bare action id have been rewritten for the journal. */
 const ATTEMPT_MARKERS_ADOPTED = "chat:attemptMarkersAdopted";
 
+/**
+ * Recognizes a queued send the private store wrote as a bare payload, for the journal's legacy
+ * upgrade path. That store kept only unresolved records, so anything recognizable here was
+ * pending; everything else at its keys is not ours to resurrect.
+ */
+function isChatAction(raw: unknown): raw is ChatAction {
+  if (typeof raw !== "object" || raw === null) return false;
+  const { type, submittedAt } = raw as Partial<ChatAction>;
+  return (type === "sendMessage" || type === "updateMessage" || type === "addReaction"
+    || type === "removeReaction") && typeof submittedAt === "number";
+}
+
+/** Coerces a legacy bare send row for the journal; `undefined` leaves anything else invisible. */
+function upgradeChatAction(raw: unknown): ChatAction | undefined {
+  return isChatAction(raw) ? raw : undefined;
+}
+
 class ChatStore {
   #kv: DurableObjectStorage["kv"];
   /** Actions queue through the kit journal under the `chat:` keys the private store wrote. */
@@ -129,7 +146,8 @@ class ChatStore {
 
   constructor(storage: DurableObjectStorage) {
     this.#kv = storage.kv;
-    this.actions = new ActionJournal<ChatAction>(storage.kv, { namespace: "chat" });
+    this.actions = new ActionJournal<ChatAction>(
+      storage.kv, { namespace: "chat", upgradeRecord: upgradeChatAction });
     this.#attempts = new AttemptJournal<true>(storage.kv, { markerPrefix: "chat:attempted:" });
     this.#adoptAttemptMarkers();
   }
@@ -141,13 +159,15 @@ class ChatStore {
    */
   #adoptAttemptMarkers(): void {
     if (this.#kv.get(ATTEMPT_MARKERS_ADOPTED) !== undefined) return;
-    this.#kv.put(ATTEMPT_MARKERS_ADOPTED, true);
     for (const [key, marker] of this.#kv.list<true>({ prefix: "chat:attempted:" })) {
       if (/^[1-9]\d*$/.test(key.slice("chat:attempted:".length))) {
         this.#kv.put(`${key}:`, marker);
         this.#kv.delete(key);
       }
     }
+    // Flagged only once every marker has landed: a crash mid-sweep rescans and rewrites the
+    // remainder, while a flag written first would orphan them as unattempted forever.
+    this.#kv.put(ATTEMPT_MARKERS_ADOPTED, true);
   }
 
 

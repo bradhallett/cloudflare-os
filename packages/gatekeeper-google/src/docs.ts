@@ -86,6 +86,22 @@ type GoogleDocAppendAction = GoogleDocActionBase & {
 
 type GoogleDocAction = GoogleDocReplaceAction | GoogleDocAppendAction;
 
+/**
+ * Recognizes a queued edit the private store wrote as a bare payload, for the journal's legacy
+ * upgrade path. That store kept only unresolved records, so anything recognizable here was
+ * pending; everything else at its keys is not ours to resurrect.
+ */
+function isGoogleDocAction(raw: unknown): raw is GoogleDocAction {
+  if (typeof raw !== "object" || raw === null) return false;
+  const { type, submittedAt } = raw as Partial<GoogleDocAction>;
+  return (type === "replaceText" || type === "appendText") && typeof submittedAt === "number";
+}
+
+/** Coerces a legacy bare edit row for the journal; `undefined` leaves anything else invisible. */
+function upgradePendingAction(raw: unknown): GoogleDocAction | undefined {
+  return isGoogleDocAction(raw) ? raw : undefined;
+}
+
 const DOC_WRITE_RECEIPT_KEY = "docWriteReceipt";
 const DOC_METADATA_REVISION_KEY = "docMetadataRevision";
 /** The last document read, replayed for this long before its revision is rechecked. */
@@ -565,7 +581,8 @@ const CREATED_DOC_TAB_KEY = "createdDocTab";
  * document are dropped.
  */
 function adoptBlankDocument(kv: DurableObjectStorage["kv"], tabId: string): void {
-  let pendingActions = new ActionJournal<GoogleDocAction>(kv, { namespace: "pending" });
+  let pendingActions = new ActionJournal<GoogleDocAction>(
+    kv, { namespace: "pending", upgradeRecord: upgradePendingAction });
   for (let { id, action } of pendingActions.listPending()) {
     if (action.tabId === BLANK_DOC_TAB_ID) pendingActions.update(id, { ...action, tabId });
   }
@@ -587,7 +604,8 @@ export class GoogleDocGatekeeperImpl
   #simulationCache: GoogleDocSimulationCacheHolder = { writes: 0 };
   // Edits queue through the kit journal under the same `pending:` keys the private store wrote,
   // so records a connector already holds stay live, now with the journal's capacity bound.
-  #journal = new ActionJournal<GoogleDocAction>(this.ctx.storage.kv, { namespace: "pending" });
+  #journal = new ActionJournal<GoogleDocAction>(
+      this.ctx.storage.kv, { namespace: "pending", upgradeRecord: upgradePendingAction });
 
   // Serialize applying and rejecting actions, and creating the document, against each other. Every
   // network await below leaves the Durable Object's input gate open, and one action id can arrive
