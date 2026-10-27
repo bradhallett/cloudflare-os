@@ -135,8 +135,8 @@ export function makeHookFiringCallback(impl: OverseerImpl, hookId: number): Nati
   // non-callable target is itself non-callable), and the bindHook contract allows the bound
   // callback to be a function type, invoked by calling the firing's callback directly. An arrow
   // function also has no `prototype` own-property to conflict with the wildcard `get` below.
-  // TODO: Same workerd bug as startGatekeeperHook: a Proxy returned as an RpcTarget is judged
-  //   non-pipelineable, so wrap it in a stub manually.
+  // TODO: workerd bug: a Proxy returned as an RpcTarget is judged non-pipelineable, so wrap
+  //   it in a stub manually.
   return new NativeRpcStub(new Proxy((() => {}) as unknown as RpcTarget, {
     // Both traps are async so a refusal is a rejection of that call, not a synchronous throw
     // escaping into the RPC machinery that invokes the function (workerd reports that as

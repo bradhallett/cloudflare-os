@@ -23,7 +23,7 @@ import { getGatewayModels, type GatewayModels } from "./ai-gateway.js";
 import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-billing/limits/config.js";
 import type { AdminSettings } from "./admin-settings.js";
 import { deleteBlueprintContent } from "./blueprint-archive.js";
-import { isReservedBlueprintKey, readBlueprintKvRecord } from "./storage-schema/blueprints-kv.js";
+import { blueprintKvKey, isReservedBlueprintKey, readBlueprintKvRecord } from "./storage-schema/blueprints-kv.js";
 import { resolveBlueprintForUser } from "./blueprint-access.js";
 import { readAdminConfig } from "./admin-config.js";
 import { refuseUnverifiableWorkspaceCap, resolveEntitlements, workspaceCapFrom } from "./entitlements.js";
@@ -491,7 +491,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * - the `deprovisioned` flag, set first so every sign-in path (password, gatekeeper, Cloudflare
    *   Access) refuses even if a later step stalls;
    * - the deployment-wide directory, where the user is flagged so collaborator search hides them
-   *   (the counterpart of `#syncDirectory()`);
+   *   (the counterpart of `UserDirectoryScopeStore.sync()`);
    * - every workspace shared *with* the user, whose collaborator edges are severed so each
    *   affected workspace force-restarts and the user's live chat sessions die with it (see
    *   `#severSharedWorkspaceAccess`);
@@ -865,7 +865,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   /**
    * Whether the user's plan may run a model of `tier`: a model that states no catalog tier, and
-   * every model while no entitlements service is bound (see #allowedModelTiers), is never
+   * every model while no entitlements service is bound (see `allowedModelTiers` in user-plan.ts), is never
    * tier-gated. The one home of the plan's model gate — listing (#listModels), refusing
    * (#requireModel) and availability (#botInfo) all ask it, so the three cannot drift.
    */
@@ -1057,7 +1057,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   // specific reason the ID doesn't resolve -- when it doesn't. Shared by the plain-model and bot
   // paths of getChatContext, so a bot's model refuses exactly like a hand-picked one. A gateway
   // model whose catalog tier the user's plan doesn't include refuses here too (see
-  // #allowedModelTiers), so a chat naming one — an existing chat after a downgrade, say — fails
+  // `allowedModelTiers`), so a chat naming one — an existing chat after a downgrade, say — fails
   // visibly rather than silently running a different model.
   #requireModel(id: string, models: GatewayModels | null,
                tiers: ReadonlySet<string> | null): UserAiModelRecord {
@@ -1640,8 +1640,20 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     for (let orgId of new Set(records.map(r => r.orgOwner).filter(o => o !== undefined))) {
       askOrg(orgId!);
     }
+    let dead: string[] = [];
     for (let record of records) {
       if (record.orgOwner !== undefined && !(await askOrg(record.orgOwner))) continue;
+      // The blueprint's authoritative home is KV under the entry's scope -- the same key
+      // resolveBlueprintForUser found it at (user-owned and bundled blueprints live at the
+      // root; an org's under its org/ prefix). An entry whose blueprint is gone there is a
+      // ghost (a workspace deleted without removing the entry, say) and is dropped below.
+      let kvKey = record.orgOwner !== undefined
+          ? blueprintKvKey({type: "org", id: record.orgOwner}, record.id)
+          : record.id;
+      if (await this.env.BLUEPRINTS.get(kvKey) === null) {
+        dead.push(record.id);
+        continue;
+      }
       result.push({
         id: record.id,
         metadata: record.metadata,
@@ -1649,6 +1661,13 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         uploaded: record.uploaded,
         pinned: pinnedBlueprintIds.has(record.id) || undefined,
       });
+    }
+    // Reconcile on read (the deleted-blueprint contract): the ghost entries collected above
+    // are removed from the store and unpinned -- the same cleanup removeBlueprintFromLibrary
+    // does -- so they disappear from every listing instead of failing the open on click.
+    for (let id of dead) {
+      this.storage.libraryBlueprints.delete(id);
+      await this.setBlueprintPinned(id, false);
     }
     result.sort((a, b) => b.addedAt.valueOf() - a.addedAt.valueOf());
     return result;
@@ -1818,7 +1837,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         if (pending.expiresAt.getTime() <= now) expired.push(pending);
       }
     } catch (err) {
-      // Same failure mode as #connectedAccountRecords: a stub for a Worker that is no longer bound
+      // Same failure mode as connectedAccountRecords (user-accounts.ts): a stub for a Worker that is no longer bound
       // fails to deserialize. Leave the sweep for next time (#armExpirySweep bounds the retry).
       logger.warn("failed to list pending handoffs", {
         event: "connect.handoff.sweep.failed", error: err,

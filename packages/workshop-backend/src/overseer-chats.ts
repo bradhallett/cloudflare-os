@@ -312,7 +312,7 @@ export abstract class OverseerChats extends OverseerCore {
     env.GADGET = this.makeBindingLoopback({type: "gadget", id: gadgetId}, caller);
     // Before the named bindings, so an edge named GIT from before the name was reserved still
     // shadows it (see bindWorkpiece). The agent's describeBinding tool mirrors this order when
-    // describing a gadget's bindings (see describeBinding in agent.ts).
+    // describing a gadget's bindings (see describeBinding in agent-tools.ts).
     env[GIT_BINDING_NAME] = this.makeBindingLoopback({type: "git"}, caller);
     for (let [name, edge] of this.visibleBindings(gadget, forChatId)) {
       env[name] = this.makeBindingLoopback({type: "gatekeeper", id: edge.target}, caller);
@@ -339,7 +339,7 @@ export abstract class OverseerChats extends OverseerCore {
     let env: Record<string, any> = {};
 
     // Before the chat's bindings, so a chat binding named GIT shadows it -- matching
-    // describeBinding (see describeBinding in agent.ts).
+    // describeBinding (see describeBinding in agent-tools.ts).
     env[GIT_BINDING_NAME] = this.makeBindingLoopback({type: "git"}, caller);
 
     for (let [name, entry] of Object.entries(bindings)) {

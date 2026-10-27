@@ -1,4 +1,3 @@
-import { RpcTarget } from "capnweb";
 import { WorkpieceId, AiChatMetadata, ChatAttachmentRef, SlashCommandChoice, SlashCommandRequest, validateBindingName, resolveSiteName } from "@gadgets/workshop-shared/api";
 import { applyCodeChange, codeChangeSerializedSize, MAX_CODE_CHANGE_SIZE, requireTextFiles } from "@gadgets/workshop-shared/code-change";
 import type { FileContent, CodeContent } from "@gadgets/workshop-shared/code-change";
@@ -376,37 +375,6 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
   }
 
   /**
-   * Load a WorkerEntrypoint exported by the gadget, used to implement a hook.
-   *
-   * TODO: There should be a way to simulate hooks within the context of a particular chat thread,
-   *   for testing. But when real-life hooks are delivered they obviously need to go to the
-   *   mainline code.
-   */
-  getGadgetHookEntrypoint(id: number): RpcTarget {
-    let gk = this.storage.gatekeepers.get(id);
-    if (gk && gk.hook) {
-      // GatekeeperRecord.hook predates multi-gadget support (it is set only by the obsolete
-      // setBindingHook tool), so it always refers to the default gadget's code.
-      let stub = this.loadGadgetWorker(this.resolveGadgetId(undefined));
-      let ep = stub.getEntrypoint(gk.hook);
-
-      // TODO: Make possible to return dynamic entrypoint stub over RPC. This Proxy is a hack.
-      return new Proxy<RpcTarget>(ep as any, {
-        get(target, prop, receiver) {
-          // Note: We need `target` to be used as the receiver. If we use `receiver` as the receiver,
-          //   we'll get an illegal invocation, as `receiver` points to our Proxy.
-          return Reflect.get(target, prop, target);
-        },
-        getPrototypeOf(target) {
-          return RpcTarget.prototype;
-        },
-      });
-    } else {
-      throw new Error("Hook is not connected.");
-    }
-  }
-
-  /**
    * Every stub to a gatekeeper facet is minted through ctx.restore(), for the reason given at
    * getGadgetFacetFetcher(): it lets the gatekeeper call its own ctx.restore() to mint persistent
    * stubs to itself, e.g. a target its push handler delivers events through. The exception is
@@ -653,8 +621,7 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
         `Title: ${desc.title}\n` +
         `TypeScript type: ${desc.tsType}\n` +
         (desc.hookTsType
-            ? `Hook TypeScript type: ${desc.hookTsType}\n` +
-              `Hook entrypoint: ${gatekeeper.hook || "(not connected)"}\n`
+            ? `Hook TypeScript type: ${desc.hookTsType}\n`
             : "") +
         `\n` +
         `The binding comes with the following bundle of TypeScript type definitions:\n` +

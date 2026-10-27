@@ -15,7 +15,7 @@ export const MAX_SCOPE_IDS = 10_000;
 /**
  * Deployment-wide directory of user profiles, so a user can find collaborators
  * by name or id. Each user DO mirrors updates to its own profile here
- * (`UserDurableObject.#syncDirectory`).
+ * (`UserDirectoryScopeStore.sync()`).
  */
 export class UserDirectoryDurableObject extends DurableObject<Cloudflare.Env> {
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
@@ -53,7 +53,7 @@ export class UserDirectoryDurableObject extends DurableObject<Cloudflare.Env> {
 
   /**
    * Flag (or unflag) `id`'s record as deprovisioned, the directory-side counterpart of
-   * UserDurableObject.#syncDirectory(): a deprovisioned user is hidden from collaborator search,
+   * `UserDirectoryScopeStore.sync()`: a deprovisioned user is hidden from collaborator search,
    * and no later profile sync can undo the flag. The user DO's own `deprovisioned` singleton
    * is what refuses re-authentication; this only removes the user from search.
    */

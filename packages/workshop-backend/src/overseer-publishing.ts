@@ -359,6 +359,18 @@ export abstract class OverseerPublishing extends OverseerFacets {
   }
 
   /**
+   * Refuse to publish a blueprint whose deletion failed partway: propagating it would
+   * resurrect what the delete already removed. The deletion must be retried to completion.
+   */
+  assertBlueprintPublishable(record: BlueprintGadgetRecord): void {
+    if (record.deleting) {
+      throw new Error(
+          `Blueprint ${JSON.stringify(record.metadata.title)}'s deletion didn't finish. ` +
+          `Delete it again to complete the removal.`);
+    }
+  }
+
+  /**
    * Propagate a blueprint to User DO, KV, and R2.
    * If `pack` is provided, it is the pack of the record's latest release, and is uploaded to R2.
    * If omitted (metadata-only update), the R2 content is left unchanged -- unless the record is
@@ -370,6 +382,7 @@ export abstract class OverseerPublishing extends OverseerFacets {
       pack?: Uint8Array,
       screenshot?: BlueprintScreenshotUpload | null,
   ): Promise<void> {
+    this.assertBlueprintPublishable(record);
     if (!this.ownerId) throw new Error("Workspace not initialized.");
     // A published blueprint belongs to its workspace's owner: the user the workspace runs as.
     let ownerSubject: BlueprintOwnerSubject = {type: "user", id: this.ownerId};
@@ -377,6 +390,13 @@ export abstract class OverseerPublishing extends OverseerFacets {
     let release = record.releases?.at(-1);
     if (!pack && record.dirty && release) {
       pack = await this.buildBlueprintPack(release.releaseCommit);
+    }
+
+    // Screenshot bookkeeping runs so a crash can never leave a claim the bytes don't back: a
+    // removal unclaims up front (persisted by the dirty-mark put below, R2 delete follows), and
+    // an upload claims only after its bytes are in R2.
+    if (screenshot === null) {
+      delete record.metadata.screenshot;
     }
 
     // Mark dirty.
@@ -391,15 +411,14 @@ export abstract class OverseerPublishing extends OverseerFacets {
 
     if (screenshot !== undefined) {
       if (screenshot === null) {
-        delete record.metadata.screenshot;
         await this.env.BLUEPRINT_CONTENT.delete(`${BLUEPRINT_SCREENSHOT_R2_PREFIX}${record.id}`);
       } else {
-        record.metadata.screenshot = true;
         await this.env.BLUEPRINT_CONTENT.put(
           `${BLUEPRINT_SCREENSHOT_R2_PREFIX}${record.id}`,
           screenshot.content,
           { httpMetadata: { contentType: screenshot.mimeType } },
         );
+        record.metadata.screenshot = true;
       }
     }
 
@@ -730,8 +749,14 @@ export abstract class OverseerPublishing extends OverseerFacets {
       this.activeWorktreeTurns.set(chatId, {access: worktreeTurn, initiator, executionId});
     }
 
+    // Accumulate what the stream delivers, so a lost trace (below) can still return the
+    // output the client already saw instead of failing the executed-anyway call.
+    let streamed = "";
     if (onOutputText) {
-      this.#codeModeOutputSubscribers.set(executionId, onOutputText);
+      this.#codeModeOutputSubscribers.set(executionId, delta => {
+        streamed += delta;
+        onOutputText(delta);
+      });
     }
 
     let tracePromise = new Promise<TraceItem>(resolve => {
@@ -797,8 +822,15 @@ export abstract class OverseerPublishing extends OverseerFacets {
       let trace = await Promise.race([tracePromise, timeout])
 
       if (!trace) {
-        // Trace must have been lost... give up waiting.
-        throw new Error("Timed out waiting for logs from code execution.");
+        // The trace was lost, but the code already ran to completion (run() above resolved,
+        // and its effects stand). Fail soft with the streamed output rather than erroring the
+        // tool call, which would only invite a re-run that re-applies those effects. The
+        // exception line is synthesized only when there was no stream to carry it; with one,
+        // the "\n\nUncaught exception:" delta above already holds it.
+        return streamed ||
+            (error !== undefined
+                ? `Uncaught exception: ${error}`
+                : "(function succeeded but its logs were lost)");
       }
 
       let log = trace.logs.map(log => {

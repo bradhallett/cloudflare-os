@@ -835,9 +835,27 @@ export abstract class OverseerAgents extends OverseerMainline {
     });
 
     let liveChat = this.getLiveChat(chatId);
-    let turn = this.#runAgentTurn(
-        chatId, aiModel, initiator, initiatorUserId, callbackInitiated, liveChat);
-    if (keepAlive) this.ctx.waitUntil(turn);
+    // A non-owner user's turn holds the build-session lease for its whole run, mirroring
+    // #resumeAgent: a scope widening that lands mid-turn then finds this session and severs it,
+    // rather than letting the reply egress under stale verification (receiveExternalMessage's
+    // own lease covers only its request). Taken before the turn starts; released on settlement
+    // below.
+    let leaveSession =
+        this.ownerId && initiator.type === "user" && initiatorUserId !== this.ownerId
+            ? this.joinSession("build")
+            : undefined;
+    try {
+      let turn = this.#runAgentTurn(
+          chatId, aiModel, initiator, initiatorUserId, callbackInitiated, liveChat);
+      // then() rather than finally(): the turn can be fire-and-forget (never awaited when
+      // keepAlive is false), and a finally-derived promise would reject unhandled if the turn
+      // ever did; both then() arms release the lease and the derived promise always settles.
+      if (leaveSession) turn.then(leaveSession, leaveSession);
+      if (keepAlive) this.ctx.waitUntil(turn);
+    } catch (err) {
+      leaveSession?.();
+      throw err;
+    }
   }
 
   #runAgentTurn(chatId: number, aiModel: UserAiModelRecord,

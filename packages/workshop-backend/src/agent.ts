@@ -1171,8 +1171,81 @@ async function runAgentPass(
   // system-prompt-blocks.ts), so the static prefix stays cached when the project-specific part
   // changes.
   let systemPromptSlots: [string, string];
-  // The regular agent's list of the workspace's gadgets, built for this pass.
+  // The regular agent's list of the workspace's gadgets, built for this pass when no persisted
+  // listing exists (see the regular-agent branch below); a spawnerConfig chat never builds one.
   let systemPromptWorkspace: string | undefined;
+  // Builds the workspace gadget listing: each gadget's files as of the start of the thread (or
+  // of its latest compaction), so mid-thread changes don't thrash the prompt cache. Computed
+  // only on demand -- by the first pass without a persisted listing, and by compaction, which
+  // refreshes the listing for the history it prunes.
+  let computeWorkspaceSection = async (): Promise<string> => {
+    if (session.gadgetInfos.length == 0) {
+      return "As of the start of this session, this workspace contained no gadgets. You can use " +
+          "connected resources and executeCode without one. Use `createGadget` tool only when the " +
+          "task calls for a new application or saved output, before writing that gadget's files.";
+    }
+    let sections: string[] = [];
+    for (let info of session.gadgetInfos) {
+      // The file list follows the same pinned/unpinned split as readFile: an unpinned gadget
+      // with committed code lists its head commit's files (the head fixed for this turn);
+      // pinned gadgets and gadgets with no committed code list from the session content.
+      let files: string[];
+      let unpinnedHead = !session.pinnedGadgets.has(info.id) ? session.observeHead(info.id) : undefined;
+      if (unpinnedHead !== undefined) {
+        files = [...(await hooks.readCommitFiles(unpinnedHead)).keys()];
+      } else {
+        files = [...(session.sessionContent.get(info.id)?.keys() ?? [])];
+      }
+      let envName = session.chatNameFor(info.id);
+      let lines = [envName !== undefined
+          ? `## Gadget ${envName}: ${JSON.stringify(info.title)}`
+          : `## Gadget ${JSON.stringify(info.title)} (no binding in your env)`];
+      if (info.isDefault) {
+        lines.push(
+            `This is the workspace's default gadget: file tools operate on it when their ` +
+            `\`workpiece\` parameter is omitted.`);
+      }
+      if (files.length == 0) {
+        lines.push(`As of the start of this session, this gadget had no code files.`);
+      } else {
+        lines.push(
+            `As of the start of this session, this gadget contained the following files:`,
+            ...files.map(f => `* ${f}`));
+      }
+      if (info.output) {
+        // When people are using common platform formats/outputs, most times people just want to use
+        // them, not to edit them. Especially non-technical folks. We tell the agent to wait to be
+        // explicitly asked.
+        lines.push(
+            `This gadget is a ${info.output.noun}: a finished application whose content is data ` +
+            `in its own storage, not text in its code. To read or change what it contains, call ` +
+            `its RPC methods from \`executeCode\`` +
+            (envName !== undefined ? ` (\`env.${envName}\`)` : ``) +
+            `; read its README.md or server.js to learn the methods it offers for this. Do NOT ` +
+            `edit its code to change its content. Edit the code only if the user asks to change ` +
+            `how the ${info.output.noun} itself works (its editor, layout, or features).`);
+      }
+      if (info.bindings.length == 0) {
+        lines.push(`This gadget has no bindings.`);
+      } else {
+        // For each of the gadget's own bindings, cross-reference how the agent can reach the
+        // same resource in its own env (matched by target workpiece), if it can.
+        lines.push(`This gadget's bindings (as its own code sees them):`,
+                   ...info.bindings.map(b => {
+          let chatName = session.chatNameFor(b.target);
+          return `* ${b.name}: ${b.title}` +
+              (chatName !== undefined
+                  ? ` — in your env as \`env.${chatName}\``
+                  : envName !== undefined
+                  ? ` — (no binding for this in your env; describeBinding with ` +
+                    `\`gadget: "${envName}"\` describes it)`
+                  : ` — (no binding for this in your env)`);
+        }));
+      }
+      sections.push(lines.join("\n"));
+    }
+    return `# This workspace's gadgets\n\n${sections.join("\n\n")}`;
+  };
 
   if (session.agentContext.spawnerConfig) {
     // This is a spawned agent. Build an appropriate system prompt. Spawned agents see only the
@@ -1210,81 +1283,16 @@ async function runAgentPass(
   } else {
     // This is a regular coding agent.
 
-    // Let's include each gadget's list of files in the system prompt so that the agent doesn't
-    // have to call a tool to list files at the start of every thread. In order to avoid cache
-    // misses, we list the gadgets and files as of the start of the thread (or of its latest
-    // compaction), even if they change during it (see AiChatAgentContext.workspacePrompt).
-    if (session.gadgetInfos.length == 0) {
-      systemPromptWorkspace =
-          "As of the start of this session, this workspace contained no gadgets. You can use " +
-          "connected resources and executeCode without one. Use `createGadget` tool only when the " +
-          "task calls for a new application or saved output, before writing that gadget's files.";
-    } else {
-      let sections: string[] = [];
-      for (let info of session.gadgetInfos) {
-        // The file list follows the same pinned/unpinned split as readFile: an unpinned gadget
-        // with committed code lists its head commit's files (the head fixed for this turn);
-        // pinned gadgets and gadgets with no committed code list from the session content.
-        let files: string[];
-        let unpinnedHead = !session.pinnedGadgets.has(info.id) ? session.observeHead(info.id) : undefined;
-        if (unpinnedHead !== undefined) {
-          files = [...(await hooks.readCommitFiles(unpinnedHead)).keys()];
-        } else {
-          files = [...(session.sessionContent.get(info.id)?.keys() ?? [])];
-        }
-        let envName = session.chatNameFor(info.id);
-        let lines = [envName !== undefined
-            ? `## Gadget ${envName}: ${JSON.stringify(info.title)}`
-            : `## Gadget ${JSON.stringify(info.title)} (no binding in your env)`];
-        if (info.isDefault) {
-          lines.push(
-              `This is the workspace's default gadget: file tools operate on it when their ` +
-              `\`workpiece\` parameter is omitted.`);
-        }
-        if (files.length == 0) {
-          lines.push(`As of the start of this session, this gadget had no code files.`);
-        } else {
-          lines.push(
-              `As of the start of this session, this gadget contained the following files:`,
-              ...files.map(f => `* ${f}`));
-        }
-        if (info.output) {
-          // When people are using common platform formats/outputs, most times people just want to use
-          // them, not to edit them. Especially non-technical folks. We tell the agent to wait to be
-          // explicitly asked.
-          lines.push(
-              `This gadget is a ${info.output.noun}: a finished application whose content is data ` +
-              `in its own storage, not text in its code. To read or change what it contains, call ` +
-              `its RPC methods from \`executeCode\`` +
-              (envName !== undefined ? ` (\`env.${envName}\`)` : ``) +
-              `; read its README.md or server.js to learn the methods it offers for this. Do NOT ` +
-              `edit its code to change its content. Edit the code only if the user asks to change ` +
-              `how the ${info.output.noun} itself works (its editor, layout, or features).`);
-        }
-        if (info.bindings.length == 0) {
-          lines.push(`This gadget has no bindings.`);
-        } else {
-          // For each of the gadget's own bindings, cross-reference how the agent can reach the
-          // same resource in its own env (matched by target workpiece), if it can.
-          lines.push(`This gadget's bindings (as its own code sees them):`,
-                     ...info.bindings.map(b => {
-            let chatName = session.chatNameFor(b.target);
-            return `* ${b.name}: ${b.title}` +
-                (chatName !== undefined
-                    ? ` — in your env as \`env.${chatName}\``
-                    : envName !== undefined
-                    ? ` — (no binding for this in your env; describeBinding with ` +
-                      `\`gadget: "${envName}"\` describes it)`
-                    : ` — (no binding for this in your env)`);
-          }));
-        }
-        sections.push(lines.join("\n"));
-      }
-      systemPromptWorkspace = `# This workspace's gadgets\n\n${sections.join("\n\n")}`;
-    }
+    // The workspace gadget listing is built only when no persisted one exists -- the first
+    // pass of the thread, or a checkpoint that predates the listing. Otherwise the persisted
+    // snapshot is reused (the prompt section below prefers it), skipping the per-gadget file
+    // reads in computeWorkspaceSection entirely.
     let savedWorkspace = checkpoint ? checkpoint.workspacePrompt : session.agentContext.workspacePrompt;
-    if (checkpoint === undefined && savedWorkspace === undefined) {
-      hooks.setChatWorkspacePrompt(chatId, systemPromptWorkspace);
+    if (savedWorkspace === undefined) {
+      systemPromptWorkspace = await computeWorkspaceSection();
+      if (checkpoint === undefined) {
+        hooks.setChatWorkspacePrompt(chatId, systemPromptWorkspace);
+      }
     }
 
     // Named in the prompt because the request that should trigger them ("make me a doc") may
@@ -1753,7 +1761,13 @@ async function runAgentPass(
           chatId,
           compactedTo,
           ...written,
-          workspacePrompt: systemPromptWorkspace,
+          // The pruned history can no longer describe gadgets created mid-thread, so
+          // compaction refreshes the listing (computing it now if this pass reused the
+          // persisted snapshot). Spawner chats carry no listing -- their prompt branch shows
+          // configured bindings instead -- so they keep an absent one, as before.
+          workspacePrompt: session.agentContext.spawnerConfig
+              ? undefined
+              : systemPromptWorkspace ?? await computeWorkspaceSection(),
           alwaysAvailableResources: [
             ...seenAlwaysAvailableResources(session.listedResources, chatMessages, compactedTo).values(),
           ],
