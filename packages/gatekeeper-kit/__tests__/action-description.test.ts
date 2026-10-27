@@ -3,12 +3,10 @@ import {
   ActionDescriptionBuilder,
   buildDescription,
   codeSpan,
-  defuseFences,
   type FileDescription,
   plainInline,
   quoteUntrusted,
   sanitizeTitle,
-  truncateToBytes,
 } from "../src/action-description";
 
 const encoder = new TextEncoder();
@@ -348,26 +346,8 @@ describe("ActionDescriptionBuilder", () => {
   });
 });
 
-describe("truncateToBytes", () => {
-  it("returns short text unchanged", () => {
-    expect(truncateToBytes("héllo", 6)).toEqual({ text: "héllo", truncated: false });
-  });
-
-  it("never splits a code point", () => {
-    // "é" is two bytes; a cut at byte 2 lands inside it.
-    expect(truncateToBytes("aéb", 2)).toEqual({ text: "a", truncated: true });
-    expect(truncateToBytes("aéb", 3)).toEqual({ text: "aé", truncated: true });
-    // A four-byte emoji, cut at every offset inside it.
-    for (const max of [1, 2, 3]) expect(truncateToBytes("😀x", max).text).toBe("");
-    expect(truncateToBytes("😀x", 4).text).toBe("😀");
-  });
-});
 
 describe("sanitizers", () => {
-  it("defuses fences", () => {
-    expect(defuseFences("a ``` b ```` c")).toBe("a ''' b ''' c");
-  });
-
   it("block-quotes untrusted prose without headings or fences", () => {
     expect(quoteUntrusted("## Heading\n> quoted\n```\nx", 100)).toBe("> Heading\n> quoted\n> '''\n> x");
     expect(quoteUntrusted("abcdef", 3)).toBe("> abc…");

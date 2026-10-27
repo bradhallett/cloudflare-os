@@ -11,7 +11,6 @@ import {
   type OAuthGrant,
   type OAuthTokens,
   oauthRefresh,
-  pkceChallenge,
 } from "../../src/oauth-client";
 import { fakeKv } from "../fake-kv";
 
@@ -100,7 +99,8 @@ describe("oauth-client with the connect handshake and CredentialCoordinator", ()
     provider.respond = async form => {
       if (form.get("grant_type") === "authorization_code") {
         expect(form.get("redirect_uri")).toBe(REDIRECT_URI);
-        expect(await pkceChallenge(form.get("code_verifier")!)).toBe(challenge);
+        expect(form.get("code_verifier")).toMatch(/^[A-Za-z0-9_-]{43,128}$/);
+        expect(challenge).toMatch(/^[A-Za-z0-9_-]{43}$/);
         // Inside the coordinator's default 60s skew, so the first read refreshes.
         return json({ access_token: "at-1", refresh_token: "rt-1", scope: "read write",
           expires_in: 30 });

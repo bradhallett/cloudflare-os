@@ -10,7 +10,8 @@
 //   3. `#beginOAuth` discovers and registers (once per endpoint, reused thereafter), then redirects.
 //   4. `acceptAuthCode` exchanges the code and completes.
 //
-// Every nonce is single-use, time-bounded, and compared in constant time; see `connect-nonce.ts`.
+// Every nonce is single-use, time-bounded, and compared in constant time; see the kit's
+// `connect-nonce.ts`.
 
 import { DurableObject } from "cloudflare:workers";
 import type { ConnectHandoff, GatekeeperConnectCallback, GatekeeperUser }
@@ -34,17 +35,17 @@ import { clientName, type ConnectionEnv, type McpConnection } from "./connection
 import {
   ACCESS_TOKEN_SAFETY_MS,
   CONNECT_TIMEOUT_MS,
-  DEFAULT_TOKEN_LIFETIME_S,
   constantTimeEqual,
   generateNonce,
   INITIATION_NONCE_LIFETIME_MS,
   OAUTH_NONCE_LIFETIME_MS,
-} from "./connect-nonce.js";
+} from "@gadgets/gatekeeper-kit/connect-nonce";
+import { DEFAULT_TOKEN_LIFETIME_S } from "./oauth.js";
 import {
   isCredentialRejection,
   revokeToken,
   safeOAuthError,
-  type OAuthTokens,
+  type McpOAuthTokens,
 } from "./oauth.js";
 import { fetchOptions, isAllowedUrl, sdkFetch, type FetchOptions } from "./fetch.js";
 import type { McpLog } from "./log.js";
@@ -124,7 +125,7 @@ export type ConnectOutcome =
 // under, which a later refresh needs. Everything goes live together, so nothing a reconnect learned
 // touches the live record before the Workshop has redeemed the ticket.
 type StagedReconnect = {
-  tokens: OAuthTokens | null;
+  tokens: McpOAuthTokens | null;
   sessionId: string | null;
   server: ConnectedServer;
   client?: StoredOAuthClientInformation;
@@ -525,7 +526,7 @@ export abstract class McpAccountBase<E extends AccountEnv, P = unknown>
         // one before the Workshop has redeemed the handoff, leaving bound facets with nothing if it
         // never does. With no tokens the SDK redirects to the authorization server instead.
         if (reconnect) return undefined;
-        const tokens = this.ctx.storage.kv.get<OAuthTokens>("tokens");
+        const tokens = this.ctx.storage.kv.get<McpOAuthTokens>("tokens");
         if (tokens && (typeof tokens.access_token !== "string" ||
             typeof tokens.token_type !== "string")) {
           this.ctx.storage.kv.delete("tokens");
@@ -535,7 +536,7 @@ export abstract class McpAccountBase<E extends AccountEnv, P = unknown>
       },
       saveTokens: (tokens, context) => {
         current();
-        const stored: OAuthTokens = {
+        const stored: McpOAuthTokens = {
           ...tokens,
           issuer: context?.issuer,
           // An absent `expires_in` is optional per RFC 6749 and means unknown, not eternal. Left
@@ -548,10 +549,10 @@ export abstract class McpAccountBase<E extends AccountEnv, P = unknown>
         // flow belongs to the account's owner (`commitReconnect`); the live tokens, which bound
         // facets read directly, are untouched until then.
         if (reconnect) {
-          this.ctx.storage.kv.put<OAuthTokens>(RECONNECT_TOKENS_KEY, stored);
+          this.ctx.storage.kv.put<McpOAuthTokens>(RECONNECT_TOKENS_KEY, stored);
           return;
         }
-        this.ctx.storage.kv.put<OAuthTokens>("tokens", stored);
+        this.ctx.storage.kv.put<McpOAuthTokens>("tokens", stored);
         this.ctx.storage.kv.put("expiredNotified", false);
       },
       redirectToAuthorization: url => {
@@ -717,7 +718,7 @@ export abstract class McpAccountBase<E extends AccountEnv, P = unknown>
   // Removes and returns what a reconnect flow parked off the live keys: the tokens `saveTokens`
   // stored, and the client registration and discovery the flow used.
   private takeParkedReconnect(): {
-    tokens: OAuthTokens | undefined;
+    tokens: McpOAuthTokens | undefined;
     client: StoredOAuthClientInformation | undefined;
     discovery: OAuthDiscoveryState | undefined;
   } {
@@ -727,7 +728,7 @@ export abstract class McpAccountBase<E extends AccountEnv, P = unknown>
       return value;
     };
     return {
-      tokens: take<OAuthTokens>(RECONNECT_TOKENS_KEY),
+      tokens: take<McpOAuthTokens>(RECONNECT_TOKENS_KEY),
       client: take<StoredOAuthClientInformation>(RECONNECT_CLIENT_KEY),
       discovery: take<OAuthDiscoveryState>(RECONNECT_DISCOVERY_KEY),
     };
@@ -744,7 +745,7 @@ export abstract class McpAccountBase<E extends AccountEnv, P = unknown>
 
   // Best effort: a server that does not implement RFC 7009 must not block a disconnect.
   private async revokeTokens(
-    tokens: OAuthTokens, discovery: OAuthDiscoveryState, client: StoredOAuthClientInformation,
+    tokens: McpOAuthTokens, discovery: OAuthDiscoveryState, client: StoredOAuthClientInformation,
   ): Promise<void> {
     try {
       const fetchFn = sdkFetch(this.fetchOptions());
@@ -759,16 +760,16 @@ export abstract class McpAccountBase<E extends AccountEnv, P = unknown>
   }
 
   // The tokens `saveTokens` just stored: live for a first connect, parked for a reconnect.
-  private freshTokens(reconnect: boolean): OAuthTokens | undefined {
-    return this.ctx.storage.kv.get<OAuthTokens>(reconnect ? RECONNECT_TOKENS_KEY : "tokens");
+  private freshTokens(reconnect: boolean): McpOAuthTokens | undefined {
+    return this.ctx.storage.kv.get<McpOAuthTokens>(reconnect ? RECONNECT_TOKENS_KEY : "tokens");
   }
 
   // Strips from an SDK error every secret the flow could have echoed: the verifier, the live tokens,
   // and -- for a reconnect -- the parked tokens and the client registration it actually presented.
   private redactedOAuthError(err: unknown, reconnect: boolean, ...secrets: string[]): Error {
     const kv = this.ctx.storage.kv;
-    const tokens = kv.get<OAuthTokens>("tokens");
-    const parked = reconnect ? kv.get<OAuthTokens>(RECONNECT_TOKENS_KEY) : undefined;
+    const tokens = kv.get<McpOAuthTokens>("tokens");
+    const parked = reconnect ? kv.get<McpOAuthTokens>(RECONNECT_TOKENS_KEY) : undefined;
     return safeOAuthError(err, [
       ...secrets,
       kv.get<string>("oauthVerifier"),
@@ -797,11 +798,11 @@ export abstract class McpAccountBase<E extends AccountEnv, P = unknown>
     // rather than replaced. It is revoked below, with the discovery and client it was issued under,
     // which this commit drops -- after which revoke() could no longer reach it.
     const retired = staged.tokens ? null : {
-      tokens: kv.get<OAuthTokens>("tokens"),
+      tokens: kv.get<McpOAuthTokens>("tokens"),
       discovery: kv.get<OAuthDiscoveryState>("oauthDiscovery"),
       client: kv.get<StoredOAuthClientInformation>("oauthClient"),
     };
-    if (staged.tokens) kv.put<OAuthTokens>("tokens", staged.tokens);
+    if (staged.tokens) kv.put<McpOAuthTokens>("tokens", staged.tokens);
     else kv.delete("tokens");
     // The live session was opened under the credentials being replaced, so it goes with them, as do
     // the server record the flow observed and the registration and discovery a refresh will need.
@@ -937,7 +938,7 @@ export abstract class McpAccountBase<E extends AccountEnv, P = unknown>
       return token;
     }
 
-    const tokens = this.ctx.storage.kv.get<OAuthTokens>("tokens");
+    const tokens = this.ctx.storage.kv.get<McpOAuthTokens>("tokens");
     if (!tokens || typeof tokens.access_token !== "string" ||
         typeof tokens.token_type !== "string") {
       await this.noteCredentialsExpired(server.endpoint, generation);
@@ -1006,7 +1007,7 @@ export abstract class McpAccountBase<E extends AccountEnv, P = unknown>
         throw new Error("Discarded credentials refreshed for a previous MCP connection.");
       }
       // Servers may or may not rotate the refresh token; keep the old one when they don't.
-      this.ctx.storage.kv.put<OAuthTokens>("tokens", {
+      this.ctx.storage.kv.put<McpOAuthTokens>("tokens", {
         ...refreshed,
         refresh_token: refreshed.refresh_token ?? refreshToken,
         issuer: client.issuer,
@@ -1102,7 +1103,7 @@ export abstract class McpAccountBase<E extends AccountEnv, P = unknown>
   }
 
   async revoke(): Promise<void> {
-    const tokens = this.ctx.storage.kv.get<OAuthTokens>("tokens");
+    const tokens = this.ctx.storage.kv.get<McpOAuthTokens>("tokens");
     const discovery = this.ctx.storage.kv.get<OAuthDiscoveryState>("oauthDiscovery");
     const client = this.ctx.storage.kv.get<StoredOAuthClientInformation>("oauthClient");
     if (tokens && discovery && client) await this.revokeTokens(tokens, discovery, client);

@@ -49,7 +49,7 @@ export async function createPkce(options: { verifierBytes?: number } = {}): Prom
  * @param codeVerifier RFC 7636 verifier: 43 to 128 unreserved characters.
  * @returns The unpadded base64url SHA-256 digest of the verifier.
  */
-export async function pkceChallenge(codeVerifier: string): Promise<string> {
+async function pkceChallenge(codeVerifier: string): Promise<string> {
   if (!CODE_VERIFIER.test(codeVerifier)) {
     throw new Error("A PKCE code verifier must be 43 to 128 unreserved characters.");
   }
@@ -436,7 +436,7 @@ export class OAuthClient {
  * @returns The parsed tokens.
  * @throws When `access_token` is missing or empty.
  */
-export function parseTokenResponse(
+function parseTokenResponse(
   body: Record<string, unknown>,
   options: { requestedAt: number; defaultExpiresIn?: number; scopeSeparator?: string },
 ): OAuthTokens {

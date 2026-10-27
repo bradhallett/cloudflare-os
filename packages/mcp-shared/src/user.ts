@@ -2,7 +2,7 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 import type { AccountDescription, AvatarImage } from "@gadgets/workshop-shared/gatekeeper";
 
 import type { ConnectedServer } from "./account.js";
-import { generateNonce } from "./connect-nonce.js";
+import { generateNonce } from "@gadgets/gatekeeper-kit/connect-nonce";
 
 /** Props shared by both MCP account capabilities. */
 export type McpGatekeeperUserProps = { accountObjectId: string };

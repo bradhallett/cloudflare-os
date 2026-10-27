@@ -286,6 +286,69 @@ describe("KvTtlCache", () => {
     await expect(cache.cached("a", 0, load)).rejects.toThrow("ttlMs must be a positive");
     expect(load).not.toHaveBeenCalled();
   });
+
+  it("deletes the unservable entry it just read, instead of abandoning it", async () => {
+    vi.useFakeTimers();
+    const kv = makeKv() as CacheKv & { keys(): string[] };
+    const cache = new KvTtlCache(kv, () => "authority", { legacyUnnamed: true });
+    const load = vi.fn(async () => "fresh");
+
+    await cache.cached("project", 1_000, load);
+    const entryKey = "cache:entry:project";
+    expect(kv.get(entryKey)).toBeDefined();
+
+    // Expired: the read deletes the entry, then the load restamps a fresh one.
+    vi.advanceTimersByTime(1_001);
+    await cache.cached("project", 1_000, load);
+    expect(load).toHaveBeenCalledTimes(2);
+    expect(kv.get<{ fetchedAt: number }>(entryKey)?.fetchedAt).toBe(Date.now());
+
+    // A foreign partition (invalidateAll advanced the generation) is deleted on its next read.
+    cache.invalidateAll();
+    await cache.cached("project", 1_000, load);
+    expect(kv.get<{ generation: number }>(entryKey)?.generation).toBe(1);
+    expect(load).toHaveBeenCalledTimes(3);
+  });
+
+  it("sweeps foreign and over-aged entries, gated by interval and paged", async () => {
+    vi.useFakeTimers();
+    const kv = makeKv() as CacheKv & { keys(): string[] };
+    const cache = new KvTtlCache(kv, () => "authority", { legacyUnnamed: true });
+    const load = vi.fn(async (n: number) => n);
+    await cache.cached("fresh", 60_000, () => load(1));
+    await cache.cached("old", 60_000, () => load(2));
+    kv.put("cache:entry:junk", "corrupt");
+
+    // The first-ever sweep runs (nothing has been swept yet) and takes the corrupt entry.
+    expect(cache.sweep(Date.now(), { maxAgeMs: 100_000 })).toBe(1);
+
+    // A foreign partition's entry: an old generation the cache can never serve again.
+    kv.put("cache:entry:ghost", { value: 3, fetchedAt: Date.now(), generation: 0, authority: "authority" });
+
+    // Inside the interval, a sweep is a no-op.
+    expect(cache.sweep(Date.now(), { maxAgeMs: 100_000 })).toBe(0);
+
+    // After the interval: ghost (foreign generation) goes, and BOTH T0 entries — `old` and
+    // `fresh` alike — have aged past `maxAgeMs`.
+    vi.advanceTimersByTime(24 * 60 * 60_000);
+    vi.advanceTimersByTime(100_001);
+    expect(cache.sweep(Date.now(), { maxAgeMs: 100_000 })).toBe(3);
+    // No generation key exists: this test never calls invalidateAll, so nothing wrote one.
+    expect(kv.keys()).toEqual(["cache:swept"]);
+
+    // The gate advances, so the next run waits a fresh interval even if called immediately.
+    expect(cache.sweep(Date.now(), { maxAgeMs: 100_000 })).toBe(0);
+
+    // Paging bounds one run; the rest wait for a later one.
+    vi.advanceTimersByTime(24 * 60 * 60_000);
+    await cache.cached("p1", 60_000, () => load(4));
+    await cache.cached("p2", 60_000, () => load(5));
+    vi.advanceTimersByTime(200_000);
+    expect(cache.sweep(Date.now(), { maxAgeMs: 100_000, limit: 1 })).toBe(1);
+    const remaining = kv.keys().filter(key => key.startsWith("cache:entry:"));
+    expect(remaining).toHaveLength(1);
+    expect(["cache:entry:p1", "cache:entry:p2"]).toContain(remaining[0]);
+  });
 });
 
 describe("KvTtlCache.partitionedBy", () => {

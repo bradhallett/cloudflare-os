@@ -1,4 +1,13 @@
-/** Durable collaborator admission and per-collection observer exclusion. */
+/**
+ * Durable collaborator admission and per-collection observer exclusion.
+ *
+ * The storage layout under `observer:` (see observer-keys) is wire-stable: five connectors shipped
+ * hand-rolled copies of this tracker with these exact keys and row shapes, and wave-2 migrates them
+ * onto this module in place — a row a pre-kit copy wrote must stay readable here, and vice versa.
+ * Do not rename keys, re-encode rows, or repurpose fields; extend with new optional fields only.
+ * The withhold latch and fence (`OBSERVER_WITHHOLD_*`) are deliberately minimal: R2 review upheld
+ * the latch, and a fancier epoch scheme was rejected as unneeded fencing.
+ */
 
 import { createLogger } from "@gadgets/observability/logger";
 import { generateNonce } from "./connect-nonce";

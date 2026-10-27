@@ -1,5 +1,5 @@
 import { stripTrailingSlashes, type ConnectHandoff } from "@gadgets/workshop-shared/gatekeeper";
-import { NONCE_BYTES } from "./connect-nonce.js";
+import { NONCE_BYTES } from "@gadgets/gatekeeper-kit/connect-nonce";
 import {
   connectHandoffPageHtml,
   errorPageHtml,

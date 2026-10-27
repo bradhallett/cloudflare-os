@@ -8,10 +8,8 @@ import type {
 import { RpcStub, RpcTarget } from "cloudflare:workers";
 import {
   ArrayCursor,
-  OffsetCursor,
   PageHookCursor,
   requestedPageSize,
-  PageNumberCursor,
   TokenCursor,
   type TokenPage,
 } from "../../src/cursors";
@@ -19,12 +17,6 @@ import { ObservationGate, trackedCollectionObservers } from "../../src/observers
 import { fakeKv } from "../fake-kv";
 
 type Issue = { id: number; open: boolean };
-
-/** Pages a fixed list the way a provider does: a short page means the end. */
-function pagedApi(items: Issue[]) {
-  return vi.fn(async (page: number, perPage: number) =>
-    items.slice((page - 1) * perPage, page * perPage));
-}
 
 /** A real authorizer, so a gate built from its stub is type-checked rather than cast into place. */
 class TestAuthorizer extends RpcTarget implements ObservationAuthorizer {
@@ -108,222 +100,6 @@ describe("requestedPageSize", () => {
   it("refuses a request a cursor could never terminate on", () => {
     expect(() => requestedPageSize({ resultsPerPage: 0 })).toThrow(/resultsPerPage must be a positive integer/);
     expect(() => requestedPageSize({ resultsPerPage: 2.5 })).toThrow(/resultsPerPage must be a positive integer/);
-  });
-});
-
-describe("PageNumberCursor", () => {
-  it("fetches only the provider pages a page of results needs", async () => {
-    const fetchPage = pagedApi([1, 2, 3, 4, 5].map(id => ({ id, open: true })));
-    const cursor = new PageNumberCursor<Issue>(
-      { fetchPage, authorizePage, pageSize: 2, remotePageSize: 2 });
-
-    expect((await cursor.next())?.map(issue => issue.id)).toEqual([1, 2]);
-    expect(fetchPage).toHaveBeenCalledOnce();
-
-    expect((await cursor.next())?.map(issue => issue.id)).toEqual([3, 4]);
-    expect((await cursor.next())?.map(issue => issue.id)).toEqual([5]);
-    expect(await cursor.next()).toBeNull();
-  });
-
-  it("serializes concurrent callers instead of duplicating and skipping pages", async () => {
-    const items = [1, 2, 3, 4, 5, 6].map(id => ({ id, open: true }));
-    const fetchPage = pagedApi(items);
-    const cursor = new PageNumberCursor<Issue>(
-      { fetchPage, authorizePage, pageSize: 2, remotePageSize: 2 });
-
-    // A gadget can pipeline these; the provider page counter must not be read twice before it moves.
-    const pages = await Promise.all([cursor.next(), cursor.next(), cursor.next()]);
-
-    expect(pages.map(page => page?.map(issue => issue.id)))
-      .toEqual([[1, 2], [3, 4], [5, 6]]);
-    expect(fetchPage.mock.calls.map(([page]) => page)).toEqual([1, 2, 3]);
-  });
-
-  it("keeps walking a provider that caps pages below the size asked for", async () => {
-    const items = Array.from({ length: 45 }, (_, index) => ({ id: index + 1, open: true }));
-    // Answers 20 to a request for 100, as Cloudflare's own /accounts endpoint does.
-    const fetchPage = vi.fn(async (page: number) => items.slice((page - 1) * 20, page * 20));
-    // The whole list is three provider pages, so the window must be deep enough to read them all.
-    const cursor = new PageNumberCursor<Issue>(
-      { fetchPage, authorizePage, pageSize: 100, remotePageSize: 100, maxProviderPagesPerCall: 3 });
-
-    // Stopping at the first short page would have returned only the first 20.
-    expect((await cursor.next())?.length).toBe(45);
-    expect(await cursor.next()).toBeNull();
-  });
-
-  it("resumes after a provider rejection, which moved no paging state", async () => {
-    const pages = [[{ id: 1, open: true }], [{ id: 2, open: true }]];
-    let attempt = 0;
-    const cursor = new PageNumberCursor<Issue>({
-      fetchPage: async page => {
-        if (++attempt === 1) throw new Error("provider 503");
-        return pages[page - 1] ?? [];
-      },
-      authorizePage,
-      pageSize: 1,
-      remotePageSize: 1,
-    });
-
-    await expect(cursor.next()).rejects.toThrow("provider 503");
-    // The same page, not the next one: a rejection consumed nothing.
-    expect(await cursor.next()).toEqual([{ id: 1, open: true }]);
-    expect(await cursor.next()).toEqual([{ id: 2, open: true }]);
-  });
-
-  it("resumes after a retain rejection, which moved no paging state", async () => {
-    const pages = [[{ id: 1, open: true }], [{ id: 2, open: true }]];
-    const fetchPage = vi.fn(async (page: number) => pages[page - 1] ?? []);
-    let attempt = 0;
-    const cursor = new PageNumberCursor<Issue>({
-      fetchPage,
-      retain: items => {
-        if (++attempt === 1) throw new Error("authorization unavailable");
-        return items;
-      },
-      authorizePage,
-      pageSize: 1,
-      remotePageSize: 1,
-    });
-
-    await expect(cursor.next()).rejects.toThrow("authorization unavailable");
-    // Page 1 again. Advancing before `retain` would have skipped it for good.
-    expect(await cursor.next()).toEqual([{ id: 1, open: true }]);
-    expect(fetchPage.mock.calls.map(([page]) => page)).toEqual([1, 1]);
-  });
-
-  it("exposes no paging method a stub holder could call", () => {
-    // capnweb resolves string paths only; reached by name it would skip the queue.
-    const cursor = new PageNumberCursor<Issue>(
-      { fetchPage: async () => [], authorizePage, pageSize: 1 });
-
-    expect((cursor as unknown as Record<string, unknown>).loadMore).toBeUndefined();
-  });
-
-  it("reports the end rather than an error when the provider is simply empty", async () => {
-    const cursor = new PageNumberCursor<Issue>(
-      { fetchPage: async () => [], authorizePage, pageSize: 2 });
-
-    expect(await cursor.next()).toBeNull();
-  });
-
-  it("walks past a page holding only rows the caller may not see", async () => {
-    // The shape that truncates GitHub's issue list today: page 1 is entirely dropped rows.
-    const pages = [[{ id: 1, open: false }, { id: 2, open: false }], [{ id: 3, open: true }]];
-    const cursor = new PageNumberCursor<Issue>({
-      fetchPage: async page => pages[page - 1] ?? [],
-      retain: items => items.filter(issue => issue.open),
-      authorizePage,
-      pageSize: 2,
-      remotePageSize: 2,
-    });
-
-    expect(ids(await cursor.next())).toEqual([3]);
-    expect(await cursor.next()).toBeNull();
-  });
-
-  it("bounds one call rather than walking a whole history of dropped pages", async () => {
-    const fetchPage = vi.fn(async () => [{ id: 1, open: false }]);
-    const cursor = new PageNumberCursor<Issue>(
-      { fetchPage, retain: () => [], authorizePage, pageSize: 2, remotePageSize: 1 });
-
-    // `[]` invites another call, where null would claim the list had ended.
-    expect(await cursor.next()).toEqual([]);
-    expect(fetchPage).toHaveBeenCalledTimes(2);
-  });
-
-  it("bounds one call when retained rows keep arriving too, not just empty pages", async () => {
-    // One survivor every third page: a consecutive-empty window would never trip, and filling a
-    // page of 100 would cost three hundred provider calls.
-    const fetchPage = vi.fn(async (page: number) => [{ id: page, open: page % 3 === 0 }]);
-    const cursor = new PageNumberCursor<Issue>({
-      fetchPage,
-      retain: items => items.filter(issue => issue.open),
-      authorizePage,
-      pageSize: 100,
-      remotePageSize: 1,
-      maxProviderPagesPerCall: 10,
-    });
-
-    expect((await cursor.next())?.map(issue => issue.id)).toEqual([3, 6, 9]);
-    expect(fetchPage).toHaveBeenCalledTimes(10);
-    // The walk resumes where the window ended rather than starting over or skipping.
-    expect((await cursor.next())?.map(issue => issue.id)).toEqual([12, 15, 18]);
-  });
-
-  it("rejects page sizes that would never terminate", () => {
-    const fetchPage = pagedApi([]);
-    expect(() => new PageNumberCursor<Issue>(
-      { fetchPage, authorizePage, pageSize: 0 })).toThrow(/positive safe integer/);
-    expect(() => new PageNumberCursor<Issue>(
-      { fetchPage, authorizePage, pageSize: 2, remotePageSize: 0 }))
-      .toThrow(/positive safe integer/);
-    expect(() => new PageNumberCursor<Issue>({ fetchPage, authorizePage, pageSize: 2.5 }))
-      .toThrow(/positive safe integer/);
-  });
-
-  it("releases what the caller acquired when it rejects the page size", () => {
-    // The documented pattern leases a gate *before* constructing the cursor, so a throw that
-    // skipped `dispose` would leak the duplicated stub on every rejected call.
-    const dispose = vi.fn();
-
-    expect(() => new PageNumberCursor<Issue>(
-      { fetchPage: pagedApi([]), authorizePage, pageSize: 0, dispose }))
-      .toThrow(/positive safe integer/);
-
-    expect(dispose).toHaveBeenCalledOnce();
-  });
-});
-
-describe("OffsetCursor", () => {
-  it("advances by the rows returned, so a capping provider skips nothing", async () => {
-    const items = Array.from({ length: 45 }, (_, index) => ({ id: index + 1, open: true }));
-    // Answers 20 to a request for 100, as jira's silent `maxResults` clamp does. Page arithmetic
-    // over this shape would request offsets 0, 100, ... and lose rows 20-99 without an error.
-    const fetchPage = vi.fn(async (offset: number) => items.slice(offset, offset + 20));
-    // The whole list is four provider pages, so the window must be deep enough to read them all.
-    const cursor = new OffsetCursor<Issue>(
-      { fetchPage, authorizePage, pageSize: 100, remotePageSize: 100, maxProviderPagesPerCall: 4 });
-
-    expect((await cursor.next())?.length).toBe(45);
-    expect(await cursor.next()).toBeNull();
-    expect(fetchPage.mock.calls.map(([offset]) => offset)).toEqual([0, 20, 40, 45]);
-  });
-
-  it("advances by the raw page, not what retain kept", async () => {
-    const items = [{ id: 1, open: false }, { id: 2, open: true }, { id: 3, open: true }];
-    const fetchPage =
-      vi.fn(async (offset: number, limit: number) => items.slice(offset, offset + limit));
-    const cursor = new OffsetCursor<Issue>({
-      fetchPage,
-      retain: page => page.filter(issue => issue.open),
-      authorizePage,
-      pageSize: 10,
-      remotePageSize: 2,
-    });
-
-    expect(ids(await cursor.next())).toEqual([2, 3]);
-    expect(await cursor.next()).toBeNull();
-    // Raw lengths moved the walk; dropped rows did not rewind it.
-    expect(fetchPage.mock.calls.map(([offset]) => offset)).toEqual([0, 2, 3]);
-  });
-
-  it("resumes after a provider rejection, which moved no offset", async () => {
-    const items = [{ id: 1, open: true }];
-    let attempt = 0;
-    const cursor = new OffsetCursor<Issue>({
-      fetchPage: async offset => {
-        if (++attempt === 1) throw new Error("provider 503");
-        return items.slice(offset, offset + 1);
-      },
-      authorizePage,
-      pageSize: 1,
-      remotePageSize: 1,
-    });
-
-    await expect(cursor.next()).rejects.toThrow("provider 503");
-    expect(ids(await cursor.next())).toEqual([1]);
-    expect(await cursor.next()).toBeNull();
   });
 });
 
@@ -471,14 +247,20 @@ describe("TokenCursor", () => {
   it("re-offers a capped page unchanged, rather than growing what was refused", async () => {
     // A heavily filtered provider caps the window before the page is full. Refilling on retry
     // would hand the approver a larger page than the one they just refused.
-    const fetchPage = vi.fn(async (page: number) => [{ id: page, open: page % 3 === 0 }]);
+    let page = 0;
+    const fetchPage = vi.fn(async () => {
+      page += 1;
+      // The provider caps its window at one row; the connector filters what the caller may see.
+      return {
+        items: [{ id: page, open: page % 3 === 0 }].filter(issue => issue.open),
+        nextToken: page < 10 ? `t${page}` : undefined,
+      };
+    });
     const offered: number[][] = [];
     let call = 0;
-    const cursor = new PageNumberCursor<Issue>({
+    const cursor = new TokenCursor<Issue>({
       fetchPage,
-      retain: rows => rows.filter(issue => issue.open),
       pageSize: 100,
-      remotePageSize: 1,
       maxProviderPagesPerCall: 10,
       authorizePage: async items => {
         offered.push(items.map(issue => issue.id));

@@ -151,7 +151,7 @@ const MODE_SYMLINK = 0o120000;
 const MODE_GITLINK = 0o160000;
 
 /** The structural kind of a tree entry, from its mode. */
-export function treeEntryKind(mode: string): "dir" | "symlink" | "gitlink" | "file" {
+function treeEntryKind(mode: string): "dir" | "symlink" | "gitlink" | "file" {
   switch (parseInt(mode, 8) & FILE_MODE_MASK) {
     case MODE_DIR: return "dir";
     case MODE_SYMLINK: return "symlink";
@@ -398,7 +398,7 @@ function hunkHeader(oldStart: number, oldCount: number, newStart: number, newCou
  * O(lines x edits) with both factors bounded, while a huge file with a small change still
  * diffs minimally.
  */
-export function diffTextLines(oldText: string, newText: string): {
+function diffTextLines(oldText: string, newText: string): {
   hunks: GitDiffHunk[];
   additions: number;
   deletions: number;

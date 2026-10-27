@@ -21,6 +21,8 @@ export const DELIVERED_RETENTION_MS = 24 * HOUR_MS;
 export const MAX_DELIVERIES_PER_RUN = 20;
 /** Finished messages one run forgets once their dedupe window has passed; the rest stay due. */
 const MAX_FORGOTTEN_PER_RUN = 500;
+/** A hook never holds more undelivered messages than this; further enqueues are refused. */
+export const MAX_PENDING_DELIVERIES = 500;
 
 /** A queued delivery of `message` to one hook, and when it is next tried. */
 type Pending<Message> = { message: Message; attempts: number; at: number };
@@ -59,6 +61,18 @@ const through = (index: string, time: number) => `${index}${timeKey(time + 1)}`;
  * alarm: it calls `run()` from it, and sets it for `nextDue()` afterwards. A driver may delete what
  * the queue stores, as on disconnecting: an index entry whose row is gone is dropped when read.
  *
+ * ## Delivery is at-least-once
+ *
+ * `run()` considers a message delivered when `deliver` resolves, but the delivery's *effect* may
+ * have landed even when it rejects — a lost reply after the consumer's work is indistinguishable
+ * from a failure, and the queue redelivers either way (up to `MAX_DELIVERY_ATTEMPTS`, then drop).
+ * Consumers must therefore key side effects on the event id and dedupe: keep a small bounded
+ * seen-id set in the gadget's own storage and skip an id already acted on. The queue's own dedupe
+ * (`(hookKey, messageId)`, 24h) collapses duplicate *pushes*; it cannot collapse a redelivery
+ * whose first attempt was interrupted after the work landed. Drivers delivering to agent-authored
+ * gadget code (the `receiveEvent` facet) must surface this contract there too — the event id the
+ * consumer sees is the dedupe key.
+ *
  * @example
  * ```ts
  * #queue = new HookDeliveryQueue<Event>(this.ctx.storage.kv, () => logger.warn("dropped an event"));
@@ -86,15 +100,29 @@ export class HookDeliveryQueue<Message> {
 
   /**
    * Queue `message` for the hook unless it is pending or finished within the dedupe window.
+   *
+   * Refused — returning `false` — when the queue already holds `MAX_PENDING_DELIVERIES` undelivered
+   * messages: an event flood then backs up to the provider instead of to this Durable Object's
+   * storage. The driver decides what a refusal means (drop, or surface the hook as unhealthy);
+   * `run()` drains the backlog either way, so refusal is transient.
    * @param hookKey The hook to deliver to.
    * @param messageId The provider's id for the message, which a duplicate push repeats.
    * @param message What `run()` hands the delivery callback.
    * @param now When the message is first due.
+   * @returns Whether the message will be delivered: `false` for a refusal, or a duplicate of a
+   *   message already finished within its dedupe window; `true` for a new row and for a message
+   *   already pending from an earlier push.
    */
-  enqueue(hookKey: string, messageId: string, message: Message, now: number): void {
+  enqueue(hookKey: string, messageId: string, message: Message, now: number): boolean {
     this.#index();
     const key = rowKey(hookKey, messageId);
-    if (this.#kv.get(key) === undefined) this.#putPending(key, { message, attempts: 0, at: now });
+    const existing = this.#kv.get<Row<Message>>(key);
+    if (existing !== undefined) return !("deliveredAt" in existing);
+    // The DUE index holds one entry per undelivered message, so a capped scan is the high-water.
+    const pending = [...this.#kv.list<true>({ prefix: DUE, limit: MAX_PENDING_DELIVERIES })];
+    if (pending.length >= MAX_PENDING_DELIVERIES) return false;
+    this.#putPending(key, { message, attempts: 0, at: now });
+    return true;
   }
 
   /**

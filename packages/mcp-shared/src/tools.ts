@@ -16,7 +16,7 @@ import {
   type McpToolCallResult,
 } from "./client.js";
 import type { McpCallResult, McpToolInfo, McpToolSummary } from "./types";
-import { hexEncode } from "./util.js";
+import { hexEncode } from "@gadgets/gatekeeper-kit/connect-nonce";
 
 /**
  * How far an endpoint's self-description is trusted.

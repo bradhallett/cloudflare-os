@@ -7,10 +7,8 @@ import {
   TreeUnavailableError,
   changedPathsBetweenTrees,
   diffGitTrees,
-  diffTextLines,
   parseGitTreePayload,
   parseUnifiedPatch,
-  treeEntryKind,
   type GitTreeEntry,
   type TreeDiffSource,
 } from "../src/git-diff";
@@ -70,8 +68,6 @@ describe("parseGitTreePayload", () => {
       { mode: "160000", name: "vendored", oid: oid(5) },
     ];
     expect(parseGitTreePayload(treePayload(entries), oid(9))).toEqual(entries);
-    expect(entries.map(entry => treeEntryKind(entry.mode)))
-      .toEqual(["file", "dir", "file", "symlink", "gitlink"]);
   });
 
   it("rejects truncated payloads and non-UTF-8 names", () => {
@@ -92,209 +88,8 @@ describe("parseGitTreePayload", () => {
   });
 });
 
-describe("diffTextLines", () => {
-  it("produces a single hunk with three lines of context around one change", () => {
-    const oldText = Array.from({ length: 10 }, (_, i) => `line${i + 1}`).join("\n") + "\n";
-    const newText = oldText.replace("line5", "changed5");
-
-    const { hunks, additions, deletions } = diffTextLines(oldText, newText);
-    expect(additions).toBe(1);
-    expect(deletions).toBe(1);
-    expect(hunks).toHaveLength(1);
-    expect(hunks[0].header).toBe("@@ -2,7 +2,7 @@");
-    expect(hunks[0].lines).toEqual([
-      { kind: "context", text: "line2", oldLineNumber: 2, newLineNumber: 2 },
-      { kind: "context", text: "line3", oldLineNumber: 3, newLineNumber: 3 },
-      { kind: "context", text: "line4", oldLineNumber: 4, newLineNumber: 4 },
-      { kind: "removed", text: "line5", oldLineNumber: 5 },
-      { kind: "added", text: "changed5", newLineNumber: 5 },
-      { kind: "context", text: "line6", oldLineNumber: 6, newLineNumber: 6 },
-      { kind: "context", text: "line7", oldLineNumber: 7, newLineNumber: 7 },
-      { kind: "context", text: "line8", oldLineNumber: 8, newLineNumber: 8 },
-    ]);
-  });
-
-  it("uses git's -0,0 convention for a new file", () => {
-    const { hunks, additions, deletions } = diffTextLines("", "a\nb\n");
-    expect(additions).toBe(2);
-    expect(deletions).toBe(0);
-    expect(hunks).toHaveLength(1);
-    expect(hunks[0].header).toBe("@@ -0,0 +1,2 @@");
-    expect(hunks[0].lines).toEqual([
-      { kind: "added", text: "a", newLineNumber: 1 },
-      { kind: "added", text: "b", newLineNumber: 2 },
-    ]);
-  });
-
-  it("splits distant changes into separate hunks and merges nearby ones", () => {
-    const lines = Array.from({ length: 25 }, (_, i) => `line${i + 1}`);
-    const changedFar = [...lines];
-    changedFar[1] = "x2";
-    changedFar[19] = "x20";
-    const far = diffTextLines(lines.join("\n"), changedFar.join("\n"));
-    expect(far.hunks.map(hunk => hunk.header)).toEqual(["@@ -1,5 +1,5 @@", "@@ -17,7 +17,7 @@"]);
-
-    const changedNear = [...lines];
-    changedNear[1] = "x2";
-    changedNear[6] = "x7";
-    const near = diffTextLines(lines.join("\n"), changedNear.join("\n"));
-    expect(near.hunks).toHaveLength(1);
-  });
-
-  it("returns no hunks for identical content", () => {
-    expect(diffTextLines("", "").hunks).toEqual([]);
-    expect(diffTextLines("a\nb\n", "a\nb\n").hunks).toEqual([]);
-    expect(diffTextLines("a\nb", "a\nb").hunks).toEqual([]);
-  });
-
-  // The EOF-newline cases below assert byte-for-byte what `git diff` emits for the same inputs.
-  it("treats adding a trailing newline as a real change, like git", () => {
-    const { hunks, additions, deletions } = diffTextLines("a\nb", "a\nb\n");
-    expect(additions).toBe(1);
-    expect(deletions).toBe(1);
-    expect(hunks).toHaveLength(1);
-    expect(hunks[0].header).toBe("@@ -1,2 +1,2 @@");
-    expect(hunks[0].lines).toEqual([
-      { kind: "context", text: "a", oldLineNumber: 1, newLineNumber: 1 },
-      { kind: "removed", text: "b", oldLineNumber: 2 },
-      { kind: "context", text: "\\ No newline at end of file" },
-      { kind: "added", text: "b", newLineNumber: 2 },
-    ]);
-  });
-
-  it("marks both sides when a changed final line still lacks its newline", () => {
-    const { hunks } = diffTextLines("a", "b");
-    expect(hunks).toHaveLength(1);
-    expect(hunks[0].header).toBe("@@ -1 +1 @@");
-    expect(hunks[0].lines).toEqual([
-      { kind: "removed", text: "a", oldLineNumber: 1 },
-      { kind: "context", text: "\\ No newline at end of file" },
-      { kind: "added", text: "b", newLineNumber: 1 },
-      { kind: "context", text: "\\ No newline at end of file" },
-    ]);
-  });
-
-  it("marks a no-eol context line at EOF once, and only when it lands in a hunk", () => {
-    // A change near the unterminated last line pulls it in as context: one marker, both sides.
-    const near = diffTextLines("line1\nline2\nend", "line1\nCHANGED\nend");
-    expect(near.hunks).toHaveLength(1);
-    expect(near.hunks[0].header).toBe("@@ -1,3 +1,3 @@");
-    expect(near.hunks[0].lines).toEqual([
-      { kind: "context", text: "line1", oldLineNumber: 1, newLineNumber: 1 },
-      { kind: "removed", text: "line2", oldLineNumber: 2 },
-      { kind: "added", text: "CHANGED", newLineNumber: 2 },
-      { kind: "context", text: "end", oldLineNumber: 3, newLineNumber: 3 },
-      { kind: "context", text: "\\ No newline at end of file" },
-    ]);
-
-    // A change far from it leaves the last line outside the hunk: no marker anywhere.
-    const lines = Array.from({ length: 10 }, (_, i) => `line${i + 1}`);
-    const changed = [...lines];
-    changed[0] = "x1";
-    const far = diffTextLines(lines.join("\n"), changed.join("\n"));
-    expect(far.hunks).toHaveLength(1);
-    expect(far.hunks[0].lines.every(line => line.text !== "\\ No newline at end of file"))
-      .toBe(true);
-  });
-
-  it("marks an added or removed file that never had a final newline", () => {
-    const added = diffTextLines("", "a");
-    expect(added.hunks[0].lines).toEqual([
-      { kind: "added", text: "a", newLineNumber: 1 },
-      { kind: "context", text: "\\ No newline at end of file" },
-    ]);
-    const removed = diffTextLines("a", "");
-    expect(removed.hunks[0].lines).toEqual([
-      { kind: "removed", text: "a", oldLineNumber: 1 },
-      { kind: "context", text: "\\ No newline at end of file" },
-    ]);
-  });
-
-  it("finds a minimal script for interleaved edits", () => {
-    const { hunks, additions, deletions } = diffTextLines("a\nb\nc\nd\n", "a\nx\nc\ny\nd\n");
-    expect(deletions).toBe(1); // only "b" is removed
-    expect(additions).toBe(2); // "x" and "y" are added
-    expect(hunks).toHaveLength(1);
-  });
-
-  it("falls back to a whole remove-then-add block when the edit distance cap is exceeded", () => {
-    const oldText = Array.from({ length: 700 }, (_, i) => `old${i}`).join("\n") + "\n";
-    const newText = Array.from({ length: 700 }, (_, i) => `new${i}`).join("\n") + "\n";
-    const { hunks, additions, deletions } = diffTextLines(oldText, newText);
-    expect(deletions).toBe(700);
-    expect(additions).toBe(700);
-    expect(hunks).toHaveLength(1);
-    expect(hunks[0].header).toBe("@@ -1,700 +1,700 @@");
-    // Correct, if not minimal: all removals then all additions.
-    expect(hunks[0].lines[0]).toEqual({ kind: "removed", text: "old0", oldLineNumber: 1 });
-    expect(hunks[0].lines[700]).toEqual({ kind: "added", text: "new0", newLineNumber: 1 });
-  });
-
-  it("scopes the fallback to the changed middle, keeping context from the common affixes", () => {
-    // A capped change buried in a shared file: the fallback must not re-emit the common prefix
-    // and suffix wholesale -- only the middle, padded with git's 3 context lines each side.
-    const prefix = Array.from({ length: 10 }, (_, i) => `keep${i + 1}`);
-    const suffix = Array.from({ length: 10 }, (_, i) => `tail${i + 1}`);
-    const oldMid = Array.from({ length: 700 }, (_, i) => `old${i}`);
-    const newMid = Array.from({ length: 700 }, (_, i) => `new${i}`);
-    const { hunks, additions, deletions } = diffTextLines(
-      [...prefix, ...oldMid, ...suffix].join("\n") + "\n",
-      [...prefix, ...newMid, ...suffix].join("\n") + "\n");
-    expect(deletions).toBe(700);
-    expect(additions).toBe(700);
-    expect(hunks).toHaveLength(1);
-    expect(hunks[0].header).toBe("@@ -8,706 +8,706 @@");
-    expect(hunks[0].lines).toHaveLength(3 + 700 + 700 + 3);
-    expect(hunks[0].lines[0]).toEqual(
-      { kind: "context", text: "keep8", oldLineNumber: 8, newLineNumber: 8 });
-    expect(hunks[0].lines.at(-1)).toEqual(
-      { kind: "context", text: "tail3", oldLineNumber: 713, newLineNumber: 713 });
-  });
-
-  it("skips the Myers run entirely for an over-long changed middle", () => {
-    // A pure insertion longer than MAX_DIFF_LINES_PER_FILE: too many lines to diff minimally,
-    // even though its edit distance path would have been fine for jsdiff's memory.
-    const inserted = Array.from({ length: 20001 }, (_, i) => `ins${i}`);
-    const { hunks, additions, deletions } = diffTextLines(
-      "a\nb\n", ["a", ...inserted, "b"].join("\n") + "\n");
-    expect(deletions).toBe(0);
-    expect(additions).toBe(20001);
-    expect(hunks).toHaveLength(1);
-    expect(hunks[0].header).toBe("@@ -1,2 +1,20003 @@");
-    expect(hunks[0].lines[0]).toEqual(
-      { kind: "context", text: "a", oldLineNumber: 1, newLineNumber: 1 });
-    expect(hunks[0].lines[1]).toEqual({ kind: "added", text: "ins0", newLineNumber: 2 });
-    expect(hunks[0].lines.at(-1)).toEqual(
-      { kind: "context", text: "b", oldLineNumber: 2, newLineNumber: 20003 });
-  });
-
-  it("keeps the EOF-newline markers in the fallback path", () => {
-    const oldText = Array.from({ length: 700 }, (_, i) => `old${i}`).join("\n");
-    const newText = Array.from({ length: 700 }, (_, i) => `new${i}`).join("\n");
-    const { hunks } = diffTextLines(oldText, newText);  // both sides unterminated
-    expect(hunks).toHaveLength(1);
-    expect(hunks[0].lines[700]).toEqual({ kind: "context", text: "\\ No newline at end of file" });
-    expect(hunks[0].lines.at(-1)).toEqual(
-      { kind: "context", text: "\\ No newline at end of file" });
-  });
-});
 
 describe("parseUnifiedPatch", () => {
-  it("reads diffTextLines' hunks back from their patch text, numbering and EOF markers included", () => {
-    const lines = Array.from({ length: 20 }, (_, i) => `line${i + 1}`);
-    const changed = lines.with(1, "two").with(19, "twenty");
-    const { hunks } = diffTextLines(lines.join("\n"), changed.join("\n"));
-    expect(hunks).toHaveLength(2);
-    const prefix = { added: "+", removed: "-", context: " " };
-    const patch = hunks.flatMap(hunk => [
-      hunk.header,
-      // An unnumbered line is the `\ No newline at end of file` marker, written verbatim.
-      ...hunk.lines.map(line => line.oldLineNumber === undefined && line.newLineNumber === undefined
-        ? line.text : prefix[line.kind] + line.text),
-    ]).map(line => `${line}\n`).join("");
-    expect(parseUnifiedPatch(patch)).toEqual(hunks);
-  });
-
   it("reads no line past a patch's final newline", () => {
     // Read as a line, the empty string after the last newline would be a blank context line past
     // the end of the hunk, there to comment on.

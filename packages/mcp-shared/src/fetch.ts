@@ -7,6 +7,7 @@
 // opt-in, since a caller forgetting to opt in is the failure mode.
 
 import { isBlockedHost } from "./endpoint.js";
+import { readTextCapped } from "@gadgets/gatekeeper-kit/response-body";
 import type { FetchLike } from "@modelcontextprotocol/client";
 
 // Enough for the http->https and apex->www hops real deployments use. Discovery already tries
@@ -47,56 +48,6 @@ export class FetchNotStartedError extends Error {
  */
 export function fetchOptions(env: InsecureEnv): FetchOptions {
   return { allowInsecure: (env.MCP_ALLOW_INSECURE ?? "").toLowerCase() === "true" };
-}
-
-/**
- * Cap on any single response body this gatekeeper buffers.
- *
- * Every response here is parsed whole -- JSON-RPC frames and SSE streams alike -- so the body is in
- * memory before any higher-level limit can apply. `listTools` bounds the catalog it *keeps*, which
- * bounds nothing about what arrives, and a `tools/call` result is not bounded at all: a server
- * answering one request with a gigabyte exhausts the Worker.
- */
-export const MAX_RESPONSE_BYTES = 1024 * 1024;
-
-/**
- * Reads a response body as text, refusing one larger than `maxBytes`.
- *
- * Refused rather than truncated: half a JSON document does not parse, and a clipped SSE stream can
- * lose the very event carrying the response, which would surface as a confusing protocol error
- * instead of the size problem it is. The body is cancelled on refusal so the transfer stops rather
- * than running to completion unread.
- */
-export async function readTextCapped(
-  response: Response, maxBytes: number = MAX_RESPONSE_BYTES,
-): Promise<string> {
-  if (!response.body) return "";
-
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > maxBytes) {
-        await reader.cancel();
-        throw new Error(`The server's response exceeded ${maxBytes} bytes.`);
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-
-  const joined = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    joined.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder().decode(joined);
 }
 
 /** Gives SDK OAuth helpers the same redirect and response-size policy as the local MCP transport. */

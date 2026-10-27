@@ -90,7 +90,7 @@ function byteLength(text: string): number {
  * Cuts `text` to at most `maxBytes` of UTF-8, on a code point boundary.
  * @returns The (possibly shortened) text and whether anything was removed.
  */
-export function truncateToBytes(text: string, maxBytes: number):
+function truncateToBytes(text: string, maxBytes: number):
     { text: string; truncated: boolean } {
   const bytes = encoder.encode(text);
   if (bytes.byteLength <= maxBytes) return { text, truncated: false };
@@ -343,7 +343,7 @@ export function buildDescription(intro?: string): ActionDescriptionBuilder {
  * Without it a value can close the fence and continue in the description's own voice. Content the
  * approver reviews goes in an `ActionDescriptionBuilder` field instead, which needs no escaping.
  */
-export function defuseFences(text: string): string {
+function defuseFences(text: string): string {
   return text.replace(/`{3,}/g, "'''");
 }
 
