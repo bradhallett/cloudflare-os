@@ -125,9 +125,6 @@ const textAfter = (changes: AppliedChange[], gadgetId: number, path: string, bas
   changes.reduce((content, { change }) => applyCodeChange(content, change), files(gadgetId, path, base))
     .get(gadgetId)?.get(path);
 
-const parentsOf = async (ws: RpcStub<Overseer>, commitId: string) =>
-  (await ws.getCommitLog(commitId, 1))[0]?.parents;
-
 async function expectText(ws: RpcStub<Overseer>, commitId: string, path: string, text: string) {
   expect(await ws.readFilesAtCommit(commitId, [path])).toEqual([[path, { kind: "text", text }]]);
 }
@@ -251,7 +248,7 @@ it.concurrent("one accept commits both gadgets a chat built, each with only its 
     expect(await ws.mergeChanges(editA)).toEqual({ outcome: "merged" });
     const head = await headOf(workpieces, a, headA);
     await expectText(ws, head, "a.txt", "edited A\n");
-    expect((await ws.getCommitLog(head, 2)).map(commit => commit.oid)).toEqual([head, headA]);
+    expect(await ws.listChangedPaths(headA, head)).toEqual(["a.txt"]);
   });
   // A fresh snapshot, so a stray update to B can't still be in flight.
   await reopen(session.username, async ({ workpieces }) => {
@@ -311,8 +308,8 @@ it.concurrent.for([
       const [{ chatCommit }] = message!.mainlineMerge!.gadgets!;
       const [{ baseCommit: merged }] = message!.pins!;
       expect(message?.pins).toEqual([{ gadgetId, baseCommit: merged, mergedCommit: mainline }]);
-      expect(await parentsOf(ws, merged)).toEqual([mainline, chatCommit]);
-      expect(await parentsOf(ws, chatCommit)).toEqual([head]);
+      expect(await ws.listChangedPaths(mainline, merged)).toEqual(["client.js"]);
+      expect(await ws.listChangedPaths(head, chatCommit)).toEqual(["client.js"]);
       await expectText(ws, chatCommit, "client.js", row.theirs);
       await expectText(ws, merged, "client.js", row.draft);
       expect(await preview()).toBe(row.draft);
@@ -347,7 +344,7 @@ it.concurrent.for([
     const accepted = await headOf(workpieces, gadgetId, mainline);
     await expectText(ws, accepted, "client.js", row.resolved ?? row.draft);
     if (row.resolved === undefined) expect(accepted).toBe(merged);
-    else expect(await parentsOf(ws, accepted)).toEqual([merged]);
+    else expect(await ws.listChangedPaths(merged, accepted)).toEqual(["client.js"]);
   });
 });
 
@@ -372,9 +369,7 @@ it.concurrent("two simultaneous chat merges choose one complete version", async 
     expect(outcomes.toSorted()).toEqual(["merged", "stale"]);
     const mainline = await headOf(workpieces, gadgetId, head);
     await expectText(ws, mainline, "app.txt", texts[outcomes.indexOf("merged")]!);
-    const log = await ws.getCommitLog(mainline, 2);
-    expect(log.map(commit => commit.oid)).toEqual([mainline, head]);
-    expect(log[0]!.parents).toEqual([head]);
+    expect(await ws.listChangedPaths(head, mainline)).toEqual(["app.txt"]);
   });
 });
 
@@ -419,19 +414,14 @@ it.concurrent("a second session follows renames, drafts, merges and reverts", as
       await propose(merged, initialHead, undefined, "merged\n");
       expect(await writer.ws.mergeChanges(merged)).toEqual({ outcome: "merged" });
       const mergedHead = await headOf(reader.workpieces, gadgetId, initialHead);
-      const author = { name: username, email: `${username}@localhost` };
-      const log = [
-        { oid: mergedHead, parents: [initialHead], message: `Accept changes from chat: ${chatTitle}\n` },
-        { oid: initialHead, parents: [], message: "Create gadget: Shared App\n" },
-      ].map(commit => ({ ...commit, author, timestamp: expect.any(Date) }));
-      expect(await reader.ws.getCommitLog(mergedHead)).toEqual(log);
+      await expectText(reader.ws, mergedHead, "shared.txt", "merged\n");
 
       const reverted = await writer.ws.newChat("Revert this draft", null);
       await propose(reverted, mergedHead, "merged\n", "merged\nreverted\n");
       await writer.ws.revertChanges(reverted, 0);
       await readerChat(reverted, chat => chat.proposedChangeWorkpieces === undefined);
       expect(reader.workpieces.summaries.get(gadgetId)).toMatchObject({ commitId: mergedHead });
-      expect(await reader.ws.getCommitLog(mergedHead)).toEqual(log);
+      await expectText(reader.ws, mergedHead, "shared.txt", "merged\n");
     });
   });
 });

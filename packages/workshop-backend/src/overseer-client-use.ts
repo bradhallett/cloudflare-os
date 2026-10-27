@@ -1,6 +1,6 @@
 import { RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
-import { Overseer, GadgetMetadata, WorkpieceId, WorkpiecesSubscriber, GadgetClient, GatekeeperClient, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, CodeChangeSubmission, CommitInfo, FileAtCommit, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AgentSpawnerConfig, ConsoleLogSubscriber, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, ObserverBindingNeed, MessageFormatRef, BotSelection, BlueprintGadgetSummary, BlueprintScreenshotUpload, ChatAttachmentHandle, BoundHookInfo, PreApprovableAction, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest } from "@gadgets/workshop-shared/api";
+import { Overseer, GadgetMetadata, WorkpieceId, WorkpiecesSubscriber, GadgetClient, GatekeeperClient, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, CodeChangeSubmission, FileAtCommit, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AgentSpawnerConfig, ConsoleLogSubscriber, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, ObserverBindingNeed, MessageFormatRef, BotSelection, BlueprintGadgetSummary, BlueprintScreenshotUpload, ChatAttachmentHandle, BoundHookInfo, PreApprovableAction, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest } from "@gadgets/workshop-shared/api";
 import { ActionKind } from "@gadgets/workshop-shared/gatekeeper";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { UserDurableObject } from "./user";
@@ -177,9 +177,6 @@ export class UseOverseerInterface extends RpcTarget implements Overseer {
     this.#deny();
   }
   async listChangedPaths(_fromCommit: string, _toCommit: string): Promise<string[]> {
-    this.#deny();
-  }
-  async getCommitLog(_fromCommit: string, _depth?: number): Promise<CommitInfo[]> {
     this.#deny();
   }
 

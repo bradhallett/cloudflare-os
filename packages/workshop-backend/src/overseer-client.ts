@@ -1,6 +1,6 @@
 import { RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
-import { Overseer, GadgetMetadata, WorkpieceId, WorkpiecesSubscriber, GadgetClient, GatekeeperClient, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, CodeChangeSubmission, CommitInfo, FileAtCommit, MAX_READ_FILES_PER_CALL, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AgentSpawnerConfig, ConsoleLogSubscriber, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverBindingNeed, MessageFormatRef, BlueprintGadgetSummary, BlueprintScreenshotUpload, blueprintScreenshotUrl, ChatAttachmentHandle, BoundHookInfo, PreApprovableAction, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, modelKind } from "@gadgets/workshop-shared/api";
+import { Overseer, GadgetMetadata, WorkpieceId, WorkpiecesSubscriber, GadgetClient, GatekeeperClient, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, CodeChangeSubmission, FileAtCommit, MAX_READ_FILES_PER_CALL, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AgentSpawnerConfig, ConsoleLogSubscriber, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverBindingNeed, MessageFormatRef, BlueprintGadgetSummary, BlueprintScreenshotUpload, blueprintScreenshotUrl, ChatAttachmentHandle, BoundHookInfo, PreApprovableAction, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, modelKind } from "@gadgets/workshop-shared/api";
 import { HookInitiator, ActionKind } from "@gadgets/workshop-shared/gatekeeper";
 import { BotSelection } from "@gadgets/workshop-shared/api";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
@@ -406,13 +406,6 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async listChangedPaths(fromCommit: string, toCommit: string): Promise<string[]> {
     return await this.impl.listChangedPaths(validateOid(fromCommit), validateOid(toCommit));
-  }
-
-  async getCommitLog(fromCommit: string, depth?: number): Promise<CommitInfo[]> {
-    if (depth !== undefined && (!Number.isInteger(depth) || depth <= 0)) {
-      throw new Error("Invalid depth.");
-    }
-    return await this.impl.gitStore.readCommitLog(validateOid(fromCommit), {depth});
   }
 
   async updateChatFromMainline(chatId: number): Promise<{conflictPaths: string[]}> {

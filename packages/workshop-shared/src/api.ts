@@ -2563,8 +2563,8 @@ export type CommitIdentity = {
 };
 
 /**
- * Metadata of one commit in a workspace's git object store, as returned by
- * Overseer.getCommitLog(). Commits are immutable, so results may be cached by oid.
+ * Metadata of one commit in a workspace's git object store, as produced by the backend's
+ * GitStore. Commits are immutable, so results may be cached by oid.
  */
 export type CommitInfo = {
   /** The commit's oid (40-hex SHA-1), as found in e.g. WorkpieceSummary.commitId. */
@@ -2898,14 +2898,6 @@ export interface Overseer extends RpcTarget {
    * two are changed in the chat even where none of the chat's code changes touch them.
    */
   listChangedPaths(fromCommit: string, toCommit: string): Promise<string[]>;
-
-  /**
-   * Walk the commit graph from `fromCommit` (that commit first, then its ancestry), returning up
-   * to `depth` commits' metadata -- all reachable commits when `depth` is omitted. Traversal
-   * order for merge commits follows git log's default (reverse chronological). Like
-   * listTree(), results are immutable and cacheable.
-   */
-  getCommitLog(fromCommit: string, depth?: number): Promise<CommitInfo[]>;
 
   /**
    * Submit one code change on a chat's branch. This is the only way to edit code: committed code
@@ -4045,11 +4037,11 @@ export type GadgetSummary = {
 
   /**
    * The gadget's head commit (40-hex hash) in the workspace's git object store -- i.e. its
-   * committed mainline code, readable via Overseer.listTree() / readFilesAtCommit() /
-   * getCommitLog(). Advances when a chat's changes are accepted; subscribeToWorkpieces()
-   * delivers a fresh entry() whenever it does. Absent only while the gadget is still pending in
-   * a chat (see `chatId`): every permanent gadget has a head, even before it has any code (an
-   * empty initial commit), so a chat's first edit always has a commit to pin (see ChatGadgetPin).
+   * committed mainline code, readable via Overseer.listTree() / readFilesAtCommit(). Advances
+   * when a chat's changes are accepted; subscribeToWorkpieces() delivers a fresh entry()
+   * whenever it does. Absent only while the gadget is still pending in a chat (see `chatId`):
+   * every permanent gadget has a head, even before it has any code (an empty initial commit),
+   * so a chat's first edit always has a commit to pin (see ChatGadgetPin).
    */
   commitId?: string;
 
