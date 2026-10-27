@@ -44,14 +44,14 @@ export function xCursor<T>(options: XCursorOptions<T>): Cursor<T> {
       fetched = await options.fetchPage(token);
       return { items: fetched.items, nextToken: fetched.nextToken };
     },
-    authorizePage: async (_items, { terminal }) => {
+    authorizePage: async () => {
       if (fetched === undefined) {
         throw new Error("The X cursor authorized a page before it fetched one.");
       }
-      // A walk that disclosed rows ends without an X page of its own to authorize: the last page's
-      // authorization already happened when it was served. An empty walk authorized nothing yet, so
-      // the final empty page — the "no such thing" answer — is authorized here, as X served it.
-      if (terminal && fetched.items.length > 0) return;
+      // A non-terminal call authorizes the page X just served. The terminal one reaches here
+      // only after an empty walk — the kit skips terminal authorization once a page was
+      // answered — and authorizes that final empty page, the "no such thing" answer, as X
+      // served it.
       await options.authorize(fetched);
     },
     dispose: () => options.dispose?.(),
