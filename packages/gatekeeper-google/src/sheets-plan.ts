@@ -29,7 +29,7 @@ import {
   baseIndexOf, deleteLines, insertLines, lineAt, lineCount, linesAt, positionOf, positionsIn, type Lines,
 } from "./sheets-structure";
 import type { SheetCellInput, SheetFormatChange } from "./sheets-types";
-import { ChangeConflict } from "./slides-text";
+import { ChangeConflict } from "./office-text";
 
 /** The rows of a sheet added with none given, as in Google Sheets. */
 export const DEFAULT_ROW_COUNT = 1000;

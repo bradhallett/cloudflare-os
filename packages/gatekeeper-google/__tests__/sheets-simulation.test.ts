@@ -13,7 +13,7 @@ import {
 } from "../src/sheets-simulation";
 import { positionOf } from "../src/sheets-structure";
 import type { SheetFormatChange } from "../src/sheets-types";
-import { ChangeConflict } from "../src/slides-text";
+import { ChangeConflict } from "../src/office-text";
 import { ERROR_VALUE_READS, grid, rect, sheet } from "./sheets-fixture";
 
 // Every export calls through to its own code; the spies only count calls from other modules.

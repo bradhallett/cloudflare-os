@@ -32,11 +32,12 @@ import {
   computeReplaceOperations, docTabToMarkdown, markdownToDocRequests, MARKDOWN_RENDERING_VERSION,
   type DocTabSnapshot, type EditableMarkdown,
 } from "./markdown-converter";
-import { DriveApi, DriveApiRequestError } from "./drive-api";
+import { DriveApi, isAccountWideRefusal } from "./drive-api";
+import { GoogleApiError } from "./google-response";
 import { driveModifiedTime } from "./drive-session";
 import type { GoogleVerifierApi } from "./google-verifier-types";
 import { AccessTokenCache, type AccessTokenRequest } from "./auth-retry";
-import { Mutex } from "./mutex";
+import { SerialTaskQueue } from "@gadgets/gatekeeper-kit/serial-queue";
 import { nativeFileUrl } from "./resources";
 import { explainUnopenedFile, officeFileError, officeLabel } from "./office-conversion";
 import { obsContext } from "./observability.js";
@@ -614,7 +615,7 @@ export class GoogleDocGatekeeperImpl
   // of it both see it pending. Interleaved, both fetch the document and the loser writes content the
   // winner already committed; the write marker is no defence, since the winner's cleanup deletes it
   // before the loser looks. Two approvals of a creation would likewise create two documents.
-  #actions = new Mutex();
+  #actions = new SerialTaskQueue();
   #tokens = new AccessTokenCache(opts => {
     let account = this.ctx.exports.UserAccount.get(
         this.ctx.exports.UserAccount.idFromString(this.#bound.userObjectId));
@@ -1073,8 +1074,8 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
       // Only a refused grant means no signal will ever arrive. A quota 403 (also 403), an outage
       // or a malformed body are transient or fixable, and dating the document from one would
       // report a changed document as unchanged for as long as Drive stays unhealthy.
-      let refusedGrant = error instanceof DriveApiRequestError && error.status === 403 &&
-          !error.isAccountWide;
+      let refusedGrant = error instanceof GoogleApiError && error.status === 403 &&
+          !isAccountWideRefusal(error);
       if (!refusedGrant) throw error;
       logger.warn("no Drive grant to date a Google Doc that has no revision", {
         event: "google.doc.metadata.drive.ungranted", error,

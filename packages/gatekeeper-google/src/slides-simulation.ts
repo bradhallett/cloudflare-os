@@ -17,7 +17,7 @@ import {
 } from "@gadgets/gatekeeper-kit/simulation";
 import type { RestPage, RestPageElement, RestSlide, RestThemePage } from "./slides-api";
 import { designDeck, pageOf, slideIdOf, type DesignChange } from "./slides-design";
-import { ChangeConflict } from "./slides-text";
+import { ChangeConflict } from "./office-text";
 
 /** A slide as it was when a change was queued, so the approver can recognize it. */
 export type SlideLabel = { number: number; title?: string };

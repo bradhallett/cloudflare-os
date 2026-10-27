@@ -43,7 +43,7 @@ describe("officeFileError", () => {
   });
 });
 
-const refused = () => new GoogleApiError("Google API request failed [http=400]", "FAILED_PRECONDITION");
+const refused = () => new GoogleApiError("Google API request failed [http=400]", 400, "FAILED_PRECONDITION");
 
 describe("explainUnopenedFile", () => {
 
@@ -73,7 +73,7 @@ describe("explainUnopenedFile", () => {
   });
 
   it("keeps the original error, and asks Drive nothing, for any other status", async () => {
-    let denied = new GoogleApiError("Google Slides get failed [http=403]", "PERMISSION_DENIED");
+    let denied = new GoogleApiError("Google Slides get failed [http=403]", 403, "PERMISSION_DENIED");
     let mimeType = vi.fn(async () => PPTX);
     await expect(explainUnopenedFile("slides", denied, mimeType)).resolves.toBe(denied);
     let plain = new Error("network down");

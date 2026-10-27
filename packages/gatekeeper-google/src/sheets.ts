@@ -12,7 +12,6 @@ import {
 import { DriveApi } from "./drive-api";
 import { unguardedNativeRead, type NativeRead } from "./drive-session";
 import type { GoogleVerifierApi } from "./google-verifier-types";
-import { Mutex } from "./mutex";
 import { explainUnopenedFile } from "./office-conversion";
 import { ReadGate } from "./read-gate";
 import { nativeFileUrl } from "./resources";
@@ -143,7 +142,7 @@ const NOT_CREATED: SheetsChangeQueue = {
 export class GoogleSheetsGatekeeperImpl
     extends DurableObject<Env, GoogleSheetsGatekeeperImplProps>
     implements Gatekeeper<GoogleSpreadsheetSession> {
-  #creating = new Mutex();
+  #creating = new SerialTaskQueue();
   #tokens = new AccessTokenCache(opts => {
     let account = this.ctx.exports.UserAccount.get(
       this.ctx.exports.UserAccount.idFromString(this.#bound.userObjectId),

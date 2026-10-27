@@ -10,6 +10,7 @@ import { createMimeMessage } from "mimetext/browser";
 import PostalMime, { addressParser } from "postal-mime";
 import type {Attachment as PostalAttachment} from "postal-mime";
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
+import { GoogleApiError } from "./google-response";
 
 /**
  * Internal type for parsed message info with raw label IDs (not yet resolved
@@ -1750,13 +1751,6 @@ async function readErrorText(response: Response, maxBytes = 4096): Promise<strin
   return new TextDecoder().decode(bytes);
 }
 
-/** A status-only provider error that is safe to use for retry decisions and server logs. */
-export class GmailApiError extends Error {
-  constructor(public readonly status: number, operation: string) {
-    super(`Gmail API ${operation} failed [http=${status}]`);
-  }
-}
-
 async function gmailApiFailure(operation: string, response: Response): Promise<never> {
   // Gmail error prose can reflect query and header values. Keep thrown errors safe to log.
   try {
@@ -1764,7 +1758,7 @@ async function gmailApiFailure(operation: string, response: Response): Promise<n
   } catch {
     // Cancellation is best-effort; the HTTP status remains authoritative.
   }
-  throw new GmailApiError(response.status, operation);
+  throw new GoogleApiError(`Gmail API ${operation} failed [http=${response.status}]`, response.status);
 }
 
 function headerValue(
@@ -3263,7 +3257,7 @@ export class GmailApi {
   /**
    * One page of the messages added to the mailbox after `startHistoryId`, by history record.
    * Each message is partial: `labelIds` is what it arrived with, and is not guaranteed present.
-   * A `GmailApiError` with status 404 means `startHistoryId` is too old to read from.
+   * A `GoogleApiError` with status 404 means `startHistoryId` is too old to read from.
    */
   async listMessagesAdded(startHistoryId: string, pageToken?: string): Promise<{
     records: Array<{id: string; messages: Array<{id: string; threadId: string; labelIds?: string[]}>}>;

@@ -3,7 +3,7 @@ import type {
   SpreadsheetValueMode,
 } from "./sheets-read-types";
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
-import { readGoogleJson } from "./google-response";
+import { GoogleApiError, readGoogleJson } from "./google-response";
 import {
   baseFormats, FORMAT_READ_FIELDS, type BaseFormats, type RestFormatSheet,
 } from "./sheets-format";
@@ -110,9 +110,9 @@ export type SpreadsheetMetadata = Omit<SpreadsheetInfo, "sheets"> & {
 };
 
 /** A `batchUpdate` Google answered with a 4xx status, so it applied none of the requests. */
-export class SheetsWriteRefused extends Error {
-  constructor(readonly status: number) {
-    super(`Google Sheets refused the update [http=${status}]`);
+export class SheetsWriteRefused extends GoogleApiError {
+  constructor(status: number) {
+    super(`Google Sheets refused the update [http=${status}]`, status);
   }
 }
 

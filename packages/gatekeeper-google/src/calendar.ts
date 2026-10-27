@@ -17,8 +17,9 @@ import { validateRpc } from "capnweb-validate";
 import { buildDescription, codeSpan } from "@gadgets/gatekeeper-kit/action-description";
 import {
   calendarEventOverlaps, calendarEventSortKey, eventPatchToGoogle, GoogleCalendarApi,
-  GoogleCalendarApiError, validateCalendarTimeWindow,
+  validateCalendarTimeWindow,
 } from "./calendar-api";
+import { GoogleApiError } from "./google-response";
 import type {
   CalendarAvailabilityMode, CalendarEvent, CalendarEventDraft, CalendarEventPatch,
   CalendarListEventsOptions, CalendarSendUpdates, CalendarTime, GoogleCalendarCapabilities,
@@ -208,7 +209,7 @@ function summarizePeople(people: string[]): string {
  * write provably did not land and the action can safely return to pending.
  */
 function isCalendarOutcomeUnknown(error: unknown): boolean {
-  return (error instanceof GoogleCalendarApiError && error.status >= 500) ||
+  return (error instanceof GoogleApiError && error.status >= 500) ||
       error instanceof TypeError;
 }
 

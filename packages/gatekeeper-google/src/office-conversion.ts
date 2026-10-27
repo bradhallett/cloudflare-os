@@ -3,7 +3,7 @@
 
 import type { AccessTokenProvider } from "./auth-retry";
 import {
-  conversionError, CONVERTED_FROM_PROPERTY, DriveApi, DriveApiRequestError, isDriveFileId,
+  conversionError, CONVERTED_FROM_PROPERTY, DriveApi, isDriveFileId,
   isInsufficientScope,
   type DriveConversionSource, type DriveCopyLocation,
 } from "./drive-api";
@@ -112,7 +112,7 @@ export function nonNativeFileError(kind: OfficeKind): Error {
 export async function explainUnopenedFile(
   kind: OfficeKind, error: unknown, mimeType: () => Promise<string | undefined>,
 ): Promise<unknown> {
-  if (!(error instanceof GoogleApiError) || error.providerStatus !== "FAILED_PRECONDITION") {
+  if (!(error instanceof GoogleApiError) || error.rpcCode !== "FAILED_PRECONDITION") {
     return error;
   }
   let type = await mimeType().catch(() => undefined);
@@ -211,8 +211,8 @@ export class OfficeConversion {
       let explained = conversionError(error);
       logger.warn("failed to convert an Office file", {
         event: "google.office.failed", conversionKind: this.#kind, fileId, method,
-        ...(error instanceof DriveApiRequestError ? {
-          httpStatus: error.status, ...(error.reason ? { providerReasons: [error.reason] } : {}),
+        ...(error instanceof GoogleApiError ? {
+          httpStatus: error.status, ...(error.rpcCode ? { providerReasons: [error.rpcCode] } : {}),
         } : {}),
         error: explained,
       });

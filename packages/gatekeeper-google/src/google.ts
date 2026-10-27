@@ -71,7 +71,8 @@ import DRIVE_CONFIGURATOR_HTML from "./generated/drive-configurator-ui.txt";
 import GOOGLE_LOGO_SVG from "./google-logo.svg";
 import { obsContext } from "./observability.js";
 import { AccessTokenRequest, ACCESS_TOKEN_EXPIRY_SAFETY_MS } from "./auth-retry";
-import { Mutex } from "./mutex";
+import { SerialTaskQueue } from "@gadgets/gatekeeper-kit/serial-queue";
+import { GoogleApiError } from "./google-response";
 import {
   BIGQUERY_RESOURCE,
   GMAIL_RESOURCE,
@@ -458,7 +459,7 @@ export class UserAccount extends DurableObject<Env> {
   // without this a single invalidated token has every concurrent caller mint its own — a burst
   // against Google's token endpoint that may get rate-limited, turning a recoverable 401 into a hard
   // failure. It also keeps a mint from interleaving with credentials being replaced or wiped.
-  #credentials = new Mutex();
+  #credentials = new SerialTaskQueue();
 
   // The last mint that failed permanently — revoked credentials, or a scope an admin has blocked.
   #mintFailure: { error: Error; at: number } | undefined;
@@ -1100,14 +1101,6 @@ type GoogleVerifierProps = {
   userObjectId: string;
 };
 
-// Extract the HTTP status from the ad-hoc Error messages thrown by the Google API helpers
-// (which embed it as `: <status> ` or `[http=<status>]`). Returns undefined if not found.
-function httpStatusFromError(error: unknown): number | undefined {
-  if (!(error instanceof Error)) return undefined;
-  let m = error.message.match(/\[http=(\d{3})\]/) ?? error.message.match(/:\s(\d{3})(?:\s|$)/);
-  return m ? Number(m[1]) : undefined;
-}
-
 // True if an error means "the observer's token cannot access this resource" (as opposed to a
 // transient failure, which is rethrown so the open fails loudly rather than silently denying).
 function isNoAccessStatus(status: number | undefined): boolean {
@@ -1139,7 +1132,7 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
       await api.getDocumentMetadata(documentId);
       return true;
     } catch (error) {
-      if (isNoAccessStatus(httpStatusFromError(error))) return false;
+      if (isNoAccessStatus(error instanceof GoogleApiError ? error.status : undefined)) return false;
       throw error;
     }
   }
@@ -1150,7 +1143,7 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
       await api.getSpreadsheet(spreadsheetId);
       return true;
     } catch (error) {
-      if (isNoAccessStatus(httpStatusFromError(error))) return false;
+      if (isNoAccessStatus(error instanceof GoogleApiError ? error.status : undefined)) return false;
       throw error;
     }
   }
@@ -1161,7 +1154,7 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
       await api.getPresentationTitle(presentationId);
       return true;
     } catch (error) {
-      if (isNoAccessStatus(httpStatusFromError(error))) return false;
+      if (isNoAccessStatus(error instanceof GoogleApiError ? error.status : undefined)) return false;
       throw error;
     }
   }
@@ -1175,7 +1168,7 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
     try {
       return hasCalendarPrivateAccessRole(await api.getCalendar(calendarId));
     } catch (error) {
-      if (isNoAccessStatus(httpStatusFromError(error))) return false;
+      if (isNoAccessStatus(error instanceof GoogleApiError ? error.status : undefined)) return false;
       throw error;
     }
   }
@@ -1185,7 +1178,7 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
     try {
       return await api.hasFreeBusyAccess(calendarId);
     } catch (error) {
-      if (isNoAccessStatus(httpStatusFromError(error))) return false;
+      if (isNoAccessStatus(error instanceof GoogleApiError ? error.status : undefined)) return false;
       throw error;
     }
   }
@@ -1196,7 +1189,7 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
       await api.getDataset(projectId, datasetId);
       return true;
     } catch (error) {
-      if (isNoAccessStatus(httpStatusFromError(error))) return false;
+      if (isNoAccessStatus(error instanceof GoogleApiError ? error.status : undefined)) return false;
       throw error;
     }
   }

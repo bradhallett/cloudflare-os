@@ -31,7 +31,7 @@ import {
   type DesignBatch, type SlideLabel, type SlidesActions, type ThemeLabel,
 } from "./slides-simulation";
 import { elementIdsOf, locate, textOfTarget, type TextAddress } from "./slides-target";
-import { ChangeConflict, projectedText, richTextOf } from "./slides-text";
+import { ChangeConflict, projectedText, richTextOf } from "./office-text";
 import type { ShapeOutline, TextFormatChange } from "./slides-types";
 
 const logger = obsContext.createLogger({ component: "gatekeeper.google.slides", vendorId: "google" });

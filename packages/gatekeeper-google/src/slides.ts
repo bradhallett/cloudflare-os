@@ -12,7 +12,6 @@ import {
 import { DriveApi } from "./drive-api";
 import { unguardedNativeRead, type NativeRead } from "./drive-session";
 import type { GoogleVerifierApi } from "./google-verifier-types";
-import { Mutex } from "./mutex";
 import { explainUnopenedFile } from "./office-conversion";
 import { ReadGate } from "./read-gate";
 import { nativeFileUrl } from "./resources";
@@ -34,7 +33,7 @@ import {
   type SlidesActions, type ThemeLabel,
 } from "./slides-simulation";
 import { elementIdsOf } from "./slides-target";
-import { ChangeConflict } from "./slides-text";
+import { ChangeConflict } from "./office-text";
 import type { GooglePresentationReadSession } from "./slides-read-types";
 import type { GooglePresentationSession, SlideChange } from "./slides-types";
 import { SLIDES_TYPES_MODULE_PREFIX, stripTypeModulePrefix } from "./type-bundle";
@@ -91,7 +90,7 @@ export type SlidesChangeQueue = {
 export class GoogleSlidesGatekeeperImpl
     extends DurableObject<Env, GoogleSlidesGatekeeperImplProps>
     implements Gatekeeper<GooglePresentationSession> {
-  #creating = new Mutex();
+  #creating = new SerialTaskQueue();
   #tokens = new AccessTokenCache(opts => {
     let account = this.ctx.exports.UserAccount.get(
       this.ctx.exports.UserAccount.idFromString(this.#bound.userObjectId),
