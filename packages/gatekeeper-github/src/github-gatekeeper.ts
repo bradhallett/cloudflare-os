@@ -900,7 +900,13 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       { undispatched: true });
   }
 
+  /**
+   * Whether a queued action cannot apply once the provisional resource is gone: it targets it,
+   * or its text names it (`#~N`, which apply would fail to rewrite -- see
+   * `referenceBearingTexts`).
+   */
   #actionDependsOnResource(action: GitHubAction, kind: EntityKind, provisionalId: string): boolean {
+    if (referenceBearingTexts(action).some(text => textReferences(text, provisionalId))) return true;
     switch (action.type) {
       case "createIssue":
       case "createPullRequest":
@@ -912,31 +918,53 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
   }
 
-  #rejectActionsForResource(kind: EntityKind, provisionalId: string): void {
+  /**
+   * A provisional resource will never exist: retire every pending action that depends on it
+   * (`#actionDependsOnResource`) and forget the provisional itself. A retired action may be a
+   * *create* -- an issue whose body cites the doomed pull request -- whose own provisional then
+   * never exists either, so the cascade recurses through it; otherwise a comment queued on that
+   * issue would stay pending and fail every apply.
+   */
+  #retireProvisional(kind: EntityKind, provisionalId: string): void {
+    this.ctx.storage.kv.delete(`provisional:${provisionalId}`);
     for (const pending of this.#listPendingActions()) {
-      if (this.#actionDependsOnResource(pending, kind, provisionalId)) {
-        this.#markActionRejected(pending);
+      if (!this.#actionDependsOnResource(pending, kind, provisionalId)) continue;
+      // A nested cascade may have retired this one already (it depended on both).
+      if (this.#actions.get(pending.approvalId)?.state !== "pending") continue;
+      this.#markActionRejected(pending);
+      if (pending.type === "createIssue" || pending.type === "createPullRequest") {
+        this.#retireProvisional(pending.type === "createIssue" ? "issue" : "pull", pending.provisionalId);
       }
     }
   }
 
   /**
-   * Discards a push along with every queued `createPullRequest` whose head or base is the push's
-   * branch, if that branch no longer exists without it -- on the remote or as the outcome of the
-   * remaining queued pushes -- and everything queued against the doomed pull request. A push no
-   * create depends on is discarded without reading GitHub, so a dead connection cannot block it.
-   * Otherwise the branch is read before anything is marked, so a failed read leaves the push
-   * pending and a retried discard still cascades; everything after the read runs without
-   * yielding, so a pull request queued during it is cascaded too, and a push applied during it
-   * is refused rather than overwritten as discarded. Returns whether anything was cascaded.
+   * Discards a push along with the queued actions stranded on heads that will now never be
+   * reached (`#rejectActionsStrandedByPush`) and the pull requests the missing-branch sweep
+   * dooms. The branch is read before anything is marked when anything queued touches it, so a
+   * failed read leaves the push pending and a retried discard still cascades; everything after
+   * the read runs without yielding, so a pull request queued during it is cascaded too, and a
+   * push applied during it is refused rather than overwritten as discarded. A push nothing
+   * touches is discarded without reading GitHub, so a dead connection cannot block it. Returns
+   * whether anything was cascaded.
    */
   async #rejectPush(push: PushAction): Promise<boolean> {
-    const dependsOnBranch = (action: GitHubAction): action is CreatePullRequestAction =>
-      action.type === "createPullRequest" &&
-      (action.options.head === push.branch || action.options.base === push.branch);
-    // `undefined`: not read, since nothing depended on the branch (and without an await, nothing
-    // can be queued before the mark); `null`: the branch does not exist on GitHub.
-    const realHead = this.#listPendingActions().some(dependsOnBranch)
+    const touchesBranch = (action: GitHubAction): boolean => {
+      switch (action.type) {
+        case "createPullRequest":
+          return action.options.head === push.branch || action.options.base === push.branch;
+        case "push":
+          return action.branch === push.branch;
+        case "mergePullRequest":
+          return action.headBranch === push.branch;
+        default:
+          return false;
+      }
+    };
+    // `undefined`: not read, since nothing queued touches the branch (and without an await,
+    // nothing can be queued before the mark); `null`: the branch does not exist on GitHub.
+    const realHead = this.#listPendingActions().some(
+      action => action.approvalId !== push.approvalId && touchesBranch(action))
       ? await this.#withApi(api => api.getBranchHead(this.ctx.props.owner, this.ctx.props.repo, push.branch))
       : undefined;
     // The read yields, so a concurrent apply or discard may have settled the push meanwhile.
@@ -947,13 +975,70 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     if (state === "failed") return false;
     // Marked before simulating, which takes the push out of the queued pushes it overlays.
     this.#markActionRejected(push);
-    if (realHead === undefined || this.#simulateBranchHead(push.branch, realHead) !== null) return false;
-    const creates = this.#listPendingActions().filter(dependsOnBranch);
-    for (const create of creates) {
-      this.#rejectActionsForResource("pull", create.provisionalId);  // the create included
-      this.ctx.storage.kv.delete(`provisional:${create.provisionalId}`);
+    return await this.#rejectActionsStrandedByPush(push, realHead ?? null);
+  }
+
+  /**
+   * Cascade for a rejected push: retire the queued actions stranded on a head that will now
+   * never be reached, then those the missing-branch check dooms
+   * (`#rejectPullRequestsForMissingBranches`). A head is stranded when the push that would
+   * leave it is retired, no other queued push to the branch would leave it too, and the branch
+   * is not there already (pushed by other means, the head needs no push, and what is bound to
+   * it can still apply; a branch that cannot be read counts as elsewhere). A push bound to a
+   * stranded head (`expectedOldSha`) could only fail its compare-and-swap -- with an error
+   * blaming the branch for moving -- and strands its own new head in turn; a merge bound to one
+   * (`expectedHeadSha`) could only be refused. Only a rejection strands a head: a branch moved
+   * by anyone else is the compare-and-swap's to report at apply. Returns whether anything
+   * cascaded.
+   */
+  async #rejectActionsStrandedByPush(rejected: PushAction, liveHead: string | null): Promise<boolean> {
+    const { branch } = rejected;
+    let cascaded = false;
+    const stranded = [rejected.newSha];
+    for (let head = stranded.pop(); head !== undefined; head = stranded.pop()) {
+      const pending = this.#listPendingActions();
+      if (head === liveHead || pending.some(
+        action => action.type === "push" && action.branch === branch && action.newSha === head)) continue;
+      for (const action of pending) {
+        if (action.type === "push" && action.branch === branch && action.expectedOldSha === head) {
+          this.#markActionRejected(action);
+          stranded.push(action.newSha);
+          cascaded = true;
+        } else if (action.type === "mergePullRequest" && action.headBranch === branch &&
+          action.expectedHeadSha === head) {
+          this.#markActionRejected(action);
+          cascaded = true;
+        }
+      }
     }
-    return creates.length > 0;
+    return await this.#rejectPullRequestsForMissingBranches() || cascaded;
+  }
+
+  /**
+   * Cascade for a rejected push: reject every queued `createPullRequest` whose head or base
+   * branch no longer exists on the remote or as the outcome of the remaining queued pushes,
+   * along with everything queued against the doomed pull request. Returns whether anything
+   * cascaded.
+   */
+  async #rejectPullRequestsForMissingBranches(): Promise<boolean> {
+    const creates = this.#listPendingActions()
+      .filter((action): action is CreatePullRequestAction => action.type === "createPullRequest");
+    const branches = [...new Set(creates.flatMap(action => [action.options.head, action.options.base]))];
+    const heads = new Map(await Promise.all(branches.map(async branch =>
+      [branch, await this.#withApi(
+        api => api.getBranchHead(this.ctx.props.owner, this.ctx.props.repo, branch))] as const)));
+    let cascaded = false;
+    for (const pending of creates) {
+      for (const branch of [pending.options.head, pending.options.base]) {
+        if (this.#simulateBranchHead(branch, heads.get(branch)!) === null) {
+          this.#markActionRejected(pending);
+          this.#retireProvisional("pull", pending.provisionalId);
+          cascaded = true;
+          break;
+        }
+      }
+    }
+    return cascaded;
   }
 
   #rejectReplyDependencyChain(rootCommentIds: string[]): void {
@@ -2752,9 +2837,6 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     } else if (this.#listPendingActions().some(leavesExpected)) {
       reason = `The push cannot be applied yet: it builds on ${expected}, the head the queued ` +
         `push to "${branch}" will leave. Approve that push first, then this one.`;
-    } else if (this.#actions.listFailed().some(({ action }) => leavesExpected(action))) {
-      reason = `The push cannot be applied: it builds on ${expected}, the head of a discarded ` +
-        `push to "${branch}". Re-push your commits from the branch's current head.`;
     } else {
       reason = `The push cannot be applied: branch "${branch}" has moved from ${expected}, the ` +
         `head it was approved against. Re-observe the branch and queue a fresh push against ` +
@@ -2826,8 +2908,9 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
 
     if (action.type === "push") {
       // A queued pull request may depend on this push for its head (or base) branch to exist at
-      // all. With the push rejected, such a pull request can never be created -- cascade-reject
-      // it (and, transitively, everything queued against it), mirroring how rejecting a
+      // all, and pushes or merges may be stacked on the head it would leave -- with the push
+      // rejected, none of those can ever apply -- so cascade-reject them (and, transitively,
+      // everything queued against the doomed pull requests), mirroring how rejecting a
       // provisional create rejects its dependents. A pull request whose branches still exist --
       // really, or through the remaining queued pushes -- is left queued: a later push can still
       // deliver the branch content.
@@ -2838,8 +2921,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
 
     this.#markActionRejected(action);
     if (action.type === "createIssue" || action.type === "createPullRequest") {
-      this.#rejectActionsForResource(action.type === "createIssue" ? "issue" : "pull", action.provisionalId);
-      this.ctx.storage.kv.delete(`provisional:${action.provisionalId}`);
+      this.#retireProvisional(action.type === "createIssue" ? "issue" : "pull", action.provisionalId);
       this.#clearCaches();
       return { restart: true };
     }

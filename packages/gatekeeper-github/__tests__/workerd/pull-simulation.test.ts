@@ -16,8 +16,8 @@ import type {
   GitHubCommitFilter, GitHubCreatePullRequestOptions, GitHubPullRequestMergeOptions,
 } from "../../src/types";
 import type {
-  CreatePullRequestActionData, GatekeeperProps, MergePullRequestActionData, Outcome,
-  PushActionData,
+  CreatePullRequestActionData, GatekeeperProps, GitHubActionData, MergePullRequestActionData,
+  Outcome, PushActionData,
 } from "./worker";
 
 const OWNER = "acme";
@@ -430,6 +430,10 @@ async function repoGatekeeper() {
       unwrap(hooks.submitMerge(scenario, props, stubOf(queue), action, {
         title: "merge", description: "test merge", implementsRevert: false,
       })),
+    /** Submits a hand-built action record (creates and comments the helpers don't cover). */
+    submitHandBuilt: (action: GitHubActionData) =>
+      unwrap(hooks.submitAction(scenario, props, stubOf(new TestApprovalQueue()), action as never,
+        { title: "test", description: "test", implementsRevert: false })),
     applyAction: (actionId: number, cache: TestGitCache) =>
       unwrap(hooks.applyAction(scenario, props, actionId, stubOf(cache))),
     rejectAction: (actionId: number) => unwrap(hooks.rejectAction(scenario, props, actionId)),
@@ -742,6 +746,77 @@ describe("push rejection cascade", () => {
     // Still pending: applying it now creates the pull request (both branches exist).
     await gk.applyAction(pr.approvalId, cache);
     expect((await gk.openPullRequest(pr.provisionalId, cache)).id).toBe("7");
+  });
+
+  it("retires the pushes and merges stacked on the rejected push's head", async () => {
+    const github = scenarioGitHub();
+    github.pulls.set(7, pullResponse(7, { ref: "main", sha: BASE }, { ref: "main", sha: BASE }));
+    const gk = await repoGatekeeper();
+    const cache = scenarioCache()
+      .withObject(HEAD2, "commit", commitPayload(TREE_1, [HEAD1], "second"))
+      .withAncestry(HEAD1, HEAD2);
+    const atBase = await queueMerge(gk, "7");   // main's head, as GitHub has it
+    const push = await queuePush(gk, cache, "main", HEAD1);
+    const atHead1 = await queueMerge(gk, "7");  // bound behind the push
+    const stacked = await queuePush(gk, cache, "main", HEAD2);
+    expect(atHead1.action).toMatchObject({ expectedHeadSha: HEAD1, headBranch: "main" });
+    expect(stacked.expectedOldSha).toBe(HEAD1);
+
+    // The stacked push's compare-and-swap could only fail -- blaming the branch for moving --
+    // and the merge bound to the head that will never exist could only be refused, so the
+    // rejection retires both; the merge bound to the head main already has is untouched.
+    expect(await gk.rejectAction(push.approvalId)).toEqual({ restart: true });
+    for (const { approvalId } of [stacked, atHead1.action]) {
+      await expect(gk.applyAction(approvalId, cache))
+        .rejects.toThrow(/was discarded, or something it depended on was/);
+    }
+    await gk.applyAction(atBase.action.approvalId, cache);
+    expect(github.merges.at(-1)).toBe(BASE);
+  });
+  it("spares what is stacked on a head the branch already has", async () => {
+    const github = scenarioGitHub();
+    const gk = await repoGatekeeper();
+    const cache = scenarioCache()
+      .withObject(HEAD2, "commit", commitPayload(TREE_1, [HEAD1], "second"))
+      .withAncestry(HEAD1, HEAD2);
+    const push = await queuePush(gk, cache, "main", HEAD1);
+    const stacked = await queuePush(gk, cache, "main", HEAD2);
+
+    // HEAD1 reached main by other means while the push that would leave it was queued: rejecting
+    // that push strands nothing, and the push stacked on HEAD1 still applies.
+    github.branches.set("main", HEAD1);
+    expect(await gk.rejectAction(push.approvalId)).toBeUndefined();
+    github.respondToPush("unpack ok", "ok refs/heads/main");
+    await gk.applyAction(stacked.approvalId, cache);
+  });
+
+  it("retires a create whose text cites a doomed provisional, recursively", async () => {
+    scenarioGitHub();
+    const gk = await repoGatekeeper();
+    const cache = scenarioCache();
+    const push = await queuePush(gk, cache, "feature", HEAD1);
+    const pr = await queuePullRequest(gk, { title: "Add new.txt", head: "feature", base: "main" });
+    const issue = {
+      approvalId: 901, submittedAt: 0, owner: OWNER, repo: REPO, type: "createIssue" as const,
+      provisionalId: "~97",
+      options: { title: "Tracking", bodyMarkdown: `Implements #${pr.provisionalId}` },
+    };
+    const comment = {
+      approvalId: 902, submittedAt: 0, owner: OWNER, repo: REPO, type: "postComment" as const,
+      targetKind: "issue" as const, targetId: "~97", bodyMarkdown: "Noted",
+      provisionalCommentId: "~comment97",
+    };
+    await gk.submitHandBuilt(issue);
+    await gk.submitHandBuilt(comment);
+
+    // Rejecting the push dooms the pull request's create (its head branch is gone); the issue's
+    // create dies with it because its body cites the doomed provisional, and the comment queued
+    // on that issue dies with the issue.
+    expect(await gk.rejectAction(push.approvalId)).toEqual({ restart: true });
+    for (const { approvalId } of [pr, issue, comment]) {
+      await expect(gk.applyAction(approvalId, cache))
+        .rejects.toThrow(/was discarded, or something it depended on was/);
+    }
   });
 });
 
