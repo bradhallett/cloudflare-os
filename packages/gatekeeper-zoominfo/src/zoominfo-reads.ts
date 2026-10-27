@@ -4,7 +4,7 @@
 // request against it, settling with whether ZoomInfo ever answered.
 
 import { createLogger } from "@gadgets/observability/logger";
-import { ZoomInfoTransportError } from "./zoominfo-api";
+import { isOutcomeUnknown } from "./zoominfo-api";
 import { VENDOR_ID } from "./zoominfo-env";
 
 const logger = createLogger<{ vendorId: string }>({ component: "gatekeeper.zoominfo", vendorId: VENDOR_ID });
@@ -58,7 +58,10 @@ export async function withinReadLimit<T>(budget: ReadBudget, read: () => Promise
     spent = true;
     return result;
   } catch (error) {
-    if (error instanceof ZoomInfoTransportError) spent = true;
+    // Anything that leaves whether ZoomInfo answered unknown -- a lost answer, and a 5xx, which
+    // still proves the request reached ZoomInfo and was counted -- keeps the reservation spent,
+    // per the policy the doc comment above states.
+    if (isOutcomeUnknown(error)) spent = true;
     throw error;
   } finally {
     if (reservation.day !== undefined) {
