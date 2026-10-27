@@ -575,6 +575,49 @@ describe("provisional pull request over a queued branch-creation push", () => {
       .toEqual([["extra.txt", "added"], ["hello.txt", "modified"], ["new.txt", "added"]]);
   });
 
+  it("picks the merge base of the queued head's whole ancestry, not just the anchor", async () => {
+    // A local merge whose side branch descends from main's newest commit: the first-parent walk
+    // anchors at BASE, but the side branch reaches M1, so the merge base GitHub will compute
+    // once the push lands is M1 -- the pairwise (main, anchor) answer BASE would fold M1's
+    // changes into the pull request's diff.
+    const github = scenarioGitHub();
+    const M1 = "e".repeat(40), S1 = "f".repeat(40), F1 = "cd".repeat(20), MERGE = "ab".repeat(20);
+    github.branches.set("main", M1);
+    github.restCommits.set(M1, { sha: M1, message: "on main", parents: [BASE], tree: TREE_BASE });
+    github.restCommits.set(S1, { sha: S1, message: "side", parents: [M1], tree: TREE_BASE });
+    github.compares.set(`main...${BASE}`, {
+      base_commit: { sha: M1 }, merge_base_commit: { sha: BASE },
+      commits: [{ sha: M1, message: "on main", parents: [BASE] }], total_commits: 1, files: [],
+    });
+    // The pairwise merge base against the side branch's frontier commit, then the two
+    // depth contests: BASE is one commit behind main's head, M1 none.
+    github.compares.set(`${M1}...${S1}`, {
+      base_commit: { sha: M1 }, merge_base_commit: { sha: M1 },
+      commits: [], total_commits: 0, files: [],
+    });
+    github.compares.set(`${BASE}...main`, {
+      base_commit: { sha: BASE }, merge_base_commit: { sha: BASE },
+      commits: [{ sha: M1, message: "on main", parents: [BASE] }], total_commits: 1, files: [],
+    });
+    github.compares.set(`${M1}...main`, {
+      base_commit: { sha: M1 }, merge_base_commit: { sha: M1 },
+      commits: [], total_commits: 0, files: [],
+    });
+    const gk = await repoGatekeeper();
+    const cache = scenarioCache()
+      .withObject(F1, "commit", commitPayload(TREE_1, [BASE], "feat: first parent"))
+      .withObject(MERGE, "commit", commitPayload(TREE_1, [F1, S1], "merge: fold in the side branch"));
+    const push = await queuePush(gk, cache, "feature", MERGE);
+    expect(push.expectedOldSha).toBe("0".repeat(40));
+    const pr = await queuePullRequest(gk, { title: "Fold in the side branch", head: "feature", base: "main" });
+
+    const diff = await gk.pullDiffAll(pr.provisionalId, cache);
+    expect(diff.revision).toEqual({ baseSha: M1, headSha: MERGE, mergeBaseSha: M1 });
+
+    const details = await gk.openPullRequest(pr.provisionalId, cache);
+    expect(details.commits).toBe(3);  // M1 plus the pending merge and its first parent
+  });
+
   it("falls back to GitHub's compare once the push has been applied", async () => {
     const github = scenarioGitHub();
     const gk = await repoGatekeeper();

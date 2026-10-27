@@ -248,6 +248,9 @@ const MAX_REPLY_TARGET_HOPS = 50;
 // Cap on the queued-but-not-yet-pushed commits walked when simulating a branch's history
 // (mirrors GitHub's own 250-commit cap on compare listings).
 const MAX_PENDING_CHAIN_COMMITS = 250;
+/** Cap on the GitHub-known frontier a simulated merge-base fold will consider, mirroring
+ * GitLab's URL-length cap: past it the read fails and callers degrade to remote reads. */
+const MAX_FRONTIER_COMMITS = 25;
 // Applied actions stay revertible while they are among the newest this many; older ones are
 // retired by the retention sweep (`#housekeepRetained`).
 const RETAINED_ACTION_LIMIT = 200;
@@ -3243,43 +3246,56 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
    * Walk a simulated branch head down to its **anchor** -- the first commit GitHub already knows
    * -- reading the not-yet-pushed commits from the workspace git cache (which serves this
    * gatekeeper's queued-push closure, pulling objects through on demand). Returns the pending
-   * first-parent chain newest-first (what simulated listings show), its anchor, and `pending`:
-   * every commit reachable from `head` that GitHub lacks, a local merge's side branches included.
-   * A chain that leaves the cache or bottoms out with no GitHub-known ancestor throws, as does
-   * exceeding the cap, and callers degrade.
+   * first-parent chain newest-first (what simulated listings show), its anchor, the frontier of
+   * GitHub-known commits its whole ancestry ends at, and `pending`: every commit the walk found
+   * GitHub lacks, a local merge's side branches included. The walk, and so every listing built
+   * from it, follows first parents only, where GitHub's own history lists every parent: a local
+   * merge's side branch is missing from simulated listings until its push lands (a known gap --
+   * matching GitHub would mean date-merging the remote history behind each side parent). A chain
+   * that leaves the cache or bottoms out with no GitHub-known ancestor throws, as does exceeding
+   * the cap, and callers degrade.
    *
    * Every pending id is recorded in `#servedSimulatedCommitIds`, so sessions withhold it from
    * advertising: listed summaries name their parents, and a side parent advertised as
    * remote-known would be left out of the push's pack, which GitHub then rejects.
    *
-   * `realHead` is the branch's remote head, the one ancestor known without a probe. It is the
-   * only base the pushes `#simulateBranchHead` consumes start from: every other expectation in
-   * that chain is a pending newSha, and a push stranded by a rejection is never consumed, so its
-   * never-received expectation must not pass as GitHub's.
+   * `realHead` is the branch's remote head, the one ancestor known without a probe. Beyond it, a
+   * push's expectedOldSha is usually known to GitHub without a probe too: it was read from the
+   * remote at queue time. Stacked pushes bind each expectedOldSha to the previous queued push's
+   * newSha (a pending commit), so those are excluded from the known set and the walk continues to
+   * the real anchor. Rejecting a push retires the pushes stacked on it
+   * (`#rejectActionsStrandedByPush`), so no pending push is left bound to a head that will never
+   * exist, which this would take for GitHub's.
    */
   async #collectPendingChain(
     gitCache: RpcStub<GitCache>, head: GitOid, realHead: string | null,
   ): Promise<{
     commits: { summary: GitHubCommitSummary; tree: GitOid }[];
     anchor: GitOid;
+    /** The commits GitHub has where the pending commits' whole ancestry ends: the anchor first. */
+    frontier: GitOid[];
+    /** Every commit the walk found GitHub lacks, side branches' included: none may be advertised. */
     pending: GitOid[];
   }> {
+    const pendingNewShas = new Set(this.#pendingPushActions().map(action => action.newSha));
+    const knownShas = new Set(this.#pendingPushActions()
+      .map(action => action.expectedOldSha)
+      .filter(sha => sha !== ZERO_OID && !pendingNewShas.has(sha)));
+
+    const onGitHub = async (oid: GitOid) =>
+      oid === realHead || knownShas.has(oid) || await this.#isCommitOnGitHub(oid);
     const commits: { summary: GitHubCommitSummary; tree: GitOid }[] = [];
-    const pending: GitOid[] = [];
-    const seen = new Set<GitOid>();
-    let anchor: GitOid | undefined;
-    // Depth-first with first parents on top: the walk descends the first-parent chain until the
-    // anchor, then drains the side parents stacked along the way.
-    const stack = [head];
-    for (let current = stack.pop(); current !== undefined; current = stack.pop()) {
-      if (seen.has(current)) continue;
-      seen.add(current);
-      if (current === realHead || await this.#isCommitOnGitHub(current)) {
-        anchor ??= current;
-        continue;
-      }
-      if (pending.length === MAX_PENDING_CHAIN_COMMITS) {
-        throw new Error(`More than ${MAX_PENDING_CHAIN_COMMITS} commits are queued for push.`);
+    const sideParents: GitOid[] = [];
+    let current = head;
+    while (commits.length <= MAX_PENDING_CHAIN_COMMITS) {
+      if (await onGitHub(current)) {
+        const chainIds = commits.map(commit => commit.summary.id);
+        const side = await this.#recordPendingSideParents(
+          gitCache, sideParents, new Set([...chainIds, current]), onGitHub);
+        return {
+          commits, anchor: current, frontier: [current, ...side.frontier],
+          pending: [...chainIds, ...side.pending],
+        };
       }
       const object = await gitCache.get(current);
       if (object === null || object.type !== "commit") {
@@ -3287,20 +3303,55 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       }
       const parsed = parseGitCommitPayload(object.content, current);
       this.#servedSimulatedCommitIds.add(current);
-      pending.push(current);
-      if (anchor === undefined) {
-        if (parsed.parents.length === 0) {
-          throw new Error(`Commit ${current} has no ancestor known to GitHub.`);
-        }
-        commits.push({
-          summary: commitDetailsFromGitObject(
-            current, object.content, canonicalRepoUrl(this.ctx.props.owner, this.ctx.props.repo)),
-          tree: parsed.tree,
-        });
+      commits.push({
+        summary: commitDetailsFromGitObject(
+          current, object.content, canonicalRepoUrl(this.ctx.props.owner, this.ctx.props.repo)),
+        tree: parsed.tree,
+      });
+      if (parsed.parents.length === 0) {
+        throw new Error(`Commit ${current} has no ancestor known to GitHub.`);
       }
-      stack.push(...parsed.parents.toReversed());
+      sideParents.push(...parsed.parents.slice(1));
+      current = parsed.parents[0];
     }
-    return { commits, anchor: anchor!, pending };
+    throw new Error(`More than ${MAX_PENDING_CHAIN_COMMITS} commits are queued for push.`);
+  }
+
+  /**
+   * Mark every not-yet-pushed commit reachable through a local merge's side parents as served
+   * (see `#collectPendingChain`), walking each side branch down to commits GitHub has. Returns
+   * the commits it marked and the GitHub ones it stopped at. `walked` holds the commits already
+   * walked, and the side walk adds to it; the served set cannot stand in, since it outlives the
+   * walk that filled it. Bounded like the main chain, and past the bound it throws, so callers
+   * degrade: a partial walk could leave a side parent unmarked that a listed merge names, and the
+   * session would advertise it. A side branch that leaves the cache is left unmarked and
+   * unfollowed (the push itself would fail on the missing object, not silently advertise it).
+   */
+  async #recordPendingSideParents(
+    gitCache: RpcStub<GitCache>, roots: GitOid[], walked: Set<GitOid>,
+    onGitHub: (oid: GitOid) => Promise<boolean>,
+  ): Promise<{ pending: GitOid[]; frontier: GitOid[] }> {
+    const pending: GitOid[] = [];
+    const frontier: GitOid[] = [];
+    const stack = [...roots];
+    while (stack.length > 0) {
+      const oid = stack.pop()!;
+      if (walked.has(oid)) continue;
+      walked.add(oid);
+      if (await onGitHub(oid)) {
+        frontier.push(oid);
+        continue;
+      }
+      const object = await gitCache.get(oid);
+      if (object === null || object.type !== "commit") continue;
+      if (pending.length === MAX_PENDING_CHAIN_COMMITS) {
+        throw new Error(`More than ${MAX_PENDING_CHAIN_COMMITS} commits are queued for push.`);
+      }
+      pending.push(oid);
+      this.#servedSimulatedCommitIds.add(oid);
+      stack.push(...parseGitCommitPayload(object.content, oid).parents);
+    }
+    return { pending, frontier };
   }
 
   /** The tree oid of a commit, from cached bytes when available, else GitHub's commit API. */
@@ -3374,8 +3425,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const simulatedHead = this.#simulateBranchHead(headBranch, realHead);
     if (simulatedHead === null || simulatedHead === realHead) return null;
 
-    // "-v2": `pendingCommitIds` gained merges' side parents, which a hit withholds from advertising.
-    const cacheKey = this.#cacheKey("pull-simulated-v2", stableKey(baseRef), simulatedHead);
+    // "-v3": the merge base became the fold over the chain's frontier (right for multi-parent
+    // histories) -- "-v2" entries hold the pairwise (base, anchor) answer, and before them
+    // `pendingCommitIds` gained merges' side parents, which a hit withholds from advertising.
+    const cacheKey = this.#cacheKey("pull-simulated-v3", stableKey(baseRef), simulatedHead);
     const cached = this.#loadCached<SimulatedPullComparison>(cacheKey, ENTITY_CACHE_TTL_MS);
     if (cached !== undefined) {
       // The served-id set is in-memory; re-record the cached result's pending ids so this
@@ -3389,9 +3442,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const compare = await this.#withApi(api =>
       api.compareBranches(this.ctx.props.owner, this.ctx.props.repo, baseRef, chain.anchor));
     this.#recordCompareMergeBase(compare, chain.anchor);
-    // Malformed (merge-base-less) responses throw here, degrading via
-    // #simulatedPullComparisonOrWarn: the tree diff below would be wrong against any other base.
-    const mergeBase = mergeBaseOfCompare(compare);
+    // The merge base the pushed head's comparison will diff from is the greatest common ancestor
+    // of the base branch and the queued head's *whole* ancestry -- which ends at the frontier,
+    // not just at the anchor. Malformed (merge-base-less) compare responses throw inside the
+    const mergeBase = await this.#simulatedMergeBase(baseRef, compare.base_commit.sha, chain.frontier);
 
     const newTree = chain.commits.length > 0
       ? chain.commits[0].tree
@@ -3401,7 +3455,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
 
     const result: SimulatedPullComparison = {
       // The pending chain descends from the anchor without touching the base branch, so the
-      // diff's merge base is the compare's (base, anchor) one.
+      // diff's merge base is the fold over the frontier above.
       revision: { baseSha: compare.base_commit.sha, headSha: simulatedHead, mergeBaseSha: mergeBase },
       files,
       additions: files.reduce((sum, file) => sum + file.additions, 0),
@@ -3416,6 +3470,41 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     };
     this.#storeCached(cacheKey, result, generation);
     return result;
+  }
+
+  /**
+   * The merge base GitHub will compute for `baseRef` and a queued head whose ancestry ends at
+   * `frontier` on GitHub: the greatest commit common to the base branch and the queued head's
+   * *whole* ancestry -- the frontier, not just the anchor, since a local merge's side branch can
+   * reach deeper into the base branch than the first-parent chain does. GitHub's compare answers
+   * only a pair of commits (GitLab asks one `/merge_base` for all), so the candidates are the
+   * pairwise merge bases against each frontier commit -- every candidate is a common ancestor of
+   * the base branch and the queued head, and the greatest is among them, since a commit common
+   * to the base branch and every frontier commit is common to it and one frontier commit, hence
+   * at most that pair's answer -- and the winner is the candidate that is greatest, told by one
+   * metadata-only compare each: for commits under the base branch's head,
+   * `candidate...baseRef` counts the head's ancestors the candidate lacks, and the greatest
+   * lacks the fewest. Ties (criss-cross history) resolve to the first candidate, as git itself
+   * resolves them arbitrarily. With no local merges the frontier is the anchor alone, and the
+   * single pairwise answer is the (base, anchor) compare `#simulatedPullComparison` already
+   * made and recorded in the pair cache, costing no extra call. A frontier past the cap fails
+   * the read (like GitLab's URL-length cap), and callers degrade.
+   */
+  async #simulatedMergeBase(baseRef: string, baseSha: GitOid, frontier: GitOid[]): Promise<GitOid> {
+    if (frontier.length > MAX_FRONTIER_COMMITS) {
+      throw new Error(`The queued head's history reaches more than ${MAX_FRONTIER_COMMITS} GitHub commits.`);
+    }
+    const { owner, repo } = this.ctx.props;
+    let best: { base: GitOid, ahead: number } | undefined;
+    for (const commit of frontier) {
+      const candidate = await this.#getMergeBaseCached(baseSha, commit);
+      // The base branch's own head is the deepest candidate there can be.
+      if (candidate === baseSha || frontier.length === 1) return candidate;
+      const ahead = (await this.#withApi(api =>
+        api.compareBranches(owner, repo, candidate, baseRef, { perPage: 1, page: 2 }))).total_commits;
+      if (best === undefined || ahead < best.ahead) best = { base: candidate, ahead };
+    }
+    return best!.base;
   }
 
   /**
