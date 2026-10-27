@@ -89,6 +89,10 @@ const PROJECTED: readonly JournalState[] = ["pending", "claimed"];
 
 const UNDECIDED: readonly JournalState[] = ["pending"];
 
+// Module-level so a scan view keeps one identity across calls -- a fresh literal per call would
+// defeat an identity-keyed cache of scan results.
+const FAILED: readonly JournalState[] = ["failed"];
+
 // The version distinguishes kit records from legacy rows that may have the same shape, so it skips
 // 1: a port whose own pre-kit rows carry `v: 1` would have them read as kit records, bypassing
 // `upgradeRecord`. Unmarked rows must go through it.
