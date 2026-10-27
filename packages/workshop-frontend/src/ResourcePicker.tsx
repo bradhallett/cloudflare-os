@@ -1,5 +1,4 @@
-import { logRpcFailure } from './rpcErrors'
-import { useState, useEffect, useMemo, useCallback, type MutableRefObject } from 'react'
+import { useEffect, useMemo, useCallback, type MutableRefObject } from 'react'
 import { useKumoToastManager } from '@cloudflare/kumo'
 import { Plus, CaretRight, Warning } from '@phosphor-icons/react'
 import { RpcStub } from 'capnweb'
@@ -10,7 +9,8 @@ import { GatekeeperIcon } from './components/GatekeeperIcon'
 import {
   PICKER_CAPTION, PICKER_EMPTY, PICKER_ROW, PICKER_ROW_ACTIVE, KeyHint,
 } from './components/pickerRows'
-import { AccountsSubscriberAdapter } from './accountsSubscriber'
+import { useConnectedAccounts } from './useConnectedAccounts'
+import { useVendors } from './useVendors'
 import { useConnectAccountActions } from './useConnectAccountActions'
 
 export interface VendorOption {
@@ -71,19 +71,6 @@ export interface ResourcePickerProps {
   activateRef?: MutableRefObject<((index: number) => void) | null>
 }
 
-type AccountEntry = {
-  description: AccountDescription
-  vendor: VendorDescription
-  supportedResources: SupportedResource[]
-  credentialsValid: boolean
-}
-
-// The picker mounts and unmounts as a URL is typed, and loads the same vendors and accounts every
-// time. The last snapshot lets a reopen render complete, with the fresh load correcting it in place.
-const sessionSnapshots = new WeakMap<RpcStub<AuthenticatedApi>, {
-  vendors: VendorOption[]
-  accounts: Map<number, AccountEntry>
-}>()
 
 function missingResourceGrants(account: AccountDescription, resource: SupportedResource): string[] {
   if (!resource.grantable) return []
@@ -106,82 +93,30 @@ export default function ResourcePicker({
     onRefine?.(newUrl, placeholder.start, placeholder.end)
   }
 
-  const snapshot = sessionSnapshots.get(authenticatedApi)
-  const [allAccounts, setAllAccounts] = useState<Map<number, AccountEntry>>(
-    () => snapshot?.accounts ?? new Map())
-  const [allVendors, setAllVendors] = useState<VendorOption[]>(() => snapshot?.vendors ?? [])
-  const [vendorsLoading, setVendorsLoading] = useState(false)
-  // The subscription reports the accounts it already has before calling `ready()`.
-  const [accountsLoaded, setAccountsLoaded] = useState(snapshot !== undefined)
+  // The picker remounts as a URL is typed, so it reads the session-seeded shared subscriptions:
+  // a reopen renders complete, with the fresh load correcting it in place.
+  const { accounts: allAccounts, ready: accountsReady, failed: accountsFailed } =
+    useConnectedAccounts(authenticatedApi, { seedFromSession: true })
+  const { vendors: catalogVendors, loading: vendorsLoading, failed: vendorsFailed } =
+    useVendors(authenticatedApi)
+  const allVendors: VendorOption[] = catalogVendors
+  // A failed subscription still means "show what we have" (see useConnectedAccounts): the panel
+  // must not hide forever behind its loader.
+  const accountsLoaded = accountsReady || accountsFailed
   const connectActions = useConnectAccountActions(authenticatedApi)
   const { connectingVendor, reconnectingAccountId: reconnectingAccount, grantingAccountId: grantingAccount } = connectActions
 
-  // Subscribe to connected accounts on mount.
+  // Clear the reconnecting marker once the subscription reports that account valid again.
+  const clearReconnecting = connectActions.clearReconnecting
   useEffect(() => {
-    let cancelled = false
-
-    const subscriber = new AccountsSubscriberAdapter({
-      add({ id, description, vendor, supportedResources, credentialsValid }) {
-        setAllAccounts(prev => {
-          const next = new Map(prev)
-          next.set(id, { description, vendor, supportedResources, credentialsValid })
-          return next
-        })
-        // Clear reconnecting state if this account was being reconnected and is now valid.
-        if (credentialsValid) connectActions.clearReconnecting(id)
-      },
-      remove(id) {
-        setAllAccounts(prev => {
-          const next = new Map(prev)
-          next.delete(id)
-          return next
-        })
-      },
-      ready() {
-        setAccountsLoaded(true)
-      },
-    })
-    const subscription = authenticatedApi.subscribeConnectedAccounts(subscriber)
-    subscription.catch(error => {
-      if (cancelled) return
-      logRpcFailure('Failed to subscribe to connected accounts:', error)
-      // Nothing more is coming, so show what we have rather than hiding forever.
-      setAccountsLoaded(true)
-    })
-
-    return () => {
-      cancelled = true
-      subscription[Symbol.dispose]()
+    if (reconnectingAccount !== null && allAccounts.get(reconnectingAccount)?.credentialsValid) {
+      clearReconnecting(reconnectingAccount)
     }
-  }, [authenticatedApi])
+  }, [allAccounts, reconnectingAccount, clearReconnecting])
 
-  // Load all vendors on mount.
   useEffect(() => {
-    const loadVendors = async () => {
-      setVendorsLoading(snapshot === undefined)
-      try {
-        const vendorList = await authenticatedApi.listGatekeeperVendors()
-        const unavailable = vendorList.filter(v => v.unavailable)
-        if (unavailable.length > 0) {
-          toasts.add({
-            title: `Some services are temporarily unavailable: ${unavailable.map(v => v.id).join(', ')}`,
-            variant: 'warning',
-          })
-        }
-        setAllVendors(vendorList.filter(v => !v.unavailable).map(v => ({
-          id: v.id,
-          description: v.description,
-          supportedResources: v.supportedResources,
-        })))
-      } catch (error) {
-        console.error('Failed to load vendors:', error)
-        toasts.add({ title: 'Failed to load available services', variant: 'error' })
-      } finally {
-        setVendorsLoading(false)
-      }
-    }
-    loadVendors()
-  }, [authenticatedApi])
+    if (vendorsFailed) toasts.add({ title: 'Failed to load available services', variant: 'error' })
+  }, [vendorsFailed, toasts])
 
   // --- Filtering and classification logic ---
 
@@ -301,9 +236,8 @@ export default function ResourcePicker({
         continue
       }
 
-      let vendorAccounts = [...allAccounts.entries()]
-        .filter(([_, { vendor: v }]) => v.displayName === vendor.description.displayName)
-        .map(([id, data]) => ({ id, ...data }))
+      let vendorAccounts = [...allAccounts.values()]
+        .filter(({ vendor: v }) => v.displayName === vendor.description.displayName)
 
       if (accountsOnly && lowerSearch) {
         vendorAccounts = vendorAccounts.filter(account => {
@@ -350,9 +284,6 @@ export default function ResourcePicker({
     onReadyChange?.(ready)
   }, [onReadyChange, ready])
 
-  useEffect(() => {
-    if (ready) sessionSnapshots.set(authenticatedApi, {vendors: allVendors, accounts: allAccounts})
-  }, [allAccounts, allVendors, authenticatedApi, ready])
 
   // Expose an activate function so the parent can trigger selection by index.
   useEffect(() => {
@@ -460,9 +391,8 @@ export default function ResourcePicker({
             }
 
             // --- Full match or no-refine prefix: render with accounts ---
-            let vendorAccounts = [...allAccounts.entries()]
-              .filter(([_, { vendor: v }]) => v.displayName === vendor.description.displayName)
-              .map(([id, data]) => ({ id, ...data }))
+            let vendorAccounts = [...allAccounts.values()]
+              .filter(({ vendor: v }) => v.displayName === vendor.description.displayName)
 
             // In accounts-only mode (HTTP alongside specific matches), only show
             // accounts whose details match the search.
