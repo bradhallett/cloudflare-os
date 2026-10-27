@@ -34,9 +34,16 @@ import {
   buildDescription,
 } from "@gadgets/gatekeeper-kit/action-description";
 import {
-  applyClaimedAction,
-  markOutcomeUnknown,
-} from "@gadgets/gatekeeper-kit/outcome-unknown";
+  ActionJournal,
+  ActionOutcomeUnknownError,
+  APPLY_OUTCOME_UNKNOWN_MESSAGE,
+  defineActions,
+  type ActionDefinition,
+  type ActionJournalKv,
+  type BoundActionSet,
+  type JournalRecord,
+  type TaggedAction,
+} from "@gadgets/gatekeeper-kit/actions";
 import type { ActionDescription, ApprovalQueue, ObservationDescription } from "@gadgets/workshop-shared/gatekeeper";
 import type {
   NotionComment,
@@ -111,8 +118,45 @@ function actionPageId(action: NotionAction): string | null {
   return action.pageId;
 }
 
+/** The payload a kind stores: the session-facing action without its discriminator, plus when it
+ *  was staged (the simulation views timestamp synthetic pages with it) and the effects apply
+ *  records on it (for revert and the views). */
+export type NotionKinds = {
+  [K in NotionAction as K["type"]]: Omit<K, "type"> & {
+    /** When the action was staged, for the synthetic entries the overlays create. */
+    submittedAt: number;
+    /** For appendContent revert: the IDs of the blocks created on apply. */
+    appendedBlockIds?: string[];
+    /** For createPage: the real Notion page ID assigned on apply. */
+    createdPageId?: string;
+  };
+};
+
+/** A journal entry as the record-shaped view the simulation and revert helpers consume. */
+function recordView(
+  id: number,
+  action: TaggedAction<NotionKinds>,
+  state: JournalRecord<TaggedAction<NotionKinds>>["state"],
+): StoredActionRecord {
+  const { kind, payload } = action;
+  return {
+    id,
+    action: { type: kind, ...payload } as NotionAction,
+    state: state === "staged" ? "pending" : state,
+    submittedAt: (payload as { submittedAt?: number }).submittedAt ?? 0,
+  };
+}
+
+// True when an action's target page resolves to the given (already-resolved) page id.
+function resolvesTo(store: NotionStore, action: NotionAction, target: string): boolean {
+  const t = actionPageId(action);
+  return t !== null && store.resolveId(t) === target;
+}
+
 // ---------------------------------------------------------------------------------------------
-// Cache + pending-action storage (backed by the gatekeeper DO's KV storage)
+// Action lifecycle (the kit's `defineActions` engine over the `ActionJournal` this port already
+// kept, on its pre-journal keys) + response caching. The pending set below is the journal's
+// pending projection; `prov:` rows map a created page's provisional id to its real one.
 
 type Kv = DurableObjectStorage["kv"];
 
@@ -139,12 +183,13 @@ export class NotionStore {
     return this.#api;
   }
 
-  // --- sequential IDs ---
-
-  nextActionId(): number {
-    const id = this.#kv.get<number>("seq:action") ?? 1;
-    this.#kv.put("seq:action", id + 1);
-    return id;
+  /**
+   * The action lifecycle shared by this storage's sessions and RPCs: one journal (one submission
+   * lane, one resolution queue) per object storage, from the kit's memo. The host is this store —
+   * the handlers drive its API client and caches.
+   */
+  get lifecycle(): { journal: ActionJournal<TaggedAction<NotionKinds>>; set: BoundActionSet<NotionKinds> } {
+    return notionActions(this.#kv, this);
   }
 
   nextProvisionalId(): string {
@@ -153,28 +198,32 @@ export class NotionStore {
     return `~${n}`;
   }
 
-  // --- pending actions ---
-
-  putAction(record: StoredActionRecord): void {
-    this.#kv.put(`action:${record.id}`, record);
-  }
-
-  getAction(id: number): StoredActionRecord | undefined {
-    return this.#kv.get<StoredActionRecord>(`action:${id}`);
-  }
-
-  deleteAction(id: number): void {
-    this.#kv.delete(`action:${id}`);
-  }
-
+  /**
+   * Every action this storage holds as a {@link StoredActionRecord} view: pending and claimed
+   * (the simulation overlay's inputs), held failures, and applied records retained for revert.
+   * Ordered by id.
+   */
   allActions(): StoredActionRecord[] {
-    return [...this.#kv.list<StoredActionRecord>({ prefix: "action:" })]
-      .map(([, record]) => record)
-      .toSorted((a, b) => a.id - b.id);
+    const views = [
+      ...this.lifecycle.journal.listPending().map((e) => recordView(e.id, e.action, "pending")),
+      ...this.lifecycle.journal.listFailed().map((e) => recordView(e.id, e.action, "failed")),
+      ...this.retainedRecords(),
+    ];
+    return views.toSorted((a, b) => a.id - b.id);
   }
 
-  pendingActions(): StoredActionRecord[] {
-    return this.allActions().filter(r => r.state === "pending" || r.state === "claimed");
+  /** Applied records, retained for revert, oldest page first. */
+  retainedRecords(): StoredActionRecord[] {
+    const views: StoredActionRecord[] = [];
+    let cursor: string | undefined;
+    for (;;) {
+      const page = this.lifecycle.journal.listRetained({ limit: 100, cursor });
+      for (const entry of page.entries) {
+        views.push(recordView(entry.id, entry.action, "applied"));
+      }
+      if (page.nextCursor === undefined) return views;
+      cursor = page.nextCursor;
+    }
   }
 
   /**
@@ -184,10 +233,13 @@ export class NotionStore {
    */
   pendingForPage(pageId: string): StoredActionRecord[] {
     const target = this.resolveId(pageId);
-    return this.pendingActions().filter(r => {
-      const t = actionPageId(r.action);
-      return t !== null && this.resolveId(t) === target;
-    });
+    return this.allActions().filter((r) =>
+      (r.state === "pending" || r.state === "claimed") && resolvesTo(this, r.action, target));
+  }
+
+  /** Pending and claimed actions, in submission order — the simulation overlay's input set. */
+  pendingActions(): StoredActionRecord[] {
+    return this.allActions().filter((r) => r.state === "pending" || r.state === "claimed");
   }
 
   // --- provisional ID resolution ---
@@ -212,14 +264,15 @@ export class NotionStore {
    */
   knowsProvisional(id: string): boolean {
     if (this.resolveId(id) !== id) return true; // already applied -> real ID mapped
-    return this.allActions().some(
-      r => r.action.type === "createPage" && r.action.provisionalId === id);
+    return this.lifecycle.journal.listPending().some(({ action }) =>
+      action.kind === "createPage" && action.payload.provisionalId === id);
   }
 
   /** The createPage action for a provisional ID, if any. */
   createActionFor(provisionalId: string): StoredActionRecord | undefined {
-    return this.allActions().find(
-      r => r.action.type === "createPage" && r.action.provisionalId === provisionalId);
+    return this.lifecycle.journal.listPending().map(({ id, action }) =>
+      recordView(id, action, "pending")).find(
+      (r) => r.action.type === "createPage" && r.action.provisionalId === provisionalId);
   }
 
   // --- base data fetch with caching ---
@@ -807,78 +860,233 @@ export function describeAction(action: NotionAction): ActionDescription {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Apply / revert
+// The declared lifecycle (kit defineActions) and its storage.
 
 /**
- * Apply a previously-submitted action against Notion. Mutates and persists the record (e.g. to
- * store created IDs for later revert). Throws on failure (the overseer surfaces this to the user).
+ * Rethrows a dispatch error under the kit's terminal classification: an outcome Notion never
+ * decisively answered is terminal and surfaced, never silently retried; anything else stays
+ * retryable (the engine returns the record to pending, as the claim loop did).
  */
-export async function applyNotionAction(store: NotionStore, record: StoredActionRecord): Promise<void> {
-  const api = store.api;
-  const action = record.action;
-
-  switch (action.type) {
-    case "appendContent": {
-      const pageId = requireResolved(store, action.pageId);
-      const ids = await api.appendBlockChildren(pageId, markdownToBlocks(action.markdown));
-      record.appendedBlockIds = ids;
-      // Persist the revert info immediately so a crash before the end of this function can't lose
-      // the IDs of the blocks we just created (which we need to revert the append).
-      store.putAction(record);
-      store.invalidateContent(action.pageId);
-      break;
-    }
-    case "setTitle": {
-      const pageId = requireResolved(store, action.pageId);
-      await api.updatePage(pageId, { properties: { [await titlePropName(store, action.pageId)]: { title: plainToRichText(action.title) } } });
-      store.invalidatePage(action.pageId);
-      break;
-    }
-    case "setProperties": {
-      const pageId = requireResolved(store, action.pageId);
-      await api.updatePage(pageId, { properties: propertyInputsToNotion(action.properties) });
-      store.invalidatePage(action.pageId);
-      break;
-    }
-    case "setIcon": {
-      const pageId = requireResolved(store, action.pageId);
-      await api.updatePage(pageId, { icon: action.icon ? iconInputToNotion(action.icon) : null });
-      store.invalidatePage(action.pageId);
-      break;
-    }
-    case "archive": {
-      const pageId = requireResolved(store, action.pageId);
-      await api.updatePage(pageId, { archived: true });
-      store.invalidatePage(action.pageId);
-      break;
-    }
-    case "restore": {
-      const pageId = requireResolved(store, action.pageId);
-      await api.updatePage(pageId, { archived: false });
-      store.invalidatePage(action.pageId);
-      break;
-    }
-    case "addComment": {
-      const pageId = requireResolved(store, action.pageId);
-      await api.createComment({ parent: { page_id: pageId }, rich_text: plainToRichText(action.text) });
-      break;
-    }
-    case "createPage": {
-      const parent = await resolveCreateParent(store, action.parent);
-      const body = buildCreateBody(
-        parent, action.title, action.properties, action.content, action.icon, action.titlePropertyName);
-      const page = await api.createPage(body);
-      record.createdPageId = page.id;
-      // Persist the real ID immediately — a crash before the end of this function would otherwise
-      // orphan the just-created Notion page (no record of it to revert).
-      store.putAction(record);
-      store.setProvisional(action.provisionalId, page.id);
-      break;
-    }
+function rethrowClassified(error: unknown): never {
+  if (isNotionOutcomeUnknown(error)) {
+    throw new ActionOutcomeUnknownError(
+      `${APPLY_OUTCOME_UNKNOWN_MESSAGE} (${error instanceof Error ? error.message : String(error)})`);
   }
+  throw error;
+}
 
-  record.state = "applied";
-  store.putAction(record);
+/** The nine kinds' declared behavior: what the approver sees, what each consumes and creates, and
+ *  the Notion dispatch that applies them. Payload effects come back as `{ action }` updates the
+ *  engine persists, so revert and the simulation views see them without bespoke storage. */
+const NOTION_DEFS = {
+  appendContent: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: (payload: NotionKinds["appendContent"]) =>
+      describeAction({ type: "appendContent", ...payload }),
+    dependsOn: (payload: NotionKinds["appendContent"]) =>
+      NotionStore.isProvisional(payload.pageId) ? [payload.pageId] : [],
+    async apply(payload: NotionKinds["appendContent"], store: NotionStore) {
+      try {
+        const ids = await store.api.appendBlockChildren(
+          requireResolved(store, payload.pageId), markdownToBlocks(payload.markdown));
+        store.invalidateContent(payload.pageId);
+        return { action: { ...payload, appendedBlockIds: ids } };
+      } catch (error) {
+        rethrowClassified(error);
+      }
+    },
+  },
+  setTitle: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: (payload: NotionKinds["setTitle"]) => describeAction({ type: "setTitle", ...payload }),
+    dependsOn: (payload: NotionKinds["setTitle"]) =>
+      NotionStore.isProvisional(payload.pageId) ? [payload.pageId] : [],
+    async apply(payload: NotionKinds["setTitle"], store: NotionStore) {
+      try {
+        await store.api.updatePage(requireResolved(store, payload.pageId), {
+          properties: { [await titlePropName(store, payload.pageId)]: { title: plainToRichText(payload.title) } },
+        });
+        store.invalidatePage(payload.pageId);
+      } catch (error) {
+        rethrowClassified(error);
+      }
+    },
+  },
+  setProperties: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: (payload: NotionKinds["setProperties"]) =>
+      describeAction({ type: "setProperties", ...payload }),
+    dependsOn: (payload: NotionKinds["setProperties"]) =>
+      NotionStore.isProvisional(payload.pageId) ? [payload.pageId] : [],
+    async apply(payload: NotionKinds["setProperties"], store: NotionStore) {
+      try {
+        await store.api.updatePage(requireResolved(store, payload.pageId), {
+          properties: propertyInputsToNotion(payload.properties),
+        });
+        store.invalidatePage(payload.pageId);
+      } catch (error) {
+        rethrowClassified(error);
+      }
+    },
+  },
+  setIcon: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: (payload: NotionKinds["setIcon"]) => describeAction({ type: "setIcon", ...payload }),
+    dependsOn: (payload: NotionKinds["setIcon"]) =>
+      NotionStore.isProvisional(payload.pageId) ? [payload.pageId] : [],
+    async apply(payload: NotionKinds["setIcon"], store: NotionStore) {
+      try {
+        await store.api.updatePage(requireResolved(store, payload.pageId), {
+          icon: payload.icon ? iconInputToNotion(payload.icon) : null,
+        });
+        store.invalidatePage(payload.pageId);
+      } catch (error) {
+        rethrowClassified(error);
+      }
+    },
+  },
+  archive: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: (payload: NotionKinds["archive"]) => describeAction({ type: "archive", ...payload }),
+    dependsOn: (payload: NotionKinds["archive"]) =>
+      NotionStore.isProvisional(payload.pageId) ? [payload.pageId] : [],
+    async apply(payload: NotionKinds["archive"], store: NotionStore) {
+      try {
+        await store.api.updatePage(requireResolved(store, payload.pageId), { archived: true });
+        store.invalidatePage(payload.pageId);
+      } catch (error) {
+        rethrowClassified(error);
+      }
+    },
+  },
+  restore: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: (payload: NotionKinds["restore"]) => describeAction({ type: "restore", ...payload }),
+    dependsOn: (payload: NotionKinds["restore"]) =>
+      NotionStore.isProvisional(payload.pageId) ? [payload.pageId] : [],
+    async apply(payload: NotionKinds["restore"], store: NotionStore) {
+      try {
+        await store.api.updatePage(requireResolved(store, payload.pageId), { archived: false });
+        store.invalidatePage(payload.pageId);
+      } catch (error) {
+        rethrowClassified(error);
+      }
+    },
+  },
+  addComment: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: (payload: NotionKinds["addComment"]) =>
+      describeAction({ type: "addComment", ...payload }),
+    dependsOn: (payload: NotionKinds["addComment"]) =>
+      NotionStore.isProvisional(payload.pageId) ? [payload.pageId] : [],
+    async apply(payload: NotionKinds["addComment"], store: NotionStore) {
+      try {
+        await store.api.createComment({
+          parent: { page_id: requireResolved(store, payload.pageId) },
+          rich_text: plainToRichText(payload.text),
+        });
+      } catch (error) {
+        rethrowClassified(error);
+      }
+    },
+  },
+  createPage: {
+    delivery: "continue-with-simulation",
+    claimBeforeApply: true,
+    describe: (payload: NotionKinds["createPage"]) => describeAction({ type: "createPage", ...payload }),
+    // The new page is addressable by its provisional id until a real one replaces it.
+    provides: (payload: NotionKinds["createPage"]) => [payload.provisionalId],
+    dependsOn: (payload: NotionKinds["createPage"]) =>
+      payload.parent.kind === "page" && NotionStore.isProvisional(payload.parent.pageId)
+        ? [payload.parent.pageId]
+        : [],
+    async apply(payload: NotionKinds["createPage"], store: NotionStore) {
+      try {
+        const parent = await resolveCreateParent(store, payload.parent);
+        const body = buildCreateBody(
+          parent, payload.title, payload.properties, payload.content, payload.icon,
+          payload.titlePropertyName);
+        const page = await store.api.createPage(body);
+        // Bind immediately, then persist the effect through the engine's payload update — a crash
+        // between the two still leaves the Notion page reachable for revert via the binding.
+        store.setProvisional(payload.provisionalId, page.id);
+        return { action: { ...payload, createdPageId: page.id } };
+      } catch (error) {
+        rethrowClassified(error);
+      }
+    },
+  },
+} as const satisfies NotionDefinitions;
+
+// A set declaring dependsOn needs the host to answer whether a provisional reference has been
+// bound to a real page — which is exactly the store's own resolution map.
+const isResolvedReference = (store: NotionStore, ref: string): boolean =>
+  store.resolveId(ref) !== ref;
+
+/** The Notion action set options: this port's records carry no fence, so actions survive
+ *  re-authorization of the same workspace; applied records stay until revert removes them. */
+const NOTION_SET_OPTIONS = {
+  fence: "none",
+  retainApplied: true,
+  vendorId: "notion",
+  isResolvedReference,
+} as const;
+
+type NotionDefinitions = {
+  [K in keyof NotionKinds]: ActionDefinition<NotionKinds[K], NotionStore>;
+};
+
+/**
+ * Converts a legacy pre-journal row. Only records still awaiting a decision upgrade: the kit
+ * coerces every converted row to pending, so anything else would come back as a re-appliable
+ * ghost and must drop — a `claimed` row's dispatch was in flight when the store swapped and its
+ * outcome is unknowable, so it drops like the other settled states rather than blindly
+ * re-dispatching (applied pages stay reachable through their `prov:` bindings; failed and
+ * reverted rows are inert).
+ */
+function upgradeLegacyRecord(raw: unknown): TaggedAction<NotionKinds> | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const { action, state } = raw as { action?: unknown; state?: unknown };
+  if (typeof action !== "object" || action === null) return undefined;
+  if (state !== "pending") return undefined;
+  const { type, ...payload } = action as { type?: unknown };
+  if (typeof type !== "string" || !(type in NOTION_DEFS)) return undefined;
+  return { kind: type as keyof NotionKinds, payload } as TaggedAction<NotionKinds>;
+}
+
+/**
+ * The lifecycle for one object's storage: the journal (this port's pre-journal keys, so deployed
+ * records upgrade in place) and the action set bound to the first store that arrives. Hosts are
+ * interchangeable — each wraps its own API client over the same token store — so first binding
+ * wins, per the kit's one-journal-per-keyspace rule.
+ */
+const lifecycles = new WeakMap<
+  ActionJournalKv,
+  { journal: ActionJournal<TaggedAction<NotionKinds>>; set: BoundActionSet<NotionKinds> }
+>();
+
+/** The bound Notion lifecycle for one object's storage. */
+export function notionActions(
+  kv: ActionJournalKv,
+  host: NotionStore,
+): { journal: ActionJournal<TaggedAction<NotionKinds>>; set: BoundActionSet<NotionKinds> } {
+  let memo = lifecycles.get(kv);
+  if (memo === undefined) {
+    const journal = new ActionJournal<TaggedAction<NotionKinds>>(kv, {
+      legacyKeys: { nextIdKey: "seq:action", recordPrefix: "action:" },
+      upgradeRecord: upgradeLegacyRecord,
+    });
+    memo = { journal, set: defineActions<NotionStore, NotionKinds>(NOTION_DEFS, NOTION_SET_OPTIONS).bind(journal, host) };
+    lifecycles.set(kv, memo);
+  }
+  return memo;
 }
 
 /** Revert a previously-applied action. Returns guidance if the revert can't fully complete. */
@@ -952,9 +1160,8 @@ export async function revertNotionAction(
       return { message: "Notion comments can't be deleted through the API; please remove the comment manually." };
   }
 
-  // Mark the action reverted so it no longer blocks reverting earlier actions on the same page.
-  record.state = "reverted";
-  store.putAction(record);
+  // The caller drops the journal record: a successful revert must stop blocking earlier reverts
+  // on the same page (the same effect the old "reverted" state had, without the tombstone).
 }
 
 // The set of logical fields an action mutates (for revert conflict detection). Actions that only
@@ -1088,23 +1295,19 @@ export function buildCreateBody(
 }
 
 /**
- * Record a pending action and submit it to the approval queue for later approval. If the submit
- * fails, the stored record is rolled back so it doesn't pollute simulation. Returns the action ID.
+ * Record a pending action and submit it to the approval queue for later approval. The engine
+ * stages the record (under its pending cap), describes it for the approver, and rolls the staging
+ * back if the submit fails without proof the overseer holds the id. Returns the action ID.
  */
 export async function stageAction(
   store: NotionStore,
   approvalQueue: RpcStub<ApprovalQueue>,
   action: NotionAction,
 ): Promise<number> {
-  const id = store.nextActionId();
-  store.putAction({ id, action, state: "pending", submittedAt: Date.now() });
-  try {
-    await approvalQueue.submitAction(id, describeAction(action));
-  } catch (err) {
-    store.deleteAction(id);
-    throw err;
-  }
-  return id;
+  const { type, ...payload } = action;
+  return await store.lifecycle.set.submit(approvalQueue, type, {
+    ...payload, submittedAt: Date.now(),
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1112,75 +1315,38 @@ export async function stageAction(
 
 export async function applyStoredAction(store: NotionStore, id: number): Promise<void> {
   // The claim-state loop (settled-is-settled, terminal failure, claim-before-dispatch, outcome
-  // unknown) is the kit's; the connector supplies only the Notion dispatch and its classifier.
-  await applyClaimedAction(
-    store,
-    id,
-    (record) => applyNotionAction(store, record),
-    isNotionOutcomeUnknown,
-  );
+  // unknown) is the kit's; the connector declared only its Notion dispatch and classifier.
+  await store.lifecycle.set.apply(id);
 }
 
-export function rejectStoredAction(store: NotionStore, id: number): void | { restart?: boolean } {
-  const record = store.getAction(id);
+export async function rejectStoredAction(store: NotionStore, id: number): Promise<void | { restart?: boolean }> {
+  const record = store.lifecycle.journal.get(id);
   if (!record) return;
-  if (record.state === "claimed") {
-    // The Notion call may already have run; deleting the record would discard the only trace
-    // that it might have. The user checks Notion, then rejects again to clear the failure
-    // this records.
-    throw markOutcomeUnknown(store, record);
-  }
-  store.deleteAction(id);
-
-  // Rejecting a page creation invalidates every pending action that targeted that provisional page
+  // Rejecting a page creation strands every pending action that targeted that provisional page
   // (they could never be applied — the page won't exist), including sub-pages created under it and
-  // their edits, transitively. Cascade-delete them all so the overseer never tries to apply an
-  // orphan, and request a restart since the Gadget already observed simulated state built on them.
-  if (record.action.type === "createPage") {
-    // Snapshot the pending set once — deleting actions below would otherwise change it under us.
-    const pending = store.pendingActions();
-    const purge = new Set<string>([record.action.provisionalId]);
-    // Expand to transitively-nested sub-page creations. Only `createSubPage` nests a creation under
-    // a provisional page (parent.kind === "page"); database/workspace creates never have a
-    // provisional parent, so they don't need handling here.
-    for (;;) {
-      let added = false;
-      for (const r of pending) {
-        if (r.action.type === "createPage" && r.action.parent.kind === "page" &&
-            purge.has(r.action.parent.pageId) && !purge.has(r.action.provisionalId)) {
-          purge.add(r.action.provisionalId);
-          added = true;
-        }
-      }
-      if (!added) break;
-    }
-    let deleted = false;
-    for (const r of pending) {
-      const t = actionPageId(r.action);
-      if (t !== null && purge.has(t)) {
-        store.deleteAction(r.id);
-        deleted = true;
-      }
-    }
-    if (deleted) return { restart: true };
-    return;
-  }
-
-  // Rejecting a mid-stack edit leaves the simulated overlay the Gadget already observed
-  // inconsistent; ask for a restart if other pending actions still target the same page.
-  const target = actionPageId(record.action);
-  if (target && store.pendingForPage(target).length > 0) {
-    return { restart: true };
-  }
+  // their edits, transitively — the engine marks them terminally failed instead of dropping them.
+  // The Gadget already observed simulated state built on them, so ask for a restart. Same for a
+  // mid-stack edit: the overlay the Gadget observed is inconsistent with the remaining stack.
+  const target = record.action.kind === "createPage"
+    ? record.action.payload.provisionalId
+    : record.action.payload.pageId;
+  const restart = record.action.kind === "createPage" || store.pendingForPage(target).length > 0;
+  await store.lifecycle.set.reject(id);
+  return restart ? { restart: true } : undefined;
 }
 
 export async function revertStoredAction(
   store: NotionStore,
   id: number,
 ): Promise<void | { message?: string; canRetry?: boolean; restart?: boolean }> {
-  const record = store.getAction(id);
+  const record = store.lifecycle.journal.get(id);
   if (!record) throw new Error(`Unknown action: ${id}`);
-  return await revertNotionAction(store, record);
+  const result = await revertNotionAction(
+    store, recordView(id, record.action, record.state === "applied" ? "applied" : "pending"));
+  // A successful revert drops the record: it stops blocking earlier reverts on the same page, the
+  // same effect the old "reverted" state had. Guidance results keep the record applied.
+  if (result === undefined) store.lifecycle.journal.remove(id);
+  return result;
 }
 
 // Re-exports used by sessions for base reads.

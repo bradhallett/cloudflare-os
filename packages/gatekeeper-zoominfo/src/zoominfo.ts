@@ -17,9 +17,8 @@ import {
   type SupportedResource,
   type VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
-import { buildDescription, codeSpan } from "@gadgets/gatekeeper-kit/action-description";
+import { codeSpan } from "@gadgets/gatekeeper-kit/action-description";
 import { connectHandoffPageHtml, errorPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
-import { ActionOutcomeUnknownError, APPLY_OUTCOME_UNKNOWN_MESSAGE } from "@gadgets/gatekeeper-kit/actions";
 import {
   commitReconnectOrThrow, ConnectionSubject,
   pinnedConnectionSubject, pinForConnect, stageReconnect,
@@ -27,7 +26,6 @@ import {
 import {
   ZoomInfoApi,
   ZoomInfoApiError,
-  isOutcomeUnknown,
   deriveCodeChallenge,
   exchangeAuthCode,
   generateCodeVerifier,
@@ -35,6 +33,8 @@ import {
   resolveOAuthConfig,
   type QueryParams,
 } from "./zoominfo-api";
+import { zoomInfoActions, type ZoomInfoActionHost } from "./zoominfo-actions";
+import { EnrichmentOutcomes } from "./zoominfo-enrichment";
 import type {
   AccountSummary,
   CompanyEnrichInput,
@@ -100,8 +100,7 @@ import {
   str,
   toSearchPage,
 } from "./zoominfo-mapping";
-import { EnrichmentStore, performEnrichment } from "./zoominfo-enrichment";
-import { withinReadLimit, ReadLimitError, type ReadReservation } from "./zoominfo-reads";
+import { withinReadLimit, type ReadReservation } from "./zoominfo-reads";
 import ZOOMINFO_ACCOUNT_CONFIGURATOR_HTML from "./generated/account-configurator-ui.txt";
 import type { ZoomInfoAccountConfiguratorRpc } from "./configurator/account-configurator-types";
 
@@ -780,7 +779,7 @@ export class ZoomInfoGatekeeperImpl extends DurableObject<Env, ZoomInfoGatekeepe
   }
 
   async getAutoApprovableActions() {
-    return [];
+    return this.#enrichment().set.autoApprovableKinds();
   }
 
   #makeApi(account: DurableObjectStub<UserAccount>): ZoomInfoApi {
@@ -792,71 +791,47 @@ export class ZoomInfoGatekeeperImpl extends DurableObject<Env, ZoomInfoGatekeepe
       this.#userAccount(), approvalQueue.dup(), resolveOAuthConfig(this.env).apiBaseUrl, this.ctx.storage.kv);
   }
 
+  /** The enrichment lifecycle and its host, bound once per storage (zoominfo-actions.ts). */
+  #enrichment() {
+    return zoomInfoActions(this.ctx.storage.kv, this.#enrichmentHost());
+  }
+
+  #enrichmentHost(): ZoomInfoActionHost {
+    const account = this.#userAccount();
+    const outcomes = this.#outcomes();
+    return {
+      call: fn => withinReadLimit(account, () => callZoomInfo(account, () => fn(this.#makeApi(account)))),
+      putOutcome: (id, outcome) => outcomes.put(id, outcome),
+    };
+  }
+
+  #outcomes(): EnrichmentOutcomes {
+    return new EnrichmentOutcomes(this.ctx.storage.kv);
+  }
+
   /**
-   * Approved: replay the queued enrichment against ZoomInfo (spending credits) and store the result
-   * for the Gadget to read via getEnrichmentResult(). A definitive ZoomInfo failure is recorded as
-   * a "failed" outcome rather than re-thrown: the action is considered resolved (we don't want the
-   * overseer to retry a paid operation that may have already charged credits), and the Gadget sees
-   * the failure.
-   *
-   * A failure whose outcome is unknown — the request may have reached ZoomInfo and been charged —
-   * is recorded as "unknown" *before* dispatch and re-thrown as `ActionOutcomeUnknownError`, so the
-   * enrichment is never replayed blind: a re-apply finds the stored record and throws its message
-   * without calling ZoomInfo again (mirrors the kit's `claimBeforeApply` contract).
+   * Approved: the engine (zoominfo-actions.ts) replays the queued enrichment against ZoomInfo,
+   * spending credits, and records the outcome for the Gadget to read via getEnrichmentResult().
+   * A definitive ZoomInfo failure resolves the action as failed rather than re-thrown as
+   * retryable: the overseer must not retry a paid operation that may have already charged
+   * credits. A failure whose outcome is unknown is recorded terminally as unknown and surfaced,
+   * so the enrichment is never replayed blind.
    */
   async applyAction(action: number): Promise<void> {
-    const store = new EnrichmentStore(this.ctx.storage.kv);
-    const pending = store.getPending(action);
-    if (!pending) {
-      const stored = store.getResult(action);
-      if (stored?.status === "unknown") throw new ActionOutcomeUnknownError(stored.message);
-      throw new Error(`Unknown pending ZoomInfo enrichment: ${action}`);
-    }
-    const account = this.#userAccount();
-    // The claim, taken before any await: Durable Objects keep processing events across an
-    // outbound RPC's await, so a rejection delivered once the apply starts awaiting must find
-    // the "unknown" record, never a pending one — it cannot record "rejected" over a dispatch
-    // in flight (the same claim-before-dispatch contract as the kit's `applyClaimedAction`).
-    store.removePending(action);
-    store.putResult(action, { status: "unknown", message: APPLY_OUTCOME_UNKNOWN_MESSAGE });
-    try {
-      const result = await withinReadLimit(account, () =>
-        callZoomInfo(account, () => performEnrichment(this.#makeApi(account), pending)));
-      store.putResult(action, { status: "ready", result });
-    } catch (error) {
-      if (error instanceof ReadLimitError) {
-        // The reservation was refused before any dispatch, so no credits were spent and the
-        // claim was false: restore the enrichment to pending and drop the claim, leaving the
-        // action retryable exactly as it was.
-        store.putPending(action, pending);
-        store.removeResult(action);
-        throw error;
-      }
-      if (isOutcomeUnknown(error)) throw new ActionOutcomeUnknownError(APPLY_OUTCOME_UNKNOWN_MESSAGE);
-      store.putResult(action, {
-        status: "failed",
-        message: error instanceof Error ? error.message : String(error),
-      });
-    }
+    await this.#enrichment().set.apply(action);
   }
 
-  /** Rejected: discard the queued enrichment (no credits spent) and record the outcome. */
+  /** Rejected: the engine discards the queued enrichment (no credits spent) and records it. */
   async rejectAction(action: number): Promise<void> {
-    const store = new EnrichmentStore(this.ctx.storage.kv);
-    store.removePending(action);
-    // An outcome a failed apply left unknown survives rejection: its credits may have been spent,
-    // and the record is what tells the Gadget the enrichment may have run.
-    if (store.getResult(action)?.status !== "unknown") {
-      store.putResult(action, { status: "rejected" });
-    }
+    await this.#enrichment().set.reject(action);
   }
 
   /**
-   * Enrichment isn't revertable: spent credits can't be refunded. submitAction sets
-   * implementsRevert: false, so this is not normally reached; we drop the stored result defensively.
+   * Enrichment isn't revertable: spent credits can't be refunded. The action sets
+   * implementsRevert: false, so this is not normally reached; we drop the stored outcome defensively.
    */
   async revertAction(action: number): Promise<void | { message?: string; canRetry?: boolean }> {
-    new EnrichmentStore(this.ctx.storage.kv).removeResult(action);
+    this.#outcomes().remove(action);
     return {
       message:
           "Enrichment can't be reverted: any ZoomInfo credits spent are not refundable. The " +
@@ -984,12 +959,11 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
     this.#kv.put<CachedValue<T>>(`cache:${key}`, { value, fetchedAt: Date.now() });
   }
 
-  // Submit a paid enrichment for approval, disclosing the worst-case credit cost. Stores the request
-  // so ZoomInfoGatekeeperImpl.applyAction() can replay it once approved, and returns a ticket the
-  // Gadget passes to getEnrichmentResult(). No credits are spent until approval. `awaitDecision`
-  // suspends the agent's turn until the user decides, so no result simulation is needed.
-  // `summary` opens the description's prose, so every agent value in it goes through `codeSpan`
-  // (`fieldList` for lists); the request itself is shown exactly in the fields.
+  // Submit a paid enrichment for approval: the engine stages it on the journal (under the
+  // pending cap, with the lost-submit-reply guard), describes it for the approver, and hands it
+  // to the queue; this returns a ticket the Gadget passes to getEnrichmentResult(). No credits
+  // are spent until approval, and `awaitDecision` (declared on the definition) suspends the
+  // agent's turn until the user decides.
   async #submitEnrichment(
     kind: EnrichmentKind,
     summary: string,
@@ -997,31 +971,19 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
     worstCaseCredits: number,
     page?: PageRequest,
   ): Promise<EnrichmentTicket> {
-    const store = new EnrichmentStore(this.#kv);
-    const id = store.submit({ kind, summary, attributes, page });
-    try {
-      await this.#approvalQueue.submitAction(id, {
-        title: `ZoomInfo: ${summary}`,
-        // The request body is what leaves the workspace (names, emails, company identifiers), so
-        // the approver sees it exactly, after the summary and the cost.
-        ...buildDescription(
-          `${summary}\n\n**Credit cost:** up to **${worstCaseCredits}** ZoomInfo bulk-data ` +
-          `credit${worstCaseCredits === 1 ? "" : "s"} (fewer if records are already under ` +
-          `management; none for no-match/error results). Charged only on approval.`)
-          .json("Request", attributes)
-          .json("Page", page ?? {})
-          .finish(),
-        // Spent credits can't be refunded, so there is no automatic revert.
-        implementsRevert: false,
-        // No simulation: suspend the agent until the user decides rather than letting it read back
-        // un-enriched state.
-        awaitDecision: true,
-      });
-    } catch (error) {
-      store.removePending(id);
-      throw error;
-    }
+    const { set } = zoomInfoActions(this.#kv, this.#enrichmentHost());
+    const id = await set.submit(this.#approvalQueue, "enrich",
+      { kind, summary, attributes, ...(page === undefined ? {} : { page }), worstCaseCredits });
     return { id, kind, summary };
+  }
+
+  /** The enrichment host over this session's account, API, and shared storage. */
+  #enrichmentHost(): ZoomInfoActionHost {
+    const outcomes = new EnrichmentOutcomes(this.#kv);
+    return {
+      call: fn => this.#call(fn),
+      putOutcome: (id, outcome) => outcomes.put(id, outcome),
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -1262,8 +1224,8 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
   // Enrichment results
 
   async getEnrichmentResult(ticket: EnrichmentTicket): Promise<EnrichmentOutcome> {
-    const store = new EnrichmentStore(this.#kv);
-    const stored = store.getResult(ticket.id);
+    const outcomes = new EnrichmentOutcomes(this.#kv);
+    const stored = outcomes.get(ticket.id);
     let outcome: EnrichmentOutcome;
     if (stored) {
       // The stored result payload is untyped (see StoredEnrichmentOutcome); its shape was produced
@@ -1272,10 +1234,19 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
       outcome = stored.status === "ready"
         ? ({ status: "ready", kind: ticket.kind, result: stored.result } as EnrichmentOutcome)
         : stored;
-    } else if (store.getPending(ticket.id)) {
-      outcome = { status: "pending" };
     } else {
-      throw new Error(`Unknown ZoomInfo enrichment ticket: ${ticket.id}`);
+      // Nothing in the window yet: the journal's live record says where the enrichment is. A
+      // failed record carries its explanation until the user rejects it; a terminal unknown
+      // outcome can land here too, right after a rejection copied it into the window.
+      const record = zoomInfoActions(this.#kv, this.#enrichmentHost()).journal.get(ticket.id);
+      if (record === undefined) {
+        throw new Error(`Unknown ZoomInfo enrichment ticket: ${ticket.id}`);
+      }
+      outcome = record.state === "failed"
+        ? (record.outcome === "unknown"
+          ? { status: "unknown", message: record.error }
+          : { status: "failed", message: record.error })
+        : { status: "pending" };
     }
     await this.#observe(
       `Read ZoomInfo enrichment result #${ticket.id}`,

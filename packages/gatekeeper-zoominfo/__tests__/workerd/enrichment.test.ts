@@ -14,7 +14,7 @@ afterEach(() => {
 const props = (id: string) => ({ userObjectId: id });
 
 type Ticket = { id: number };
-type StoredOutcome = { status: "pending" | "ready" | "failed" | "unknown"; message?: string };
+type StoredOutcome = { status: "pending" | "ready" | "failed" | "unknown" | "rejected"; message?: string };
 
 async function submit(facet: string, id: string): Promise<Ticket> {
   const result = await hooks().run(facet, props(id), [
@@ -72,7 +72,9 @@ describe("enrichment outcomes", () => {
     zi.failEnrich = 400;
     const id = await seedAccount(zi);
     const ticket = await submit("enrich-400", id);
-    unwrap(await hooks().applyAction("enrich-400", props(id), ticket.id));
+    // The apply surfaces the failure (the engine records it terminally; the overseer must not
+    // retry a paid call that already answered) and the Gadget reads the recorded outcome.
+    expect(failure(await hooks().applyAction("enrich-400", props(id), ticket.id))).toBeTruthy();
     const stored = unwrap(await hooks().run("enrich-400", props(id), [
       ["getEnrichmentResult", ticket],
     ])) as StoredOutcome;
@@ -80,12 +82,12 @@ describe("enrichment outcomes", () => {
     expect(zi.enrichRequests).toBe(1);
   });
 
-  it("takes its claim before the read reservation, so a mid-reservation rejection cannot supersede it (ZC-1)", async () => {
+  it("records a rejection that lands during a refused apply, without ever dispatching (ZC-1)", async () => {
     const zi = new FakeZoomInfo().install();
     const id = await seedAccount(zi);
     // Spend the day's single read (the limit is 1 in this suite) so the apply stops inside its
-    // read reservation -- exactly the await window where a rejection used to land between the
-    // pending check and a claim that only the reservation's callback would write.
+    // read reservation -- exactly the await window where a rejection used to be able to land
+    // between the pending check and a claim.
     const spent = await hooks().run("claim-budget", props(id), [["searchCompanies", {}]]);
     expect(unwrap(spent)).toBeTruthy();
 
@@ -99,14 +101,33 @@ describe("enrichment outcomes", () => {
     expect(raced.apply.error).toContain("used today's 1 ZoomInfo reads");
     expect(zi.enrichRequests).toBe(0);
 
-    // The claim outran the rejection, so the refused apply restored the enrichment to pending:
-    // it stays retryable (the retry hits the same budget refusal), and the Gadget reads the
-    // ticket as pending rather than "rejected" over a dispatch that never ran.
-    const retry = await hooks().applyAction("claim-race", props(id), ticket.id);
-    expect(failure(retry)).toContain("used today's 1 ZoomInfo reads");
+    // The engine serializes decisions, so the rejection lands after the refused apply restores
+    // the enrichment to pending -- the user's decision is recorded ("rejected" over a dispatch
+    // that never ran), and no zombie pending action survives the race.
+    expect((raced.rejection as { error?: string }).error).toBeUndefined();
     const stored = unwrap(await hooks().run("claim-race", props(id), [
       ["getEnrichmentResult", ticket],
     ])) as StoredOutcome;
-    expect(stored.status).toBe("pending");
+    expect(stored.status).toBe("rejected");
+    const retry = await hooks().applyAction("claim-race", props(id), ticket.id);
+    expect(failure(retry)).toBeTruthy();
+    expect(zi.enrichRequests).toBe(0);
+  });
+
+  it("refuses a submission past the engine's pending cap instead of queueing it unbounded", async () => {
+    const zi = new FakeZoomInfo().install();
+    const id = await seedAccount(zi);
+    // Fill the journal's pending slots (default cap 50), all against one gatekeeper instance;
+    // submissions dispatch nothing, so none is ever decided or pruned along the way.
+    for (let i = 0; i < 50; i++) {
+      const result = await hooks().run("cap", props(id), [
+        ["enrichCompanies", [{ companyId: `100${i % 10}` }], ["id", "name"]],
+      ]);
+      expect(unwrap(result)).toBeTruthy();
+    }
+    const overflow = await hooks().run("cap", props(id), [
+      ["enrichCompanies", [{ companyId: "1001" }], ["id", "name"]],
+    ]);
+    expect(failure(overflow)).toContain("Too many pending actions");
   });
 });
