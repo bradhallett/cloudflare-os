@@ -144,10 +144,15 @@ type CursorShape<T> = {
    * `{ kind: "baseline" }` scope or a synthetic collection id: the gate refuses a `collections`
    * scope naming none. A mid-walk empty page (a spent fetch window that still says "ask again")
    * arrives with `terminal: false`.
+   * Omit for a walk whose observation was authorized once, up front — a session method that
+   * authorizes the whole listing before returning the cursor, so per-page checking would only
+   * repeat it. Everything else above still holds: the buffer only ever holds rows a fetch
+   * callback already returned, and a fetch that authorizes its own page as it reads it leaves
+   * nothing in the buffer that was not authorized.
    * @param items The provider rows of the page, without injected rows. Empty when `terminal`.
    * @param context `terminal` when this ends the walk.
    */
-  authorizePage(items: readonly T[], context: { terminal: boolean }): Promise<void>;
+  authorizePage?(items: readonly T[], context: { terminal: boolean }): Promise<void>;
 };
 
 /** The default fetch bound, exported for a connector that names it beside an explicit override. */
@@ -273,7 +278,7 @@ abstract class BufferedCursor<T> extends RpcTarget implements Cursor<T>, Disposa
     // to authorize. A walk that disclosed nothing still answered the query: "no such thing" is
     // provider data. Authorized once, so a repeated terminal `next()` emits no duplicate observation.
     const injectedOnly = page.items.length > 0 && page.provided.length === 0;
-    if (terminal ? !this.#answered : !injectedOnly) {
+    if (this.#authorizePage !== undefined && (terminal ? !this.#answered : !injectedOnly)) {
       try {
         await this.#authorizePage(page.provided, { terminal });
       } catch (error) {
@@ -428,6 +433,91 @@ export class TokenCursor<T> extends BufferedCursor<T> {
     this[enqueue](page.items, next === undefined);
     if (next !== undefined) this.#seenTokens.add(next);
     this.#token = next;
+  }
+}
+
+/** One page of a provider listing keyed by page number: `nextPage` absent or null ends the walk. */
+export type ProviderPage<R> = {
+  /** Safe to filter: `nextPage`, not this length, ends the walk. */
+  readonly items: readonly R[];
+  /**
+   * The page number that continues the listing. Absent or null ends the remote walk, whether the
+   * provider says so itself (GitLab's `nextPage: null`) or the page came back short (GitHub's
+   * `per_page` maximum). Presence means "ask again", even when `items` is empty.
+   */
+  readonly nextPage?: number | null;
+};
+
+/** Options for a provider that pages by page number, with each row retained through an overlay. */
+export type PageCursorOptions<T, R = T> = CursorShape<T> & {
+  /**
+   * Fetches one provider page by its 1-based number.
+   * @param page The page to fetch: `1` on the first call, then `nextPage`.
+   * @param perPage Requested provider page size.
+   * @returns The page's rows and where the listing continues.
+   */
+  fetchPage(page: number, perPage: number): Promise<ProviderPage<R>>;
+  /**
+   * Retains each fetched page's rows through the simulation overlay: the items to serve, dropping
+   * any row the overlay retires (and any placeholder the provider pads a page with). Must keep the
+   * rows' order, since injected items merge against it. Defaults to serving the rows as-is, which
+   * is the whole contract when `R` stays at its default.
+   */
+  retain?(rows: readonly R[]): readonly T[];
+};
+
+/**
+ * Fetches a page-numbered provider listing lazily, retaining each page's rows through an overlay,
+ * and merges injected rows in at their sort positions. One `next()` is serialized, so interleaved
+ * calls neither duplicate nor skip pages, and the fetch bound plus the monotonic page sequence
+ * bound a walk that a misbehaving provider would otherwise run forever.
+ *
+ * @example
+ * ```ts
+ * // A selective overlay can drop page after page, so the walk names its own fetch bound: one
+ * // `next()` must not read a whole history to fill one small page.
+ * return new PageCursor<Issue, RawIssue>({
+ *   pageSize: 50,
+ *   maxProviderPagesPerCall: 10,
+ *   fetchPage: (page, perPage) => api.listIssues({ page, perPage }),
+ *   retain: rows => rows.map(overlay).filter(item => item !== null),
+ *   inject: { items: provisionals, compare },
+ * });
+ * ```
+ */
+export class PageCursor<T, R = T> extends BufferedCursor<T> {
+  readonly #fetchPage: PageCursorOptions<T, R>["fetchPage"];
+  readonly #retain: (rows: readonly R[]) => readonly T[];
+  // The next page to ask for. Only read while the walk is live: once a page reports exhaustion,
+  // `[loadMore]` is never called again, so this never observes the null that ended the walk.
+  #nextPage = 1;
+
+  /**
+   * Creates a page-numbered cursor.
+   * @param options Provider fetch and retention, page sizes, and the shared buffered settings.
+   */
+  constructor(options: PageCursorOptions<T, R>) {
+    super(options);
+    this.#fetchPage = options.fetchPage;
+    // The fallback is the identity: with `retain` omitted `R` is `T` (the type's default), so the
+    // fetched rows are themselves the served items.
+    this.#retain = options.retain ?? ((rows: readonly R[]) => rows as unknown as readonly T[]);
+  }
+
+  /** Loads one page-numbered provider page, retaining its rows. */
+  protected override async [loadMore](): Promise<void> {
+    const asked = this.#nextPage;
+    const page = await this.#fetchPage(asked, this.remotePageSize);
+    const next = page.nextPage ?? null;
+    // Refuse a page that would repeat or restart the walk before moving cursor state, so retrying
+    // asks for the same page: a provider that echoes the page it was asked to continue from, or
+    // resets to 1, would otherwise page forever, and the fetch bound is no backstop against it.
+    if (next !== null && next <= asked) {
+      throw new Error(
+        `Provider returned page ${next} to continue a listing that asked for page ${asked}.`);
+    }
+    this[enqueue](this.#retain(page.items), next === null);
+    if (next !== null) this.#nextPage = next;
   }
 }
 

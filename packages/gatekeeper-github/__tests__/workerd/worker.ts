@@ -21,6 +21,7 @@ import type {
   GitHubCommitDetails,
   GitHubCommitFilter,
   GitHubCommitSummary,
+  GitHubCreateIssueOptions,
   GitHubCreatePullRequestOptions,
   GitHubEvent,
   GitHubIssue,
@@ -124,6 +125,9 @@ export type CreatePullRequestActionData = {
   options: GitHubCreatePullRequestOptions;
 };
 
+/** github.ts's (unexported) `CreateIssueAction` record, read off the real prepare signature. */
+export type CreateIssueActionData = Awaited<ReturnType<GitHubGatekeeperImpl["prepareCreateIssue"]>>;
+
 /** github.ts's (unexported) `PostReviewAction` record, read off the real submit signature. */
 export type PostReviewActionData = Extract<
   Parameters<GitHubGatekeeperImpl["submitActionForApproval"]>[1], { type: "postReview" }>;
@@ -197,6 +201,7 @@ type GatekeeperFacet = Pick<GitHubGatekeeperImpl, "gitPull"> & {
   listCommits(filter: GitHubCommitFilter | undefined, pageSize: number, cache?: RpcStub<GitCache>)
     : Promise<{ next(): Promise<GitHubCommitSummary[] | null> }>;
   openIssue(id: string): Promise<GitHubIssueDetails>;
+  prepareCreateIssue(options: GitHubCreateIssueOptions): Promise<CreateIssueActionData>;
   prepareSetTitle(kind: "issue" | "pull", id: string, title: string): Promise<IssueEditActionData>;
   prepareChangeState(kind: "issue" | "pull", id: string, state: "open" | "closed")
     : Promise<IssueEditActionData>;
@@ -487,6 +492,19 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
     });
   }
 
+  /** Queues a create-issue action for approval, as the session's createIssue would. */
+  async queueCreateIssue(
+    facetName: string, props: GatekeeperProps, queue: unknown, options: GitHubCreateIssueOptions,
+  ): Promise<Outcome<number>> {
+    return await outcome(async () => {
+      const gatekeeper = this.#gatekeeper(facetName, props);
+      const action = await gatekeeper.prepareCreateIssue(options);
+      await gatekeeper.submitActionForApproval(
+        queue, action, { title: action.type, description: action.type, implementsRevert: true });
+      return action.approvalId;
+    });
+  }
+
   /**
    * One listing cursor's `next()` results, for up to `calls` calls or through its `null`. A call
    * that throws is recorded as its message and retried on the same cursor; a second throw in a
@@ -508,6 +526,20 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
         }
       }
       return pages;
+    });
+  }
+
+  /**
+   * Several concurrent `next()` calls on one listing cursor, their pages in call order:
+   * interleaved callers must neither duplicate nor skip pages, whatever the fetches' timing.
+   */
+  async concurrentListingPages(
+    facetName: string, props: GatekeeperProps,
+    method: ListingMethod, query: unknown, pageSize: number, calls: number,
+  ): Promise<Outcome<(unknown[] | null)[]>> {
+    return await outcome(async () => {
+      const cursor = await this.#gatekeeper(facetName, props)[method](query as never, pageSize);
+      return await Promise.all(Array.from({ length: calls }, () => cursor.next()));
     });
   }
 

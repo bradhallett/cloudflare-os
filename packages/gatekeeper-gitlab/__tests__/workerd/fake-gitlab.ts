@@ -45,6 +45,17 @@ export function json(data: unknown, init: ResponseInit = {}): Response {
 export class FakeGitLab {
   readonly requests: FakeRequest[] = [];
   #routes: Array<{ method: string; pattern: RegExp; handler: Handler }> = [];
+  /**
+   * The next request, held by `holdNextRequest` and released on its own arrival: the concurrency
+   * test needs two `next()` calls in flight, and a self-releasing gate cannot deadlock a
+   * serialized cursor that only ever arrives once.
+   */
+  #held: { promise: Promise<void>; resolve: () => void } | null = null;
+
+  /** Holds the next request, releasing it as it arrives (see `#held`). */
+  holdNextRequest(): void {
+    this.#held ??= Promise.withResolvers<void>();
+  }
 
   install(): void {
     vi.stubGlobal("fetch", this.#handle.bind(this));
@@ -77,6 +88,12 @@ export class FakeGitLab {
       recorded.body = new TextDecoder().decode(recorded.bytes);
     }
     this.requests.push(recorded);
+    const held = this.#held;
+    if (held) {
+      this.#held = null;
+      held.resolve();
+      await held.promise;
+    }
     for (const route of this.#routes) {
       if (route.method === request.method && route.pattern.test(url.pathname + url.search)) {
         return await route.handler(recorded);
