@@ -31,7 +31,9 @@ export default defineConfig({
     }),
   ],
   test: {
-    testTimeout: 60_000,
+    // The Google suites keep the tighter 15s container-reproducibility standard of #747 (pinned
+    // by scripts/vitest-task.test.ts), not the 60s workerd default.
+    testTimeout: 15_000,
     include: [
       "__tests__/workerd/chat-actions.test.ts",
       "__tests__/workerd/chat-hooks.test.ts",

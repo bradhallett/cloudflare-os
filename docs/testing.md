@@ -26,7 +26,9 @@ that runs its tests inside workerd (the `cloudflareTest` configs) sets a pool-le
 `testTimeout: 60_000`, the lesson of PR #120: cold gates run every suite at once, a starved test
 times out at the 5-second default, and its abandoned body keeps running in the isolate and
 corrupts sibling tests. New workerd pools carry the same line; keep per-test overrides only for
-known-marathon tests. Google's Node pool allows 15 seconds per test.
+known-marathon tests. The Google gatekeeper is the deliberate exception: all three of its projects
+pin `testTimeout: 15_000`, the container-reproducibility standard of #747 (a Google test that
+needs longer is a bug in the test, and scripts/vitest-task.test.ts holds the line).
 
 For a slow container or CI runner, explicitly override both bounds rather than changing local
 defaults:
