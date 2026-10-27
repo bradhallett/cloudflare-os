@@ -13,7 +13,6 @@ import {
   type ActionKind,
   type ObservationDescription,
   type ResourceDescription,
-  type SupportedResource,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { codeSpan, sanitizeTitle } from "@gadgets/gatekeeper-kit/action-description";
 import {
@@ -28,7 +27,6 @@ import {
   type GitHubCompareResponse,
   type GitHubIssueCommentResponse,
   type GitHubIssueResponse,
-  type GitHubLabelResponse,
   type GitHubPullFileResponse,
   type GitHubPullRequestResponse,
   type GitHubPullRequestReviewCommentResponse,
@@ -55,7 +53,7 @@ import {
   type TreeDiffSource,
 } from "@gadgets/gatekeeper-kit/git-diff";
 import { ArrayCursor, SessionGitCache } from "@gadgets/gatekeeper-kit/cursors";
-import { commitIdsOfSummary, isCommitOid, parseGitCommitPayload } from "@gadgets/gatekeeper-kit/git-objects";
+import { isCommitOid, parseGitCommitPayload } from "@gadgets/gatekeeper-kit/git-objects";
 import { startGitPull } from "@gadgets/gatekeeper-kit/git-pull-transfer";
 import {
   GitRefUpdateRejectedError,
@@ -63,7 +61,6 @@ import {
   emptyPackBytes,
   pushGitRefUpdate,
   simulateBranchHead,
-  validateBranchName,
 } from "@gadgets/gatekeeper-kit/git-transport";
 import { desiredStateReached } from "@gadgets/gatekeeper-kit/outcome-unknown";
 import {
@@ -150,25 +147,19 @@ import type {
   GitHubCommitSummary,
   GitHubCreateIssueOptions,
   GitHubCreatePullRequestOptions,
-  GitHubDiffCommentTarget,
   GitHubDiffThread,
   GitHubDiscussionEntry,
   GitHubEvent,
   GitHubEventKind,
-  GitHubEventReview,
   GitHubIssue,
   GitHubIssueDetails,
   GitHubIssueFilter,
   GitHubIssueSearch,
   GitHubIssueState,
   GitHubIssueSummary,
-  GitHubLabel,
-  GitHubPageOptions,
   GitHubPullRequest,
-  GitHubPullRequestBranchRef,
   GitHubPullRequestDetails,
   GitHubPullRequestDiffFile,
-  GitHubPullRequestEvent,
   GitHubPullRequestFilter,
   GitHubPullRequestMergeOptions,
   GitHubPullRequestReviewDraft,
@@ -177,9 +168,6 @@ import type {
   GitHubPullRequestSummary,
   GitHubRepo as GitHubRepoSession,
   GitHubRepoMetadata,
-  GitHubRepoRef,
-  GitHubReviewDecision,
-  GitHubSubmittedDiffComment,
   GitHubSubscribeOptions,
   GitHubTagSummary,
 } from "./types";

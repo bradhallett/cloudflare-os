@@ -14,9 +14,11 @@ import type {
   RemoveLabelsAction,
 } from "./github-action-types";
 
-// Apply replaces `#~N` in a Markdown body with the GitHub number of the issue or pull request
-// created in this workspace as `~N`. Both name the same thing, so the body shown stays the body
-// sent, but the approver is told the number will change.
+/**
+ * Apply replaces `#~N` in a Markdown body with the GitHub number of the issue or pull request
+ * created in this workspace as `~N`. Both name the same thing, so the body shown stays the body
+ * sent, but the approver is told the number will change.
+ */
 export const PROVISIONAL_REFERENCE = /#~\d+/;
 
 export function noteReferenceRewrite(builder: ActionDescriptionBuilder, ...bodies: (string | undefined)[]):
@@ -28,8 +30,10 @@ export function noteReferenceRewrite(builder: ActionDescriptionBuilder, ...bodie
     : builder;
 }
 
-// The label set a `removeLabels` apply writes with `setLabels`: the labels staged in
-// `previousLabels` minus the removed ones, compared case-insensitively.
+/**
+ * The label set a `removeLabels` apply writes with `setLabels`: the labels staged in
+ * `previousLabels` minus the removed ones, compared case-insensitively.
+ */
 export function remainingLabels(action: RemoveLabelsAction): string[] {
   return action.previousLabels.filter(
     label => !action.labels.some(removed => removed.toLowerCase() === label.toLowerCase()));
