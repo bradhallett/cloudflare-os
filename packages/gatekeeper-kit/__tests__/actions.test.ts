@@ -379,6 +379,68 @@ describe("ActionJournal", () => {
     expect(() => journal.allocate({ sql: "three" })).toThrow(/Too many pending/);
   });
 
+  it("adopts in place over the legacy row its target key already holds", () => {
+    // A port that must delete its legacy row before adopting loses the action to a crash between
+    // the two writes. The adopt itself overwrites the row atomically, and `hasRecord` tells a
+    // resumed port which rows are already its own.
+    const kv = makeKv();
+    kv.put("legacy:rec:7", { sql: "the old record" });
+    const journal = new ActionJournal<Sql>(kv, {
+      legacyKeys: { nextIdKey: "legacy:next", recordPrefix: "legacy:rec:" },
+      upgradeRecord: raw => ({ sql: (raw as { sql: string }).sql }),
+    });
+
+    expect(journal.hasRecord(7)).toBe(false);
+    journal.adopt(7, { state: "staged", action: { sql: "the adopted record" } });
+    expect(journal.get(7)).toEqual({ state: "staged", action: { sql: "the adopted record" } });
+    expect(journal.hasRecord(7)).toBe(true);
+    expect(kv.get("legacy:rec:7")).toMatchObject({ v: 2 });
+    // A resumed port asks before adopting again, and the journal backs the answer.
+    expect(() => journal.adopt(7, { state: "pending", action: { sql: "again" } }))
+      .toThrow(/already issued/);
+  });
+
+  it("keeps a journal-written failed row failed, never re-adoptable as pending", () => {
+    // The rerun hazard a one-time port faces: its own earlier attempt left a versioned failed
+    // row on the pending tier, and the legacy-prefix scan lists that key again.
+    const kv = makeKv();
+    kv.put("pending:action:5", {
+      v: 2, state: "failed", action: { sql: "discarded" },
+      error: "action 5 was discarded", undispatched: true,
+    });
+    const journal = new ActionJournal<Sql>(kv, { namespace: "pending" });
+
+    expect(journal.hasRecord(5)).toBe(true);
+    expect(() => journal.adopt(5, { state: "pending", action: { sql: "resurrected" } }))
+      .toThrow(/already issued/);
+    expect(journal.listPending()).toEqual([]);
+    expect(journal.listFailed().map(({ id }) => id)).toEqual([5]);
+  });
+
+  it("releases the slot an undispatched or unknown-outcome failure holds when it is removed", () => {
+    // The kit never prunes those records -- only a rejection can release what a discard set up
+    // -- so `remove` on rejection is the recovery path the capacity error points at.
+    const kv = makeKv();
+    const journal = new ActionJournal<Sql>(kv, { namespace: "pending", maxPending: 3 });
+    const ids = [1, 2, 3].map(n => journal.allocate({ sql: `action ${n}` }));
+    for (const id of ids) {
+      journal.markSubmitted(id);
+      journal.markFailed(id, `action ${id} was discarded`, { undispatched: true });
+    }
+    expect(() => journal.reserveId()).toThrow(/Too many pending/);
+
+    journal.remove(ids[1]);
+    expect(journal.reserveId()).toBe(4);
+
+    const stage = journal.stage(4, { sql: "replacement" });
+    expect(stage).toBeUndefined();
+    journal.markSubmitted(4);
+    journal.markFailed(4, "outcome never reported", { outcome: "unknown" });
+    expect(() => journal.reserveId()).toThrow(/Too many pending/);
+    journal.remove(4);
+    expect(journal.reserveId()).toBe(5);
+  });
+
   it("updates a pending-tier payload in place, keeping state and failure reason", () => {
     const journal = new ActionJournal<Sql>(makeKv(), { namespace: "pending" });
     const id = journal.allocate({ sql: "one" });

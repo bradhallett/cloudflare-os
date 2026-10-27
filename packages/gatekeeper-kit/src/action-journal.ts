@@ -216,8 +216,9 @@ export class ActionJournal<A> {
 
   /**
    * Reserves the next action ID without staging a record, for a connector whose action payload
-   * embeds its own ID and so is built after the ID exists. The ID must reach `stage` while it is
-   * still the newest reservation: a reserved ID nothing stages is skipped, never reused.
+   * embeds its own ID and so is built after the ID exists. A reserved ID nothing stages is
+   * skipped by every later reservation; `stage` cannot tell it from one just reserved (both sit
+   * below the id counter, unoccupied), so a caller stages only IDs it reserved itself.
    * @returns Reserved action ID.
    */
   reserveId(): number {
@@ -237,8 +238,9 @@ export class ActionJournal<A> {
   }
 
   /**
-   * Stages an action at an ID `reserveId` returned. The reservation and the record stay paired:
-   * an ID this journal never reserved, or one a record already occupies, is refused.
+   * Stages an action at an ID `reserveId` returned or `reserveThrough` issued. The check is
+   * positional, not a reservation registry: any unoccupied ID below the counter passes, so the
+   * pairing is the caller's to keep -- one a record already occupies is refused outright.
    * @param id Reserved action ID.
    * @param action Payload to store.
    * @param fence Connection generation the staging operation ran under.
@@ -269,10 +271,31 @@ export class ActionJournal<A> {
     if (!Number.isInteger(id) || id < 1) {
       throw new Error(`Cannot adopt an action id of ${id}.`);
     }
-    if (this.#occupied(id) || this.wasApplied(id)) {
+    // Only a record this journal wrote (or retired memory) blocks the id: a raw legacy row at
+    // the target key is exactly what adoption replaces, and refusing it would force a port into
+    // delete-then-adopt -- a crash between the two loses the action. The adopt overwrites the
+    // legacy row in place.
+    if (this.hasRecord(id) || this.wasApplied(id)) {
       throw new Error(`Action ${id} was already issued; cannot adopt over it.`);
     }
     this.#write(record.state === "applied" ? this.#retainedKey(id) : this.#pendingKey(id), record);
+  }
+
+  /**
+   * Whether this journal itself wrote a record at the id, at either tier. A one-time port
+   * resumed after a crash uses it to tell an id it already adopted from one still held as
+   * legacy storage: `get` cannot, because it reads convertible legacy rows as records too.
+   * @param id Action ID to check.
+   * @returns Whether a journal-written record holds the id.
+   */
+  hasRecord(id: number): boolean {
+    return this.#isJournalRow(this.#pendingKey(id)) || this.#isJournalRow(this.#retainedKey(id));
+  }
+
+  /** @returns Whether the row at a key is one this journal wrote, not legacy storage. */
+  #isJournalRow(key: string): boolean {
+    const raw: unknown = this.#kv.get<unknown>(key);
+    return typeof raw === "object" && raw !== null && "v" in raw && raw.v === JOURNAL_VERSION;
   }
 
   /**
@@ -526,8 +549,9 @@ export class ActionJournal<A> {
 
   /**
    * @returns Failed actions still held for the explanations they carry -- a discarded action
-   * awaiting its user-visible rejection, a dispatch whose outcome was never reported. Pruned
-   * under the same capacity bound as any other pending-tier record.
+   * awaiting its user-visible rejection, a dispatch whose outcome was never reported. Ordinary
+   * failures prunable under the capacity bound come and go; an `undispatched` or unknown-outcome
+   * one holds its slot until rejected, and `remove` on rejection is what releases it.
    */
   listFailed(): JournalEntry<A>[] {
     return this.#scan(FAILED);
