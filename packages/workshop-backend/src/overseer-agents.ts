@@ -13,7 +13,7 @@ import { AgentTurnError } from "./ai-invoke";
 import { runAgent } from "./agent";
 import { chatChangeStatuses } from "./agent-compaction";
 import { UserDurableObject } from "./user";
-import type { UserChatContext } from "./user";
+import type { UserChatContext } from "./user-models";
 import { reportIssue } from "@gadgets/observability/error-reporting";
 import { checkUsageAndBalance } from "./ai-gateway-billing/limits/usage-checker";
 import { refreshCachedBalance } from "./ai-gateway-billing/cloudflare/connection-service";

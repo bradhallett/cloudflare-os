@@ -172,9 +172,13 @@ describe("UserDurableObject gateway model modes", () => {
                             config: Partial<AdminConfig> = {}) {
     const stub = env.TEST_USER.getByName(`user-models-${++userCounter}`);
     return runInDurableObject(stub, async user => {
-      const impl = user as unknown as { env: Cloudflare.Env };
+      // The model store (user-models.ts) snapshots env at construction, like the account
+      // store: keep the rewrite visible to both holders.
+      const impl = user as unknown as {
+        env: Cloudflare.Env; models: { env: Cloudflare.Env };
+      };
       const original = impl.env;
-      impl.env = {
+      const swapped = {
         ...original,
         CF_AI_GATEWAY: "platform-gateway",
         CF_AI_GATEWAY_ACCOUNT_ID: "account-id",
@@ -184,10 +188,13 @@ describe("UserDurableObject gateway model modes", () => {
           get: async () => serializeAdminConfig({ ...DEFAULT_ADMIN_CONFIG, ...config }),
         } as unknown as KVNamespace,
       };
+      impl.env = swapped;
+      impl.models.env = swapped;
       try {
         return await f(user);
       } finally {
         impl.env = original;
+        impl.models.env = original;
       }
     });
   }

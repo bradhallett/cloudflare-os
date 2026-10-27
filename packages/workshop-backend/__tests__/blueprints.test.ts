@@ -558,8 +558,14 @@ describe("publishing a blueprint", () => {
     kv.set("orphan", JSON.stringify({ metadata, ownerId: stub.id.toString() }));
 
     await runInDurableObject(stub, async (user: UserDurableObject) => {
-      let internals = user as unknown as { env: Cloudflare.Env };
-      internals.env = { ...internals.env, BLUEPRINTS };
+      // The blueprint store (user-blueprints.ts) snapshots env at construction, like the
+      // account store: keep the rewrite visible to both holders.
+      let internals = user as unknown as {
+        env: Cloudflare.Env; blueprints: { env: Cloudflare.Env };
+      };
+      let swapped = { ...internals.env, BLUEPRINTS };
+      internals.blueprints.env = swapped;
+      internals.env = swapped;
       await user.deleteOwnedBlueprint("orphan");
     });
 

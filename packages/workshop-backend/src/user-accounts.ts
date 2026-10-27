@@ -11,7 +11,6 @@ import {
   GatekeeperVendorFilter,
   GatekeeperVendorInfo,
   ConnectFlowStart,
-  createPlanRefusalError,
 } from "@gadgets/workshop-shared/api";
 import {
   ActionDescription,
@@ -37,11 +36,9 @@ import {
   type PendingHandoffRecord,
   type UserStorage,
 } from "./storage-schema/user-storage.js";
-import { allowedGatekeepers } from "./user-plan.js";
 import { UserDirectoryScopeStore } from "./user-directory-scope.js";
 import { createWorkshopLogger } from "./observability";
-import { ambientGatekeeperMode, shouldAutoProvisionAccount } from "./provisioning-policy.js";
-import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./admin-config.js";
+import { filterEnabledResources, gatekeeperAccessPolicy, readAdminConfig } from "./admin-config.js";
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
 import {
   CONNECT_FLOW_LIFETIME_MS,
@@ -190,17 +187,15 @@ export class UserAccountStore {
     // Admin-disabled resources/gatekeepers are filtered out here, and so is any vendor the
     // user's plan doesn't offer, which also covers the agent (the Overseer's
     // connectable-vendor/resource list is sourced from this method).
-    let config = await readAdminConfig(this.env);
-    let disabledGatekeeperSet = new Set(config.disabledGatekeepers);
-    let planAllowed = await allowedGatekeepers(this.env, this.ctx.id.toString());
+    let policy = await gatekeeperAccessPolicy(this.env, this.ctx.id.toString());
 
     let promises: Promise<GatekeeperVendorInfo | null>[] = [];
 
     for (let [id, vendor] of this.vendors) {
-      if (disabledGatekeeperSet.has(id)) {
+      if (policy.adminDisabled(id)) {
         continue;  // Whole gatekeeper disabled by admin.
       }
-      if (planAllowed !== null && !planAllowed.has(id.toLowerCase())) {
+      if (!policy.onPlan(id)) {
         continue;  // Not on the user's plan.
       }
       promises.push((async () => {
@@ -221,7 +216,7 @@ export class UserAccountStore {
             ]);
           }
           let enabledResources =
-              filterEnabledResources(config, id, supportedResources);
+              filterEnabledResources(policy.config, id, supportedResources);
           // The filter matches what would be pushed (the same enabled basis notifyAdd applies):
           // a URL that matches only an admin-disabled resource hides the vendor entirely.
           if (filter?.resourceUrl &&
@@ -261,17 +256,9 @@ export class UserAccountStore {
     if (!vendor) {
       throw new Error("No such service: " + vendorId);
     }
-    let normalized = vendorId.toLowerCase();
-    if ((await readAdminConfig(this.env)).disabledGatekeepers.includes(normalized)) {
-      throw new Error(`The "${vendorId}" gatekeeper is disabled on this deployment.`);
-    }
-    // The plan gate mirrors #assertResourceEnabled's ordering (admin first), so a connect never
-    // completes an OAuth flow only to fail at the first gatekeeper mint.
-    let allowed = await allowedGatekeepers(this.env, this.ctx.id.toString());
-    if (allowed !== null && !allowed.has(normalized)) {
-      throw createPlanRefusalError("CONNECTOR_NOT_ON_PLAN",
-          `The "${vendorId}" connector isn't available on your plan.`);
-    }
+    // The access-policy gate (admin-disable first, then the plan) mirrors the mints' ordering,
+    // so a connect never completes an OAuth flow only to fail at the first gatekeeper mint.
+    (await gatekeeperAccessPolicy(this.env, this.ctx.id.toString())).assertConnectable(vendorId);
 
     let accountId = this.storage.nextAccountId.get();
     this.storage.nextAccountId.put(accountId + 1);
@@ -342,18 +329,18 @@ export class UserAccountStore {
   }
 
   /**
-   * The ambient gatekeepers the user can opt into now: mode "optional", not yet added, and on
-   * the user's plan. Backs the Connectors "Available" section. ("enabled" ones are already
-   * provisioned; "disabled" ones, and ones the plan doesn't offer, aren't listed — the same
-   * dormancy treatment listProvidedAccounts gives an already-added account.)
+   * The ambient gatekeepers the user can opt into now: mode "optional", not yet added, and
+   * neither admin-disabled nor off the user's plan. Backs the Connectors "Available" section.
+   * ("enabled" ones are already provisioned; "disabled" ones, and ones the plan doesn't offer,
+   * aren't listed — the same dormancy treatment listProvidedAccounts gives an already-added
+   * account.)
    */
   async listAddableGatekeepers(): Promise<GatekeeperVendorInfo[]> {
-    let config = await readAdminConfig(this.env);
-    let planAllowed = await allowedGatekeepers(this.env, this.ctx.id.toString());
+    let policy = await gatekeeperAccessPolicy(this.env, this.ctx.id.toString());
     return (await this.#ambientVendors())
-        .filter(({vendorId}) =>
-            ambientGatekeeperMode(config, vendorId) === "optional" && !this.#hasAccountForVendor(vendorId))
-        .filter(({vendorId}) => planAllowed === null || planAllowed.has(vendorId.toLowerCase()))
+        .filter(({vendorId}) => policy.ambientMode(vendorId) === "optional" &&
+            !policy.adminDisabled(vendorId) && policy.onPlan(vendorId) &&
+            !this.#hasAccountForVendor(vendorId))
         // Same shape as listGatekeeperVendors; ambient gatekeepers expose no resources.
         .map(({vendorId, description}) => ({id: vendorId, description, supportedResources: []}));
   }
@@ -380,16 +367,9 @@ export class UserAccountStore {
     let vendor = this.vendors.get(vendorId);
     if (!vendor) throw new Error("No such service: " + vendorId);
 
-    if (ambientGatekeeperMode(await readAdminConfig(this.env), vendorId) === "disabled") {
-      throw new Error(`The "${vendorId}" gatekeeper is disabled on this deployment.`);
-    }
-    // The plan gate mirrors admin-disabled (and #assertResourceEnabled's ordering), so an
-    // ambient vendor the plan doesn't offer can't be opted into directly either.
-    let allowed = await allowedGatekeepers(this.env, this.ctx.id.toString());
-    if (allowed !== null && !allowed.has(vendorId)) {
-      throw createPlanRefusalError("CONNECTOR_NOT_ON_PLAN",
-          `The "${vendorId}" connector isn't available on your plan.`);
-    }
+    // The same access gate a connect applies (admin-disable, ambient-disable, plan), so the
+    // opt-in path can't provision past a disable the listing already honors.
+    (await gatekeeperAccessPolicy(this.env, this.ctx.id.toString())).assertConnectable(vendorId);
 
     let description = await vendor.describe();
     if (!description.autoProvisionsAccount) {
@@ -444,16 +424,15 @@ export class UserAccountStore {
       if (rec.autoProvisioned) provisioned.add(rec.vendorId);
     }
 
-    let config = await readAdminConfig(this.env);
-    let planAllowed = await allowedGatekeepers(this.env, this.ctx.id.toString());
+    let policy = await gatekeeperAccessPolicy(this.env, this.ctx.id.toString());
     for (let {vendorId, vendor} of await this.#ambientVendors()) {
       if (provisioned.has(vendorId)) continue;
-      // Only "enabled" (forced) vendors are auto-provisioned for everyone. "optional" vendors are
-      // added on demand by the user (provisionAmbientAccount); "disabled" ones never.
-      if (!shouldAutoProvisionAccount(config, vendorId)) continue;
-      // A vendor the user's plan doesn't offer is never auto-provisioned either (the plan gate
-      // provisionAmbientAccount applies on demand).
-      if (planAllowed !== null && !planAllowed.has(vendorId.toLowerCase())) continue;
+      // Only "enabled" (forced) vendors are auto-provisioned for everyone, never one the admin
+      // disabled outright. "optional" vendors are added on demand by the user
+      // (provisionAmbientAccount); "disabled" ones, and ones the user's plan doesn't offer,
+      // never.
+      if (!policy.forcedAmbient(vendorId) || policy.adminDisabled(vendorId) ||
+          !policy.onPlan(vendorId)) continue;
 
       try {
         await this.#createAutoProvisionedAccount(vendorId, vendor);
@@ -469,22 +448,18 @@ export class UserAccountStore {
    * then list those that declare an agent singleton and/or a management UI. Folding the ensure in lets
    * callers (gadget open, app nav) provision and read the accounts back in a single round trip to this
    * DO. Callers filter on `description.singleton` (ambient capsules / catalog) or
-   * `description.providesUi` (management-UI listing).
+   * `description.providesUi` (management-UI listing). A dormant account (the dormancy invariant,
+   * GatekeeperAccessPolicy.accountUsable) is not listed whatever kind it is: the mints enforce
+   * the same gate, and its record stays so re-enabling or re-upgrading restores it.
    */
   async listProvidedAccounts(): Promise<ProvidedAccountInfo[]> {
     await this.ensureAutoProvisionedAccounts();
-    let config = await readAdminConfig(this.env);
-    let planAllowed = await allowedGatekeepers(this.env, this.ctx.id.toString());
+    let policy = await gatekeeperAccessPolicy(this.env, this.ctx.id.toString());
     let result: ProvidedAccountInfo[] = [];
     for (let rec of this.connectedAccountRecords()) {
       if (!rec.description.singleton && !rec.description.providesUi) continue;
-      // A "disabled" ambient gatekeeper's account stays dormant: don't surface its singleton capsule
-      // or management UI. (Its data is preserved, so re-enabling restores it.) A plan that doesn't
-      // offer the vendor dorms it the same way — the account record stays, so disconnecting and
-      // re-upgrading both keep working.
-      if (rec.autoProvisioned && ambientGatekeeperMode(config, rec.vendorId) === "disabled") continue;
-      if (rec.autoProvisioned && planAllowed !== null &&
-          !planAllowed.has(rec.vendorId.toLowerCase())) continue;
+      // Dormant (see the doc above): no singleton capsule, no management UI, data preserved.
+      if (!policy.accountUsable(rec.vendorId, rec.autoProvisioned)) continue;
       result.push({ accountId: rec.id, vendorId: rec.vendorId, description: rec.description });
     }
     return result;
@@ -494,8 +469,11 @@ export class UserAccountStore {
    * this gatekeeper into the owner's gadgets (as a Facet) like any other gatekeeper, so the session
    * and catalog run gadget-side in the gatekeeper's own worker — no further round-trips through this
    * DO. The account capability stays encapsulated here; only the class reference crosses out.
-   * Returns null while the user's plan doesn't offer the vendor, mirroring the dormancy
-   * listProvidedAccounts applies: the account stays, but it is not bound into new chats.
+   *
+   * Mint-side enforcement of the dormancy invariant (GatekeeperAccessPolicy.accountUsable): a
+   * dormant account — its vendor admin-disabled or off-plan, or its ambient mode "disabled" —
+   * mints nothing, whatever caller asked. The listings (listProvidedAccounts, listBotSkills)
+   * filter on the same invariant, but they are UX; this is the gate.
    */
   async getSingletonGatekeeperClass(accountId: number)
       : Promise<DurableObjectClass<Gatekeeper<any>> | null> {
@@ -503,8 +481,8 @@ export class UserAccountStore {
     // Present only when description.singleton is set; gate on that, then call through the derived
     // SingletonAccountStub view (see its definition for why the cast is needed).
     if (!record?.description.singleton) return null;
-    let allowed = await allowedGatekeepers(this.env, this.ctx.id.toString());
-    if (allowed !== null && !allowed.has(record.vendorId.toLowerCase())) return null;
+    if (!(await gatekeeperAccessPolicy(this.env, this.ctx.id.toString()))
+        .accountUsable(record.vendorId, record.autoProvisioned)) return null;
     let cls = await (record.account as unknown as SingletonAccountStub).getSingletonGatekeeperClass();
     await this.#pushVendorAdminPolicy(record);
     return cls;
@@ -533,24 +511,16 @@ export class UserAccountStore {
   }
 
   /**
-   * The account record behind one of this user's gatekeeper apps, or undefined
-   * if `accountId` is not a UI-providing account the deployment currently
-   * offers (the same tests listProvidedAccounts applies, since a "disabled"
-   * ambient gatekeeper's account, or one the user's plan doesn't offer, stays
-   * dormant).
+   * The account record behind one of this user's gatekeeper apps, or undefined if `accountId`
+   * is not a UI-providing account the deployment currently offers: a dormant account (the
+   * dormancy invariant, GatekeeperAccessPolicy.accountUsable) has no reachable management UI
+   * while its record stays.
    */
   async uiAccountRecord(accountId: number): Promise<ConnectedAccountRecord | undefined> {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record?.description.providesUi) return undefined;
-    let config = await readAdminConfig(this.env);
-    if (config.disabledGatekeepers.includes(record.vendorId)) return undefined;
-    if (record.autoProvisioned) {
-      if (ambientGatekeeperMode(config, record.vendorId) === "disabled") return undefined;
-    }
-    // A plan that doesn't offer the vendor dorms the account here too (see
-    // listProvidedAccounts), so its management UI is unreachable while the record stays.
-    let allowed = await allowedGatekeepers(this.env, this.ctx.id.toString());
-    if (allowed !== null && !allowed.has(record.vendorId.toLowerCase())) return undefined;
+    if (!(await gatekeeperAccessPolicy(this.env, this.ctx.id.toString()))
+        .accountUsable(record.vendorId, record.autoProvisioned)) return undefined;
     return record;
   }
   /**
@@ -595,10 +565,9 @@ export class UserAccountStore {
     let seenIds = new Set<number>();
     let vendorDescriptions = new Map<string, Promise<VendorDescription>>();
 
-    // Snapshot the admin config once for this subscription. Changes take effect when the client
-    // re-subscribes (e.g. on reconnect), matching other deployment config.
-    let config = await readAdminConfig(this.env);
-    let disabledGatekeeperSet = new Set(config.disabledGatekeepers);
+    // Snapshot the access policy once for this subscription. Changes take effect when the
+    // client re-subscribes (e.g. on reconnect), matching other deployment config.
+    let policy = await gatekeeperAccessPolicy(this.env, this.ctx.id.toString());
 
     async function notifyAdd(record: ConnectedAccountRecord) {
       // Ambient (auto-provisioned) accounts only appear in the Connectors list when their vendor is
@@ -606,14 +575,16 @@ export class UserAccountStore {
       // nothing to manage, and "disabled" ones are dormant, so both are hidden.
       // Forced accounts are included when observer verification explicitly requests them.
       if (record.autoProvisioned) {
-        let mode = ambientGatekeeperMode(config, record.vendorId);
+        let mode = policy.ambientMode(record.vendorId);
         if (mode === "disabled" ||
             (mode === "enabled" && !filter?.includeForcedAutoProvisionedAccounts)) {
           return;
         }
       }
-      if (disabledGatekeeperSet.has(record.vendorId)) {
-        return;  // Whole gatekeeper disabled by admin.
+      // The same gates the vendor listing applies, so the Connectors list can't show what the
+      // picker omits: an admin-disabled or off-plan vendor's account is hidden here too.
+      if (policy.adminDisabled(record.vendorId) || !policy.onPlan(record.vendorId)) {
+        return;
       }
 
       // One getSupportedResources() call is both the filter input and the pushed payload (the
@@ -621,7 +592,7 @@ export class UserAccountStore {
       let supportedResources: SupportedResource[] = [];
       try {
         supportedResources = filterEnabledResources(
-            config, record.vendorId, await record.account.getSupportedResources());
+            policy.config, record.vendorId, await record.account.getSupportedResources());
       } catch (err) {
         if (filter?.resourceUrl) {
           // Filtered subscription: an unloadable account is hidden, exactly like one whose
@@ -724,7 +695,8 @@ export class UserAccountStore {
     if (account) {
       if (account.autoProvisioned) {
         // A forced ("enabled") ambient account can't be removed by the user — the admin controls it.
-        if (shouldAutoProvisionAccount(await readAdminConfig(this.env), account.vendorId)) {
+        if ((await gatekeeperAccessPolicy(this.env, this.ctx.id.toString()))
+            .forcedAmbient(account.vendorId)) {
           throw new Error("This account is provided automatically and can't be disconnected.");
         }
         // An opt-in ("optional") ambient account: the user added it, so let them remove it. revoke()
@@ -1018,7 +990,8 @@ export class UserAccountStore {
     let account = this.storage.connectedAccounts.get(accountId);
     if (!account) throw new Error("No such account.");
     let {class: cls, resource} = await account.account.getGatekeeperClassFor(url);
-    await this.#assertResourceEnabled(account.vendorId, resource);
+    (await gatekeeperAccessPolicy(this.env, this.ctx.id.toString()))
+        .assertResourceEnabled(account.vendorId, resource);
     await this.#pushVendorAdminPolicy(account);
     return {class: cls, vendorId: account.vendorId, typeUrlPattern: resource.urlPattern};
   }
@@ -1063,34 +1036,9 @@ export class UserAccountStore {
       throw new Error(`"${resource.title}" resources can't be created. ` +
           "listConnectableResources marks the types that can.");
     }
-    await this.#assertResourceEnabled(vendorId, resource);
+    (await gatekeeperAccessPolicy(this.env, this.ctx.id.toString()))
+        .assertResourceEnabled(vendorId, resource);
     return {class: cls, typeUrlPattern: resource.urlPattern, action};
-  }
-  // Block whole gatekeepers + disabled resources at the core-side chokepoints where a gatekeeper
-  // class is minted (reached only via the user/UI-facing Overseer.newGatekeeper, blueprint
-  // instantiation, and the agent's createExternalResource -- never from gadget code). An ambient
-  // gatekeeper an admin set to "disabled" is blocked here too. Blocking here prevents minting a
-  // capability to a disabled resource even if the request bypasses the (separately filtered)
-  // picker/agent listings. A bound SaaS's plan composes with these: a vendor the plan doesn't
-  // offer is refused the same way, with the admin's settings checked first so an admin-disabled
-  // gatekeeper keeps its message when both apply.
-  async #assertResourceEnabled(vendorId: string, resource: SupportedResource) {
-    let config = await readAdminConfig(this.env);
-    let normalized = vendorId.toLowerCase();
-    if (config.disabledGatekeepers.includes(normalized) ||
-        ambientGatekeeperMode(config, normalized) === "disabled") {
-      throw new Error(
-          `The "${vendorId}" gatekeeper is disabled on this deployment by an administrator.`);
-    }
-    if (isResourceDisabled(config, normalized, resource.urlPattern)) {
-      throw new Error(
-          `The "${resource.title}" resource is disabled on this deployment by an administrator.`);
-    }
-    let allowed = await allowedGatekeepers(this.env, this.ctx.id.toString());
-    if (allowed !== null && !allowed.has(normalized)) {
-      throw createPlanRefusalError("CONNECTOR_NOT_ON_PLAN",
-          `The "${vendorId}" connector isn't available on your plan.`);
-    }
   }
   /**
    * Mint a verifier from one of THIS user's connected accounts, identified by accountId. The
@@ -1108,28 +1056,31 @@ export class UserAccountStore {
     let account = this.storage.connectedAccounts.get(accountId);
     if (!account) return null;
     if (account.vendorId !== expectedVendorId) {
-      // Details stay server-side: this error reaches the browser via ensureObserver → open.
-      console.error(
-          `getVerifier: account ${accountId} vendor "${account.vendorId}" ` +
-          `!= expected "${expectedVendorId}"`);
+      // Details stay server-side: this error reaches the browser via ensureObserver → open, so
+      // the mismatch goes to the deployment log through the repo's logger conventions. The
+      // expected vendor rides in the message; the field vocabulary carries the account's.
+      logger.warn(`getVerifier: expected vendor "${expectedVendorId}"`, {
+        event: "account.verifier.vendor.mismatch",
+        accountId, vendorId: account.vendorId,
+      });
       throw new Error("Invalid account selection for this service.");
     }
     return await account.account.getVerifier();
   }
-  // All currently eligible accounts this selected user has with the requested vendor. The
-  // gatekeeper, not the Workshop, decides what zero or multiple accounts mean for its operation.
+  // All currently eligible accounts this selected user has with the requested vendor — the
+  // usable ones (the dormancy invariant, GatekeeperAccessPolicy.accountUsable), so an
+  // admin-disabled or off-plan vendor offers nothing. The gatekeeper, not the Workshop, decides
+  // what zero or multiple accounts mean for its operation.
   async #eligibleGatekeeperAccounts(vendorId: string): Promise<ConnectedAccountRecord[]> {
     if (!this.storage.created.get()) return [];
     vendorId = vendorId.toLowerCase();
 
-    let config = await readAdminConfig(this.env);
-    if (config.disabledGatekeepers.includes(vendorId)) return [];
-
+    let policy = await gatekeeperAccessPolicy(this.env, this.ctx.id.toString());
     await this.ensureAutoProvisionedAccounts();
 
     return [...this.connectedAccountRecords()].filter((record) =>
       record.vendorId === vendorId && areCredentialsValid(record) &&
-      (!record.autoProvisioned || ambientGatekeeperMode(config, vendorId) !== "disabled")
+      policy.accountUsable(record.vendorId, record.autoProvisioned)
     );
   }
   /**

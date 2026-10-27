@@ -1,6 +1,6 @@
 import { RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
-import { Overseer, GadgetMetadata, WorkpieceId, WorkpiecesSubscriber, GadgetClient, GatekeeperClient, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, CodeChangeSubmission, CommitInfo, FileAtCommit, MAX_READ_FILES_PER_CALL, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AgentSpawnerConfig, ConsoleLogSubscriber, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverBindingNeed, MessageFormatRef, BlueprintGadgetSummary, BlueprintScreenshotUpload, blueprintScreenshotUrl, ChatAttachmentHandle, BoundHookInfo, PreApprovableAction, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, modelKind } from "@gadgets/workshop-shared/api";
+import { Overseer, GadgetMetadata, WorkpieceId, WorkpiecesSubscriber, GadgetClient, GatekeeperClient, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, CodeChangeSubmission, FileAtCommit, MAX_READ_FILES_PER_CALL, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AgentSpawnerConfig, ConsoleLogSubscriber, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverBindingNeed, MessageFormatRef, BlueprintGadgetSummary, BlueprintScreenshotUpload, blueprintScreenshotUrl, ChatAttachmentHandle, BoundHookInfo, PreApprovableAction, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, modelKind } from "@gadgets/workshop-shared/api";
 import { HookInitiator, ActionKind } from "@gadgets/workshop-shared/gatekeeper";
 import { BotSelection } from "@gadgets/workshop-shared/api";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
@@ -406,13 +406,6 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async listChangedPaths(fromCommit: string, toCommit: string): Promise<string[]> {
     return await this.impl.listChangedPaths(validateOid(fromCommit), validateOid(toCommit));
-  }
-
-  async getCommitLog(fromCommit: string, depth?: number): Promise<CommitInfo[]> {
-    if (depth !== undefined && (!Number.isInteger(depth) || depth <= 0)) {
-      throw new Error("Invalid depth.");
-    }
-    return await this.impl.gitStore.readCommitLog(validateOid(fromCommit), {depth});
   }
 
   async updateChatFromMainline(chatId: number): Promise<{conflictPaths: string[]}> {
@@ -1448,39 +1441,5 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
   async updateShareLink(linkId: string, note?: string): Promise<void> {
     (await this.impl.getSharingManager())
         .updateShareLink(await this.#sharingCaller(), linkId, note);
-  }
-
-  async transferToOrg(orgId: string): Promise<void> {
-    // Only the user owner may transfer, and only from a user-owned workspace: an org-owned one
-    // has no user owner any more (see open()), and transfer is one-way by design.
-    if (!this.isOwner) {
-      throw new Error("Only the workspace owner can transfer it to an organization.");
-    }
-    if (this.impl.workspaceOwner()?.type === "org") {
-      throw new Error("This workspace already belongs to an organization.");
-    }
-    const gadgetId = this.impl.ctx.id.toString();
-    // Register with the org before flipping the durable owner subject. Registration is where the
-    // org refuses (unknown org, the caller is not one of its owners/admins, or — with the
-    // workspace's user owner named — the org is at its plan's workspace cap, see addOwnedGadget),
-    // so a refusal leaves this workspace exactly as it was--no rollback window. And if this DO is
-    // evicted between the two writes, the only residue is an org index entry for a workspace
-    // that is still user-owned, which severs nothing (severOrgMemberSessions no-ops without an
-    // org owner subject) and is simply rewritten by a retried transfer.
-    await this.impl.ctx.exports.OrgDurableObject.getByName(orgId)
-        .addOwnedGadget(this.clientProfileId, gadgetId, this.impl.ownerId!);
-    this.impl.storage.ownerSubject.put({ type: "org", id: orgId });
-    // From here on the workspace's logger and activity events carry the owning org.
-    this.impl.adoptOwningOrg(orgId);
-    this.impl.logger.info("transferred workspace to an organization", {
-      event: "workspace.transfer.org.completed",
-    });
-    // Everyone -- the transferring owner included -- is now authorized through the org's
-    // membership, so sever all live sessions (this one too); each client reopens and re-checks.
-    // Fire-and-forget like removeCollaborator: the abort inside fires ~100ms later so this
-    // RPC's own response escapes first, and awaiting it would instead reject the transfer
-    // client-side even though it succeeded.
-    this.impl.scheduleAccessRestart(
-        "Gadget restarted because its ownership moved to an organization.");
   }
 }
