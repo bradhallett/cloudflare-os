@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES, DEFAULT_UPDATE_MINIMUM_AGE_HOURS, DEFAULT_UPDATE_NOTICE_SNOOZE_HOURS, MAX_UPDATE_CHECK_INTERVAL_MINUTES, MAX_UPDATE_HOURS, type GatewayModel } from "@gadgets/workshop-shared/api";
-import { defaultOutputFormatId, isUpdateCheckInterval, isUpdateHours, normalizeAdminConfig, parseAdminConfig, reorderFormats, resolveFormatOutput, sanitizeAddedModel, sanitizeModelSettings, sanitizeOutputOverrides, serializeAdminConfig } from "../src/admin-config.js";
+import { defaultOutputFormatId, GatekeeperAccessPolicy, isUpdateCheckInterval, isUpdateHours, normalizeAdminConfig, parseAdminConfig, reorderFormats, resolveFormatOutput, sanitizeAddedModel, sanitizeModelSettings, sanitizeOutputOverrides, serializeAdminConfig } from "../src/admin-config.js";
 import { DEFAULT_ADMIN_CONFIG } from "../src/storage-schema/admin-settings-storage.js";
 
 describe("parseAdminConfig", () => {
@@ -488,5 +488,78 @@ describe("admin config update notice", () => {
       expect(parseAdminConfig(kv).updateCheckIntervalMinutes).toBe(stored);
       expect(isUpdateCheckInterval(stored)).toBe(true);
     }
+  });
+});
+
+describe("gatekeeper access policy", () => {
+  // The three admin knobs — an outright disable, an ambient mode set to "disabled", and one
+  // resource disabled under an allowed vendor — built through parseAdminConfig so the
+  // normalization a deployed config gets applies here too. The plan set is the lowercase shape
+  // allowedGatekeepers produces; "hidden" is on it so the two knobs can be
+  // shown deciding independently.
+  const config = parseAdminConfig(JSON.stringify({
+    disabledGatekeepers: ["Hidden"],
+    ambientGatekeeperModes: { modeoff: "disabled" },
+    disabledResources: { fakekee: ["fakekee:widgets"] },
+  }));
+  const planAllowed = new Set(["fakekee", "modeoff", "hidden"]);
+  const policy = new GatekeeperAccessPolicy(config, planAllowed);
+
+  it("matches admin settings and plan answers case-insensitively", () => {
+    expect(policy.adminDisabled("hidden")).toBe(true);
+    expect(policy.adminDisabled("HIDDEN")).toBe(true);
+    expect(policy.adminDisabled("fakekee")).toBe(false);
+    expect(policy.onPlan("FAKEKEE")).toBe(true);
+    expect(policy.onPlan("HIDDEN")).toBe(true);  // on the plan AND disabled: independent knobs
+    expect(policy.onPlan("other")).toBe(false);
+  });
+
+  it("offers every vendor while no entitlements service is bound, and none when one fails", () => {
+    const unbound = new GatekeeperAccessPolicy(config, null);
+    expect(unbound.onPlan("anything")).toBe(true);  // every OSS deployment
+    const failed = new GatekeeperAccessPolicy(config, new Set());  // an outage's empty answer
+    expect(failed.onPlan("fakekee")).toBe(false);
+  });
+
+  it("disables a vendor by either the admin's list or its ambient mode", () => {
+    expect(policy.vendorDisabled("hidden")).toBe(true);   // adminDisabled
+    expect(policy.vendorDisabled("MODEOFF")).toBe(true);  // ambient mode "disabled"
+    expect(policy.vendorDisabled("fakekee")).toBe(false);
+  });
+
+  it("holds an ambient mode's disable against auto-provisioned accounts only", () => {
+    // An OAuth account of a mode-disabled vendor stays usable — that mode is the vendor's
+    // provisioning knob, not a verdict on accounts the user connected — while an
+    // auto-provisioned one goes dormant. An admin disable spares neither.
+    expect(policy.accountUsable("modeoff", undefined)).toBe(true);
+    expect(policy.accountUsable("modeoff", true)).toBe(false);
+    expect(policy.accountUsable("hidden", undefined)).toBe(false);
+    expect(policy.accountUsable("fakekee", true)).toBe(true);
+  });
+
+  it("assertConnectable: the admin's message first, then the plan's", () => {
+    expect(() => policy.assertConnectable("HIDDEN"))
+        .toThrow('The "HIDDEN" gatekeeper is disabled on this deployment.');
+    expect(() => policy.assertConnectable("other"))
+        .toThrow('The "other" connector isn\'t available on your plan.');
+    // Both knobs off at once: the admin's message is the one kept.
+    const offPlan = new GatekeeperAccessPolicy(config, new Set());
+    expect(() => offPlan.assertConnectable("hidden"))
+        .toThrow('The "hidden" gatekeeper is disabled on this deployment.');
+    expect(() => policy.assertConnectable("fakekee")).not.toThrow();
+  });
+
+  it("assertResourceEnabled: vendor disable, resource disable, then plan", () => {
+    const widgets = { urlPattern: "fakekee:widgets", title: "Widgets", description: "Widgets", creatable: true };
+    const fine = { urlPattern: "fakekee:reports", title: "Reports", description: "Reports", creatable: true };
+    expect(() => policy.assertResourceEnabled("modeoff", fine))
+        .toThrow('The "modeoff" gatekeeper is disabled on this deployment by an administrator.');
+    expect(() => policy.assertResourceEnabled("fakekee", widgets))
+        .toThrow('The "Widgets" resource is disabled on this deployment by an administrator.');
+    expect(() => policy.assertResourceEnabled("fakekee", fine))
+        .not.toThrow();
+    const offPlan = new GatekeeperAccessPolicy(config, new Set());
+    expect(() => offPlan.assertResourceEnabled("fakekee", fine))
+        .toThrow('The "fakekee" connector isn\'t available on your plan.');
   });
 });

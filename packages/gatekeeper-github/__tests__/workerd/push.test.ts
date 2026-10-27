@@ -621,7 +621,7 @@ describe("apply", () => {
       .rejects.toThrow("GitHub refused the push: protected branch hook declined");
   });
 
-  it("names a discarded push as the reason a push stacked on it cannot apply", async () => {
+  it("retires a push stacked on the discarded one, so its apply names the discard", async () => {
     const github = new FakeGitHub();
     github.branches.set("main", BASE);
     github.install();
@@ -631,10 +631,12 @@ describe("apply", () => {
     const stacked = (await queuePush(gk, cache, new TestApprovalQueue(), "main", HEAD2))!;
     expect(stacked.expectedOldSha).toBe(HEAD1);
 
-    await gk.rejectAction(first.approvalId);
+    // Rejecting the first push strands HEAD1 (nothing else would leave it), so the cascade
+    // retires the stacked push with the rejection rather than leaving it to fail its CAS.
+    expect(await gk.rejectAction(first.approvalId)).toEqual({ restart: true });
     github.respondToPush("unpack ok", "ng refs/heads/main fetch first");
     await expect(gk.applyAction(stacked.approvalId, cache))
-      .rejects.toThrow(`it builds on ${HEAD1}, the head of a discarded push to "main"`);
+      .rejects.toThrow(/was discarded, or something it depended on was/);
   });
 
   it("treats the branch already being at newSha as success (desired state)", async () => {

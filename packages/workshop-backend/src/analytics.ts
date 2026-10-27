@@ -33,8 +33,9 @@ export type ProductAnalyticsRecord = {
 };
 
 /**
- * Events about a specific gadget. `gadget_org_id` is stamped by recordGadgetAnalytics when the
- * gadget's workspace is org-owned, and absent on user-owned ones.
+ * Events about a specific gadget. `gadget_org_id` is no longer stamped by any caller (the
+ * org-transfer wake path that adopted it is gone); the field and its mapping serve the
+ * historic events recorded while that flow lived.
  */
 export type ProductAnalyticsGadgetInput = {
   /** The organization that owns the gadget's workspace, on org-owned workspaces. */
