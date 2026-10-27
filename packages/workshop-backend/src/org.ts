@@ -13,14 +13,13 @@ import { validateRpc } from "capnweb-validate";
 import { createWorkshopLogger, type WorkshopLogger } from "./observability";
 import {
   MAX_ORG_NAME_LENGTH, type OrgCommerceMember, type OrgMember, type OrgMemberStatus,
-  type OrgRole, type OrgSummary, createPlanRefusalError,
+  type OrgRole, type OrgSummary,
 } from "@gadgets/workshop-shared/api";
 import {
-  canManageOrgAssets, canManageRoles, canRemoveMember, canUpdateSettings, canViewMembers,
+  canManageRoles, canRemoveMember, canUpdateSettings, canViewMembers,
   gadgetBaselineRole, isActiveMember, invitableView, wouldLoseLastOwner, type OrgAccess,
 } from "./org-access";
 import { makeOrgStorage, type OrgRecord, type OrgSettings } from "./storage-schema/org-storage";
-import { refuseUnverifiableWorkspaceCap, resolveEntitlements, workspaceCapFrom } from "./entitlements.js";
 import { notifyOrgMembersChanged } from "./commerce.js";
 
 const logger = createWorkshopLogger("workshop.org");
@@ -407,53 +406,9 @@ export class OrgDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * Record that the org owns the workspace `gadgetId` (an Overseer DO id): `Overseer.transferToOrg`
-   * calls this before writing its own owner subject (register-first, so no window exists where
-   * the org records a workspace the UserDO does not). The actor must be an active owner/admin of
-   * org (org-access.ts), checked here rather than in the caller. Idempotent per workspace: a
-   * retried transfer refreshes the record rather than duplicating it.
-   *
-   * `transferringUserId` (the workspace's user owner, passed by transferToOrg) applies the plan's
-   * workspace cap to the org's own count: this transfer is the moment a workspace *becomes*
-   * org-owned, so it is where an org-wide cap is enforced (a user's own creations are capped in
-   * their UserDurableObject instead). The cap is read from the transferring user's plan — the
-   * entitlements port answers per user, and a SaaS that models orgs as tenants gives every member
-   * the same number. Refused, like any other failure here, before any write: the workspace stays
-   * exactly as it was.
-   */
-  async addOwnedGadget(
-      actorId: string, gadgetId: string, transferringUserId?: string): Promise<void> {
-    this.#org();
-    if (!canManageOrgAssets(this.#accessFor(actorId))) {
-      throw new Error("Only an owner or admin of this organization may transfer workspaces into it.");
-    }
-    if (transferringUserId !== undefined) {
-      // The cap is folded from the answer once (see workspaceCapFrom): "unavailable" — a bound
-      // plan service that failed — refuses the transfer, as the personal-creation cap does (see
-      // UserDurableObject.newGadget); "unbound" is unlimited.
-      let gate = workspaceCapFrom(await resolveEntitlements(this.env, transferringUserId));
-      refuseUnverifiableWorkspaceCap(gate, "transferred");
-      if (gate.status === "capped") {
-        // Count the org's owned workspaces, excluding this one: a retried transfer must not be
-        // refused by the index entry its own crashed attempt left behind.
-        let owned = [...this.storage.ownedGadgets.list()]
-            .filter(gadget => gadget.gadgetId !== gadgetId).length;
-        if (owned >= gate.cap) {
-          throw createPlanRefusalError("WORKSPACE_CAP_REACHED",
-              `This organization has reached its plan's limit of ${gate.cap} workspaces.`);
-        }
-      }
-    }
-    this.storage.ownedGadgets.put({ gadgetId });
-    this.#log.info("a workspace was transferred into the org", {
-      event: "org.gadget.transferred",
-    });
-  }
-
-  /**
    * Drop a workspace from the org's index: its own Overseer calls this while deleting itself, so
-   * it takes no actor (the workspace already authorized the deletion). Best-effort symmetry with
-   * addOwnedGadget; a lost entry only means a future membership change notifies a dead DO.
+   * it takes no actor (the workspace already authorized the deletion). A lost entry only means a
+   * future membership change notifies a dead DO.
    */
   async removeOwnedGadget(gadgetId: string): Promise<void> {
     this.#org();

@@ -6,7 +6,7 @@ import { summarizeArgs } from "./agent";
 import type { AgentHooks } from "./agent-hooks";
 import { ChatCacheWarmer } from "./chat-cache-warming";
 import { UserDurableObject } from "./user";
-import type { UserChatContext } from "./user";
+import type { UserChatContext } from "./user-models";
 import { AutoApprovalDrainer } from "./auto-approval";
 import { OverseerBots } from "./overseer-bots";
 import { AGENT_KEEPALIVE_ALARM_MS, ALARM_MAX_RETRIES, stringifyError } from "./overseer-support";
