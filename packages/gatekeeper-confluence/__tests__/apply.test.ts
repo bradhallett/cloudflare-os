@@ -1,4 +1,4 @@
-import { APPLY_OUTCOME_UNKNOWN_MESSAGE, ActionOutcomeUnknownError } from "@gadgets/gatekeeper-kit/actions";
+import { APPLY_OUTCOME_UNKNOWN_MESSAGE, ActionOutcomeUnknownError, type TaggedAction } from "@gadgets/gatekeeper-kit/actions";
 import { describe, expect, it } from "vitest";
 import {
   ConfluenceStore,
@@ -7,6 +7,7 @@ import {
   revertStoredAction,
   stageAction,
   type ConfluenceAction,
+  type ConfluenceKinds,
   type UploadAttachmentAction,
 } from "../src/confluence-actions";
 import { ConfluenceApiError, ConfluenceTransportError, type ConfluenceApi } from "../src/confluence-api";
@@ -70,10 +71,16 @@ function storeWith(api: ConfluenceApi) {
   return new ConfluenceStore(makeStorage(), api);
 }
 
-function stage(store: ConfluenceStore, action: ConfluenceAction): number {
-  const id = store.nextActionId();
-  store.putAction({ id, action, state: "pending", submittedAt: id });
-  return id;
+type Queue = Parameters<typeof stageAction>[1];
+
+// An approval queue that accepts every submission.
+function queue(): Queue {
+  return { submitAction: async () => {} } as unknown as Queue;
+}
+
+// Stages through the real submission path, so describe and the engine's guards run.
+async function stage(store: ConfluenceStore, action: ConfluenceAction): Promise<number> {
+  return stageAction(store, queue(), action);
 }
 
 async function uploadAction(
@@ -89,7 +96,7 @@ describe("applyStoredAction", () => {
   it("marks the action applied so reads stop overlaying it", async () => {
     const { api } = makeApi();
     const store = storeWith(api);
-    const id = stage(store, { type: "setTitle", contentId: "123", title: "New", previousTitle: "Title" });
+    const id = await stage(store, { type: "setTitle", contentId: "123", title: "New", previousTitle: "Title" });
 
     await applyStoredAction(store, id);
 
@@ -101,7 +108,7 @@ describe("applyStoredAction", () => {
   it("posts blog-post comments with a blogpost container type", async () => {
     const { api, calls } = makeApi("blogpost");
     const store = storeWith(api);
-    const id = stage(store, { type: "addComment", contentId: "555", text: "hi" });
+    const id = await stage(store, { type: "addComment", contentId: "555", text: "hi" });
 
     await applyStoredAction(store, id);
 
@@ -111,7 +118,7 @@ describe("applyStoredAction", () => {
   it("posts page comments with a page container type", async () => {
     const { api, calls } = makeApi("page");
     const store = storeWith(api);
-    const id = stage(store, { type: "addComment", contentId: "555", text: "hi" });
+    const id = await stage(store, { type: "addComment", contentId: "555", text: "hi" });
 
     await applyStoredAction(store, id);
 
@@ -121,7 +128,7 @@ describe("applyStoredAction", () => {
   it("keeps a draft page a draft when editing its content (does not publish it)", async () => {
     const { api, calls } = makeApi("page", "draft");
     const store = storeWith(api);
-    const id = stage(store, { type: "setContent", contentId: "123", markdown: "new", previousMarkdown: "old" });
+    const id = await stage(store, { type: "setContent", contentId: "123", markdown: "new", previousMarkdown: "old" });
 
     await applyStoredAction(store, id);
 
@@ -132,7 +139,7 @@ describe("applyStoredAction", () => {
   it("publishes edits to a current page as current", async () => {
     const { api, calls } = makeApi("page", "current");
     const store = storeWith(api);
-    const id = stage(store, { type: "setContent", contentId: "123", markdown: "new", previousMarkdown: "old" });
+    const id = await stage(store, { type: "setContent", contentId: "123", markdown: "new", previousMarkdown: "old" });
 
     await applyStoredAction(store, id);
 
@@ -144,7 +151,7 @@ describe("applyStoredAction", () => {
     const store = storeWith(api);
     const data = Uint8Array.from([0, 1, 127, 128, 255]);
     const action = await uploadAction(store, data);
-    const id = stage(store, action);
+    const id = await stage(store, action);
 
     await applyStoredAction(store, id);
     await applyStoredAction(store, id);
@@ -160,7 +167,7 @@ describe("applyStoredAction", () => {
     const store = storeWith(api);
     const data = Uint8Array.from([1, 2, 3]);
     const action = await uploadAction(store, data);
-    const id = stage(store, action);
+    const id = await stage(store, action);
 
     await expect(applyStoredAction(store, id)).rejects.toThrow("temporary failure");
 
@@ -172,10 +179,12 @@ describe("applyStoredAction", () => {
     const { api, calls } = makeApi();
     const store = storeWith(api);
     const data = Uint8Array.from([4, 5, 6]);
-    const id = stage(store, {
-      type: "uploadAttachment", contentId: "123", filename: "legacy.bin",
-      mediaType: "application/octet-stream", data,
-    } as unknown as ConfluenceAction);
+    // Staged straight onto the journal, as the legacy row's lazy upgrade would read it.
+    const id = store.journal.reserveId();
+    store.journal.stage(id, {
+      kind: "uploadAttachment",
+      payload: { contentId: "123", filename: "legacy.bin", mediaType: "application/octet-stream", data },
+    } as unknown as TaggedAction<ConfluenceKinds>);
 
     await applyStoredAction(store, id);
 
@@ -188,9 +197,9 @@ describe("claim-before-apply", () => {
   it("refuses a replayed action whose claim was left behind, marking it terminally failed", async () => {
     const { api, calls } = makeApi();
     const store = storeWith(api);
-    const id = stage(store, { type: "setTitle", contentId: "123", title: "New", previousTitle: "Title" });
+    const id = await stage(store, { type: "setTitle", contentId: "123", title: "New", previousTitle: "Title" });
     // Simulate a dispatch that died after claiming: the record still says `claimed`.
-    store.putAction({ ...store.getAction(id)!, state: "claimed" });
+    store.journal.markClaimed(id);
 
     await expect(applyStoredAction(store, id)).rejects.toThrow(APPLY_OUTCOME_UNKNOWN_MESSAGE);
 
@@ -198,7 +207,7 @@ describe("claim-before-apply", () => {
     expect(store.getAction(id)).toMatchObject({ state: "failed", failure: APPLY_OUTCOME_UNKNOWN_MESSAGE });
     // The failed record is inert: pending reads skip it, and rejection clears it.
     expect(store.pendingActions()).toHaveLength(0);
-    rejectStoredAction(store, id);
+    await rejectStoredAction(store, id);
     expect(store.getAction(id)).toBeUndefined();
   });
 
@@ -206,7 +215,7 @@ describe("claim-before-apply", () => {
     const { api } = makeApi();
     api.updateContent = async () => { throw new ConfluenceTransportError("socket hang up"); };
     const store = storeWith(api);
-    const id = stage(store, { type: "setContent", contentId: "123", markdown: "new", previousMarkdown: "old" });
+    const id = await stage(store, { type: "setContent", contentId: "123", markdown: "new", previousMarkdown: "old" });
 
     await expect(applyStoredAction(store, id)).rejects.toThrow(ActionOutcomeUnknownError);
 
@@ -218,7 +227,7 @@ describe("claim-before-apply", () => {
     const { api } = makeApi();
     api.updateContent = async () => { throw new ConfluenceApiError(503, "Atlassian overloaded"); };
     const store = storeWith(api);
-    const id = stage(store, { type: "setContent", contentId: "123", markdown: "new", previousMarkdown: "old" });
+    const id = await stage(store, { type: "setContent", contentId: "123", markdown: "new", previousMarkdown: "old" });
 
     await expect(applyStoredAction(store, id)).rejects.toThrow(ActionOutcomeUnknownError);
 
@@ -234,7 +243,7 @@ describe("claim-before-apply", () => {
       return { id: "123", title: body.title };
     };
     const store = storeWith(api);
-    const id = stage(store, { type: "setContent", contentId: "123", markdown: "new", previousMarkdown: "old" });
+    const id = await stage(store, { type: "setContent", contentId: "123", markdown: "new", previousMarkdown: "old" });
 
     await expect(applyStoredAction(store, id)).rejects.toThrow("bad request");
     expect(store.getAction(id)?.state).toBe("pending");
@@ -248,8 +257,8 @@ describe("claim-before-apply", () => {
   it("counts a claimed action as still pending for the simulation and sweep", async () => {
     const { api } = makeApi();
     const store = storeWith(api);
-    const id = stage(store, { type: "setTitle", contentId: "123", title: "New", previousTitle: "Title" });
-    store.putAction({ ...store.getAction(id)!, state: "claimed" });
+    const id = await stage(store, { type: "setTitle", contentId: "123", title: "New", previousTitle: "Title" });
+    store.journal.markClaimed(id);
 
     expect(store.pendingActions()).toHaveLength(1);
     expect(store.pendingForContent("123")).toHaveLength(1);
@@ -258,13 +267,13 @@ describe("claim-before-apply", () => {
   it("refuses to reject an action whose claim is still outstanding", async () => {
     const { api } = makeApi();
     const store = storeWith(api);
-    const id = stage(store, { type: "setTitle", contentId: "123", title: "New", previousTitle: "Title" });
-    store.putAction({ ...store.getAction(id)!, state: "claimed" });
+    const id = await stage(store, { type: "setTitle", contentId: "123", title: "New", previousTitle: "Title" });
+    store.journal.markClaimed(id);
 
-    expect(() => rejectStoredAction(store, id)).toThrow(APPLY_OUTCOME_UNKNOWN_MESSAGE);
+    await expect(rejectStoredAction(store, id)).rejects.toThrow(APPLY_OUTCOME_UNKNOWN_MESSAGE);
     // The refusal marked it failed; the second rejection — the operator's explicit choice — clears it.
     expect(store.getAction(id)).toMatchObject({ state: "failed" });
-    rejectStoredAction(store, id);
+    await rejectStoredAction(store, id);
     expect(store.getAction(id)).toBeUndefined();
   });
 });
@@ -274,29 +283,34 @@ describe("attachment files", () => {
     const { api } = makeApi();
     const store = storeWith(api);
     const action = await uploadAction(store, Uint8Array.from([1, 2, 3]));
-    const queue = { submitAction: async () => { throw new Error("submission failed"); } };
+    const failQueue = { submitAction: async () => { throw new Error("submission failed"); } };
 
-    await expect(stageAction(store, queue as never, action)).rejects.toThrow("submission failed");
+    await expect(stageAction(store, failQueue as never, action)).rejects.toThrow("submission failed");
 
     expect(store.getAction(1)).toBeUndefined();
     await expect(store.readAttachment(action)).rejects.toThrow(/incomplete or corrupted/);
   });
 
-  it("are deleted on direct and cascaded rejection", async () => {
+  it("are deleted on direct rejection, and on a stranded dependent's own rejection", async () => {
     const { api } = makeApi();
     const store = storeWith(api);
     const direct = await uploadAction(store, Uint8Array.from([1]));
-    rejectStoredAction(store, stage(store, direct));
+    await rejectStoredAction(store, await stage(store, direct));
 
-    const createId = stage(store, {
+    const createId = await stage(store, {
       type: "createContent", provisionalId: "~parent", kind: "page",
       parent: { type: "space", spaceKey: "ENG" }, title: "Parent", status: "current",
     });
     const cascaded = await uploadAction(store, Uint8Array.from([2]), "~parent");
-    stage(store, cascaded);
-    expect(rejectStoredAction(store, createId)).toEqual({ restart: true });
+    const strandedId = await stage(store, cascaded);
+    expect(await rejectStoredAction(store, createId)).toEqual({ restart: true });
 
     await expect(store.readAttachment(direct)).rejects.toThrow(/incomplete or corrupted/);
+    // The engine strands the dependent as a terminal failure rather than deleting it; its staged
+    // bytes are released when the user rejects that failed record.
+    expect(store.getAction(strandedId)).toMatchObject({ state: "failed" });
+    await expect(store.readAttachment(cascaded)).resolves.toEqual(Uint8Array.from([2]));
+    await rejectStoredAction(store, strandedId);
     await expect(store.readAttachment(cascaded)).rejects.toThrow(/incomplete or corrupted/);
   });
 
@@ -305,7 +319,7 @@ describe("attachment files", () => {
     const storage = makeStorage();
     const store = new ConfluenceStore(storage, api);
     const referenced = await uploadAction(store, Uint8Array.from([1]));
-    stage(store, referenced);
+    await stage(store, referenced);
     const orphan = await uploadAction(store, Uint8Array.from([2]));
     for (const [key, value] of storage.kv.list<{ createdAt: number }>({ prefix: "confluence:actionFileAllocation:" })) {
       if (typeof value === "object") storage.kv.put(key, { ...value, createdAt: 0 });
@@ -319,21 +333,21 @@ describe("attachment files", () => {
 });
 
 describe("revertStoredAction", () => {
-  it("marks the action reverted on success", async () => {
+  it("removes the action on success, so it stops blocking older reverts", async () => {
     const { api } = makeApi();
     const store = storeWith(api);
-    const id = stage(store, { type: "setTitle", contentId: "123", title: "New", previousTitle: "Old" });
+    const id = await stage(store, { type: "setTitle", contentId: "123", title: "New", previousTitle: "Old" });
     await applyStoredAction(store, id);
 
     await revertStoredAction(store, id);
 
-    expect(store.getAction(id)?.state).toBe("reverted");
+    expect(store.getAction(id)).toBeUndefined();
   });
 
   it("leaves the record applied when an append cannot be reverted", async () => {
     const { api } = makeApi();
     const store = storeWith(api);
-    const id = stage(store, { type: "appendContent", contentId: "123", markdown: "x" }); // no previousMarkdown
+    const id = await stage(store, { type: "appendContent", contentId: "123", markdown: "x" }); // no previousMarkdown
     await applyStoredAction(store, id);
 
     const result = await revertStoredAction(store, id);
@@ -362,17 +376,15 @@ describe("stageAction", () => {
     const store = storeWith(api);
     const action: ConfluenceAction = { type: "setTitle", contentId: "123", title: "New", previousTitle: "Title" };
 
-    // The overseer received the action and applied it; only the reply was lost (CF-1).
-    await expect(
-      stageAction(store, queueLosingReply(id => applyStoredAction(store, id)), action),
-    ).rejects.toThrow("reply lost");
+    // The overseer received the action and applied it; only the reply was lost (CF-1). The
+    // engine's staging treats the record as submitted and resolves rather than throwing.
+    const id = await stageAction(store, queueLosingReply(id2 => applyStoredAction(store, id2)), action);
     expect(calls.updateContent).toHaveLength(1);
 
     // The applied record survives with its revert trail intact.
-    const record = store.allActions().find(r => r.action.type === "setTitle");
-    expect(record?.state).toBe("applied");
-    await revertStoredAction(store, record!.id);
-    expect(store.getAction(record!.id)?.state).toBe("reverted");
+    expect(store.getAction(id)?.state).toBe("applied");
+    await revertStoredAction(store, id);
+    expect(store.getAction(id)).toBeUndefined();
   });
 
   it("keeps a claimed record a racing approval left mid-dispatch", async () => {
@@ -381,15 +393,12 @@ describe("stageAction", () => {
     const action: ConfluenceAction = { type: "setTitle", contentId: "123", title: "New", previousTitle: "Title" };
 
     // The racing apply took the claim but has not settled: its record is not the submit's to delete.
-    await expect(
-      stageAction(store, queueLosingReply(id => {
-        const record = store.getAction(id)!;
-        store.putAction({ ...record, state: "claimed" });
-        return Promise.resolve();
-      }), action),
-    ).rejects.toThrow("reply lost");
+    const id = await stageAction(store, queueLosingReply(id2 => {
+      store.journal.markClaimed(id2);
+      return Promise.resolve();
+    }), action);
 
-    expect(store.allActions().find(r => r.action.type === "setTitle")?.state).toBe("claimed");
+    expect(store.getAction(id)?.state).toBe("claimed");
   });
 
   it("drops the record when the submit failed without a handover", async () => {
@@ -399,6 +408,7 @@ describe("stageAction", () => {
 
     await expect(stageAction(store, queueLosingReply(), action)).rejects.toThrow("reply lost");
 
-    expect(store.allActions()).toEqual([]);
+    expect(store.pendingActions()).toEqual([]);
+    expect(store.getAction(1)).toBeUndefined();
   });
 });
