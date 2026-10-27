@@ -20,6 +20,9 @@ export default defineConfig({
           name: "span-sink",
           modules: true,
           compatibilityDate: COMPATIBILITY_DATE,
+          // The sink opts into the streaming tail path (workerd refuses tailStream without it;
+          // see tracing.test.ts's header) — the same experimental mode the main pool enables.
+          compatibilityFlags: ["streaming_tail_worker"],
           // The no-op tail() silences workerd's legacy tail delivery, which it attempts alongside
           // the streaming path.
           script: `export default { tail: () => {}, tailStream: () => () => {} }`,

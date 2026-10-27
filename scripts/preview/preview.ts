@@ -123,7 +123,7 @@ interface FetchedPullRequest {
   state?: string;
 }
 
-const USAGE = "Usage: preview.ts <config|deploy|delete|sweep> [--dry-run]";
+const USAGE = "Usage: preview.ts <config|deploy|delete|sweep> [--dry-run] [--scan-root <dir>]...";
 const OUTPUT_DIR = join(ROOT, "output");
 const PREVIEW_COMMENT = join(OUTPUT_DIR, "preview-comment.md");
 const GATEKEEPER_CONCURRENCY = 8;
@@ -450,7 +450,9 @@ async function deletePreview(
  * Delete one preview from every worker that carries it.
  *
  * Dependents first — the router, then the backend, then the rest concurrently — so nothing is left
- * bound to a preview that no longer exists.
+ * bound to a preview that no longer exists. A failure aborts the walk rather than plowing on:
+ * deleting the backend after the router's own delete failed would strand exactly such a binding.
+ * The sweep still moves on to the other previews; its per-preview catch is where that resumes.
  */
 async function deletePreviewFrom(
   workers: readonly DeployablePackage[],
