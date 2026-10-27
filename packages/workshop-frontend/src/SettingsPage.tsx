@@ -1,5 +1,6 @@
 import { useKumoToastManager } from '@cloudflare/kumo'
 import { useAuthenticatedApi } from './AuthContext'
+import { rpcFailureDescription } from './rpcErrors'
 import { Suspense, useState, useEffect, useRef } from 'react'
 import { AiChatAuthorInfo, validateCommitEmail } from '@gadgets/workshop-shared/api'
 import { hashPassword } from './passwordHash'
@@ -12,12 +13,11 @@ import { OrgBillingSection } from './features/saas/commerceGate'
 import { useDocumentTitle } from './useDocumentTitle'
 import { isImeComposing } from './keyboardEvent'
 import { INPUT_LG } from './components/inputStyles'
+import { PRIMARY_BTN } from './components/controlStyles'
 
 // Shared, on-language control classes (match the rest of the app: Workspaces/Blueprints headers,
 // the gatekeepers toolbar, the command palette). Kept here so the profile page reads as part of the
 // system rather than a stack of default Kumo cards.
-const PRIMARY_BTN =
-  'press inline-flex h-9 cursor-pointer items-center justify-center gap-1.5 rounded-lg bg-kumo-brand px-3.5 text-[13px] font-medium tracking-[-0.25px] text-white transition-colors hover:bg-kumo-brand-hover disabled:cursor-not-allowed disabled:opacity-60'
 const ICON_BTN =
   'press grid h-8 w-8 shrink-0 cursor-pointer place-items-center rounded-lg text-kumo-inactive transition-colors hover:bg-kumo-tint hover:text-kumo-default'
 const INPUT = `${INPUT_LG} sm:h-9 sm:text-[14px]`
@@ -338,7 +338,7 @@ export default function SettingsPage({ org }: { org?: string }) {
       setNewPassword('')
       setConfirmPassword('')
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Failed to change password'
+      const errorMessage = rpcFailureDescription(err) ?? 'Failed to change password'
       setPasswordError(errorMessage)
     } finally {
       setPasswordLoading(false)

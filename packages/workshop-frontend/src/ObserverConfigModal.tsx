@@ -17,8 +17,7 @@ import {
 import { WorkshopButton } from './components/WorkshopControls'
 import Avatar from './components/Avatar'
 import { AccountsSubscriberAdapter } from './accountsSubscriber'
-import { openConnectWindow } from './connectHandoff'
-import { AuthPopupCancelledError } from './features/native-app/authPopup'
+import { mergeGrantedPatterns, useConnectAccountActions } from './useConnectAccountActions'
 
 // Shown when a non-owner opens a shared Gadget that reads data through one or more gatekeeper
 // bindings, and they haven't yet chosen which of their own connected accounts to use for each one.
@@ -97,9 +96,9 @@ export default function ObserverConfigModal({
   // end without adding one (abandoned, refused by the provider, or an account the user already has),
   // and waiting on it would strand the dialog with every way forward disabled. The result arrives
   // through the accounts subscription whenever the flow does complete.
-  const [connecting, setConnecting] = useState<string | null>(null)
-  const [reconnecting, setReconnecting] = useState<number | null>(null)
-  const [granting, setGranting] = useState<number | null>(null)
+  const connectActions = useConnectAccountActions(authenticatedApi)
+  // Held only while the request that starts a flow is in flight (see useConnectAccountActions).
+  const { connectingVendor: connecting, grantingAccountId: granting, reconnectingAccountId: reconnecting } = connectActions
 
   // ── subscribe to the user's connected accounts ────────────────────────────────
   useEffect(() => {
@@ -195,41 +194,19 @@ export default function ObserverConfigModal({
   }, [accounts, needs])
 
   // ── connect / reconnect handlers ──────────────────────────────────────────────
-  const handleConnect = async (need: ObserverBindingNeed) => {
+  const handleConnect = (need: ObserverBindingNeed) => {
     const { vendorId } = need
-    setConnecting(vendorId)
-    try {
-      const vendor = vendorsById.get(vendorId)
-      if (vendor?.description.autoProvisionsAccount) {
-        await authenticatedApi.provisionAmbientAccount(vendorId)
-      } else {
-        const required = requiredResourceUrlPatterns(need, vendor)
-        await openConnectWindow(await authenticatedApi.connectAccount(
-          vendorId,
-          required.length > 0 ? required : undefined,
-        ), authenticatedApi)
-      }
-    } catch (err) {
-      if (err instanceof AuthPopupCancelledError) return
-      console.error('Failed to initiate connection:', err)
-      toasts.add({ title: err instanceof Error ? err.message : 'Could not complete connection flow', variant: 'error' })
-    } finally {
-      setConnecting(null)
+    const vendor = vendorsById.get(vendorId)
+    if (vendor?.description.autoProvisionsAccount) {
+      void connectActions.connectAmbient(vendorId)
+      return
     }
+    const required = requiredResourceUrlPatterns(need, vendor)
+    void connectActions.connect(vendorId, required.length > 0 ? required : undefined)
   }
 
-  const handleReconnect = async (accountId: number) => {
-    setReconnecting(accountId)
-    try {
-      // After ticket redemption the restored account arrives through the subscription.
-      await openConnectWindow(await authenticatedApi.reconnectAccount(accountId), authenticatedApi)
-    } catch (err) {
-      if (err instanceof AuthPopupCancelledError) return
-      console.error('Failed to initiate reconnection:', err)
-      toasts.add({ title: err instanceof Error ? err.message : 'Could not complete re-authentication flow', variant: 'error' })
-    } finally {
-      setReconnecting(null)
-    }
+  const handleReconnect = (accountId: number) => {
+    void connectActions.reconnect(accountId)
   }
 
   const handleGrantResourceAccess = async (need: ObserverBindingNeed, account: AccountInfo) => {
@@ -240,38 +217,20 @@ export default function ObserverConfigModal({
     )
     const missing = missingResourceUrlPatterns(account, required)
     if (missing.length === 0) return
-    setGranting(account.id)
-    try {
-      const flow = await authenticatedApi.ensureAccountResources(account.id, missing)
-      if (flow) await openConnectWindow(flow, authenticatedApi)
-      else {
-        // The gatekeeper confirmed this account already has access. Update the modal so the user can
-        // continue without an OAuth flow.
-        setAccounts(prev => {
-          const current = prev.get(account.id)
-          if (!current) return prev
-          const next = new Map(prev)
-          next.set(account.id, {
-            ...current,
-            description: {
-              ...current.description,
-              grantedResourceUrlPatterns: [
-                ...new Set([
-                  ...(current.description.grantedResourceUrlPatterns ?? []),
-                  ...missing,
-                ]),
-              ],
-            },
-          })
-          return next
+    const outcome = await connectActions.grant(account.id, missing)
+    if (outcome === 'already-granted') {
+      // The gatekeeper confirmed this account already has access. Update the modal so the user can
+      // continue without an OAuth flow.
+      setAccounts(prev => {
+        const current = prev.get(account.id)
+        if (!current) return prev
+        const next = new Map(prev)
+        next.set(account.id, {
+          ...current,
+          description: mergeGrantedPatterns(current.description, missing),
         })
-      }
-    } catch (err) {
-      if (err instanceof AuthPopupCancelledError) return
-      console.error('Failed to request additional access:', err)
-      toasts.add({ title: err instanceof Error ? err.message : 'Failed to request additional access', variant: 'error' })
-    } finally {
-      setGranting(null)
+        return next
+      })
     }
   }
 

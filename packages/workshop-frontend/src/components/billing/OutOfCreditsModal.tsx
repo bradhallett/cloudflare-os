@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { CloudflareUsageInfo, CloudflareAccountOption } from '@gadgets/workshop-shared/api'
-import { Dialog, Button, Loader, useKumoToastManager } from '@cloudflare/kumo'
+import { Dialog, Button, Loader } from '@cloudflare/kumo'
 import { CloudWarning, Lightning } from '@phosphor-icons/react'
 import { useOptionalAuthenticatedApi } from '../../AuthContext'
 import { buildAddCreditsUrl } from './creditsUrl'
 import ResetCountdown from './ResetCountdown'
-import { NATIVE_CONNECT_COMPLETE_EVENT, openConnectWindow } from '../../connectHandoff'
-import { AuthPopupCancelledError } from '../../features/native-app/authPopup'
+import { NATIVE_CONNECT_COMPLETE_EVENT } from '../../connectHandoff'
+import { useConnectAccountActions } from '../../useConnectAccountActions'
+import { useReportRpcFailure } from '../../useReportRpcFailure'
 
 interface OutOfCreditsModalProps {
   open: boolean
@@ -20,9 +21,8 @@ interface OutOfCreditsModalProps {
  */
 export default function OutOfCreditsModal({ open, onClose }: OutOfCreditsModalProps) {
   const auth = useOptionalAuthenticatedApi()
-  const toasts = useKumoToastManager()
+  const reportRpcFailure = useReportRpcFailure()
   const [usage, setUsage] = useState<CloudflareUsageInfo | null>(null)
-  const [connecting, setConnecting] = useState(false)
   const refreshVersion = useRef(0)
   const [accounts, setAccounts] = useState<CloudflareAccountOption[] | null>(null)
   const [selecting, setSelecting] = useState<string | null>(null)
@@ -67,21 +67,12 @@ export default function OutOfCreditsModal({ open, onClose }: OutOfCreditsModalPr
     return () => { cancelled = true }
   }, [auth, usage, accounts])
 
-  const connect = async () => {
-    if (!auth) return
-    setConnecting(true)
-    try {
-      await openConnectWindow(await auth.authenticatedApi.connectAccount('cloudflare', []), auth.authenticatedApi)
-    } catch (err) {
-      if (err instanceof AuthPopupCancelledError) return
-      toasts.add({
-        title: 'Could not connect Cloudflare',
-        description: err instanceof Error ? err.message : undefined,
-        variant: 'error',
-      })
-    } finally {
-      setConnecting(false)
-    }
+  const connectActions = useConnectAccountActions(auth ? auth.authenticatedApi : null)
+  const connecting = connectActions.connectingVendor !== null
+
+  const connect = () => {
+    // Connecting (or signing in with) Cloudflare is handled by the Cloudflare gatekeeper.
+    void connectActions.connect('cloudflare', [], { errorTitle: 'Could not connect Cloudflare' })
   }
 
   const selectAccount = async (accountId: string) => {
@@ -92,8 +83,7 @@ export default function OutOfCreditsModal({ open, onClose }: OutOfCreditsModalPr
       setAccounts(null)
       refresh()
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to select account'
-      toasts.add({ title: msg, variant: 'error' })
+      reportRpcFailure('Failed to select account', err)
     } finally {
       setSelecting(null)
     }

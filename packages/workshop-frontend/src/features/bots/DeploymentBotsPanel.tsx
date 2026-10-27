@@ -4,14 +4,14 @@
 import { useEffect, useRef, useState } from 'react'
 import { useInvalidShake } from '@gadgets/ui'
 import { PencilSimple, Plus, Trash } from '@phosphor-icons/react'
-import { useKumoToastManager } from '@cloudflare/kumo'
 import type { RpcStub } from 'capnweb'
+
 import type { AdminApi, AiChatAuthorInfo, BotDefinition, BotSkillChoice } from '@gadgets/workshop-shared/api'
 import { useAuthenticatedApi } from '../../AuthContext'
 import DeleteConfirmationDialog from '../../components/DeleteConfirmationDialog'
 import { WorkshopButton, WorkshopIconButton, WorkshopInput } from '../../components/WorkshopControls'
 import { BotEditorDialog } from './BotEditorDialog'
-import { rpcFailureDescription } from '../../rpcErrors'
+import { useReportRpcFailure } from '../../useReportRpcFailure'
 
 const CARD = 'rounded-xl border border-kumo-line bg-kumo-elevated p-6'
 
@@ -28,7 +28,7 @@ type EditorSession = { mode: 'add'; id: string } | { mode: 'edit'; id: string; d
  */
 export const DeploymentBotsPanel = ({ admin }: { admin: RpcStub<AdminApi> }) => {
   const { authenticatedApi } = useAuthenticatedApi()
-  const toasts = useKumoToastManager()
+  const reportFailure = useReportRpcFailure()
   const [bots, setBots] = useState<(BotDefinition & { id: string })[]>([])
   const [models, setModels] = useState<AiChatAuthorInfo[]>([])
   const [skills, setSkills] = useState<BotSkillChoice[]>([])
@@ -65,13 +65,7 @@ export const DeploymentBotsPanel = ({ admin }: { admin: RpcStub<AdminApi> }) => 
       .catch((err) => console.error('Failed to load bot skills:', err))
   }, [admin, authenticatedApi])
 
-  const reportFailure = (title: string, err: unknown) => {
-    console.error(`${title}:`, err)
-    toasts.add({ title, description: rpcFailureDescription(err), variant: 'error' })
-  }
-
   const idTaken = (id: string): boolean => bots.some((bot) => bot.id === id)
-
   const slugError = (id: string): string | undefined => {
     if (id === '') return undefined
     if (!SLUG_PATTERN.test(id)) {

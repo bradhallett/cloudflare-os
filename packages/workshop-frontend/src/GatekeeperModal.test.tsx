@@ -349,7 +349,7 @@ describe('GatekeeperModal grouped resource types', () => {
 
     await vi.waitFor(() => expect(button('Add connection').disabled).toBe(false))
     await act(async () => button('Add connection').click())
-    expect(testState.toasts).toEqual([{ title: 'Grant access to Service to connect it.', variant: 'error' }])
+    expect(testState.toasts).toEqual([{ title: 'Failed to create connection', description: 'Grant access to Service to connect it.', variant: 'error' }])
   })
 
   // A URL no narrower type names binds the whole-instance catch-all, which the check must see too.
@@ -367,7 +367,7 @@ describe('GatekeeperModal grouped resource types', () => {
 
     await vi.waitFor(() => expect(button('Add connection').disabled).toBe(false))
     await act(async () => button('Add connection').click())
-    expect(testState.toasts).toEqual([{ title: 'Grant access to Whole catalog to connect it.', variant: 'error' }])
+    expect(testState.toasts).toEqual([{ title: 'Failed to create connection', description: 'Grant access to Whole catalog to connect it.', variant: 'error' }])
   })
 
   it('finds a grouped card by searching for any type on it', async () => {
@@ -579,7 +579,7 @@ describe('GatekeeperModal resource grant step', () => {
     await clickGrantAccess()
 
     expect(api.ensureAccountResources).toHaveBeenCalledExactlyOnceWith(1, [GRANTABLE.urlPattern])
-    expect(openConnectWindow).toHaveBeenCalledExactlyOnceWith(FLOW, testState.authenticatedApi)
+    expect(openConnectWindow).toHaveBeenCalledExactlyOnceWith(FLOW, testState.authenticatedApi, undefined)
     expect(testState.toasts).toEqual([
       { title: 'Grant the additional access in the pop-up window.', variant: 'success' },
     ])
@@ -601,7 +601,7 @@ describe('GatekeeperModal resource grant step', () => {
       await clickGrantAccess()
 
       expect(openConnectWindow).not.toHaveBeenCalled()
-      expect(testState.toasts).toEqual([{ title: 'Account is gone.', variant: 'error' }])
+      expect(testState.toasts).toEqual([{ title: 'Failed to request additional access', description: 'Account is gone.', variant: 'error' }])
     } finally {
       consoleError.mockRestore()
     }
@@ -696,7 +696,7 @@ describe('GatekeeperModal plan-refusal upgrade prompt (SaaS build)', () => {
       await clickConnectAccount()
 
       await vi.waitFor(() =>
-        expect(testState.toasts).toEqual([{ title: 'Popup blocked.', variant: 'error' }]))
+        expect(testState.toasts).toEqual([{ title: 'Could not complete connection flow', description: 'Popup blocked.', variant: 'error' }]))
       expect(document.body.querySelector('[data-testid="saas-upgrade-prompt"]')).toBeNull()
     } finally {
       consoleError.mockRestore()

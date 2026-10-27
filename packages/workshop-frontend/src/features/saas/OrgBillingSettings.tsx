@@ -13,6 +13,7 @@ import {
   CommercePlan, OrgBillingOverview, OrgMember, OrgSummary,
 } from '@gadgets/workshop-shared/api'
 import { useAuthenticatedApi } from '../../AuthContext'
+import { useReportRpcFailure } from '../../useReportRpcFailure'
 import { useSaasEnabled } from '../../ServerConfigContext'
 import { canAdministerOrg } from './orgAccess'
 import { INPUT_SM } from '../../components/inputStyles'
@@ -29,6 +30,7 @@ function OrgBillingPanel({ org, onCheckoutStart }: {
 }) {
   const { authenticatedApi } = useAuthenticatedApi()
   const toasts = useKumoToastManager()
+  const reportRpcFailure = useReportRpcFailure()
   const [billing, setBilling] = useState<OrgBillingOverview | null>(null)
   const [members, setMembers] = useState<OrgMember[] | null>(null)
   const [inviteId, setInviteId] = useState('')
@@ -63,7 +65,7 @@ function OrgBillingPanel({ org, onCheckoutStart }: {
       setInviteId('')
       refresh()
     } catch (err) {
-      toasts.add({ title: err instanceof Error ? err.message : 'Could not invite.', variant: 'error' })
+      reportRpcFailure('Could not invite.', err)
     } finally {
       setBusy(false)
     }
@@ -77,7 +79,7 @@ function OrgBillingPanel({ org, onCheckoutStart }: {
       toasts.add({ title: 'Removed.', variant: 'success' })
       refresh()
     } catch (err) {
-      toasts.add({ title: err instanceof Error ? err.message : 'Could not remove.', variant: 'error' })
+      reportRpcFailure('Could not remove.', err)
     } finally {
       setBusy(false)
     }
@@ -90,7 +92,7 @@ function OrgBillingPanel({ org, onCheckoutStart }: {
       const { url } = await authenticatedApi.openOrgBillingPortal(org.id)
       window.open(url, '_blank', 'noopener')
     } catch (err) {
-      toasts.add({ title: err instanceof Error ? err.message : 'Could not open the billing portal.', variant: 'error' })
+      reportRpcFailure('Could not open the billing portal.', err)
     } finally {
       setBusy(false)
     }
@@ -210,7 +212,7 @@ export default function OrgBillingSettings({ org: requestedOrg }: { org?: string
   const saasEnabled = useSaasEnabled()
   const { authenticatedApi } = useAuthenticatedApi()
   const navigate = useNavigate()
-  const toasts = useKumoToastManager()
+  const reportRpcFailure = useReportRpcFailure()
   const [orgs, setOrgs] = useState<OrgSummary[] | null>(null)
   const [plans, setPlans] = useState<CommercePlan[] | null>(null)
   const [upgradingOrg, setUpgradingOrg] = useState<string | null>(null)
@@ -257,7 +259,7 @@ export default function OrgBillingSettings({ org: requestedOrg }: { org?: string
       const { url } = await authenticatedApi.startOrgCheckout(upgradingOrg, planId, seats)
       window.location.assign(url)
     } catch (err) {
-      toasts.add({ title: err instanceof Error ? err.message : 'Could not start checkout.', variant: 'error' })
+      reportRpcFailure('Could not start checkout.', err)
       setBusy(false)
     }
   }
