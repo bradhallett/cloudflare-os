@@ -6,11 +6,17 @@ import { Gadget } from "../files/server.ts";
 // blocks. A real instance, since the class keeps private methods, over a state that is only the
 // storage the gadget reads and writes -- the `cloudflare:workers` stub vitest.config.ts aliases in
 // accepts it, where the runtime's base would refuse a state that is not a real DurableObjectState.
+// Real DO storage structured-clones on every get, so a mutator never aliases the stored object
+// (two unfenced mutators would then edit one shared deck and the queue tests would pass vacuously).
+// The fake clones too, for the same semantics.
 function inMemoryState(deck: unknown) {
   const stored = new Map<string, unknown>([["deck", deck]]);
   const state = {
     storage: {
-      get: async (key: string) => stored.get(key),
+      get: async (key: string) => {
+        const value = stored.get(key);
+        return value === undefined ? undefined : structuredClone(value);
+      },
       put: async (key: string, value: unknown) => { stored.set(key, value); },
     },
   } as unknown as DurableObjectState;

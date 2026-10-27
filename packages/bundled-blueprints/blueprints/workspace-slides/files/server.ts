@@ -268,8 +268,9 @@ export class Gadget extends DurableObject<unknown> implements GadgetStub {
   }
 
   async #setDeckLocked(deck: Deck): Promise<void> {
-    // Stamped as current: getDeck() reseeds a deck without the marker, which a caller building a
-    // whole deck from the public type would otherwise lose on the next read.
+    // Stamped as current: a deck built from the public type may omit the marker, and #loadDeck
+    // would have to convert-and-rewrite it on the next read; the stamp stores it current in one
+    // write.
     await this.#save({ ...deck, themeVersion: THEME_VERSION });
   }
 
