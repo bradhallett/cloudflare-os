@@ -5,6 +5,7 @@ import { Button, Banner } from '@cloudflare/kumo'
 import { openDisownedPopup, uniquePopupName } from '../../connectHandoff'
 import type { AuthPopup } from '../../features/native-app/authPopup'
 import { nativeApp } from '../../features/native-app/nativeApp'
+import { rpcFailureDescription } from '../../rpcErrors'
 
 interface OAuthButtonsProps {
   rpcStub: RpcStub<PublicApi>
@@ -148,7 +149,7 @@ export default function OAuthButtons({ rpcStub, vendors, onSuccess }: OAuthButto
       else window.location.reload()
     } catch (err) {
       if (err === CANCELLED || !mountedRef.current) return
-      setError(err instanceof Error ? err.message : 'Could not sign in')
+      setError(rpcFailureDescription(err) ?? 'Could not sign in')
       setPending(null)
     }
   }

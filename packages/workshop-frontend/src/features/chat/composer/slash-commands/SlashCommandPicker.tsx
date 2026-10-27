@@ -16,6 +16,7 @@ import {
   loadSlashCommandCatalog,
   slashCommandKey,
 } from "../../../../components/chat/slash-command-catalog";
+import { rpcFailureDescription } from "../../../../rpcErrors";
 
 type SlashCommandPopupLayout = {
   left: number;
@@ -171,8 +172,7 @@ export function useSlashCommandPicker({
       })
       .catch((err) => {
         if (cancelled) return;
-        setLoading(false);
-        setError(err instanceof Error ? err.message : `${err}`);
+        setError(rpcFailureDescription(err) ?? "Could not load slash commands");
         console.error("Failed to list slash commands:", err);
       });
     return () => {

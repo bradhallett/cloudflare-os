@@ -3,6 +3,7 @@ import type { GatekeeperUiFrame } from '@gadgets/workshop-shared/gatekeeper'
 import { useAuthenticatedApi } from './AuthContext'
 import SandboxedGatekeeperApp from './SandboxedGatekeeperApp'
 import { reportIssue } from './errorReporting'
+import { rpcFailureDescription } from './rpcErrors'
 
 // The frame's `ui` is an RPC stub at runtime; dispose it to release the server-side capability.
 function disposeFrame(frame: GatekeeperUiFrame | null) {
@@ -42,7 +43,7 @@ export default function GatekeeperAppPage({ appId }: { appId: string }) {
         reportIssue('gatekeeper-app.load', err, {
           gatekeeperVendorId: appId,
         })
-        if (!cancelled) setError(`${err}`)
+        if (!cancelled) setError(rpcFailureDescription(err) ?? 'Failed to load this app.')
       })
     return () => {
       cancelled = true
