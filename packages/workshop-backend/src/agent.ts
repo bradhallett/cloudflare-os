@@ -11,13 +11,12 @@ import type{ AssistantMessage, Message, SystemMessage } from "@earendil-works/pi
 import { runAgentLoopContinue, type AgentContext, type AgentEvent } from "@earendil-works/pi-agent-core";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { seenAlwaysAvailableResources } from "./agent-catalog";
-import { formatInstanceInstructions } from "./admin-config";
 import { traceRejectedToolCall, traceTool } from "./agent-tracing";
 import { AgentTurnError, completeText, httpStatusFromError } from "./ai-invoke";
 import { buildTools, defineTool } from "./agent-tools";
 
 import type{ AgentProgress } from "./agent-session";
-import { COMMUNICATION_GUIDANCE, SYSTEM_PROMPT, SPAWNER_SYSTEM_PROMPT, SPAWNED_AGENT_TOOLS, SPAWNED_TASK_PROMPT, formatCallableAgentPrompt } from "./agent-prompt";
+import { SPAWNED_AGENT_TOOLS, buildSystemPrompt } from "./agent-prompt";
 import { createTurnSession, makeStoredAssistantMessage } from "./agent-session";
 import { replayChatLog } from "./agent-replay";
 import type{ ChatHistory, AiChatMessageBodyWithModelData } from "./agent-hooks";
@@ -131,195 +130,8 @@ async function runAgentPass(
   await replayChatLog(
       {session, hooks, handle, chatId, chatMessages, checkpoint});
 
-  // Deployment-wide admin instructions, appended to the static system slot (slot 0) so they stay
-  // inside the Anthropic prompt cache window. "" when unset.
-  let instanceInstructions = formatInstanceInstructions(await hooks.getInstanceInstructions());
-
-  // The two system prompt slots: the non-project-specific parts, followed by the
-  // project-specific parts. They become the leading system message's content and its one
-  // section, which pi renders as `${slot0}\n\n${slot1}`. On APIs with cache breakpoints, the
-  // model handle sends that as two blocks with a breakpoint between them (see
-  // system-prompt-blocks.ts), so the static prefix stays cached when the project-specific part
-  // changes.
-  let systemPromptSlots: [string, string];
-  // The regular agent's list of the workspace's gadgets, built for this pass when no persisted
-  // listing exists (see the regular-agent branch below); a spawnerConfig chat never builds one.
-  let systemPromptWorkspace: string | undefined;
-  // Builds the workspace gadget listing: each gadget's files as of the start of the thread (or
-  // of its latest compaction), so mid-thread changes don't thrash the prompt cache. Computed
-  // only on demand -- by the first pass without a persisted listing, and by compaction, which
-  // refreshes the listing for the history it prunes.
-  let computeWorkspaceSection = async (): Promise<string> => {
-    if (session.gadgetInfos.length == 0) {
-      return "As of the start of this session, this workspace contained no gadgets. You can use " +
-          "connected resources and executeCode without one. Use `createGadget` tool only when the " +
-          "task calls for a new application or saved output, before writing that gadget's files.";
-    }
-    let sections: string[] = [];
-    for (let info of session.gadgetInfos) {
-      // The file list follows the same pinned/unpinned split as readFile: an unpinned gadget
-      // with committed code lists its head commit's files (the head fixed for this turn);
-      // pinned gadgets and gadgets with no committed code list from the session content.
-      let files: string[];
-      let unpinnedHead = !session.pinnedGadgets.has(info.id) ? session.observeHead(info.id) : undefined;
-      if (unpinnedHead !== undefined) {
-        files = [...(await hooks.readCommitFiles(unpinnedHead)).keys()];
-      } else {
-        files = [...(session.sessionContent.get(info.id)?.keys() ?? [])];
-      }
-      let envName = session.chatNameFor(info.id);
-      let lines = [envName !== undefined
-          ? `## Gadget ${envName}: ${JSON.stringify(info.title)}`
-          : `## Gadget ${JSON.stringify(info.title)} (no binding in your env)`];
-      if (info.isDefault) {
-        lines.push(
-            `This is the workspace's default gadget: file tools operate on it when their ` +
-            `\`workpiece\` parameter is omitted.`);
-      }
-      if (files.length == 0) {
-        lines.push(`As of the start of this session, this gadget had no code files.`);
-      } else {
-        lines.push(
-            `As of the start of this session, this gadget contained the following files:`,
-            ...files.map(f => `* ${f}`));
-      }
-      if (info.output) {
-        // When people are using common platform formats/outputs, most times people just want to use
-        // them, not to edit them. Especially non-technical folks. We tell the agent to wait to be
-        // explicitly asked.
-        lines.push(
-            `This gadget is a ${info.output.noun}: a finished application whose content is data ` +
-            `in its own storage, not text in its code. To read or change what it contains, call ` +
-            `its RPC methods from \`executeCode\`` +
-            (envName !== undefined ? ` (\`env.${envName}\`)` : ``) +
-            `; read its README.md or server.js to learn the methods it offers for this. Do NOT ` +
-            `edit its code to change its content. Edit the code only if the user asks to change ` +
-            `how the ${info.output.noun} itself works (its editor, layout, or features).`);
-      }
-      if (info.bindings.length == 0) {
-        lines.push(`This gadget has no bindings.`);
-      } else {
-        // For each of the gadget's own bindings, cross-reference how the agent can reach the
-        // same resource in its own env (matched by target workpiece), if it can.
-        lines.push(`This gadget's bindings (as its own code sees them):`,
-                   ...info.bindings.map(b => {
-          let chatName = session.chatNameFor(b.target);
-          return `* ${b.name}: ${b.title}` +
-              (chatName !== undefined
-                  ? ` — in your env as \`env.${chatName}\``
-                  : envName !== undefined
-                  ? ` — (no binding for this in your env; describeBinding with ` +
-                    `\`gadget: "${envName}"\` describes it)`
-                  : ` — (no binding for this in your env)`);
-        }));
-      }
-      sections.push(lines.join("\n"));
-    }
-    return `# This workspace's gadgets\n\n${sections.join("\n\n")}`;
-  };
-
-  if (session.agentContext.spawnerConfig) {
-    // This is a spawned agent. Build an appropriate system prompt. Spawned agents see only the
-    // bindings the spawner configured (snapshotted into the chat's seed layer at spawn time),
-    // never the whole workspace.
-    let namedSeeds = session.seedBindings.filter(seed => seed.catalog === undefined);
-    let systemPromptBindings: string;
-    if (namedSeeds.length == 0) {
-      systemPromptBindings =
-          "Aside from `env.GIT` and any resources described below, the `env` object is empty.";
-    } else {
-      let lines = namedSeeds.map(seed =>
-          `* env.${seed.name} — ` +
-          (seed.isGadget
-              ? `the Gadget ${JSON.stringify(seed.title)}: \`.rpc\` is an RPC stub to its ` +
-                `server-side Durable Object, \`.exports\` exports it as a file.`
-              : seed.title));
-      systemPromptBindings =
-          `You have access to the following bindings via the \`env\` object:\n${lines.join("\n")}`;
-    }
-
-    // Split the system prompt into static and dynamic parts for better caching. How the task is
-    // delivered depends on how the chat was spawned, and for a callable agent includes the
-    // chat-specific (but stable across the chat) interface, so that goes in the second slot.
-    systemPromptSlots = [
-      SPAWNER_SYSTEM_PROMPT,
-      [
-        session.agentContext.spawnerTypes
-            ? formatCallableAgentPrompt(session.agentContext.spawnerTypes)
-            : SPAWNED_TASK_PROMPT,
-        systemPromptBindings,
-        session.alwaysAvailableResourcesPrompt,
-      ].filter(part => part !== "").join("\n\n"),
-    ];
-  } else {
-    // This is a regular coding agent.
-
-    // The workspace gadget listing is built only when no persisted one exists -- the first
-    // pass of the thread, or a checkpoint that predates the listing. Otherwise the persisted
-    // snapshot is reused (the prompt section below prefers it), skipping the per-gadget file
-    // reads in computeWorkspaceSection entirely.
-    let savedWorkspace = checkpoint ? checkpoint.workspacePrompt : session.agentContext.workspacePrompt;
-    if (savedWorkspace === undefined) {
-      systemPromptWorkspace = await computeWorkspaceSection();
-      if (checkpoint === undefined) {
-        hooks.setChatWorkspacePrompt(chatId, systemPromptWorkspace);
-      }
-    }
-
-    // Named in the prompt because the request that should trigger them ("make me a doc") may
-    // not look trigger the agent to browse blueprints.
-    let standardFormats = await hooks.describeStandardFormats();
-
-    // Build connectable-vendors section. We only list vendor names here; the agent fetches a
-    // vendor's resource URL patterns on demand via listConnectableResources.
-    let connectableVendors = await hooks.listConnectableVendors();
-    let systemPromptConnections: string;
-    if (connectableVendors.length == 0) {
-      systemPromptConnections = "";
-    } else {
-      systemPromptConnections =
-          `\n\nIf you need access to an external resource that isn't already a binding, you can ask ` +
-          `the user to connect one with the requestConnection tool (pre-configure it as much as you ` +
-          `can; use listConnectableResources to learn a vendor's resource URL patterns first). The ` +
-          `user accepts or denies in the chat. If they accept, you'll be resumed and the resource ` +
-          `becomes available as a binding in your env; if they deny, your turn ends and you wait ` +
-          `for the user's next message.\n` +
-          `If one of these services likely holds information relevant to the task, consider ` +
-          `requesting a connection and reading from it before you answer, instead of answering from ` +
-          `guesswork — a connection often gives you the real information. Connectable vendors:\n` +
-          `${connectableVendors.map(v => `* ${v.id}: ${v.displayName}`).join("\n")}`;
-    }
-
-    // Split the system prompt into static and dynamic parts for better caching.
-    systemPromptSlots = [
-      SYSTEM_PROMPT,
-      (standardFormats ? `${standardFormats}\n\n` : "") +
-          `${savedWorkspace ?? systemPromptWorkspace}${systemPromptConnections}` +
-          (session.alwaysAvailableResourcesPrompt ? `\n\n${session.alwaysAvailableResourcesPrompt}` : "") +
-          // The bot section is part of the chat's identity, so it lives in the dynamic slot
-          // (slot 1): slot 0 stays byte-stable, preserving the cross-chat cache prefix, and a
-          // mid-chat bot switch costs exactly one cache miss. Only regular chats run as bots --
-          // gadget-spawned agents never do -- so the spawner branch above needs nothing.
-          (session.agentContext.botSection ? `\n\n${session.agentContext.botSection}` : ""),
-    ];
-  }
-
-  // Shared guidance precedes deployment instructions for both agent types.
-  systemPromptSlots[0] += `\n\n${COMMUNICATION_GUIDANCE}`;
-  if (instanceInstructions) {
-    systemPromptSlots[0] += `\n\n${instanceInstructions}`;
-  }
-  // Prompt caches are shared across the provider account, so anyone on it could probe for a cached
-  // prefix. The workspace's random salt leads the project-specific part, so nobody without this
-  // prompt can probe that part, or the chat after it.
-  let systemMessage: SystemMessage = {
-    role: "system", content: systemPromptSlots[0],
-    sections: {
-      environment: `Prompt cache salt (ignore): ${hooks.getPromptCacheSalt()}\n\n` +
-          systemPromptSlots[1],
-    },
-    timestamp: 0,
-  };
+  let {systemMessage, workspacePrompt, computeWorkspacePrompt} =
+      await buildSystemPrompt({session, hooks, chatId, checkpoint});
 
   // Some models charge their response to the same window as the prompt, so the reservation is both
   // withheld from the prompt's budget and sent as the response cap -- the two can't disagree.
@@ -736,7 +548,7 @@ async function runAgentPass(
           // configured bindings instead -- so they keep an absent one, as before.
           workspacePrompt: session.agentContext.spawnerConfig
               ? undefined
-              : systemPromptWorkspace ?? await computeWorkspaceSection(),
+              : workspacePrompt ?? await computeWorkspacePrompt(),
           alwaysAvailableResources: [
             ...seenAlwaysAvailableResources(session.listedResources, chatMessages, compactedTo).values(),
           ],
