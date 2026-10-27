@@ -204,10 +204,10 @@ describe("refreshing", () => {
       state.storage.kv.put("credentials", { ...creds, refreshToken: "revoked-refresh-token" });
     });
     const message = "Spotify credentials have expired or been revoked. Please reconnect the account.";
-    await expect(accountStub(id).getAccessToken()).rejects.toThrow(message);
+    await expect(runInDurableObject(accountStub(id), instance => instance.getAccessToken())).rejects.toThrow(message);
     // The expiry latch is set, so a retry must neither hit the provider nor change its answer.
     const refreshes = refreshRequests(x);
-    await expect(accountStub(id).getAccessToken()).rejects.toThrow(message);
+    await expect(runInDurableObject(accountStub(id), instance => instance.getAccessToken())).rejects.toThrow(message);
     expect(refreshRequests(x)).toBe(refreshes);
     const latched = await runInDurableObject(accountStub(id), (_instance, state) =>
       state.storage.kv.get("credentials:expired"));
