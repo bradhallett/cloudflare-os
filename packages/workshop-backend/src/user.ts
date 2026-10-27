@@ -1,7 +1,6 @@
 import { RpcStub } from "capnweb";
 import {GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, createPlanRefusalError, type DeviceSessionHandoffStart, type BotDefinition, type BotInfo, type BotSelection, type BotSkillChoice, type OrgMemberStatus, type OrgRole} from '@gadgets/workshop-shared/api';
 import {Gatekeeper, GatekeeperUser, GatekeeperConnectCallback, ConnectHandoff, AppUiContext, GatekeeperUserSelection, GatekeeperUserSelectionExchange, RedeemedGatekeeperUserSelection} from "@gadgets/workshop-shared/gatekeeper";
-import { ambientGatekeeperMode } from "./provisioning-policy.js";
 import { isActiveMember } from "./org-access.js";
 import { retryOnDoReset } from "./do-retry.js";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
@@ -1171,22 +1170,18 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   /**
    * List the skills this user can declare on a bot: the slash commands offered by their
    * connected accounts' agent singletons (e.g. the Context Library), each carrying the vendor id
-   * a BotSkillRef stores. A vendor whose singleton can't be reached -- its class won't mint, its
-   * provider won't load -- is skipped, not fatal, exactly like the slash-command catalog.
+   * a BotSkillRef stores. A vendor whose singleton can't be reached -- its class won't mint
+   * (including a dormant account: the mint applies the dormancy invariant, see
+   * getSingletonGatekeeperClass), its provider won't load -- is skipped, not fatal, exactly
+   * like the slash-command catalog.
    */
   async listBotSkills(): Promise<BotSkillChoice[]> {
     // Self-sufficient like listGatekeeperApps: ambient singletons (Context) are provisioned
     // first (idempotent), so the list works even before the user has opened a workspace.
     await this.accounts.ensureAutoProvisionedAccounts();
-    let config = await readAdminConfig(this.env);
 
     let perAccount = await Promise.all([...this.accounts.connectedAccountRecords()].map(async record => {
       if (!record.description.singleton) return [];
-      // A "disabled" ambient gatekeeper's account stays dormant (the same test
-      // listProvidedAccounts applies): its skills are not offerable while disabled.
-      if (record.autoProvisioned && ambientGatekeeperMode(config, record.vendorId) === "disabled") {
-        return [];
-      }
       try {
         let cls = await this.accounts.getSingletonGatekeeperClass(record.id);
         if (!cls) return [];
