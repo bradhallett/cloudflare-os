@@ -27,7 +27,7 @@ import { sanitizeCommandPosition } from "./overseer-message-format";
 import { SlashCommandAuthorizerImpl } from "./overseer-gatekeeper-client";
 import type { RestoreForgerEntrypoint } from "./overseer-harness";
 import { RESTORE_FORGER_WORKER } from "./overseer-harness";
-import { COMPATIBILITY_DATE } from "@gadgets/scripts/worker-config";
+import { COMPATIBILITY_DATE } from "@gadgets/scripts/compatibility-date";
 
 /**
  * OverseerFacets: worker/facet loading, gatekeeper usability and description, slash commands, and stub forging.
