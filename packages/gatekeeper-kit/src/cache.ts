@@ -1,12 +1,15 @@
 /** Principal-partitioned Durable Object TTL caching. */
 
-import type { KvReadWrite } from "./kv";
+import type { KvScannable } from "./kv";
 import { requirePositiveInt } from "./positive-int";
 import { perStorage } from "./per-storage";
 import { SingleFlight } from "./single-flight";
 
-/** The Durable Object KV surface used by the cache. */
-export type CacheKv = KvReadWrite;
+/**
+ * The Durable Object KV surface used by the cache. Scanning exists for `sweep`; every caller has
+ * `ctx.storage.kv`, which provides it.
+ */
+export type CacheKv = KvScannable;
 
 /** What `KvTtlCache.partitionedBy` asks for the current cache partition. */
 export type AuthoritySource = {
@@ -131,6 +134,13 @@ export class KvTtlCache {
       && Date.now() - entry.fetchedAt < ttlMs) {
       return entry.value;
     }
+    if (entry !== undefined) {
+      // The entry just read is unservable (foreign partition or expired), and nothing will visit
+      // it again — delete it here, synchronously with the fence read, so stamp-and-abandon stops
+      // accumulating. The in-flight load below re-checks its fence immediately before its put, so
+      // this delete cannot evict a value that load is about to store.
+      this.#kv.delete(entryKey);
+    }
 
     // Keyed by the storage entry plus generation and authority: stale and current callers never
     // share a load, and two named caches over one storage never share one either.
@@ -154,6 +164,46 @@ export class KvTtlCache {
       }
       return value;
     });
+  }
+
+  /**
+   * Deletes entries this cache can never serve again — a foreign partition's (generation or
+   * authority mismatched), a corrupt one, and anything older than `maxAgeMs` — so the canonical
+   * cache does not inherit stamp-and-abandon storage growth.
+   *
+   * Interval-gated: unless `intervalMs` has passed since the last run, this is a no-op, so callers
+   * can sweep from a periodic alarm. Paged: at most `limit` entries per run; the rest wait for a
+   * later one. Deletes are collected after the scan completes, in the hook-delivery-queue pattern.
+   * No coordination with in-flight loads is needed: a load's put re-checks its fence immediately
+   * before writing, and this never deletes a current-partition entry inside its TTL.
+   * @param now The current time in milliseconds.
+   * @param options `maxAgeMs` bounds an entry's life beyond its TTL; `intervalMs` gates runs
+   *   (default 24h); `limit` pages the scan (default 500).
+   * @returns How many entries were deleted.
+   */
+  sweep(now: number,
+    options: { maxAgeMs: number; intervalMs?: number; limit?: number },
+  ): number {
+    requirePositiveInt("maxAgeMs", options.maxAgeMs);
+    const intervalMs = options.intervalMs ?? 24 * 60 * 60_000;
+    requirePositiveInt("intervalMs", intervalMs);
+    const limit = options.limit ?? 500;
+    requirePositiveInt("limit", limit);
+    const sweptKey = `${this.#prefix}swept`;
+    const last = this.#kv.get<number>(sweptKey);
+    if (last !== undefined && now - last < intervalMs) return 0;
+    this.#kv.put(sweptKey, now);
+
+    const stale = [...this.#kv.list<CacheEntry<unknown>>({ prefix: `${this.#prefix}entry:`, limit })];
+    const doomed: string[] = [];
+    for (const [entryKey, entry] of stale) {
+      if (entry === null || typeof entry !== "object" || entry.generation !== this.#generation()
+        || now - entry.fetchedAt >= options.maxAgeMs) {
+        doomed.push(entryKey);
+      }
+    }
+    for (const entryKey of doomed) this.#kv.delete(entryKey);
+    return doomed.length;
   }
 
   /** Invalidates every cached entry by advancing the shared generation. */
