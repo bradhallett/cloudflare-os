@@ -816,7 +816,7 @@ export class NotionItemGatekeeperImpl extends DurableObject<Env, NotionItemGatek
   }
 
   async getAutoApprovableActions() {
-    return [];
+    return this.#store().lifecycle.set.autoApprovableKinds();
   }
 
   async startSession(
@@ -901,7 +901,7 @@ export class NotionWorkspaceGatekeeperImpl
   }
 
   async getAutoApprovableActions() {
-    return [];
+    return this.#store().lifecycle.set.autoApprovableKinds();
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<NotionWorkspaceSession> {

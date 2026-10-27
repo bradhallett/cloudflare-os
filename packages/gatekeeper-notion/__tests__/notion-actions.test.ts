@@ -6,7 +6,6 @@ import {
   findWorkspaceParentPage,
   rejectStoredAction,
   type NotionAction,
-  type StoredActionRecord,
 } from "../src/notion-actions";
 import {
   NotionApiError,
@@ -141,37 +140,25 @@ describe("findWorkspaceParentPage", () => {
 
 describe("applyStoredAction", () => {
   it("applies once: a replayed apply after the crash window is a no-op", async () => {
-    const records = new Map<number, StoredActionRecord>();
-    const updatePage = vi.fn(async () => ({}));
-    const store = {
-      api: { updatePage },
-      getAction: (id: number) => records.get(id),
-      putAction: (record: StoredActionRecord) => void records.set(record.id, record),
-      invalidatePage: () => {},
-      resolveId: (id: string) => id,
-      getPageResponse: async () => ({ properties: { title: { type: "title" } } }),
-    } as unknown as NotionStore;
-
-    records.set(1, {
-      id: 1,
-      action: { type: "setTitle", pageId: "page-1", title: "New", previousTitle: "Old" },
-      state: "pending",
-      submittedAt: 0,
-    });
+    const updatePage = vi.fn(async () => ({}) as NotionPageResponse);
+    const { api } = makeApi();
+    api.updatePage = updatePage;
+    const store = storeWith(api);
+    const id = await stage(store, { type: "setTitle", pageId: "page-1", title: "New", previousTitle: "Old" });
 
     await applyStoredAction(store, 1);
     expect(updatePage).toHaveBeenCalledTimes(1);
-    expect(records.get(1)?.state).toBe("applied");
+    expect(store.lifecycle.journal.get(id)).toMatchObject({ state: "applied" });
 
     // The Workshop records its approval only after the RPC returns; a restart in that window
     // replays the apply, which must settle instead of writing the title again.
-    await applyStoredAction(store, 1);
+    await applyStoredAction(store, id);
     expect(updatePage).toHaveBeenCalledTimes(1);
   });
 
   it("still throws for an unknown action id", async () => {
-    const store = { getAction: () => undefined } as unknown as NotionStore;
-    await expect(applyStoredAction(store, 4)).rejects.toThrow("Unknown action: 4");
+    const store = storeWith(makeApi().api);
+    await expect(applyStoredAction(store, 4)).rejects.toThrow("Unknown pending action: 4");
   });
 });
 
@@ -203,48 +190,58 @@ function makeApi() {
   return { api, calls };
 }
 
+// An approval queue that takes the submission and answers nothing (tests apply directly).
+const quietQueue = {
+  submitAction: async () => {},
+} as unknown as Parameters<NotionStore["lifecycle"]["set"]["submit"]>[0];
+
 function storeWith(api: NotionApi): NotionStore {
   return new NotionStore(makeKv(), api);
 }
 
-function stage(store: NotionStore, action: NotionAction): number {
-  const id = store.nextActionId();
-  store.putAction({ id, action, state: "pending", submittedAt: id });
-  return id;
+/** Stages an action through the engine, as a session would (deterministic submittedAt). */
+async function stage(store: NotionStore, action: NotionAction): Promise<number> {
+  const { type, ...payload } = action;
+  return await store.lifecycle.set.submit(quietQueue, type, { ...payload, submittedAt: 1 });
 }
 
 describe("claim-before-apply", () => {
   it("refuses a replayed action whose claim was left behind, marking it terminally failed", async () => {
     const { api, calls } = makeApi();
     const store = storeWith(api);
-    const id = stage(store, { type: "addComment", pageId: "page-1", text: "Hi" });
+    const id = await stage(store, { type: "addComment", pageId: "page-1", text: "Hi" });
     // Simulate a dispatch that died after claiming: the record still says `claimed`.
-    store.putAction({ ...store.getAction(id)!, state: "claimed" });
+    store.lifecycle.journal.markClaimed(id);
 
     await expect(applyStoredAction(store, id)).rejects.toThrow(APPLY_OUTCOME_UNKNOWN_MESSAGE);
 
     expect(calls.createComment).toHaveLength(0);
-    expect(store.getAction(id)).toMatchObject({ state: "failed", failure: APPLY_OUTCOME_UNKNOWN_MESSAGE });
+    expect(store.lifecycle.journal.get(id)).toMatchObject({
+      state: "failed", error: APPLY_OUTCOME_UNKNOWN_MESSAGE,
+    });
     // The failed record is inert: pending reads skip it, and rejection clears it.
     expect(store.pendingActions()).toHaveLength(0);
-    rejectStoredAction(store, id);
-    expect(store.getAction(id)).toBeUndefined();
+    await rejectStoredAction(store, id);
+    expect(store.lifecycle.journal.get(id)).toBeUndefined();
   });
 
   it("does not create the page twice when a crash left a claimed createPage with its real id", async () => {
     const { api, calls } = makeApi();
     const store = storeWith(api);
-    const id = stage(store, {
-      type: "createPage", provisionalId: "~1", parent: { kind: "page", pageId: "parent-1" }, title: "New",
-    });
+    const id = await stage(store, {
+      type: "createPage", provisionalId: "~1", parent: { kind: "page", pageId: "parent-1" },
+      title: "New", createdPageId: "created-page",
+    } as NotionAction);
     // The crash window the claim guards: the API call landed and the created id was persisted,
     // but the final "applied" write never did.
-    store.putAction({ ...store.getAction(id)!, state: "claimed", createdPageId: "created-page" });
+    store.lifecycle.journal.markClaimed(id);
 
     await expect(applyStoredAction(store, id)).rejects.toThrow(APPLY_OUTCOME_UNKNOWN_MESSAGE);
 
     expect(calls.createPage).toHaveLength(0);
-    expect(store.getAction(id)).toMatchObject({ state: "failed", createdPageId: "created-page" });
+    expect(store.lifecycle.journal.get(id)).toMatchObject({
+      state: "failed", action: { payload: { createdPageId: "created-page" } },
+    });
   });
 
   it("treats a transport failure as an unknown outcome and stops retrying", async () => {
@@ -255,11 +252,13 @@ describe("claim-before-apply", () => {
       throw new NotionTransportError("socket hang up");
     };
     const store = storeWith(api);
-    const id = stage(store, { type: "setTitle", pageId: "page-1", title: "New", previousTitle: "Old" });
+    const id = await stage(store, { type: "setTitle", pageId: "page-1", title: "New", previousTitle: "Old" });
 
     await expect(applyStoredAction(store, id)).rejects.toThrow(ActionOutcomeUnknownError);
 
-    expect(store.getAction(id)).toMatchObject({ state: "failed", failure: expect.stringContaining("socket hang up") });
+    expect(store.lifecycle.journal.get(id)).toMatchObject({
+      state: "failed", error: expect.stringContaining("socket hang up"),
+    });
     expect(store.pendingActions()).toHaveLength(0);
     // A retry answers with the recorded failure instead of dispatching again.
     await expect(applyStoredAction(store, id)).rejects.toThrow("socket hang up");
@@ -270,11 +269,11 @@ describe("claim-before-apply", () => {
     const { api } = makeApi();
     api.updatePage = async () => { throw new NotionApiError(503, "Notion overloaded"); };
     const store = storeWith(api);
-    const id = stage(store, { type: "setTitle", pageId: "page-1", title: "New", previousTitle: "Old" });
+    const id = await stage(store, { type: "setTitle", pageId: "page-1", title: "New", previousTitle: "Old" });
 
     await expect(applyStoredAction(store, id)).rejects.toThrow(ActionOutcomeUnknownError);
 
-    expect(store.getAction(id)).toMatchObject({ state: "failed" });
+    expect(store.lifecycle.journal.get(id)).toMatchObject({ state: "failed" });
   });
 
   it("returns a retryable 4xx failure to pending, where a retry succeeds", async () => {
@@ -286,22 +285,22 @@ describe("claim-before-apply", () => {
       return {} as NotionPageResponse;
     };
     const store = storeWith(api);
-    const id = stage(store, { type: "setTitle", pageId: "page-1", title: "New", previousTitle: "Old" });
+    const id = await stage(store, { type: "setTitle", pageId: "page-1", title: "New", previousTitle: "Old" });
 
     await expect(applyStoredAction(store, id)).rejects.toThrow("bad request");
-    expect(store.getAction(id)?.state).toBe("pending");
+    expect(store.lifecycle.journal.get(id)?.state).toBe("pending");
 
     await applyStoredAction(store, id);
 
-    expect(store.getAction(id)?.state).toBe("applied");
+    expect(store.lifecycle.journal.get(id)?.state).toBe("applied");
     expect(calls.updatePage).toHaveLength(1);
   });
 
   it("counts a claimed action as still pending for the simulation", async () => {
     const { api } = makeApi();
     const store = storeWith(api);
-    const id = stage(store, { type: "setTitle", pageId: "page-1", title: "New", previousTitle: "Old" });
-    store.putAction({ ...store.getAction(id)!, state: "claimed" });
+    const id = await stage(store, { type: "setTitle", pageId: "page-1", title: "New", previousTitle: "Old" });
+    store.lifecycle.journal.markClaimed(id);
 
     expect(store.pendingActions()).toHaveLength(1);
     expect(store.pendingForPage("page-1")).toHaveLength(1);
@@ -310,13 +309,32 @@ describe("claim-before-apply", () => {
   it("refuses to reject an action whose claim is still outstanding", async () => {
     const { api } = makeApi();
     const store = storeWith(api);
-    const id = stage(store, { type: "setTitle", pageId: "page-1", title: "New", previousTitle: "Old" });
-    store.putAction({ ...store.getAction(id)!, state: "claimed" });
+    const id = await stage(store, { type: "setTitle", pageId: "page-1", title: "New", previousTitle: "Old" });
+    store.lifecycle.journal.markClaimed(id);
 
-    expect(() => rejectStoredAction(store, id)).toThrow(APPLY_OUTCOME_UNKNOWN_MESSAGE);
+    await expect(rejectStoredAction(store, id)).rejects.toThrow(APPLY_OUTCOME_UNKNOWN_MESSAGE);
     // The refusal marked it failed; the second rejection — the operator's explicit choice — clears it.
-    expect(store.getAction(id)).toMatchObject({ state: "failed" });
-    rejectStoredAction(store, id);
-    expect(store.getAction(id)).toBeUndefined();
+    expect(store.lifecycle.journal.get(id)).toMatchObject({ state: "failed" });
+    await rejectStoredAction(store, id);
+    expect(store.lifecycle.journal.get(id)).toBeUndefined();
+  });
+
+  it("strands a dependent staged under a rejected page creation instead of dispatching it", async () => {
+    const { api, calls } = makeApi();
+    const store = storeWith(api);
+    const createId = await stage(store, {
+      type: "createPage", provisionalId: "~1", parent: { kind: "page", pageId: "parent-1" }, title: "New",
+    });
+    const dependentsId = await stage(store, { type: "addComment", pageId: "~1", text: "Hi" });
+
+    await rejectStoredAction(store, createId);
+
+    // The dependent is terminally failed (its reference can never resolve), not dispatchable:
+    // applying it refuses without calling Notion, and rejecting clears the stranded record.
+    expect(store.lifecycle.journal.get(dependentsId)).toMatchObject({ state: "failed" });
+    await expect(applyStoredAction(store, dependentsId)).rejects.toThrow(/needed action 1/);
+    expect(calls.createComment).toHaveLength(0);
+    await rejectStoredAction(store, dependentsId);
+    expect(store.lifecycle.journal.get(dependentsId)).toBeUndefined();
   });
 });
