@@ -32,7 +32,9 @@ export function generateNonce(): string {
 }
 
 /**
- * Compares well-formed strings without data-dependent timing. Ill-formed UTF-16 is rejected because
+ * Compares well-formed strings without data-dependent timing. Prefers the Workers platform's
+ * `crypto.subtle.timingSafeEqual`; where the platform lacks it (Node test runs), falls back to a
+ * fixed-length XOR fold, which is likewise data-independent. Ill-formed UTF-16 is rejected because
  * distinct lone surrogates encode to the same bytes.
  * @param a First string.
  * @param b Second string.
@@ -43,7 +45,14 @@ export function constantTimeEqual(a: string, b: string): boolean {
   const bufA = encoder.encode(a);
   const bufB = encoder.encode(b);
   if (bufA.byteLength !== bufB.byteLength) return false;
-  return crypto.subtle.timingSafeEqual(bufA, bufB);
+  if (typeof crypto.subtle.timingSafeEqual === "function") {
+    return crypto.subtle.timingSafeEqual(bufA, bufB);
+  }
+  let diff = 0;
+  for (let i = 0; i < bufA.byteLength; i++) {
+    diff |= (bufA[i] ?? 0) ^ (bufB[i] ?? 0);
+  }
+  return diff === 0;
 }
 
 /** A single-use secret and the instant it stops being valid. */

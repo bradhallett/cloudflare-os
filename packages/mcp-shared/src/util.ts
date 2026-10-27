@@ -1,11 +1,6 @@
 // Small helpers with no policy in them. Kept apart from `tools.ts` so that file stays only the trust
 // boundary.
 
-/** Lowercase hex for a byte string. Used for nonces and catalog fingerprints. */
-export function hexEncode(bytes: Uint8Array): string {
-  return [...bytes].map(byte => byte.toString(16).padStart(2, "0")).join("");
-}
-
 /** Upper-snake-cases an id for use in a suggested binding name (e.g. `my-portal` -> `MY_PORTAL`). */
 export function bindingNameFragment(id: string): string {
   return id.toUpperCase().replace(/[^A-Z0-9]+/g, "_");

@@ -13,11 +13,10 @@
 // needs in order to stay inside the storage budget. `guardedFetch`, the capped body readers, and the
 // 401/403/404 classification below are the SSRF and response-size boundary for this connector.
 
+import { MAX_RESPONSE_BYTES, readTextCapped } from "@gadgets/gatekeeper-kit/response-body";
 import {
   guardedFetch,
   FetchNotStartedError,
-  MAX_RESPONSE_BYTES,
-  readTextCapped,
   type FetchOptions,
 } from "./fetch.js";
 import { redactSecrets, safeServerText } from "./util.js";

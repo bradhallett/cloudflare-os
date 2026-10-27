@@ -10,7 +10,8 @@
 //   3. `#beginOAuth` discovers and registers (once per endpoint, reused thereafter), then redirects.
 //   4. `acceptAuthCode` exchanges the code and completes.
 //
-// Every nonce is single-use, time-bounded, and compared in constant time; see `connect-nonce.ts`.
+// Every nonce is single-use, time-bounded, and compared in constant time; see the kit's
+// `connect-nonce.ts`.
 
 import { DurableObject } from "cloudflare:workers";
 import type { ConnectHandoff, GatekeeperConnectCallback, GatekeeperUser }
@@ -34,12 +35,12 @@ import { clientName, type ConnectionEnv, type McpConnection } from "./connection
 import {
   ACCESS_TOKEN_SAFETY_MS,
   CONNECT_TIMEOUT_MS,
-  DEFAULT_TOKEN_LIFETIME_S,
   constantTimeEqual,
   generateNonce,
   INITIATION_NONCE_LIFETIME_MS,
   OAUTH_NONCE_LIFETIME_MS,
-} from "./connect-nonce.js";
+} from "@gadgets/gatekeeper-kit/connect-nonce";
+import { DEFAULT_TOKEN_LIFETIME_S } from "./oauth.js";
 import {
   isCredentialRejection,
   revokeToken,

@@ -8,7 +8,6 @@
     "./account": "./src/account.ts",
     "./base-types": "./src/base-types.ts",
     "./client": "./src/client.ts",
-    "./connect-nonce": "./src/connect-nonce.ts",
     "./connection": "./src/connection.ts",
     "./endpoint": "./src/endpoint.ts",
     "./fetch": "./src/fetch.ts",

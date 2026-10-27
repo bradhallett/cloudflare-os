@@ -11,6 +11,12 @@ import { redactSecrets, safeServerText } from "./util.js";
 /** SDK tokens plus the absolute expiry used by the account's hot path. */
 export type OAuthTokens = StoredOAuthTokens & { expiresAt?: number };
 
+/**
+ * Assumed access-token lifetime when the server states none. `expires_in` is optional per RFC 6749,
+ * and an unknown expiry has to be treated as near rather than as never.
+ */
+export const DEFAULT_TOKEN_LIFETIME_S = 60 * 60;
+
 const CREDENTIAL_REJECTIONS = new Set([
   "invalid_grant",
   "invalid_client",
