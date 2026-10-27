@@ -7,7 +7,7 @@ import type { ChatBindingEntry } from "./storage-schema/overseer-storage";
  * walk that decides which names a message log binds, claims, or reserves.
  *
  * Three callers previously maintained three private copies of this walk -- the agent's turn
- * replay (agent.ts), the turn-start naming chokepoint (overseer-bindings.ts), and compaction
+ * replay (agent-replay.ts), the turn-start naming chokepoint (overseer-bindings.ts), and compaction
  * (agent-compaction.ts) -- which had drifted apart. All three now seed a
  * {@link ChatBindingScope} and fold messages through {@link applyMessageBindings}, so the
  * semantics live here exactly once:

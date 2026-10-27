@@ -826,7 +826,7 @@ export class OverseerClientInterface extends RpcTarget implements Overseer {
 
     msg.state = "accepted";
     // The gatekeeper is surfaced to the agent as a named binding in the chat's env, under the
-    // name recorded on the request (see the connectionRequest history case in agent.ts).
+    // name recorded on the request (see the connectionRequest history case in agent-replay.ts).
     msg.gatekeeperId = result.gatekeeperId;
     // Bump the timestamp so clients that were offline during the decision still receive the
     // mutated card on reconnect (the catch-up scan is ordered by timestamp).

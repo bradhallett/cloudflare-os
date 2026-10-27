@@ -4,7 +4,7 @@ import type { FileContent } from "@gadgets/workshop-shared/code-change";
 import { chatKeyPrefix } from "./storage-schema/overseer-storage";
 import type { ChatChangeBoundaryRecord, GadgetRecord } from "./storage-schema/overseer-storage";
 import { commitIdentityForAuthor, filesEqual, threeWayMerge } from "./git-store";
-import { formatMissingBlueprintBindings } from "./agent";
+import { formatMissingBlueprintBindings } from "./agent-prompt";
 import { deploymentOutputForBlueprint, readAdminConfig } from "./admin-config";
 import { chatChangeStatuses } from "./agent-compaction";
 import { sanitizeBlueprintOutput } from "./blueprint-archive";
@@ -150,7 +150,7 @@ export abstract class OverseerBlueprints extends OverseerBindings {
     });
 
     // The turn has no message to answer. What prompts it is the record of the proposal, which
-    // replay renders as the agent's task (see the "changes" case of runAgentPass in agent.ts).
+    // replay renders as the agent's task (see the "changes" case of runAgentPass in agent-replay.ts).
     // Starting it here, with the chat, is what makes it one turn per proposal however many
     // clients are watching.
     if (reviewer) this.startAgent(chatId, reviewer, author, clientUserId);

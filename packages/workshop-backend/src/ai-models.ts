@@ -711,7 +711,7 @@ const hasEnabledThinking = (payload: object): boolean =>
     "type" in payload.thinking && payload.thinking.type === "enabled";
 
 // Gemini 3 rejects a request whose current turn holds a function call without a thought signature.
-// The synthetic calls history replay adds (see makeReplayObservation in agent.ts) have none, nor do
+// The synthetic calls history replay adds (see makeReplayObservation in agent-session.ts) have none, nor do
 // calls another model made, so they get the value Google documents for a call the model didn't
 // make. pi can't send it: it passes on only base64 signatures.
 function signGeminiFunctionCalls(model: Model<Api>, payload: unknown): object | undefined {
