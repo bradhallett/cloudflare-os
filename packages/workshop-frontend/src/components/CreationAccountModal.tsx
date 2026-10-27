@@ -11,7 +11,7 @@ import { rpcFailureDescription } from '../rpcErrors'
 import { requestAccountResources } from '../requestAccountResources'
 import { useConnectAccountActions } from '../useConnectAccountActions'
 import { useConnectedAccounts } from '../useConnectedAccounts'
-import { AccountChooser } from '../gatekeeper-modal/AccountChooser'
+import { AccountChooser, accountOptionFromEvent } from '../gatekeeper-modal/AccountChooser'
 import ResourceConfiguratorHost from '../ResourceConfiguratorHost'
 import { disposeConfiguratorFrame } from '../disposeConfiguratorFrame'
 import { WorkshopButton } from './WorkshopControls'
@@ -157,7 +157,7 @@ export const CreationAccountModal = ({ overseer, gatekeeperId, onChoose, onCance
           ) : (
             <div className="space-y-4">
               <AccountChooser
-                accounts={matching.map(a => ({ ...a, vendorDescription: a.vendor }))}
+                accounts={matching.map(accountOptionFromEvent)}
                 selectedAccountId={selected?.id ?? null}
                 vendorName={target.vendor.description.displayName}
                 connecting={connectActions.connectingVendor !== null}
