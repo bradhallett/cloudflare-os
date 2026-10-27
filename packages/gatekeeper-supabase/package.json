@@ -14,7 +14,6 @@
     "@gadgets/gatekeeper-kit": "workspace:*",
     "@gadgets/observability": "workspace:*",
     "@gadgets/workshop-shared": "workspace:*",
-    "capnweb": "catalog:",
     "capnweb-validate": "catalog:"
   },
   "devDependencies": {
