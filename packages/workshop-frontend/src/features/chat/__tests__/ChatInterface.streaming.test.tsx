@@ -44,6 +44,7 @@ vi.mock('../../../AuthContext', () => {
 })
 
 import { flushFrames, makeOverseer, makeTestRoot } from '../../../action-test-harness'
+import * as chatDisplayEntries from '../transcript/chatDisplayEntries'
 import ChatInterface from '../ChatInterface'
 
 const testRoot = makeTestRoot()
@@ -129,5 +130,29 @@ describe('provisional streaming renders', () => {
 
     chat.message('Hello world, finalized.')
     expect(document.body.textContent).toContain('Hello world, finalized.')
+  })
+
+  // M2's perf guarantee: a provisional tick repaints the streaming row without rebuilding
+  // the durable transcript's entry list or message states. If currentMessages were ever
+  // re-keyed on provisionalTick, these memos would re-run per tick and this test fails
+  // instead of the regression passing silently.
+  it('does not rebuild durable entries or message states on provisional ticks', async () => {
+    const buildEntries = vi.spyOn(chatDisplayEntries, 'buildChatDisplayEntries')
+    const computeStates = vi.spyOn(chatDisplayEntries, 'computeMessageStates')
+    const chat = await openActiveChat()
+    chat.stream({ type: 'textDelta', delta: 'Hello' })
+    await flushFrames()
+    const buildsAfterFirstTick = buildEntries.mock.calls.length
+    const statesAfterFirstTick = computeStates.mock.calls.length
+
+    chat.stream({ type: 'textDelta', delta: ' world' })
+    await flushFrames()
+    expect(document.body.textContent).toContain('Hello world')
+    expect(buildEntries.mock.calls.length).toBe(buildsAfterFirstTick)
+    expect(computeStates.mock.calls.length).toBe(statesAfterFirstTick)
+
+    // A durable message changes the memo inputs, so the rebuild resumes.
+    chat.message('Hello world, finalized.')
+    expect(buildEntries.mock.calls.length).toBeGreaterThan(buildsAfterFirstTick)
   })
 })
