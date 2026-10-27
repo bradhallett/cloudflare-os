@@ -4,6 +4,16 @@
   "name": "dev-router",
   "main": "packages/router/src/index.ts",
   "compatibility_date": "2026-09-04",
+  "compatibility_flags": [
+    "allow_irrevocable_stub_storage"
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": {
+      "invocation_logs": false
+    }
+  },
   "services": [
     {
       "binding": "WORKSHOP_BACKEND",

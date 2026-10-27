@@ -65,12 +65,24 @@ class FakeGitHub {
   readonly failing = new Set<string>();
   readonly requests: string[] = [];
   /**
-   * While set, a `GET /issues/{n}` stalls (answering with what it read on arrival) and is logged
-   * in `stalled`. Polled rather than awaited: a promise settled from the test would carry the
-   * test's I/O context into the gatekeeper's Durable Object.
+   * `GET /issues/{n}` reads held by `holdIssueReads`, each logged in `stalled`. A resolver gate
+   * (the fake-spotify pattern), not a polled flag: the held read awaits a promise the test
+   * settles, so a test that fails mid-hold leaves one inert pending fetch rather than a 1ms
+   * scheduler spinner running for the rest of the pool.
    */
-  stall = false;
+  #issueReads: { promise: Promise<void>; resolve: () => void } | null = null;
   stalled = 0;
+
+  /** Holds every `GET /issues/{n}` (answering with what it read on arrival) until release. */
+  holdIssueReads(): void {
+    this.#issueReads ??= Promise.withResolvers<void>();
+  }
+
+  /** Answers the reads `holdIssueReads` holds; a no-op when none is. */
+  releaseIssueReads(): void {
+    this.#issueReads?.resolve();
+    this.#issueReads = null;
+  }
 
   constructor() {
     vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) =>
@@ -108,9 +120,10 @@ class FakeGitHub {
         return Response.json(this.issues.get(number));
       }
       const body = this.issues.get(number);
-      if (this.stall) {
+      const held = this.#issueReads;
+      if (held) {
         this.stalled++;
-        while (this.stall) await scheduler.wait(1);
+        await held.promise;
       }
       return Response.json(body);
     }
@@ -271,11 +284,14 @@ describe("read cache", () => {
     const gk = await repoGatekeeper();
     const actionId = await gk.queueEdit("issue", "5", { title: "New" });
 
-    github.stall = true;
+    github.holdIssueReads();
     const straddling = gk.openIssue("5");
-    await vi.waitFor(() => expect(github.stalled).toBe(1));
-    await gk.applyAction(actionId);
-    github.stall = false;
+    try {
+      await vi.waitFor(() => expect(github.stalled).toBe(1));
+      await gk.applyAction(actionId);
+    } finally {
+      github.releaseIssueReads();
+    }
     expect((await straddling).title).toBe("Old");
 
     expect((await gk.openIssue("5")).title).toBe("New");

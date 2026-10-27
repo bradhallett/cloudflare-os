@@ -1,14 +1,12 @@
 import {
-  CAPNWEB_VALIDATE_BUILD, OBSERVABILITY, defineGadgetsWorker, textModules,
+  CAPNWEB_VALIDATE_BUILD, defineGadgetsWorker, textModules,
   type DurableObjectMigration, type WranglerExtras,
 } from "@gadgets/scripts/worker-config";
 
 export default defineGadgetsWorker({
   name: "gatekeeper-scheduler",
   entrypoint: ".wrangler/validate/src/worker.ts",
-  // ScheduleDriver persists HookInitiator capabilities in SQLite-backed KV.
-  compatibilityFlags: ["allow_irrevocable_stub_storage", "nodejs_als"],
-  observability: OBSERVABILITY,
+  compatibilityFlags: ["nodejs_als"],
 });
 
 export const wrangler = {

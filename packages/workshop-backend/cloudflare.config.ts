@@ -21,7 +21,6 @@ export default defineGadgetsWorker({
   // only takes effect in production or when running workerd stand-alone. That's an acceptable
   // tradeoff for dev.
   compatibilityFlags: [
-    "allow_irrevocable_stub_storage",
     "global_fetch_strictly_public",
 
     // The pi-ai inference layer wraps the official provider SDKs (@anthropic-ai/sdk, openai,

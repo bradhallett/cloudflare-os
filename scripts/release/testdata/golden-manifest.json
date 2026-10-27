@@ -216,8 +216,8 @@
       ],
       "compatibilityDate": "2026-09-04",
       "compatibilityFlags": [
-        "nodejs_compat",
-        "allow_irrevocable_stub_storage"
+        "allow_irrevocable_stub_storage",
+        "nodejs_compat"
       ],
       "inputs": [],
       "installable": true,
@@ -947,7 +947,11 @@
         }
       ],
       "observability": {
-        "enabled": false
+        "enabled": true,
+        "head_sampling_rate": 1,
+        "logs": {
+          "invocation_logs": false
+        }
       },
       "shortName": "slack",
       "vars": {
@@ -1306,7 +1310,9 @@
         }
       ],
       "compatibilityDate": "2026-09-04",
-      "compatibilityFlags": [],
+      "compatibilityFlags": [
+        "allow_irrevocable_stub_storage"
+      ],
       "gatekeeperBindingExpansion": {
         "propsByPackage": {}
       },

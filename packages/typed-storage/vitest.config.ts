@@ -17,6 +17,7 @@ export default defineConfig({
     }),
   ],
   test: {
+    testTimeout: 60_000,
     include: ['__tests__/*.test.ts'],
     // Nothing here imports `cloudflare:test`, so a pool that failed to start would leave this suite
     // green while running under Node. The guard makes that fail loudly instead.

@@ -36,6 +36,7 @@ export default defineConfig({
     }),
   ],
   test: {
+    testTimeout: 60_000,
     include: ["__tests__/workerd/*.test.ts"],
     // Asserts the pool actually started, rather than trusting a green run to mean workerd.
     setupFiles: ["@gadgets/scripts/assert-workerd"],

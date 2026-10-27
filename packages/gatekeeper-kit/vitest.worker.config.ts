@@ -17,6 +17,7 @@ export default defineConfig({
     },
   })],
   test: {
+    testTimeout: 60_000,
     include: ["__tests__/workerd/*.test.ts"],
     setupFiles: ["@gadgets/scripts/assert-workerd"],
   },

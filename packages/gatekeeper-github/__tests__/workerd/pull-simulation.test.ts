@@ -208,13 +208,27 @@ class FakeGitHub {
   /** Branches whose next read fails with a 502. */
   readonly failingBranchReads = new Set<string>();
   /**
-   * Branches whose next read is held until `heldReadsReleased`, counted in `heldReads`. Polled
-   * rather than awaited: a promise settled from the test would carry the test's I/O context into
-   * the gatekeeper's Durable Object.
+   * Branches whose next read `holdBranchRead` holds, counted in `heldReads`. A resolver gate
+   * (the fake-spotify pattern), not a polled flag: a held read awaits a promise the test
+   * settles, so a test that fails mid-hold leaves an inert pending fetch rather than a 1ms
+   * scheduler spinner running for the rest of the pool.
    */
   readonly heldBranchReads = new Set<string>();
   heldReads = 0;
-  heldReadsReleased = false;
+  #heldReads: { promise: Promise<void>; resolve: () => void } | null = null;
+
+  /** Holds the next read of each named branch until `releaseHeldReads`. */
+  holdBranchRead(name: string): void {
+    this.heldBranchReads.add(name);
+    this.#heldReads ??= Promise.withResolvers<void>();
+  }
+
+  /** Answers the reads `holdBranchRead` holds; a no-op when none is. */
+  releaseHeldReads(): void {
+    this.#heldReads?.resolve();
+    this.#heldReads = null;
+  }
+
   /** Merge the next merge request but lose its reply (a 502). */
   loseNextMergeReply = false;
   #nextPullNumber = 7;
@@ -265,7 +279,7 @@ class FakeGitHub {
       const name = decodeURIComponent(path.slice(`${API_BASE}/git/ref/heads/`.length));
       if (this.heldBranchReads.delete(name)) {
         this.heldReads++;
-        while (!this.heldReadsReleased) await scheduler.wait(1);
+        await this.#heldReads?.promise;
       }
       const head = this.branches.get(name);
       if (this.failingBranchReads.delete(name)) {
@@ -673,15 +687,18 @@ describe("push rejection cascade", () => {
     const push = await queuePush(gk, cache, "feature", HEAD1);
     const first = await queuePullRequest(gk, { title: "First", head: "feature", base: "main" });
 
-    github.heldBranchReads.add("feature");
+    github.holdBranchRead("feature");
     const discard = gk.rejectAction(push.approvalId);
     await vi.waitFor(() => expect(github.heldReads).toBe(1));
-    const second = await queuePullRequest(gk, { title: "Second", head: "feature", base: "main" });
-    github.heldReadsReleased = true;
-
-    expect(await discard).toEqual({ restart: true });
-    for (const { approvalId } of [first, second]) {
-      await expect(gk.applyAction(approvalId, cache)).rejects.toThrow(/was discarded/);
+    try {
+      const second = await queuePullRequest(gk, { title: "Second", head: "feature", base: "main" });
+      github.releaseHeldReads();
+      expect(await discard).toEqual({ restart: true });
+      for (const { approvalId } of [first, second]) {
+        await expect(gk.applyAction(approvalId, cache)).rejects.toThrow(/was discarded/);
+      }
+    } finally {
+      github.releaseHeldReads();
     }
   });
 

@@ -1,5 +1,5 @@
 import {
-  CAPNWEB_VALIDATE_BUILD, OBSERVABILITY, defineGadgetsWorker,
+  CAPNWEB_VALIDATE_BUILD, defineGadgetsWorker,
   type DurableObjectMigration, type WranglerExtras,
 } from "@gadgets/scripts/worker-config";
 
@@ -14,9 +14,7 @@ export default defineGadgetsWorker({
   // not break legitimate instances: a deployed Worker has no route to a private network anyway,
   // so reachable instances are public hostnames (Nabu Casa, tunnels), and `wrangler dev`
   // reconfigures its outbound to permit any address, keeping local instances usable in dev.
-  compatibilityFlags: ["allow_irrevocable_stub_storage", "global_fetch_strictly_public"],
-
-  observability: OBSERVABILITY,
+  compatibilityFlags: ["global_fetch_strictly_public"],
 });
 
 export const wrangler = {

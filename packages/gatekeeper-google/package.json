@@ -15,7 +15,6 @@
     "@gadgets/gatekeeper-kit": "workspace:*",
     "@gadgets/observability": "workspace:*",
     "@gadgets/workshop-shared": "workspace:*",
-    "capnweb": "catalog:",
     "capnweb-validate": "catalog:",
     "jose": "^6.2.12",
     "mimetext": "^3.0.28",

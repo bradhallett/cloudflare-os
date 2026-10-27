@@ -1,13 +1,12 @@
 import {
-  DEFAULT_GATEKEEPER_WRANGLER, OBSERVABILITY, bindings, defineGadgetsWorker,
+  DEFAULT_GATEKEEPER_WRANGLER, bindings, defineGadgetsWorker,
   type DurableObjectMigration,
 } from "@gadgets/scripts/worker-config";
 
 export default defineGadgetsWorker({
   name: "gatekeeper-google",
   entrypoint: ".wrangler/validate/src/google.ts",
-  compatibilityFlags: ["allow_irrevocable_stub_storage", "nodejs_als"],
-  observability: OBSERVABILITY,
+  compatibilityFlags: ["nodejs_als"],
   env: {
     // Workers AI's `toMarkdown()`, which converts Drive PDFs to text. It always runs remotely, so
     // `pnpm dev-server` keeps it only with --use-workers-ai-binding.

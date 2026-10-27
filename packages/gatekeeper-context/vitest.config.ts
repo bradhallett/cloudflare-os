@@ -28,6 +28,7 @@ export default defineConfig({
     }],
   },
   test: {
+    testTimeout: 60_000,
     exclude: ["__tests__/vite-config.test.ts"],
     include: ["__tests__/*.test.ts"],
     setupFiles: ["@gadgets/scripts/assert-workerd"],

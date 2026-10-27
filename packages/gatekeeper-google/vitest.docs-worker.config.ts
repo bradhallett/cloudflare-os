@@ -29,6 +29,8 @@ export default defineConfig({
     }),
   ],
   test: {
+    // The Google suites keep the tighter 15s container-reproducibility standard of #747 (pinned
+    // by scripts/vitest-task.test.ts), not the 60s workerd default.
     testTimeout: 15_000,
     include: [
       "__tests__/workerd/calendar-session.test.ts",

@@ -1,5 +1,5 @@
 import {
-  OBSERVABILITY, bindings, defineGadgetsWorker, type WranglerExtras,
+  bindings, defineGadgetsWorker, type WranglerExtras,
 } from "@gadgets/scripts/worker-config";
 
 export default defineGadgetsWorker({
@@ -27,8 +27,6 @@ export default defineGadgetsWorker({
     WORKSHOP_BACKEND: bindings.worker({ worker: "workshop-backend" }),
     ASSETS: bindings.assets(),
   },
-
-  observability: OBSERVABILITY,
 });
 
 export const wrangler = {
