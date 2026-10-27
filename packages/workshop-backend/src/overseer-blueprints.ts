@@ -4,7 +4,7 @@ import type { FileContent } from "@gadgets/workshop-shared/code-change";
 import { chatKeyPrefix } from "./storage-schema/overseer-storage";
 import type { ChatChangeBoundaryRecord, GadgetRecord } from "./storage-schema/overseer-storage";
 import { commitIdentityForAuthor, filesEqual, threeWayMerge } from "./git-store";
-import { formatMissingBlueprintBindings } from "./agent";
+import { formatMissingBlueprintBindings } from "./agent-prompt";
 import { deploymentOutputForBlueprint, readAdminConfig } from "./admin-config";
 import { chatChangeStatuses } from "./agent-compaction";
 import { sanitizeBlueprintOutput } from "./blueprint-archive";

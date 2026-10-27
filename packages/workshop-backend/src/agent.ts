@@ -37,6 +37,7 @@ import {
   SPAWNED_TASK_PROMPT,
   formatCallableAgentPrompt,
   OBSERVE_USER_CHANGES_NOOP_RESULT,
+  formatMissingBlueprintBindings,
 } from "./agent-prompt";
 import {
   createTurnSession,
@@ -95,59 +96,6 @@ type AgentPassOutcome =
   | {type: "transientFailure"; error: AgentTurnError};
 
 
-
-// =======================================================================================
-
-/**
- * Tells the agent which bindings a blueprint's code expects that a gadget lacks, and how to wire
- * each one up. `gadget` is what the text calls the gadget, as in "the new gadget". Shared by
- * the createGadget tool's result for a gadget made from a blueprint (see
- * AgentHooks.fetchBlueprint) and the summary of a blueprint merged into an existing gadget.
- */
-export function formatMissingBlueprintBindings(
-    bindings: Record<string, BlueprintBinding>, gadget: string): string {
-  let lines = [
-      `The blueprint's code expects the following bindings, which ${gadget} does not ` +
-      `have yet. Wire up each one under the exact binding name given. For external ` +
-      `resources, use setGadgetBinding on ${gadget} (first requesting a connection via ` +
-      `requestConnection if your env doesn't already hold a suitable resource). For an ` +
-      `agent-spawner binding, request a spawner via requestConnection with vendorId ` +
-      `"${AGENT_SPAWNER_CONNECTION_ID}", give it each binding its agents get with ` +
-      `setGadgetBinding on the spawner, under the name left of the \`=\`, then bind the spawner ` +
-      `into ${gadget}; a binding marked "for agent spawners only" goes only into a spawner. ` +
-      `AI-model bindings cannot be created from chat; ask the user to add those from the ` +
-      `gadget's Connections panel.`];
-  for (let [name, binding] of Object.entries(bindings)) {
-    let details: string;
-    switch (binding.type) {
-      case "gatekeeper":
-        details = `external resource via the "${binding.gatekeeperName}" gatekeeper; ` +
-            `resource URL pattern ${JSON.stringify(binding.typeUrlPattern)}` +
-            (binding.resourceUrl
-                ? `; the blueprint author suggests ${JSON.stringify(binding.resourceUrl)}`
-                : ``);
-        break;
-      case "aiModel":
-        details = binding.modelKind === "decision"
-            ? `an AI decision model binding` : `an AI model binding`;
-        break;
-      case "agentSpawner": {
-        let env = Object.entries(binding.env).map(([envName, target]) =>
-            `${envName} = ${target.type === "gadget" ? gadget : `binding ${target.name}`}`);
-        details = `an agent-spawner binding whose agents get ${env.join(", ") || "no bindings"}`;
-        break;
-      }
-      default:
-        binding satisfies never;
-        details = `unknown`;
-        break;
-    }
-    lines.push(`* ${name} — ${JSON.stringify(binding.title)} (${details}` +
-        `${binding.spawnerOnly ? `; for agent spawners only` : ``})` +
-        (binding.description ? `: ${binding.description}` : ``));
-  }
-  return lines.join("\n");
-}
 
 // How many files each list in the agent's summary of a merge, of a blueprint or from mainline,
 // names before it counts the rest instead, so that a merge of very many files cannot fill the
