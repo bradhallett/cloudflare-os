@@ -1708,13 +1708,13 @@ it.each<[string, (github: FakeGitHub) => () => number, number]>([
     github.holdViewerReads(ADA);
     return () => github.stalledViewerReads;
   }, 0],
-])("refuses an enable whose account is disconnected while it %s, leaving no webhook", async (_, stall, added) => {
+])("refuses an enable whose account is disconnected while it %s, leaving no webhook", async (_, hold, added) => {
   const github = new FakeGitHub();
   const account = await connectAccount();
   const triage = binding(account);
   await triage.subscribe();
 
-  const stalled = stall(github);
+  const stalled = hold(github);
   // Expected at once, as the enable is refused while the test is still acting.
   const refused = expect(triage.enable()).rejects.toThrow("This GitHub account has been disconnected.");
   await vi.waitFor(() => expect(stalled()).toBe(1));
