@@ -12,7 +12,7 @@
 // user could reach in the Chat UI.
 
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
-import { readGoogleJson } from "./google-response";
+import { GoogleApiError, readGoogleJson } from "./google-response";
 import type {
   ChatAttachmentInfo, ChatListMessagesOptions, ChatListSpacesOptions,
   ChatMembership, ChatMessageInfo, ChatMessageSearch, ChatPerson, ChatReaction,
@@ -60,16 +60,6 @@ export const MAX_CHAT_MESSAGE_BYTES = 32_000;
 const MAX_FIND_GROUP_CHAT_PAGES = 20;
 const MAX_AUDIENCE_PAGES = 20;
 
-/** A status-only provider error, safe to log and to base retry decisions on. */
-export class ChatApiError extends Error {
-  constructor(
-    public readonly status: number,
-    operation: string,
-    public readonly rpcCode?: string,
-  ) {
-    super(`Google Chat API ${operation} failed [http=${status}${rpcCode ? ` ${rpcCode}` : ""}]`);
-  }
-}
 
 /** The canonical google.rpc code names — a closed enum that can never carry caller content. */
 const RPC_STATUS_NAMES = new Set([
@@ -89,7 +79,9 @@ export async function chatApiFailure(operation: string, response: Response): Pro
   } catch {
     // Best effort; the status line is what matters.
   }
-  throw new ChatApiError(response.status, operation, rpcCode);
+  throw new GoogleApiError(
+    `Google Chat API ${operation} failed [http=${response.status}${rpcCode ? ` ${rpcCode}` : ""}]`,
+    response.status, rpcCode);
 }
 
 /** A deliberately omitted app-authored message with a viewer narrower than its space. */
@@ -113,7 +105,7 @@ function isDeletedChatMessage(raw: ChatMessageRaw): boolean {
 /** Whether an error means "this identity cannot see that", rather than a transient failure. */
 export function isChatNoAccessError(error: unknown): boolean {
   return error instanceof PrivateChatMessageError ||
-    (error instanceof ChatApiError &&
+    (error instanceof GoogleApiError &&
       (error.status === 403 || error.status === 404));
 }
 
@@ -122,7 +114,7 @@ export function isChatNoAccessError(error: unknown): boolean {
  * validated before sending, so a 400 can only mean it names no real account: the same answer.
  */
 function isChatUserNotFound(error: unknown): boolean {
-  return error instanceof ChatApiError && (error.status === 400 || error.status === 404);
+  return error instanceof GoogleApiError && (error.status === 400 || error.status === 404);
 }
 
 // ── Identifier validation ───────────────────────────────────────────

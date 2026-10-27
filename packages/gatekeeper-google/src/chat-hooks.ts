@@ -19,7 +19,8 @@ import type {
   ApprovalQueue, HookController, HookInitiator, HookTargetMetadata,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { fetchWithAuthRetry, type AccessTokenProvider } from "./auth-retry";
-import { ChatApiError, chatApiFailure, type ChatMessageRaw } from "./chat-api";
+import { chatApiFailure, type ChatMessageRaw } from "./chat-api";
+import { GoogleApiError } from "./google-response";
 import type { ChatMessageHook } from "./chat-types";
 import { obsContext } from "./observability";
 import type { PushHooksEnv } from "./pubsub-push";
@@ -346,7 +347,7 @@ class WorkspaceEventsApi {
       // Google holds one subscription per app, account and space, so a create that outlived our
       // wait, or whose response was lost, refuses the next. It is ours if it publishes to our
       // topic, and is renewed, since it may be in its last minutes.
-      if (!(error instanceof ChatApiError && error.rpcCode === "ALREADY_EXISTS")) throw error;
+      if (!(error instanceof GoogleApiError && error.rpcCode === "ALREADY_EXISTS")) throw error;
       const filter = `event_types:"${MESSAGE_CREATED}" AND target_resource="${targetResource}"`;
       const { subscriptions = [] } = await this.#request<{ subscriptions?: SubscriptionRaw[] }>(
         "subscriptions.list", `/subscriptions?filter=${encodeURIComponent(filter)}`);
@@ -361,7 +362,7 @@ class WorkspaceEventsApi {
     try {
       return await this.#request<SubscriptionRaw>("subscriptions.get", `/${name}`);
     } catch (error) {
-      if (error instanceof ChatApiError && error.status === 404) return null;
+      if (error instanceof GoogleApiError && error.status === 404) return null;
       throw error;
     }
   }

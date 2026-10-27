@@ -16,7 +16,8 @@ import { SingleFlight } from "@gadgets/gatekeeper-kit/single-flight";
 import type {
   ApprovalQueue, HookController, HookInitiator, HookTargetMetadata,
 } from "@gadgets/workshop-shared/gatekeeper";
-import { GmailApi, GmailApiError } from "./google-api";
+import { GmailApi } from "./google-api";
+import { GoogleApiError } from "./google-response";
 import { obsContext } from "./observability";
 import type { PushHooksEnv } from "./pubsub-push";
 import type { GmailMessageHook } from "./types";
@@ -277,7 +278,7 @@ export class GmailHookDriver extends DurableObject<Env> {
             pageToken = page.nextPageToken;
           }
         } catch (error) {
-          if (!(error instanceof GmailApiError && error.status === 404)) throw error;
+          if (!(error instanceof GoogleApiError && error.status === 404)) throw error;
           // Mail that arrived in the gap is not delivered.
           logger.warn("Gmail history expired; watching from now", { event: "gmail.hooks.history.expired" });
           next = profile.historyId;
@@ -426,7 +427,7 @@ export class GmailHookDriver extends DurableObject<Env> {
       try {
         watch = await api.watch(this.env.PUBSUB_GMAIL_TOPIC!);
       } catch (cause) {
-        if (!(cause instanceof GmailApiError && (cause.status === 400 || cause.status === 403))) throw cause;
+        if (!(cause instanceof GoogleApiError && (cause.status === 400 || cause.status === 403))) throw cause;
         throw new Error(`Gmail refused to watch this mailbox [http=${cause.status}]. Check that PUBSUB_GMAIL_TOPIC is in the OAuth client's Cloud project and grants gmail-api-push@system.gserviceaccount.com the Pub/Sub Publisher role; a 403 can also mean Gmail is rate-limiting this account.`, { cause });
       }
       this.ctx.storage.kv.put<Watch>("watch", {

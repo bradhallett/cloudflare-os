@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  DRIVE_FILE_ITEM_FIELDS, DriveApi, DriveApiDisabledError, DriveApiRequestError,
+  DRIVE_FILE_ITEM_FIELDS, DriveApi, DriveApiDisabledError, driveRequestFailure,
   FOLDER_MIME_TYPE, MAX_QUERY_PARENTS, buildDriveQuery, conversionError,
   escapeDriveQueryLiteral, isInsufficientScope, lacksFileContentAccess,
   type DriveConversionSource,
 } from "../src/drive-api";
+import { GoogleApiError } from "../src/google-response";
 
 /** Google's real error envelope for an API that is not enabled on the project. */
 const API_DISABLED_BODY = JSON.stringify({
@@ -756,8 +757,8 @@ describe("error handling", () => {
       error: { errors: [{ reason: "insufficientPermissions" }] },
     }), { status: 403 })]);
     let error = await api().listFiles().catch(e => e);
-    expect(error).toBeInstanceOf(DriveApiRequestError);
-    expect(error).toMatchObject({ status: 403, reason: "insufficientPermissions" });
+    expect(error).toBeInstanceOf(GoogleApiError);
+    expect(error).toMatchObject({ status: 403, rpcCode: "insufficientPermissions" });
     expect(error.message).toBe("Google Drive API request failed: 403 (insufficientPermissions)");
   });
 
@@ -769,7 +770,7 @@ describe("error handling", () => {
     }), { status: 403 })]);
     let error = await api().listFiles({ corpus: { kind: "drive", driveId: "drive-1" } })
       .catch(e => e);
-    expect(error).toMatchObject({ status: 403, reason: "teamDriveMembershipRequired" });
+    expect(error).toMatchObject({ status: 403, rpcCode: "teamDriveMembershipRequired" });
     expect(error.message).toBe(
       "Google Drive API request failed: 403 (the connected account is not a member of the " +
       "shared drive this item belongs to)");
@@ -778,8 +779,8 @@ describe("error handling", () => {
   it("preserves an ordinary 404 without a provider reason", async () => {
     stubFetch([new Response("{}", { status: 404 })]);
     let error = await api().listFiles().catch(e => e);
-    expect(error).toBeInstanceOf(DriveApiRequestError);
-    expect(error).toMatchObject({ status: 404, reason: undefined });
+    expect(error).toBeInstanceOf(GoogleApiError);
+    expect(error).toMatchObject({ status: 404, rpcCode: undefined });
     expect(error.message).toBe("Google Drive API request failed: 404");
   });
 
@@ -1303,8 +1304,8 @@ describe("openDownload", () => {
 
     let error = await api().openDownload("pdf-1").catch((caught: unknown) => caught);
 
-    expect(error).toBeInstanceOf(DriveApiRequestError);
-    expect(error).toMatchObject({ status: 403, reason: "appNotAuthorizedToFile" });
+    expect(error).toBeInstanceOf(GoogleApiError);
+    expect(error).toMatchObject({ status: 403, rpcCode: "appNotAuthorizedToFile" });
     expect((error as Error).message).not.toContain("123456789");
     expect(lacksFileContentAccess(error)).toBe(true);
     // The Office flow's missing-scope check keeps its narrower meaning.
@@ -1318,19 +1319,19 @@ describe("openDownload", () => {
 
     let error = await api().openDownload("pdf-1").catch((caught: unknown) => caught);
 
-    expect(error).toBeInstanceOf(DriveApiRequestError);
-    expect(error).toMatchObject({ status: 404, reason: "notFound" });
+    expect(error).toBeInstanceOf(GoogleApiError);
+    expect(error).toMatchObject({ status: 404, rpcCode: "notFound" });
     expect(lacksFileContentAccess(error)).toBe(false);
   });
 });
 
 describe("lacksFileContentAccess", () => {
   it("recognizes a 403 appNotAuthorizedToFile or insufficientPermissions only", () => {
-    expect(lacksFileContentAccess(new DriveApiRequestError(403, "appNotAuthorizedToFile"))).toBe(true);
-    expect(lacksFileContentAccess(new DriveApiRequestError(403, "insufficientPermissions"))).toBe(true);
-    expect(lacksFileContentAccess(new DriveApiRequestError(403, "cannotDownloadFile"))).toBe(false);
-    expect(lacksFileContentAccess(new DriveApiRequestError(403))).toBe(false);
-    expect(lacksFileContentAccess(new DriveApiRequestError(401, "appNotAuthorizedToFile"))).toBe(false);
+    expect(lacksFileContentAccess(driveRequestFailure(403, "appNotAuthorizedToFile"))).toBe(true);
+    expect(lacksFileContentAccess(driveRequestFailure(403, "insufficientPermissions"))).toBe(true);
+    expect(lacksFileContentAccess(driveRequestFailure(403, "cannotDownloadFile"))).toBe(false);
+    expect(lacksFileContentAccess(driveRequestFailure(403))).toBe(false);
+    expect(lacksFileContentAccess(driveRequestFailure(401, "appNotAuthorizedToFile"))).toBe(false);
     expect(lacksFileContentAccess(new Error("appNotAuthorizedToFile"))).toBe(false);
   });
 });

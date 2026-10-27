@@ -11,6 +11,7 @@ import type {
   PersonAvailability,
 } from "./calendar-types";
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
+import { GoogleApiError, providerErrorCode } from "./google-response";
 
 const CALENDAR_API_BASE = "https://www.googleapis.com/calendar/v3";
 
@@ -194,15 +195,6 @@ export function validateCalendarTimeWindow(timeMin: Date, timeMax: Date, maxDays
   }
 }
 
-/**
- * A Calendar API response that arrived but refused the request. A status of 500 or more means the
- * write may still have landed, so callers treating one as outcome-unknown must see the class.
- */
-export class GoogleCalendarApiError extends Error {
-  constructor(readonly status: number, body: string) {
-    super(`Google Calendar API request failed: ${status} ${body}`);
-  }
-}
 
 export class GoogleCalendarApi {
   constructor(private getAccessToken: AccessTokenProvider) {}
@@ -222,8 +214,11 @@ export class GoogleCalendarApi {
     }, this.getAccessToken);
 
     if (!response.ok) {
+      // The body is provider prose and can reflect request values; keep only the whitelisted code.
       let text = await response.text();
-      throw new GoogleCalendarApiError(response.status, text);
+      throw new GoogleApiError(
+        `Google Calendar API request failed: ${response.status}`, response.status,
+        providerErrorCode(text));
     }
 
     if (response.status === 204) return undefined as T;
@@ -281,7 +276,7 @@ export class GoogleCalendarApi {
     try {
       return hasCalendarWriteRole(await this.getCalendar(calendarId));
     } catch (error) {
-      if (error instanceof GoogleCalendarApiError && error.status === 404) return false;
+      if (error instanceof GoogleApiError && error.status === 404) return false;
       throw error;
     }
   }

@@ -362,7 +362,7 @@ describe("native Google content API safety", () => {
 
     expect(error).toBeInstanceOf(GoogleApiError);
     expect(error).toMatchObject({
-      providerStatus: "FAILED_PRECONDITION",
+      rpcCode: "FAILED_PRECONDITION",
       message: "Google Sheets get spreadsheet failed [http=400]",
     });
   });
@@ -370,7 +370,7 @@ describe("native Google content API safety", () => {
 
 describe("explainUnopenedFile for a spreadsheet", () => {
   const unopened = new GoogleApiError(
-    "Google Sheets get spreadsheet failed [http=400]", "FAILED_PRECONDITION");
+    "Google Sheets get spreadsheet failed [http=400]", 400, "FAILED_PRECONDITION");
   const XLSX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
   it("tells the caller to convert a file Drive says is not a Google Sheet", async () => {
@@ -396,7 +396,7 @@ describe("explainUnopenedFile for a spreadsheet", () => {
 
   it("does not ask Drive about any other failure", async () => {
     const denied = new GoogleApiError(
-      "Google Sheets get spreadsheet failed [http=403]", "PERMISSION_DENIED");
+      "Google Sheets get spreadsheet failed [http=403]", 403, "PERMISSION_DENIED");
     const mimeType = vi.fn(async () => XLSX_MIME_TYPE);
 
     await expect(explainUnopenedFile("sheets", denied, mimeType)).resolves.toBe(denied);

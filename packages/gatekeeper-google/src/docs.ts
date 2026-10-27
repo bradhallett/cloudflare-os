@@ -32,7 +32,8 @@ import {
   computeReplaceOperations, docTabToMarkdown, markdownToDocRequests, MARKDOWN_RENDERING_VERSION,
   type DocTabSnapshot, type EditableMarkdown,
 } from "./markdown-converter";
-import { DriveApi, DriveApiRequestError } from "./drive-api";
+import { DriveApi, isAccountWideRefusal } from "./drive-api";
+import { GoogleApiError } from "./google-response";
 import { driveModifiedTime } from "./drive-session";
 import type { GoogleVerifierApi } from "./google-verifier-types";
 import { AccessTokenCache, type AccessTokenRequest } from "./auth-retry";
@@ -1073,8 +1074,8 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
       // Only a refused grant means no signal will ever arrive. A quota 403 (also 403), an outage
       // or a malformed body are transient or fixable, and dating the document from one would
       // report a changed document as unchanged for as long as Drive stays unhealthy.
-      let refusedGrant = error instanceof DriveApiRequestError && error.status === 403 &&
-          !error.isAccountWide;
+      let refusedGrant = error instanceof GoogleApiError && error.status === 403 &&
+          !isAccountWideRefusal(error);
       if (!refusedGrant) throw error;
       logger.warn("no Drive grant to date a Google Doc that has no revision", {
         event: "google.doc.metadata.drive.ungranted", error,

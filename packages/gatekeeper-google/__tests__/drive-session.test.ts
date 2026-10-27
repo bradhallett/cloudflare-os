@@ -8,9 +8,10 @@ import {
 } from "../src/drive-session";
 import { readFolderRoot, type FolderLocation } from "../src/drive-folder-scope";
 import {
-  DriveApiRequestError, FOLDER_MIME_TYPE,
+  driveRequestFailure, FOLDER_MIME_TYPE,
   type DriveFile, type DriveListFilesOptions, type DriveScopeNode,
 } from "../src/drive-api";
+import { GoogleApiError } from "../src/google-response";
 import type { DriveListOptions, DriveSearchQuery } from "../src/drive-types";
 import type { ObserverCheck } from "../src/observers";
 import { driveObserverTracker } from "../src/drive-observers";
@@ -97,7 +98,7 @@ function tree(nodes: DriveFile[]) {
     byId,
     getFile: async (id: string) => {
       let found = byId.get(id);
-      if (!found) throw new DriveApiRequestError(404);
+      if (!found) throw driveRequestFailure(404);
       return found;
     },
     getScopeNodes: async (ids: readonly string[]) => ids.map((id): DriveScopeNode | undefined => {
@@ -423,11 +424,11 @@ describe("Drive native sessions", () => {
     "tracks an account-scope %s probe so later observers are checked against it",
     async status => {
       let { session, prepared, authorizations, events } = core({
-        getFile: async () => { throw new DriveApiRequestError(status); },
+        getFile: async () => { throw driveRequestFailure(status); },
       });
 
       await expect(session.openNativeFile("file-1", docMime, "Google Doc"))
-        .rejects.toBeInstanceOf(DriveApiRequestError);
+        .rejects.toBeInstanceOf(GoogleApiError);
       expect(prepared).toEqual([["file-1"]]);
       expect(events).toEqual(["authorize", "commit"]);
       expect(authorizations).toEqual([{
@@ -447,7 +448,7 @@ describe("Drive native sessions", () => {
     let session = new DriveSessionCore({
       api: {
         listFiles: async () => ({ files: [] }),
-        getFile: async () => { throw new DriveApiRequestError(404); },
+        getFile: async () => { throw driveRequestFailure(404); },
         getScopeNodes: async ids => ids.map(() => undefined),
       },
       scope: { kind: "account" },
@@ -457,7 +458,7 @@ describe("Drive native sessions", () => {
     });
 
     await expect(session.openNativeFile("file-1", docMime, "Google Doc"))
-      .rejects.toBeInstanceOf(DriveApiRequestError);
+      .rejects.toBeInstanceOf(GoogleApiError);
 
     await expect(track.addObserver("late", "verifier"))
       .rejects.toThrow(/cannot access Drive data this workspace has read/);

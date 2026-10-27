@@ -7,7 +7,6 @@ import type {
 import {
   base64UrlDecodedByteLength, decodeBase64UrlToBytes, enumerateGmailAttachments,
   emailRecipientToAddress, getGoogleAccountDescription, getGoogleAccountSubject, GmailApi,
-  GmailApiError,
   GmailDraftFull, GmailDraftRaw, GmailDraftRef, GmailLabelRaw, GmailMessageFull, GmailMessageInfoRaw,
   GmailMessageRaw,
   GmailMessageRef,
@@ -20,6 +19,7 @@ import {
   normalizeTextBody, parseGmailDraft, parseLegacyGmailDraft, parseGmailMessageMetadata, GmailThreadMetadataRaw,
   shouldIncludeSpamTrash, summarizeGmailThread,
 } from "./google-api";
+import { GoogleApiError } from "./google-response";
 import type {
   EmailAddress, EmailContent, GmailAttachment, GmailAttachmentEntry, GmailAttachmentInfo, GmailAttachmentInput,
   GmailComposeOptions, GmailCustomLabel,
@@ -1350,7 +1350,7 @@ async function readDraftProviderBaseline(
   try {
     current = await api.getDraft(receipt.draftId);
   } catch (error) {
-    if (error instanceof GmailApiError && error.status === 404) {
+    if (error instanceof GoogleApiError && error.status === 404) {
       store.markDraftWriteMissing(actionId, receipt);
     }
     throw error;
@@ -2250,7 +2250,7 @@ async function loadSimulatedDraft(
   try {
     loaded = await loadDraftBase(ctx, resource, captureAttachments);
   } catch (error) {
-    if (!(error instanceof GmailApiError && error.status === 404 && providerId)) throw error;
+    if (!(error instanceof GoogleApiError && error.status === 404 && providerId)) throw error;
     const current = ctx.store.getDraft(canonicalId);
     if (!current || current.logicalId !== canonicalId || current.providerId !== providerId ||
         current.version !== version || current.status !== "active") {
@@ -2776,7 +2776,7 @@ class GmailSessionImpl extends ApprovalQueueRpcTarget implements GmailSession {
     try {
       metadata = await this.#ctx.api.getMessageMetadata(providerId);
     } catch (error) {
-      if (this.#ctx.restricted && error instanceof GmailApiError && error.status === 404) {
+      if (this.#ctx.restricted && error instanceof GoogleApiError && error.status === 404) {
         throw new Error(
           "This Gmail message is not available through this restricted binding.", {cause: error});
       }
@@ -2805,7 +2805,7 @@ class GmailSessionImpl extends ApprovalQueueRpcTarget implements GmailSession {
     try {
       scope = await restrictedThreadScope(this.#ctx, id, [], admitted);
     } catch (error) {
-      if (error instanceof GmailApiError && error.status === 404) {
+      if (error instanceof GoogleApiError && error.status === 404) {
         throw new Error(
           "This Gmail thread is not available through this restricted binding.", {cause: error});
       }
@@ -3883,7 +3883,7 @@ class GmailHookDeliveryImpl extends RpcTarget implements GmailHookDelivery {
       metadata = await read.api.getMessageMetadata(messageId);
     } catch (error) {
       // Deleted since it arrived.
-      if (error instanceof GmailApiError && error.status === 404) return;
+      if (error instanceof GoogleApiError && error.status === 404) return;
       throw error;
     }
     if (metadata.id !== messageId) throw new Error("Gmail message identity changed unexpectedly.");
@@ -4524,7 +4524,7 @@ function providerLabelId(store: GmailStore, logicalId: string): string {
 }
 
 function isDefinitiveWriteRejection(error: unknown): boolean {
-  return error instanceof GmailApiError && error.status >= 400 && error.status < 500 &&
+  return error instanceof GoogleApiError && error.status >= 400 && error.status < 500 &&
     error.status !== 408 && error.status !== 429;
 }
 
@@ -4682,7 +4682,7 @@ async function applyMessageMutation(
       try {
         await api.batchModifyMessages(chunk, add, remove);
       } catch (error) {
-        if (!(reconciling && error instanceof GmailApiError && error.status === 404)) throw error;
+        if (!(reconciling && error instanceof GoogleApiError && error.status === 404)) throw error;
         // A retry must not wedge on a message deleted since the first attempt, so modify the rest.
         const remaining = await existingMessageIds(api, chunk);
         if (remaining.length) await api.batchModifyMessages(remaining, add, remove);
@@ -4704,7 +4704,7 @@ async function existingMessageIds(api: GmailApi, ids: readonly string[]): Promis
         await api.getMessageMetadata(id);
         return true;
       } catch (error) {
-        if (error instanceof GmailApiError && error.status === 404) return false;
+        if (error instanceof GoogleApiError && error.status === 404) return false;
         throw error;
       }
     }));
@@ -5143,7 +5143,7 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
         try {
           current = await api.getDraft(id);
         } catch (error) {
-          if (!(error instanceof GmailApiError && error.status === 404)) {
+          if (!(error instanceof GoogleApiError && error.status === 404)) {
             throw error;
           }
           const resource = store.getDraft(action.draftId);
@@ -5174,7 +5174,7 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
         try {
           await applyUncertainWrite(store, actionId, () => api.deleteDraft(id));
         } catch (error) {
-          if (!(error instanceof GmailApiError && error.status === 404)) throw error;
+          if (!(error instanceof GoogleApiError && error.status === 404)) throw error;
         }
         const resource = store.getDraft(action.draftId)!;
         resource.status = "deleted";
@@ -5310,7 +5310,7 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
         try {
           await applyUncertainWrite(store, actionId, () => api.deleteLabel(id));
         } catch (error) {
-          if (!(error instanceof GmailApiError && error.status === 404)) throw error;
+          if (!(error instanceof GoogleApiError && error.status === 404)) throw error;
         }
         const resource = store.getLabel(action.labelId);
         if (resource) {

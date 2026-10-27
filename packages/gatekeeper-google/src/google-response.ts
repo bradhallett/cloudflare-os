@@ -19,9 +19,13 @@ type GoogleJsonResponseOptions = {
   maxBytes: number;
 };
 
-/** A failed Google API request, carrying Google's status code but none of its response prose. */
+/**
+ * A failed Google API request: Google's HTTP status and, when it sent one, its whitelisted error
+ * code (an `error.status` string such as "FAILED_PRECONDITION", or Drive's reason), but never any
+ * of its response prose.
+ */
 export class GoogleApiError extends Error {
-  constructor(message: string, readonly providerStatus: string | undefined) {
+  constructor(message: string, readonly status: number, readonly rpcCode?: string) {
     super(message);
   }
 }
@@ -66,6 +70,14 @@ function parseProviderDiagnostics(text: string): GoogleProviderDiagnostics {
   if (providerStatus !== undefined) diagnostics.providerStatus = providerStatus;
   if (reasons.size > 0) diagnostics.providerReasons = [...reasons];
   return diagnostics;
+}
+
+/**
+ * Google's own error code from a failure body a caller has already read as text, whitelisted the
+ * same way as `GoogleApiError.rpcCode` — `undefined` when the body is not JSON or sent none.
+ */
+export function providerErrorCode(text: string): string | undefined {
+  return parseProviderDiagnostics(text).providerStatus;
 }
 
 async function readProviderDiagnostics(
@@ -134,7 +146,8 @@ export async function readGoogleJson<T>(
       ...diagnostics,
     });
     throw new GoogleApiError(
-      `${provider} ${operation} failed [http=${response.status}]`, diagnostics.providerStatus);
+      `${provider} ${operation} failed [http=${response.status}]`,
+      response.status, diagnostics.providerStatus);
   }
 
   let text = await readBoundedText(response, maxBytes, provider);

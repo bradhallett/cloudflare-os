@@ -2,12 +2,12 @@ import {afterEach, describe, expect, it, vi} from "vitest";
 import {
   base64UrlDecodedByteLength, buildEncodedEmail, decodeBase64UrlToBytes,
   enumerateGmailAttachments, gmailAttachmentInputToOutbound, gmailMessageIdQueryValue, GmailApi,
-  GmailApiError,
   MAX_GMAIL_ATTACHMENT_BYTES, MAX_GMAIL_FORWARD_SOURCE_BYTES,
   normalizeAggregateRecipients, normalizeContentId, normalizeMessageIdHeader,
   normalizeReferencesHeader, normalizeTextBody, parseGmailDraft, parseGmailDraftSnapshot, parseGmailPayloadContent,
   parseLegacyGmailDraft, parseMimeMessage, type GmailPayloadPart,
 } from "../src/google-api";
+import { GoogleApiError } from "../src/google-response";
 import {containsBytes} from "./gmail-test-utils";
 
 const json = (value: unknown, status = 200) =>
@@ -1853,7 +1853,7 @@ describe("Gmail API request shapes", () => {
     stubFetch([new Response(new ReadableStream({cancel}), {status: 400})]);
     const error = await api().listMessages(20).catch(value => value);
     expect(cancel).toHaveBeenCalledOnce();
-    expect(error).toBeInstanceOf(GmailApiError);
+    expect(error).toBeInstanceOf(GoogleApiError);
     expect(error.status).toBe(400);
   });
 });

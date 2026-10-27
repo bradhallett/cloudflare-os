@@ -32,12 +32,13 @@ import type {
   ResourceDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import {
-  ChatApi, ChatApiError, ChatPage, DeletedChatMessageError, MAX_CHAT_MESSAGE_BYTES, isChatNoAccessError,
+  ChatApi, ChatPage, DeletedChatMessageError, MAX_CHAT_MESSAGE_BYTES, isChatNoAccessError,
   chatAttachmentInfoFromRaw, chatAttachmentMediaName, chatMessageInfoFromRaw, chatMessageParts,
   chatMessagesSearchFilter,
   chatSpaceId, chatSpaceNameFromIdOrUrl, chatThreadParts, chatUserName, validateChatEmoji,
   validateChatSpaceId, validateChatThreadId, validateChatWindow,
 } from "./chat-api";
+import { GoogleApiError } from "./google-response";
 import {
   ChatAction, ChatNewConversation, ChatSendMessageAction, PendingChatAction, chatActionSpaceName,
   overlayMessage, overlayMessageList, overlayReactions, pendingMessageActionId,
@@ -237,7 +238,7 @@ class ChatStore {
     } catch (error) {
       // 408 and 429 leave the outcome open, and a later refusal says nothing about whether an
       // earlier attempt landed: a send has no read that could tell.
-      if (first && error instanceof ChatApiError && error.status >= 400 && error.status < 500 &&
+      if (first && error instanceof GoogleApiError && error.status >= 400 && error.status < 500 &&
           error.status !== 408 && error.status !== 429) {
         this.clearAttempt(id);
       }
@@ -592,7 +593,7 @@ async function fetchThreadRoot(
 }
 
 const isChatMessageGone = (error: unknown): boolean =>
-  error instanceof DeletedChatMessageError || (error instanceof ChatApiError && error.status === 404);
+  error instanceof DeletedChatMessageError || (error instanceof GoogleApiError && error.status === 404);
 
 /** Undo a send, counting a message already removed in Google Chat as success. */
 async function deleteMessageIfPresent(api: ChatApi, messageName: string): Promise<void> {
@@ -616,7 +617,7 @@ async function undo(api: ChatApi, self: ChatUser, info: ChatRevertInfo): Promise
         // Chat refuses a non-force delete of a message with threaded replies, and force would
         // cascade into deleting other people's replies. Leave the revert record so a retry
         // works once the replies are gone.
-        if (error instanceof ChatApiError && error.rpcCode === "FAILED_PRECONDITION") {
+        if (error instanceof GoogleApiError && error.rpcCode === "FAILED_PRECONDITION") {
           return {
             message: "This message has threaded replies, so it cannot be un-sent " +
               "automatically. Delete it in Google Chat.",
@@ -1646,7 +1647,7 @@ export class GoogleChatGatekeeperImpl
         .catch((error: unknown) => {
           if (error instanceof DeletedChatMessageError) throw deletedTarget(store, actionId, error);
           // Not finding it doesn't show that the earlier attempt never landed.
-          if (error instanceof ChatApiError && error.status === 404) return undefined;
+          if (error instanceof GoogleApiError && error.status === 404) return undefined;
           throw error;
         });
       if (posted) return { spaceName, posted };

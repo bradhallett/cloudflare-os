@@ -1,6 +1,6 @@
 import { readBytesCapped, ResponseTooLargeError } from "@gadgets/gatekeeper-kit/response-body";
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
-import { readGoogleJson } from "./google-response";
+import { GoogleApiError, readGoogleJson } from "./google-response";
 import {
   LAYOUT_PAGE_FIELDS, OUTLINE_FIELDS, SLIDE_FIELDS, SUMMARY_FIELDS,
 } from "./slides-fields";
@@ -244,9 +244,9 @@ export type RestPresentation = {
 };
 
 /** A `batchUpdate` Google answered with a 4xx status, so it applied none of the requests. */
-export class SlidesWriteRefused extends Error {
-  constructor(readonly status: number) {
-    super(`Google Slides refused the update [http=${status}]`);
+export class SlidesWriteRefused extends GoogleApiError {
+  constructor(status: number) {
+    super(`Google Slides refused the update [http=${status}]`, status);
   }
 }
 
@@ -379,7 +379,8 @@ export class GoogleSlidesApi {
     });
     if (!image.ok) {
       await image.body?.cancel();
-      throw new Error(`Google Slides thumbnail download failed [http=${image.status}]`);
+      throw new GoogleApiError(
+        `Google Slides thumbnail download failed [http=${image.status}]`, image.status);
     }
     let content = await readBytesCapped(image, MAX_THUMBNAIL_BYTES).catch((error: unknown) => {
       if (!(error instanceof ResponseTooLargeError)) throw error;

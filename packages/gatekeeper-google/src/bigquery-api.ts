@@ -10,9 +10,12 @@ import type {
   BigQueryQueryOptions, BigQueryQueryResult, BigQueryTable,
 } from "./bigquery-types";
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
+import { GoogleApiError } from "./google-response";
 
 const API_BASE = "https://bigquery.googleapis.com/bigquery/v2";
 const REQUEST_TIMEOUT_MS = 60_000;
+/** Google's own error code strings, whitelisted so one can never carry caller content. */
+const PROVIDER_CODE_PATTERN = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
 // Give the client-side AbortSignal headroom over the server-side `timeoutMs` so the server
 // finishes long-poll responses cleanly instead of racing into an AbortError.
 const REQUEST_ABORT_TIMEOUT_MS = REQUEST_TIMEOUT_MS + 10_000;
@@ -255,24 +258,15 @@ async function callRest<T>(
   let contentType = response.headers.get("Content-Type") ?? "";
   let isJson = contentType.includes("application/json");
   if (!response.ok) {
-    let detail: string;
-    let rawBody: GoogleErrorResponse = {};
-    if (isJson) {
-      rawBody = (await response.json().catch(() => ({}))) as GoogleErrorResponse;
-      detail = rawBody.error?.message ?? `${response.status} ${response.statusText}`;
-    } else {
-      detail = (await response.text().catch(() => "")).slice(0, 500)
-          || `${response.status} ${response.statusText}`;
-    }
-    detail += ` [http=${response.status}]`;
-    if (rawBody.error?.status) {
-      detail += ` [status=${rawBody.error.status}]`;
-    }
-    if (rawBody.error?.errors && rawBody.error.errors.length > 0) {
-      detail += ` [errors=${rawBody.error.errors.map(
-          e => `${e.reason ?? "?"}:${e.message ?? "?"}`).join(" | ")}]`;
-    }
-    throw new Error(`BigQuery API error: ${detail}`);
+    // BigQuery's error prose can quote the SQL and echo request values; keep only the status and
+    // Google's own whitelisted error code.
+    let rawBody: GoogleErrorResponse = isJson
+      ? (await response.json().catch(() => ({}))) as GoogleErrorResponse
+      : {};
+    let status = rawBody.error?.status;
+    let rpcCode = typeof status === "string" && PROVIDER_CODE_PATTERN.test(status) ? status : undefined;
+    throw new GoogleApiError(
+      `BigQuery API error [http=${response.status}]`, response.status, rpcCode);
   }
   if (!isJson) {
     throw new Error(`BigQuery API: expected JSON, got ${contentType}`);

@@ -3,6 +3,7 @@
 import type { DriveObservation } from "./drive-observers";
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
 import { obsContext } from "./observability";
+import { GoogleApiError } from "./google-response";
 
 const logger = obsContext.createLogger({ component: "gatekeeper.google.drive", vendorId: "google" });
 
@@ -202,26 +203,21 @@ export type DriveSharedDriveList = { drives: DriveSharedDrive[]; nextPageToken?:
 /** Drive refused because the API is not enabled on this OAuth project. */
 export class DriveApiDisabledError extends Error {}
 
-/** Sanitized HTTP failure from the Google Drive API. */
-export class DriveApiRequestError extends Error {
-  constructor(
-    readonly status: number,
-    readonly reason?: string,
-  ) {
-    super(`Google Drive API request failed: ${status}${
-      reason ? ` (${REASON_EXPLANATIONS[reason] ?? reason})` : ""}`);
-  }
+/** A sanitized HTTP failure from the Google Drive API, its whitelisted reason as `rpcCode`. */
+export function driveRequestFailure(status: number, reason?: string): GoogleApiError {
+  return new GoogleApiError(`Google Drive API request failed: ${status}${
+    reason ? ` (${REASON_EXPLANATIONS[reason] ?? reason})` : ""}`, status, reason);
+}
 
-  /**
-   * Whether this failure describes the account or the app rather than one file.
-   *
-   * A file-specific denial is a scope fact a caller may record; these are not, so recording one
-   * would narrow a listing or deny a binding on an outage.
-   */
-  get isAccountWide(): boolean {
-    return this.status === 403 && this.reason !== undefined &&
-      ACCOUNT_WIDE_403_REASONS.has(this.reason);
-  }
+/**
+ * Whether a failure describes the account or the app rather than one file.
+ *
+ * A file-specific denial is a scope fact a caller may record; these are not, so recording one
+ * would narrow a listing or deny a binding on an outage.
+ */
+export function isAccountWideRefusal(error: GoogleApiError): boolean {
+  return error.status === 403 && error.rpcCode !== undefined &&
+    ACCOUNT_WIDE_403_REASONS.has(error.rpcCode);
 }
 
 const MAX_ERROR_BODY_BYTES = 4096;
@@ -307,7 +303,7 @@ async function driveError(response: Response): Promise<Error> {
     return new DriveApiDisabledError(
       "the Google Drive API is not enabled for this OAuth project");
   }
-  return new DriveApiRequestError(response.status, reason);
+  return driveRequestFailure(response.status, reason);
 }
 
 function megabytes(bytes: number): string {
@@ -448,8 +444,8 @@ function parseConvertedCopy(value: unknown): DriveConvertedCopy {
 
 /** Whether Drive refused because the token lacks a scope the request needs. */
 export function isInsufficientScope(error: unknown): boolean {
-  return error instanceof DriveApiRequestError && error.status === 403 &&
-    error.reason === "insufficientPermissions";
+  return error instanceof GoogleApiError && error.status === 403 &&
+    error.rpcCode === "insufficientPermissions";
 }
 
 /**
@@ -460,7 +456,7 @@ export function isInsufficientScope(error: unknown): boolean {
  * narrow a listing or deny a binding for everyone.
  */
 export function isFileInvisible(error: unknown): boolean {
-  return error instanceof DriveApiRequestError && !error.isAccountWide &&
+  return error instanceof GoogleApiError && !isAccountWideRefusal(error) &&
     (error.status === 403 || error.status === 404);
 }
 
@@ -470,8 +466,8 @@ export function isFileInvisible(error: unknown): boolean {
  * `appNotAuthorizedToFile`, which {@link isInsufficientScope} does not match.
  */
 export function lacksFileContentAccess(error: unknown): boolean {
-  return isInsufficientScope(error) || (error instanceof DriveApiRequestError &&
-    error.status === 403 && error.reason === "appNotAuthorizedToFile");
+  return isInsufficientScope(error) || (error instanceof GoogleApiError &&
+    error.status === 403 && error.rpcCode === "appNotAuthorizedToFile");
 }
 
 const RATE_LIMIT_REASONS = new Set(["rateLimitExceeded", "userRateLimitExceeded", "dailyLimitExceeded"]);
@@ -481,8 +477,8 @@ const RATE_LIMIT_REASONS = new Set(["rateLimitExceeded", "userRateLimitExceeded"
  * is not a Drive HTTP failure is returned as it is.
  */
 export function conversionError(error: unknown): unknown {
-  if (!(error instanceof DriveApiRequestError)) return error;
-  let { status, reason } = error;
+  if (!(error instanceof GoogleApiError)) return error;
+  let { status, rpcCode: reason } = error;
   if (status === 404) {
     return new Error(
       "Google Drive could not find this file, or the connected account cannot open it.");
@@ -854,8 +850,8 @@ export class DriveApi {
       let max = await this.getMaxImportSize(mimeType).catch((error: unknown) => {
         logger.warn("could not read Drive's import size limit; copying without the check", {
           event: "google.office.import-size.unavailable", fileId: source.id,
-          ...(error instanceof DriveApiRequestError ? {
-            httpStatus: error.status, ...(error.reason ? { providerReasons: [error.reason] } : {}),
+          ...(error instanceof GoogleApiError ? {
+            httpStatus: error.status, ...(error.rpcCode ? { providerReasons: [error.rpcCode] } : {}),
           } : { error }),
         });
         return undefined;
