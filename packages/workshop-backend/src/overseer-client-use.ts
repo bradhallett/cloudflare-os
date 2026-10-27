@@ -302,5 +302,4 @@ export class UseOverseerInterface extends RpcTarget implements Overseer {
     this.#deny();
   }
   async previewRevokeShareLink(_linkId: string): Promise<AffectedCollaborator[]> { this.#deny(); }
-  async transferToOrg(_orgId: string): Promise<void> { this.#deny(); }
 }
