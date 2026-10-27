@@ -284,12 +284,12 @@ describe("read cache", () => {
 
 describe("applied-action retention", () => {
   // 205 queue+apply round-trips run ~0.7s serially, but a cold gate running every suite at once
-  // starved this past vitest's 5s default (CI run 40438611289 failed the same-shaped twin in
-  // gatekeeper-gitlab). The roomier timeout is half the fix: a timed-out test's body keeps
+  // starved this past vitest's 5s default (CI run 40438611289 failed this test at 5013ms; a
+  // loaded 16-task local gate timed the gatekeeper-gitlab twin out too, where its abandoned loop
+  // also drove +1 onto request-count assertions later in that file). The roomier timeout is half
+  // the fix; the per-iteration abort check below is the other half: a timed-out test's body keeps
   // running in this isolate, and its late provider calls land in whichever sibling test owns the
-  // fetch stub by then -- the gitlab twin showed up as +1 on request-count assertions later in
-  // its file. The per-iteration abort check is the other half: an abandoned run stops issuing
-  // applies instead of zombifying into its siblings.
+  // fetch stub by then, so an abandoned run must stop issuing applies instead of zombifying.
   it("retires applied actions beyond the retention limit from apply, so revert covers the newest only",
     async ({ signal }) => {
       // The retained tier would grow without bound otherwise, exactly as the hand-kept
