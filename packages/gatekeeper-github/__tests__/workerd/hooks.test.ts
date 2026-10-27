@@ -109,11 +109,8 @@ async function hmac(secret: string, body: string): Promise<string> {
 class FakeGitHub {
   /** Who the account's token belongs to. */
   viewer = ADA;
-  /**
-   * While set, a read of who the account is that GitHub answers as this user stalls, counted in
-   * `stalledViewerReads`. Polled, as `stallDeletes` is.
-   */
-  stallViewerReadsAs: typeof ADA | undefined;
+  /** Reads of who the account is, held by `holdViewerReads` as this user, in `stalledViewerReads`. */
+  #viewerReads: { viewer: typeof ADA; promise: Promise<void>; resolve: () => void } | null = null;
   stalledViewerReads = 0;
   admin = true;
   /** Whether the account can still read the repository at all. */
@@ -130,10 +127,12 @@ class FakeGitHub {
   #redeliveries: number[] = [];
   #nextDeliveryId = 1;
   /**
-   * While set, a webhook DELETE stalls, counted in `stalledDeletes`. Polled rather than awaited:
-   * a promise settled from the test would carry the test's I/O context into the driver.
+   * Webhook DELETEs held by `holdDeletes`, counted in `stalledDeletes`. A resolver gate (the
+   * fake-spotify pattern), not a polled flag: a held delete awaits a promise the test settles,
+   * so a test that fails mid-hold leaves an inert pending fetch rather than a 1ms scheduler
+   * spinner running for the rest of the pool.
    */
-  stallDeletes = false;
+  #deletes: { promise: Promise<void>; resolve: () => void } | null = null;
   stalledDeletes = 0;
   /** While set, a webhook DELETE fails with this status; with `deleteDespiteFailure`, once it has deleted the webhook, as when its answer is lost. */
   failDeletesWith: number | undefined;
@@ -141,13 +140,13 @@ class FakeGitHub {
   /** Headers a failed DELETE is answered with, such as a rate limit's, and its message. */
   failDeletesHeaders: Record<string, string> = {};
   failDeletesMessage = "Failed";
-  /** While set, adding a webhook stalls, counted in `stalledCreates`, polled as `stallDeletes` is. */
-  stallCreates = false;
+  /** Webhook creates held by `holdCreates`, counted in `stalledCreates`; a resolver gate as `#deletes` is. */
+  #creates: { promise: Promise<void>; resolve: () => void } | null = null;
   stalledCreates = 0;
   /** While set, GitHub adds a webhook but its answer is lost, as when the connection drops. */
   loseCreateAnswers = false;
-  /** While set, GitHub adds a webhook but stalls its answer, counted in `stalledCreateAnswers`. */
-  stallCreateAnswers = false;
+  /** Create answers held by `holdCreateAnswers`, counted in `stalledCreateAnswers`; a resolver gate as `#deletes` is. */
+  #createAnswers: { promise: Promise<void>; resolve: () => void } | null = null;
   stalledCreateAnswers = 0;
   /** How many repository reads GitHub answered 304, as it does a conditional read of an unchanged one. */
   notModified = 0;
@@ -164,15 +163,60 @@ class FakeGitHub {
       this.#handle(new Request(input, init)));
   }
 
+  /** Holds each read of who the account is that GitHub answers as `viewer` until `releaseViewerReads`. */
+  holdViewerReads(viewer: typeof ADA): void {
+    this.#viewerReads = { viewer, ...Promise.withResolvers<void>() };
+  }
+
+  /** Answers the viewer reads `holdViewerReads` holds; a no-op when none is. */
+  releaseViewerReads(): void {
+    this.#viewerReads?.resolve();
+    this.#viewerReads = null;
+  }
+
+  /** Holds each webhook DELETE until `releaseDeletes`. */
+  holdDeletes(): void {
+    this.#deletes ??= Promise.withResolvers<void>();
+  }
+
+  /** Answers the deletes `holdDeletes` holds; a no-op when none is. */
+  releaseDeletes(): void {
+    this.#deletes?.resolve();
+    this.#deletes = null;
+  }
+
+  /** Holds each webhook create until `releaseCreates`. */
+  holdCreates(): void {
+    this.#creates ??= Promise.withResolvers<void>();
+  }
+
+  /** Answers the creates `holdCreates` holds; a no-op when none is. */
+  releaseCreates(): void {
+    this.#creates?.resolve();
+    this.#creates = null;
+  }
+
+  /** Holds each webhook create's answer (the webhook exists once held) until `releaseCreateAnswers`. */
+  holdCreateAnswers(): void {
+    this.#createAnswers ??= Promise.withResolvers<void>();
+  }
+
+  /** Answers the create answers `holdCreateAnswers` holds; a no-op when none is. */
+  releaseCreateAnswers(): void {
+    this.#createAnswers?.resolve();
+    this.#createAnswers = null;
+  }
+
   async #handle(request: Request): Promise<Response> {
     const { pathname, searchParams } = new URL(request.url);
     const { method } = request;
     this.requests.push(`${method} ${pathname}`);
     if (pathname === "/user") {
       const { viewer } = this;
-      if (this.stallViewerReadsAs === viewer) {
+      const held = this.#viewerReads;
+      if (held?.viewer === viewer) {
         this.stalledViewerReads++;
-        while (this.stallViewerReadsAs === viewer) await scheduler.wait(1);
+        await held.promise;
       }
       return Response.json(viewer);
     }
@@ -200,16 +244,18 @@ class FakeGitHub {
           message: "Validation Failed", errors: [{ message: "Hook already exists on this repository" }],
         }, { status: 422 });
       }
-      if (this.stallCreates) {
+      const heldCreate = this.#creates;
+      if (heldCreate) {
         this.stalledCreates++;
-        while (this.stallCreates) await scheduler.wait(1);
+        await heldCreate.promise;
       }
       const id = this.#nextId++;
       this.webhooks.set(id, this.#configured(id, name, await request.json<WebhookBody>()));
       if (this.loseCreateAnswers) throw new TypeError("Network connection lost.");
-      if (this.stallCreateAnswers) {
+      const heldAnswer = this.#createAnswers;
+      if (heldAnswer) {
         this.stalledCreateAnswers++;
-        while (this.stallCreateAnswers) await scheduler.wait(1);
+        await heldAnswer.promise;
       }
       return Response.json({ id, config: { url: this.webhooks.get(id)!.url } }, { status: 201 });
     }
@@ -218,9 +264,10 @@ class FakeGitHub {
     if (rest === `/hooks/${id}`) {
       if (!webhook) return Response.json({ message: "Not Found" }, { status: 404 });
       if (method === "DELETE") {
-        if (this.stallDeletes) {
+        const heldDelete = this.#deletes;
+        if (heldDelete) {
           this.stalledDeletes++;
-          while (this.stallDeletes) await scheduler.wait(1);
+          await heldDelete.promise;
         }
         if (this.failDeletesWith === undefined || this.deleteDespiteFailure) {
           this.webhooks.delete(id);
@@ -898,13 +945,16 @@ it("leaves a working webhook when a hook is enabled while the last one's is bein
   await second.subscribe();
   await first.enable();
 
-  github.stallDeletes = true;
+  github.holdDeletes();
   const disabling = first.disable();
   await vi.waitFor(() => expect(github.stalledDeletes).toBe(1));
   const enabling = second.enable();
-  // Time for the enable to reach the driver, which must not touch the webhook being deleted.
-  await scheduler.wait(100);
-  github.stallDeletes = false;
+  try {
+    // Time for the enable to reach the driver, which must not touch the webhook being deleted.
+    await scheduler.wait(100);
+  } finally {
+    github.releaseDeletes();
+  }
   await Promise.all([disabling, enabling]);
 
   expect(github.deleted).toEqual([100]);
@@ -1088,7 +1138,7 @@ it("skips the comments of the GitHub user its account reconnected as while GitHu
   await triage.enable();
 
   // The hourly check asks who the account is, and GitHub is slow to answer Ada...
-  github.stallViewerReadsAs = ADA;
+  github.holdViewerReads(ADA);
   const checking = after(HOUR, account);
   await vi.waitFor(() => expect(github.stalledViewerReads).toBe(1));
   // ...until the account has reconnected as Bob.
@@ -1102,9 +1152,12 @@ it("skips the comments of the GitHub user its account reconnected as while GitHu
     return staged.stageId;
   });
   const reconnecting = userAccount.commitReconnect(stageId);
-  // Time for the reconnect's own read to be answered first, were it made alongside the check's.
-  await scheduler.wait(300);
-  github.stallViewerReadsAs = undefined;
+  try {
+    // Time for the reconnect's own read to be answered first, were it made alongside the check's.
+    await scheduler.wait(300);
+  } finally {
+    github.releaseViewerReads();
+  }
   await Promise.all([checking, reconnecting]);
 
   await github.deliver("issue_comment", comment(42, "From Bob, whom the account is now.", { sender: BOB }));
@@ -1606,11 +1659,14 @@ it("keeps on record what a disconnect has yet to delete from GitHub, for another
   const stored = () => runInDurableObject(driver(account), (_instance, state) =>
     [...state.storage.kv.list()].map(([key]) => key).filter(key => !key.startsWith("queue:")).toSorted());
 
-  github.stallDeletes = true;
+  github.holdDeletes();
   const disconnecting = triage.hooks.revokeAccount(account);
-  await vi.waitFor(() => expect(github.stalledDeletes).toBe(1));
-  expect(await stored()).toEqual(["account", "revoked", `webhook:${REPO_ID}`]);
-  github.stallDeletes = false;
+  try {
+    await vi.waitFor(() => expect(github.stalledDeletes).toBe(1));
+    expect(await stored()).toEqual(["account", "revoked", `webhook:${REPO_ID}`]);
+  } finally {
+    github.releaseDeletes();
+  }
   await unwrap(disconnecting);
   expect(await stored()).toEqual(["revoked"]);
 });
@@ -1644,12 +1700,12 @@ it.each<[string, boolean]>([
 
 it.each<[string, (github: FakeGitHub) => () => number, number]>([
   ["adds its webhook", github => {
-    github.stallCreates = true;
+    github.holdCreates();
     return () => github.stalledCreates;
   }, 1],
   // Before it asks GitHub for one.
   ["reads who the account is", github => {
-    github.stallViewerReadsAs = ADA;
+    github.holdViewerReads(ADA);
     return () => github.stalledViewerReads;
   }, 0],
 ])("refuses an enable whose account is disconnected while it %s, leaving no webhook", async (_, stall, added) => {
@@ -1663,10 +1719,13 @@ it.each<[string, (github: FakeGitHub) => () => number, number]>([
   const refused = expect(triage.enable()).rejects.toThrow("This GitHub account has been disconnected.");
   await vi.waitFor(() => expect(stalled()).toBe(1));
   const disconnecting = triage.hooks.revokeAccount(account);
-  // Until the disconnect has reached the driver, where it waits for the enable.
-  await fenced(account);
-  github.stallCreates = false;
-  github.stallViewerReadsAs = undefined;
+  try {
+    // Until the disconnect has reached the driver, where it waits for the enable.
+    await fenced(account);
+  } finally {
+    github.releaseCreates();
+    github.releaseViewerReads();
+  }
   await refused;
   await unwrap(disconnecting);
   expect(github.requests.filter(request => request === `POST ${API}/hooks`)).toHaveLength(added);
@@ -1697,14 +1756,17 @@ it("deletes at the next hourly check a webhook GitHub added as the driver restar
   const triage = binding(account);
   await triage.subscribe();
 
-  github.stallCreateAnswers = true;
+  github.holdCreateAnswers();
   const refused = expect(triage.enable()).rejects.toThrow();
-  await vi.waitFor(() => expect(github.stalledCreateAnswers).toBe(1));
-  await runInDurableObject(driver(account), async (_instance, state) => {
-    await state.storage.sync();
-    state.abort("The test hook driver restarted.");
-  }).catch(() => {});
-  github.stallCreateAnswers = false;
+  try {
+    await vi.waitFor(() => expect(github.stalledCreateAnswers).toBe(1));
+    await runInDurableObject(driver(account), async (_instance, state) => {
+      await state.storage.sync();
+      state.abort("The test hook driver restarted.");
+    }).catch(() => {});
+  } finally {
+    github.releaseCreateAnswers();
+  }
   await refused;
   expect(github.webhooks.size).toBe(1);
 
@@ -1746,13 +1808,16 @@ it("keeps on record the webhook an enable added as its account was disconnected,
   const triage = binding(account);
   await triage.subscribe();
 
-  github.stallCreates = true;
+  github.holdCreates();
   const refused = expect(triage.enable()).rejects.toThrow("This GitHub account has been disconnected.");
   await vi.waitFor(() => expect(github.stalledCreates).toBe(1));
   const disconnecting = triage.hooks.revokeAccount(account);
-  await fenced(account);
-  github.failDeletesWith = 500;
-  github.stallCreates = false;
+  try {
+    await fenced(account);
+    github.failDeletesWith = 500;
+  } finally {
+    github.releaseCreates();
+  }
   await refused;
   expect(await disconnecting).toEqual({
     error: "GitHub failed to delete some of this account's webhooks, so it is still connected. Disconnect it again to finish.",
