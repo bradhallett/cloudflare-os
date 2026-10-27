@@ -2,15 +2,17 @@ import { WorkpieceId, ChatGadgetPinState, AiChatMetadata, AiChatMessage, AiChatA
 import { applyCodeChange, codeChangeSerializedSize, validateCodeChangeContent, validateCodeChangeSchema } from "@gadgets/workshop-shared/code-change";
 import type { FileContent, CodeContent, CodeChange } from "@gadgets/workshop-shared/code-change";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
+import { OutputsFanout } from "./outputs-fanout";
+import { ChatCompactionStore } from "./chat-compaction-store";
 import { chatKey, chatKeyPrefix } from "./storage-schema/overseer-storage";
 import type { AiChatAgentContext, BindingRecord, ChatChangeRecord, CompactionCheckpoint, ExternalMessageRecord, GadgetRecord, GatekeeperRecord, StoredChatMetadata, WorkpieceRecord, WorktreeRecord } from "./storage-schema/overseer-storage";
 import type { BindingHolder } from "./overseer-support";
 import { getModel } from "./ai-models";
 import { completeText } from "./ai-invoke";
-import { AgentGadgetInfo, GIT_BINDING_NAME } from "./agent";
-import type { ChatHistory } from "./agent";
+import { GIT_BINDING_NAME } from "./agent-session";
+import type { AgentGadgetInfo } from "./agent-hooks";
+import type { ChatHistory } from "./agent-hooks";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
-import { foldCompactedCode } from "./agent-compaction";
 import { UserDurableObject } from "./user";
 import { checkOwnerUsage } from "./ai-gateway-billing/limits/usage-checker";
 import { wrapDoStubForTelemetry } from "./do-retry";
@@ -148,87 +150,33 @@ export abstract class OverseerChatRuntime extends OverseerChats {
     return prepared;
   }
 
-  // Whether a flush is already queued. Registry mutations arrive in synchronous bursts (a chat's
-  // changes may create and stamp several gadgets), so pushes coalesce onto a single flush.
-  #outputsFlushScheduled = false;
-
-  // User DO ids whose outputs index this workspace is keeping live, one token per open session.
-  //
-  // In memory, not persisted, which is what makes fanning out to collaborators safe: revoking
-  // access aborts the DO (see scheduleAccessRestart()), so this is destroyed with the sessions
-  // it describes and can only be rebuilt by an open() that re-checks the permission graph.
-  #connectedIndexes = new Map<string, Set<object>>();
+  /**
+   * The outputs index fan-out (see OutputsFanout): which user DO indexes this workspace keeps
+   * live, the coalescing dirty flag, and the last-acknowledged snapshot. Kept as a collaborator
+   * so that state lives in exactly one place; joinOutputsFanout()/markOutputsDirty() delegate
+   * to it.
+   */
+  protected outputsFanout = new OutputsFanout({
+    ownerId: () => this.ownerId,
+    workspaceId: () => this.ctx.id.toString(),
+    outputsSnapshot: () => this.outputsSnapshot(),
+    syncOutputsTo: (userId, snapshot) =>
+        this.syncOutputsTo(this.users.get(this.users.idFromString(userId)), snapshot),
+    logger: this.logger,
+  });
 
   /**
    * Keep `userId`'s outputs index up to date for the duration of one session. Returns a function
    * that ends it, like joinPresence().
    */
   joinOutputsFanout(userId: string): () => void {
-    let token = {};
-    let sessions = this.#connectedIndexes.get(userId);
-    if (sessions) {
-      sessions.add(token);
-    } else {
-      this.#connectedIndexes.set(userId, new Set([token]));
-    }
-
-    let left = false;
-    return () => {
-      if (left) return;
-      left = true;
-      let remaining = this.#connectedIndexes.get(userId);
-      if (!remaining) return;
-      remaining.delete(token);
-      if (remaining.size === 0) this.#connectedIndexes.delete(userId);
-    };
+    return this.outputsFanout.join(userId);
   }
 
   /** Note that the gadget registry changed, scheduling a push to every index that should be live. */
   markOutputsDirty(): void {
-    if (this.#outputsFlushScheduled || !this.ownerId) return;
-    this.#outputsFlushScheduled = true;
-    scheduler.wait(0).then(() => {
-      // Cleared before the push, so a change made while it is in flight schedules another.
-      this.#outputsFlushScheduled = false;
-      return this.#syncOutputsToWatchers();
-    }).catch(err => {
-      this.logger.warn("failed to flush workspace outputs", {
-        event: "workspace.outputs.flush.failed", gadgetId: this.ctx.id.toString(), error: err,
-      });
-    });
+    this.outputsFanout.markDirty();
   }
-
-  // Push the current snapshot to the owner's index and to every collaborator with a session open.
-  // The owner is included whether or not they are connected, since a workspace goes on producing
-  // while its owner is away; a disconnected collaborator is caught up by the sync in open().
-  async #syncOutputsToWatchers(): Promise<void> {
-    let ownerId = this.ownerId;
-    if (!ownerId) return;
-
-    // Built once and shared, rather than once per recipient: the registry is the same for all of
-    // them, and rebuilding it per viewer is what made a push cost outputs times viewers.
-    let snapshot = this.outputsSnapshot();
-
-    // The registry notifies on every gadget update, but this carries only titles and presentation,
-    // so code commits, binding edits and activity stamps all produce a snapshot nobody's index
-    // would change on. Skipping those is most of the traffic. Safe to compare against what this
-    // instance last sent because a newly connected watcher is synced by open() before it joins the
-    // fan-out, and a cold DO has nothing recorded and so always pushes.
-    let encoded = JSON.stringify(snapshot);
-    if (encoded === this.#lastOutputsPushed) return;
-
-    let userIds = new Set([ownerId, ...this.#connectedIndexes.keys()]);
-    let delivered = await Promise.all([...userIds].map(
-        userId => this.syncOutputsTo(this.users.get(this.users.idFromString(userId)), snapshot)));
-
-    // Recorded only once every index has it, so that a recipient this failed for is included in
-    // the next flush instead of being remembered as up to date. If nothing changes again, their
-    // open() corrects it.
-    if (delivered.every(ok => ok)) this.#lastOutputsPushed = encoded;
-  }
-
-  // The snapshot every watcher last acknowledged, to suppress pushes that would change nothing.
-  #lastOutputsPushed?: string;
 
   /**
    * Increment the code version and restart the affected gadgets so they reload. If
@@ -660,11 +608,16 @@ export abstract class OverseerChatRuntime extends OverseerChats {
         `\`\`\`\n`;
   }
 
+  /**
+   * The chat's compaction checkpoints (see ChatCompactionStore): the stored rows, the active
+   * pointer, and the folds over them. Kept as a collaborator so checkpoint manipulation lives
+   * in exactly one place; the accessors below delegate to it.
+   */
+  protected chatCompactions = new ChatCompactionStore(this.storage, this.ctx.storage);
+
   /** Returns the checkpoint named by `chatMeta.compactedTo`. */
   getActiveChatCompaction(chatId: number): CompactionCheckpoint | undefined {
-    let compactedTo = this.storage.chatMeta.get(chatId)?.compactedTo;
-    return compactedTo === undefined
-        ? undefined : this.storage.chatCompactions.get(chatKey(chatId, compactedTo));
+    return this.chatCompactions.getActive(chatId);
   }
 
   /**
@@ -672,25 +625,7 @@ export abstract class OverseerChatRuntime extends OverseerChats {
    * backwards without selecting the checkpoint that bounds the current page.
    */
   getChatCompactionBelow(chatId: number, sequence: number): CompactionCheckpoint | undefined {
-    // Boundaries are never negative, and keyString doesn't order negative numbers, so a negative
-    // bound would select records instead of none.
-    if (sequence <= 0) return undefined;
-    for (let checkpoint of this.storage.chatCompactions.list({
-      prefix: chatKeyPrefix(chatId),
-      end: chatKey(chatId, sequence),
-      reverse: true,
-      limit: 1,
-    })) {
-      return checkpoint;
-    }
-    return undefined;
-  }
-
-  // Returns the newest checkpoint whose boundary is at or before `sequence`. A revert's refold uses
-  // the inclusive bound because a checkpoint at `revertFrom` covers only unaffected earlier messages.
-  #getChatCompactionAtOrBefore(
-      chatId: number, sequence: number): CompactionCheckpoint | undefined {
-    return this.getChatCompactionBelow(chatId, sequence + 1);
+    return this.chatCompactions.getBelow(chatId, sequence);
   }
 
   /**
@@ -709,50 +644,17 @@ export abstract class OverseerChatRuntime extends OverseerChats {
     };
   }
 
-  /**
-   * Publishes a checkpoint: stores it and points the chat at it. `runAgent` produces the checkpoint,
-   * for both automatic compaction and `/compact`, so there is one path here rather than two.
-   *
-   * Safe to call after the summary's model I/O even though that releases the input gate: the turn
-   * that produced this checkpoint is still the chat's active agent, and every operation that could
-   * invalidate it -- merge and revert -- refuses while a turn is active. So the checkpoint cannot
-   * be stale by the time it lands.
-   */
+  /** Publishes a checkpoint: stores it and points the chat at it (see ChatCompactionStore). */
   commitChatCompaction(chatId: number, checkpoint: CompactionCheckpoint): void {
-    this.ctx.storage.transactionSync(() => {
-      let meta = this.storage.chatMeta.get(chatId);
-      if (!meta) return;  // Chat deleted while the summary was being written.
-      this.storage.chatCompactions.put(checkpoint);
-      meta.compactedTo = checkpoint.compactedTo;
-      // The prompt is about to shrink, so the recorded total no longer describes it. Without this
-      // the next turn would weigh a short prompt's usage against a long one and never re-trigger.
-      delete meta.totalTokens;
-      this.storage.chatMeta.put(meta);
-    });
+    this.chatCompactions.commit(chatId, checkpoint);
   }
 
   /**
-   * Refolds each checkpoint a revert reaches into, oldest first, from the one before it. A revert
-   * changes what the chat proposes, not what was said, so a checkpoint keeps its boundary and
-   * summary and only the code state foldCompactedCode derives from the log changes. `messages` is
-   * the chat's whole log, the revert included.
+   * Refolds each checkpoint a revert reaches into, oldest first, from the one before it
+   * (see ChatCompactionStore).
    */
   refoldChatCompactions(chatId: number, revertFrom: number, messages: AiChatMessage[]): void {
-    let previous = this.#getChatCompactionAtOrBefore(chatId, revertFrom);
-    // Buffer the checkpoints first: rewriting them while listing would disturb the cursor.
-    let affected = Array.from(this.storage.chatCompactions.list({
-      prefix: chatKeyPrefix(chatId),
-      start: chatKey(chatId, revertFrom + 1),
-    }));
-    for (let checkpoint of affected) {
-      let spanStart = previous?.compactedTo ?? 0;
-      previous = {
-        ...checkpoint,
-        ...foldCompactedCode(messages.filter(message => message.sequence >= spanStart),
-                             checkpoint.compactedTo, previous),
-      };
-      this.storage.chatCompactions.put(previous);
-    }
+    this.chatCompactions.refold(chatId, revertFrom, messages);
   }
 
   /** Whether any calls to the chat's agent are recorded but not yet appended to its chat log. */

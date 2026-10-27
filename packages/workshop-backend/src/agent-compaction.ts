@@ -5,6 +5,7 @@ import {
 import {composeEpochChanges, type CodeChange} from "@gadgets/workshop-shared/code-change";
 import type {Api, Message, Model} from "@earendil-works/pi-ai";
 import type {ChatBindingEntry, CompactionCheckpoint} from "./storage-schema/overseer-storage";
+import {ChatBindingScope, applyMessageBindings} from "./project-chat-log";
 import {zeroUsage} from "./ai-invoke";
 
 // Context compaction keeps long chats within the model's limit. It summarizes the messages before a
@@ -328,56 +329,20 @@ export function buildCompactionState(
     previous: CompactionCheckpoint | undefined)
     : Omit<CompactionCheckpoint, "chatId" | "compactedTo" | "summary"> {
   let compacted = messages.filter(message => message.sequence < compactedTo);
-  let chatBindings = new Map([...initialBindings, ...previous?.chatBindings ?? []]);
+  // The checkpoint's binding map is the seed folded with the prefix's log effects, rebuilt with
+  // the ONE walk shared with replay and the naming chokepoint (see project-chat-log.ts). The
+  // plain Map keeps the previous checkpoint's entries winning over a re-derived seed, as before.
+  let scope = new ChatBindingScope(
+      new Map([...initialBindings, ...previous?.chatBindings ?? []]));
   let nextChangeId = previous?.nextChangeId ?? 0;
 
   for (let message of compacted) {
-    if (message.type === "message") {
-      for (let capsule of message.capsules ?? []) {
-        if (capsule.bindingName !== undefined && !chatBindings.has(capsule.bindingName)) {
-          chatBindings.set(capsule.bindingName, {type: "workpiece", id: capsule.gatekeeperId});
-        }
-      }
-      for (let call of message.toolCalls ?? []) {
-        if (call.error) continue;
-        if (call.toolName === "createGadget" && call.output !== undefined) {
-          chatBindings.set(call.input.bindingName, {type: "workpiece", id: call.output.gadgetId});
-        } else if (call.toolName === "createWorktree" && call.output !== undefined) {
-          chatBindings.set(call.input.bindingName,
-              {type: "workpiece", id: call.output.worktreeId});
-        } else if (call.toolName === "createExternalResource" && call.output !== undefined) {
-          chatBindings.set(call.input.bindingName,
-              {type: "workpiece", id: call.output.gatekeeperId});
-        }
-      }
-    } else if (message.type === "agentCallback") {
-      // The name was stamped when the call was appended; a message without one predates durable
-      // calls and binds nothing (its arguments are gone).
-      if (message.bindingName !== undefined) {
-        chatBindings.set(message.bindingName, {type: "value", messageSequence: message.sequence});
-      }
-    } else if (message.type === "connectionRequest" && message.state === "accepted" &&
-               message.gatekeeperId !== undefined && message.bindingName !== undefined) {
-      if (!chatBindings.has(message.bindingName)) {
-        chatBindings.set(message.bindingName, {type: "workpiece", id: message.gatekeeperId});
-      }
-    } else if (message.type === "changes") {
-      for (let {gadgetId, bindingName} of message.createdGadgets ?? []) {
-        if (!chatBindings.has(bindingName)) {
-          chatBindings.set(bindingName, {type: "workpiece", id: gadgetId});
-        }
-      }
-      for (let {worktreeId, bindingName} of message.createdWorktrees ?? []) {
-        if (!chatBindings.has(bindingName)) {
-          chatBindings.set(bindingName, {type: "workpiece", id: worktreeId});
-        }
-      }
-      ++nextChangeId;
-    }
+    applyMessageBindings(scope, message);
+    if (message.type === "changes") ++nextChangeId;
   }
 
   return {
-    chatBindings: [...chatBindings],
+    chatBindings: [...scope.bindings],
     nextChangeId,
     ...foldCompactedCode(messages, compactedTo, previous),
   };

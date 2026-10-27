@@ -1,7 +1,10 @@
 import { WorkpieceId, AiChatMessage, AiChatAuthorInfo, AiModelConfig, validateBindingName } from "@gadgets/workshop-shared/api";
 import type { AgentCatalog } from "@gadgets/workshop-shared/gatekeeper";
-import type { BoundHookRecord } from "./storage-schema/overseer-storage";
-import { SeedBindingInfo, alwaysAvailableResources, GIT_BINDING_NAME } from "./agent";
+import type { BoundHookRecord, ChatBindingEntry } from "./storage-schema/overseer-storage";
+import { chatKeyPrefix } from "./storage-schema/overseer-storage";
+import { ChatBindingScope, applyMessageBindings } from "./project-chat-log";
+import { alwaysAvailableResources, GIT_BINDING_NAME } from "./agent-session";
+import type { SeedBindingInfo } from "./agent-hooks";
 import { reportIssue } from "@gadgets/observability/error-reporting";
 import { normalizeAgentCatalog } from "./agent-catalog";
 import { obsContext } from "./observability";
@@ -90,6 +93,84 @@ export abstract class OverseerBindings extends OverseerAgents {
       }
     }
     this.deleteBindingEdges(edge => edge.pending?.chatId === chatId);
+  }
+
+  /**
+   * Delete a chat outright: the single cleanup point for every table keyed by it. Cancels any
+   * waiting external-message response first (so its waiter settles rather than hanging), then
+   * removes the workpiece footprint (see removeChatWorkpieces), then sweeps every chat-keyed
+   * record in one durable step -- metadata, context, compaction checkpoints, the change stream
+   * and its per-client dedupe records, legacy drafts, messages with their attachment content,
+   * callback args, undelivered agent calls, bot delegations (either side), model-facing
+   * snapshots, and the resume record (so a deleted chat is never resumed; aborting the live
+   * agent also clears it via the tracked promise's finally, but the chat may have no live agent
+   * in memory, e.g. after a restart before resumption ran). Finally drops the in-memory live
+   * state (see destroyLiveChat).
+   */
+  async destroyChat(chatId: number): Promise<void> {
+    let startedAt = Date.now();
+    let response = this.storage.gadgetResponseDeliveries.undeliveredByChatId.get(chatId);
+    if (response?.status === "waiting") {
+      this.deliverExternalMessageResponse(response,
+          "The chat was deleted before the agent responded.");
+    }
+
+    await this.removeChatWorkpieces(chatId);
+
+    // Buffer prefix scans first: deleting records invalidates the list cursors.
+    let checkpoints = Array.from(this.storage.chatCompactions.list({prefix: chatKeyPrefix(chatId)}));
+    let changeClients = Array.from(
+        this.storage.chatChangeClients.list({prefix: chatKeyPrefix(chatId)}));
+    let drafts = Array.from(this.storage.chatDraftUpdates.list({prefix: chatKeyPrefix(chatId)}));
+    let messages = Array.from(this.storage.chats.list({prefix: chatKeyPrefix(chatId)}));
+    let callbackArgs = Array.from(this.storage.agentCallbackArgs.list({prefix: chatKeyPrefix(chatId)}));
+    let pendingCalls = Array.from(this.storage.pendingAgentCalls.list({prefix: chatKeyPrefix(chatId)}));
+    let delegations = Array.from([
+      ...this.storage.pendingDelegations.byParentChatId.get(chatId),
+      ...this.storage.pendingDelegations.byChildChatId.get(chatId),
+    ]);
+    let modelData = Array.from(this.storage.chatModelData.list({prefix: chatKeyPrefix(chatId)}));
+
+    this.ctx.storage.transactionSync(() => {
+      this.storage.chatMeta.delete(chatId);
+      this.storage.chatContext.delete(chatId);
+      for (let checkpoint of checkpoints) this.storage.chatCompactions.deleteRecord(checkpoint);
+      // The chat's change stream: rows (retired included), the straggler-bridge boundary, and the
+      // per-client dedupe records (which live exactly as long as the chat -- see submitCodeChange).
+      this.deleteAllChatChanges(chatId);
+      for (let client of changeClients) this.storage.chatChangeClients.deleteRecord(client);
+      // Any pre-conversion legacy drafts (see ChatDraftUpdateRecord).
+      for (let draft of drafts) this.storage.chatDraftUpdates.deleteRecord(draft);
+      // Delete the chat's messages and the attachment content referenced by them. Attachment
+      // metadata is canonical in each message's ChatAttachmentRef, so no separate attachment
+      // index is needed.
+      for (let msg of messages) {
+        if (msg.type === "message") {
+          for (let attachment of msg.attachments ?? []) {
+            let content = this.storage.chatAttachmentContent.get(attachment.id);
+            if (content?.state.type === "committed" && content.state.chatId === chatId) {
+              this.storage.chatAttachmentContent.delete(attachment.id);
+            }
+          }
+        }
+        this.storage.chats.deleteRecord(msg);
+      }
+      for (let entry of callbackArgs) this.storage.agentCallbackArgs.deleteRecord(entry);
+      for (let entry of pendingCalls) this.storage.pendingAgentCalls.deleteRecord(entry);
+      // Bot delegations involving this chat, from either side: a parent's records die with it
+      // (nothing will await the children), and a child's die because its awaiting parent must
+      // not treat a deleted thread as still running.
+      for (let record of delegations) this.storage.pendingDelegations.deleteRecord(record);
+      for (let entry of modelData) this.storage.chatModelData.deleteRecord(entry);
+      this.storage.activeAgents.delete(chatId);
+    });
+
+    // Clean up all in-memory live state for this chat.
+    this.destroyLiveChat(chatId);
+
+    this.logger.info("deleted chat", {
+      event: "chat.delete.completed", chatId, durationMs: Date.now() - startedAt,
+    });
   }
 
   /**
@@ -267,91 +348,36 @@ export abstract class OverseerBindings extends OverseerAgents {
     let seedMap = context.bindings;
 
     // --- The naming chokepoint: stamp binding names onto persisted messages that lack them. ---
-    // First collect every name already in the chat's scope (and a target -> name map for reuse)
-    // from the seed plus the log, then name and stamp the unnamed, in log order. We scan and
-    // stamp the caller's in-memory message objects (not a fresh storage listing, which would
-    // deserialize separate copies): the caller replays these same objects right after we return,
-    // and must see the names we stamp. (This scan can't reuse chatScopeNames: that method rereads
-    // the chat context from storage, where a seed map created just above isn't persisted yet.)
-    // TODO: The logic here is replaying the chat message log to regenerate the binding map.
-    //   Could this logic be incorporated into the chat log replay that happens inside runAgent(),
-    //   in agent.ts? It feels similar, and it would be nice to consolidate all "tool call replay"
-    //   logic into one place. Ideally, there shouldn't be logic outside of agent.ts that is
-    //   interpreting tool semantics at all (though making that true will require more refactoring
-    //   than just this).
-    let taken = new Set([...Object.keys(seedMap), GIT_BINDING_NAME]);  // (see chatScopeNames)
-    let nameByTarget = new Map<WorkpieceId, string>();
-    for (let [name, target] of Object.entries(seedMap)) {
-      if (!nameByTarget.has(target)) nameByTarget.set(target, name);
-    }
-    // Names allocated before the compaction boundary aren't in `chatMessages`, so take them from the
-    // checkpoint. Skipping them would hand a new resource a name the prefix already bound, and replay
-    // -- which seeds its map from the same checkpoint -- would keep resolving that name to the older
-    // target while rendering the new resource's link with it.
-    for (let [name, entry] of this.getActiveChatCompaction(chatId)?.chatBindings ?? []) {
-      taken.add(name);
-      if (entry.type === "workpiece" && !nameByTarget.has(entry.id)) {
-        nameByTarget.set(entry.id, name);
-      }
-    }
+    // One walk over the seed and the log (see project-chat-log.ts -- the same walk the agent's
+    // replay and compaction apply) collects every name in the chat's scope and the target ->
+    // name map the stamping below reuses. We scan the caller's in-memory message objects (not a
+    // fresh storage listing, which would deserialize separate copies): the caller replays these
+    // same objects right after we return, and must see the names we stamp. (This can't reuse
+    // chatScopeNames: that method rereads the chat context from storage, where a seed map
+    // created just above isn't persisted yet.)
+    //
+    // Names allocated before the compaction boundary aren't in `chatMessages`, so the
+    // checkpoint's entries join the seed in the initial scope; skipping them would hand a new
+    // resource a name the prefix already bound, and replay -- which seeds its map from the same
+    // checkpoint -- would keep resolving that name to the older target while rendering the new
+    // resource's link with it.
+    let scope = new ChatBindingScope([
+      ...Object.entries(seedMap).map(([name, target]) =>
+          [name, {type: "workpiece", id: target}] as [string, ChatBindingEntry]),
+      ...this.getActiveChatCompaction(chatId)?.chatBindings ?? [],
+    ]);
+    scope.taken.add(GIT_BINDING_NAME);
+    for (let msg of chatMessages) applyMessageBindings(scope, msg);
+    let taken = scope.taken;
+    let nameByTarget = scope.nameByTarget;
     let namingLog = chatMessages;
-    let anythingToName = false;
-    for (let msg of namingLog) {
-      if (msg.type === "message") {
-        for (let capsule of msg.capsules ?? []) {
-          if (capsule.bindingName !== undefined) {
-            taken.add(capsule.bindingName);
-            if (!nameByTarget.has(capsule.gatekeeperId)) {
-              nameByTarget.set(capsule.gatekeeperId, capsule.bindingName);
-            }
-          } else {
-            anythingToName = true;
-          }
-        }
-        for (let call of msg.toolCalls ?? []) {
-          if (call.toolName === "createGadget") {
-            taken.add(call.input.bindingName);
-            if (call.output && !nameByTarget.has(call.output.gadgetId)) {
-              nameByTarget.set(call.output.gadgetId, call.input.bindingName);
-            }
-          } else if (call.toolName === "createWorktree") {
-            taken.add(call.input.bindingName);
-            if (call.output && !nameByTarget.has(call.output.worktreeId)) {
-              nameByTarget.set(call.output.worktreeId, call.input.bindingName);
-            }
-          } else if (call.toolName === "createExternalResource") {
-            taken.add(call.input.bindingName);
-            if (call.output && !nameByTarget.has(call.output.gatekeeperId)) {
-              nameByTarget.set(call.output.gatekeeperId, call.input.bindingName);
-            }
-          }
-        }
-      } else if (msg.type === "connectionRequest") {
-        if (msg.bindingName !== undefined) {
-          if (msg.state !== "denied") taken.add(msg.bindingName);
-          if (msg.gatekeeperId !== undefined && !nameByTarget.has(msg.gatekeeperId)) {
-            nameByTarget.set(msg.gatekeeperId, msg.bindingName);
-          }
-        } else if (msg.state !== "denied") {
-          anythingToName = true;
-        }
-      } else if (msg.type === "changes") {
-        for (let created of msg.createdGadgets ?? []) {
-          taken.add(created.bindingName);
-          if (!nameByTarget.has(created.gadgetId)) {
-            nameByTarget.set(created.gadgetId, created.bindingName);
-          }
-        }
-        for (let created of msg.createdWorktrees ?? []) {
-          taken.add(created.bindingName);
-          if (!nameByTarget.has(created.worktreeId)) {
-            nameByTarget.set(created.worktreeId, created.bindingName);
-          }
-        }
-      } else if (msg.type === "agentCallback") {
-        if (msg.bindingName !== undefined) taken.add(msg.bindingName);
-      }
-    }
+    // Anything the walk saw that lacks a name (an unstamped capsule, or a not-yet-denied
+    // connection request) needs one allocated below.
+    let anythingToName = namingLog.some(msg =>
+        (msg.type === "message" &&
+          msg.capsules?.some(capsule => capsule.bindingName === undefined) === true) ||
+        (msg.type === "connectionRequest" &&
+          msg.state !== "denied" && msg.bindingName === undefined));
 
     // A regular chat also takes in each ambient resource the workspace gained after the chat
     // started (e.g. the owner turned on Web Search), deduped against every name in its scope. The

@@ -17,7 +17,7 @@ import type {Usage} from "@earendil-works/pi-ai";
 import type {UsageEvent} from "@gadgets/workshop-shared/usage-events";
 import type {OverseerDurableObject} from "../src/overseer";
 import {emitUsageEvent, usageEventId, usageTokens} from "../src/usage-events.js";
-import {makeStoredAssistantMessage} from "../src/agent.js";
+import {makeStoredAssistantMessage} from "../src/agent-session.js";
 
 declare module "cloudflare:workers" {
   interface ProvidedEnv {

@@ -32,7 +32,8 @@ import { diffFiles, validateCodeChangeSchema, type FileChange, type FileContent 
 import { UnreadableContentError } from "./git-walker";
 import type { WorkspaceGitCache } from "./git-cache";
 import { commitIdentityForAuthor, type GitStore } from "./git-store";
-import { formatUnifiedDiff, type WorktreeTurnAccess } from "./agent";
+import { formatUnifiedDiff } from "./agent-session";
+import type { WorktreeTurnAccess } from "./agent-hooks";
 import { formatGrep, matchLines, scanWorkpieceForGrep } from "./grep";
 
 /**

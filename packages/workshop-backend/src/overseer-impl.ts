@@ -2,14 +2,15 @@ import { WorkpieceId, AiChatMetadata, AiChatAuthorInfo, AiToolCall, CapsuleSpeci
 import { Gatekeeper, GitPullHints } from "@gadgets/workshop-shared/gatekeeper";
 import { WorkspaceGitCache } from "./git-cache";
 import { migrateToActionIndexes, migrateToBlueprintUpstreams, migrateToGitStorage, migrateToMultiGadget, migrateToWorkpieceTypes, migrateToSpawnerBindings, migrateToDeclaredBots } from "./storage-schema/overseer-migrations";
-import { AgentHooks, summarizeArgs } from "./agent";
+import { summarizeArgs } from "./agent";
+import type { AgentHooks } from "./agent-hooks";
 import { ChatCacheWarmer } from "./chat-cache-warming";
 import { UserDurableObject } from "./user";
 import type { UserChatContext } from "./user";
 import { AutoApprovalDrainer } from "./auto-approval";
 import { OverseerBots } from "./overseer-bots";
 import { AGENT_KEEPALIVE_ALARM_MS, ALARM_MAX_RETRIES, stringifyError } from "./overseer-support";
-import { GIT_BINDING_NAME } from "./agent";
+import { GIT_BINDING_NAME } from "./agent-session";
 import { assertBindingNameFree, type ExternalMessageResponseTargetRegistration } from "./overseer-support";
 import { observerBindingNeed } from "./overseer-binding-info";
 
@@ -163,14 +164,11 @@ export class OverseerImpl extends OverseerBots implements AgentHooks {
       }
     }
 
-    // Backwards compatibility: Prior to the introduction of the `activeAgents` table, we could
-    // only detect abandoned agents by the presence of `activeAgent` in the `AiChatMetadata` for
-    // the chat thread. On the first app update after `activeAgents` is introduced, we could still
-    // have such threads with no record in `activeAgents`. We can't resume these threads, but at
-    // the very least, we should properly cancel them.
-    //
-    // After this change has been deployed, we could plausibly remove this block, though it might
-    // be nice to keep for consistency purposes.
+    // Clear busy markers left without an execution row. cancelAgent() deletes the row and
+    // defers clearing chatMeta.activeAgent to the cancelled turn's teardown; a reset in between
+    // orphans the marker, and this construction-time sweep is the only thing left to clear it.
+    // (It also covers chats from before the activeAgents table existed, whose only trace of a
+    // running agent is the marker itself; those cannot be resumed, only cancelled.)
     for (let thread of Array.from(this.storage.chatMeta.list())) {
       if (thread.activeAgent && !this.runningAgents.has(thread.id)) {
         this.postAgentErrorMessage(thread.id, thread.activeAgent,

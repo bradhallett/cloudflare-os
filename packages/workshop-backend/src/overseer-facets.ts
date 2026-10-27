@@ -10,7 +10,7 @@ import { formatBotSection } from "./bot-config";
 import type { ResolvedBotSkill, UnavailableBotSkill } from "./bot-config";
 import type { UserChatContext } from "./user";
 import type { ActionRecord, ChatBindingEntry, GatekeeperClass, GatekeeperRecord } from "./storage-schema/overseer-storage";
-import { GIT_BINDING_NAME } from "./agent";
+import { GIT_BINDING_NAME } from "./agent-session";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
 import EXPORTS_BINDING_TYPES from "./exports-binding.txt";
 import { readAdminConfig } from "./admin-config";
@@ -27,6 +27,7 @@ import { sanitizeCommandPosition } from "./overseer-message-format";
 import { SlashCommandAuthorizerImpl } from "./overseer-gatekeeper-client";
 import type { RestoreForgerEntrypoint } from "./overseer-harness";
 import { RESTORE_FORGER_WORKER } from "./overseer-harness";
+import { COMPATIBILITY_DATE } from "@gadgets/scripts/worker-config";
 
 /**
  * OverseerFacets: worker/facet loading, gatekeeper usability and description, slash commands, and stub forging.
@@ -253,8 +254,9 @@ export abstract class OverseerFacets extends OverseerChatRuntime {
       };
 
       return {
-        // TODO: compatibility date configuration
-        compatibilityDate: "2026-02-01",
+        // The minimal flag set is deliberate; the compatibility date flows from the repo's
+        // single home (COMPATIBILITY_DATE).
+        compatibilityDate: COMPATIBILITY_DATE,
         compatibilityFlags: [
           // Make ctx.restore() available.
           "allow_irrevocable_stub_storage",

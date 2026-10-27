@@ -13,6 +13,7 @@ import {
 import { buildSnapshotRelease } from "../src/blueprint-release";
 import { GITDIR, GitStore, blobOid, makeGitObjectsFs } from "../src/git-store";
 import { makeOverseerStorage } from "../src/storage-schema/overseer-storage";
+import { COMPATIBILITY_DATE } from "@gadgets/scripts/worker-config";
 import {
   buildPackBytes,
   concatBytes,
@@ -1109,7 +1110,7 @@ describe("consumePack", () => {
     // support BYOB reads"); it works only because Workers RPC delivers it as a byte stream.
     let t = makeCache();
     let sender = env.LOADER.get("pack-sender", () => ({
-      compatibilityDate: "2026-09-04",
+      compatibilityDate: COMPATIBILITY_DATE,
       mainModule: "sender.js",
       modules: {
         "sender.js": `

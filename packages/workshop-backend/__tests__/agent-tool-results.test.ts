@@ -1,5 +1,5 @@
 import {describe, expect, it} from "vitest";
-import {MAX_TOOL_RESULT_CHARS, readFileWindow} from "../src/agent";
+import {MAX_TOOL_RESULT_CHARS, readFileWindow} from "../src/agent-tools";
 import {formatGrep, matchLines, scanWorkpieceForGrep, type GrepScan} from "../src/grep";
 
 describe("grep", () => {

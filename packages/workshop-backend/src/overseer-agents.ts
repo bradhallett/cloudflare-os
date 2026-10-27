@@ -427,6 +427,53 @@ export abstract class OverseerAgents extends OverseerMainline {
     this.traceAgentActionApproval(record, "approved");
   }
 
+  /**
+   * Reject a single pending action: invoke the gatekeeper (unless it is a creation, where the
+   * whole simulated resource goes away instead), mark it rejected, and persist -- the mirror of
+   * applyPendingAction, and with it the single chokepoint where an action transitions to
+   * "rejected". `resolvedBy` is required so the audit log always records the rejecting user.
+   */
+  async rejectPendingAction(record: ActionRecord & {type: "action"},
+                            resolvedBy: AiChatAuthorInfo): Promise<void> {
+    if (record.action === "create") {
+      // Rejecting a creation removes its connection, as disconnecting would (clearing queued
+      // pushes' marks), and rejects every action queued against the simulated resource: none can
+      // apply now. Their gatekeeper-side state goes with the facet's storage, so no rejectAction()
+      // is called.
+      let queued = Array.from(this.storage.actions.pendingByGatekeeper.get(record.gatekeeperId));
+      this.removeGatekeeper(record.gatekeeperId);
+      for (let queuedRecord of queued) {
+        if (queuedRecord.type !== "action") continue;
+        queuedRecord.state = "rejected";
+        queuedRecord.appliedAt = new Date();
+        queuedRecord.resolvedBy = resolvedBy;
+        this.storage.actions.put(queuedRecord);
+        this.traceAgentActionApproval(queuedRecord, "denied");
+        if (queuedRecord.caller.from === "agent") {
+          this.resumeAgentAfterDecision(queuedRecord.caller.chatId, queuedRecord.id);
+        }
+      }
+      return;
+    }
+
+    let gatekeeper = await this.getGatekeeperFacet(record.gatekeeperId);
+    await gatekeeper.rejectAction(record.action);
+
+    record.state = "rejected";
+    record.appliedAt = new Date();
+    record.resolvedBy = resolvedBy;
+    // A rejected push's pending-push marks are removed in the same durable step as the state
+    // change (nothing was transmitted, so nothing became proven). No-op for pushless actions.
+    this.storage.transaction(() => {
+      this.gitCache.clearPushMarks(record.id);
+      this.storage.actions.put(record);
+    });
+    this.traceAgentActionApproval(record, "denied");
+    if (record.caller.from === "agent") {
+      this.resumeAgentAfterDecision(record.caller.chatId, record.id);
+    }
+  }
+
   /** Blocks other messages and agent turns for this chat until the returned object is disposed. */
   reserveChatMessagePreparation(chatId: number): Disposable {
     if (this.preparingChatMessages.has(chatId)) {

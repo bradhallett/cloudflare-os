@@ -1,6 +1,7 @@
 import { WorkerEntrypoint, RpcStub as NativeRpcStub, RpcTarget as NativeRpcTarget } from "cloudflare:workers";
 import type { ChatBindingEntry } from "./storage-schema/overseer-storage";
 import { OverseerImpl } from "./overseer-impl";
+import { COMPATIBILITY_DATE } from "@gadgets/scripts/worker-config";
 
 /** Split out of the former overseer.ts (internal). */
 export const CODE_MODE_HARNESS =
@@ -87,7 +88,7 @@ class PlaceholderRpcTarget extends RpcTarget {
 
 /** Split out of the former overseer.ts (internal). */
 export const RESTORE_FORGER_WORKER: WorkerLoaderWorkerCode = {
-  compatibilityDate: "2026-02-01",
+  compatibilityDate: COMPATIBILITY_DATE,
   compatibilityFlags: [
     // The forger holds no bindings, but lock it down like the code-mode worker anyway.
     "disallow_importable_env",

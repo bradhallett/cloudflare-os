@@ -7,7 +7,7 @@ import type { GrepFileError } from "./worktree-binding";
 import type { WorkpieceId } from "@gadgets/workshop-shared/api";
 import type { GitOid } from "@gadgets/workshop-shared/gatekeeper";
 import { UnreadableContentError, type GitObjectWalker } from "./git-walker";
-import type { WorktreeTurnAccess } from "./agent";
+import type { WorktreeTurnAccess } from "./agent-hooks";
 
 /** A searchable file: its path within the workpiece and full text. */
 export type GrepFile = { path: string, text: string };

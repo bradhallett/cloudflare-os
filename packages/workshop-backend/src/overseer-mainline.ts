@@ -1,6 +1,8 @@
 import { RpcStub, RpcTarget } from "capnweb";
 import { UiBundle, WorkpieceId, ChatGadgetPinRecord, MainlineMergeGadget, ChatGadgetPinState, AiChatAuthorInfo, ConsoleLogSubscriber, ConsoleLogEvent, AffectedCollaborator, BlueprintBinding, AGENT_SPAWNER_CONNECTION_ID } from "@gadgets/workshop-shared/api";
 import { requireTextFiles } from "@gadgets/workshop-shared/code-change";
+import { ConsoleTail } from "./console-tail";
+import { ObserverGatekeepers } from "./observer-gatekeepers";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import type { GadgetRecord } from "./storage-schema/overseer-storage";
 import { commitIdentityForAuthor, filesEqual, threeWayMerge } from "./git-store";
@@ -498,104 +500,60 @@ export abstract class OverseerMainline extends OverseerChanges {
     }
   }
 
-  #tailSubscribers: Set<RpcStub<ConsoleLogSubscriber>> = new Set();
+  /**
+   * The workspace's live console tail (see ConsoleTail): the connected log subscribers and the
+   * fan-out of gadget log events. Kept as a collaborator so the subscriber set lives in exactly
+   * one place; deliverGadgetLogs()/subscribeToConsoleLogs() delegate to it.
+   */
+  protected consoleTail = new ConsoleTail();
 
   async deliverGadgetLogs(chatId: number | null, logs: ConsoleLogEvent[]) {
-    for (let sub of this.#tailSubscribers) {
-      sub.event(chatId, logs).catch(() => {
-        sub[Symbol.dispose]();
-        this.#tailSubscribers.delete(sub);
-      });
-    }
+    this.consoleTail.deliver(chatId, logs);
   }
 
   async subscribeToConsoleLogs(subscriber: RpcStub<ConsoleLogSubscriber>): Promise<RpcStub<{}>> {
-    let sub = subscriber.dup();
-    sub.onRpcBroken(_ => unsubscribe());
-    this.#tailSubscribers.add(sub);
-
-    let self = this;
-    function unsubscribe() {
-      self.#tailSubscribers.delete(sub);
-      sub[Symbol.dispose]();
-    }
-
-    // @ts-expect-error Bugs in native RPC types make this not work currently.
-    return new NativeRpcStub<{}>({
-      [Symbol.dispose]() {
-        unsubscribe();
-      }
-    });
+    return this.consoleTail.subscribe(subscriber);
   }
 
-  // Tail of the in-flight addObserver/removeObserver chain per `${observerId}/${gatekeeperId}`
-  // (see #withObserverGatekeeperLock). In-memory only, entries dropped as each chain drains; the
-  // calls it orders are themselves re-run/repaired across DO restarts.
-  #observerGatekeeperLocks = new Map<string, Promise<void>>();
+  /**
+   * The workspace's observer bookkeeping (see ObserverGatekeepers): the in-flight
+   * addObserver/removeObserver chain per (observer, gatekeeper) pair, and the best-effort
+   * teardowns that walk them. Kept as a collaborator so the lock state and removal routines
+   * live in exactly one place; the methods below delegate to it.
+   */
+  protected observerGatekeepers = new ObserverGatekeepers({
+    getGatekeeperFacet: id => this.getGatekeeperFacet(id),
+    storage: {
+      gatekeepers: this.storage.gatekeepers,
+      observers: this.storage.observers,
+    },
+    logger: this.logger,
+  });
 
   /**
-   * Serialize this DO's addObserver/removeObserver RPCs per (observer, gatekeeper) pair. The
-   * overseer is the only caller of either, so ordering our own calls is enough to close the race
-   * between an exclusion teardown's in-flight removeObserver and a fresh open's addObserver on
-   * the same pair: the add either lands first or waits for the removal and re-registers cleanly.
+   * Serialize this DO's addObserver/removeObserver RPCs per (observer, gatekeeper) pair
+   * (see ObserverGatekeepers.withLock).
    */
   protected async withObserverGatekeeperLock<T>(
       observerId: string, gatekeeperId: number, fn: () => Promise<T>): Promise<T> {
-    let key = `${observerId}/${gatekeeperId}`;
-    let prior = this.#observerGatekeeperLocks.get(key) ?? Promise.resolve();
-    let release!: () => void;
-    let tail = new Promise<void>(resolve => { release = resolve; });
-    this.#observerGatekeeperLocks.set(key, tail);
-    tail.then(() => {
-      // Drop the entry once the chain drains; a newer tail means someone queued behind us.
-      if (this.#observerGatekeeperLocks.get(key) === tail) {
-        this.#observerGatekeeperLocks.delete(key);
-      }
-    });
-    await prior;  // never rejects: each holder settles its own tail via the finally below
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
+    return await this.observerGatekeepers.withLock(observerId, gatekeeperId, fn);
   }
 
   /**
-   * Best-effort `removeObserver(observerId)` across the given gatekeeper ids. Never throws; logs
-   * and continues on error. An orphaned observer entry only ever causes superfluous future checks,
-   * never a data leak: a registration is what admits an open, and every open re-runs addObserver,
-   * so a stale one grants nothing on its own.
+   * Best-effort `removeObserver(observerId)` across the given gatekeeper ids (see
+   * ObserverGatekeepers.removeFromGatekeepers).
    */
-  protected async removeObserverFromGatekeepers(observerId: string, gatekeeperIds: number[]): Promise<void> {
-    await Promise.all(gatekeeperIds.map(async id => {
-      try {
-        await this.withObserverGatekeeperLock(observerId, id,
-            async () => (await this.getGatekeeperFacet(id)).removeObserver(observerId));
-      } catch (err) {
-        this.logger.warn("failed to remove observer from gatekeeper", {
-          event: "gatekeeper.observer.remove.failed", gatekeeperId: id, observerId, error: err,
-        });
-      }
-    }));
+  protected async removeObserverFromGatekeepers(observerId: string, gatekeeperIds: number[])
+      : Promise<void> {
+    await this.observerGatekeepers.removeFromGatekeepers(observerId, gatekeeperIds);
   }
 
   /**
-   * Tear down observer records for collaborators who lost access as a result of a sharing change.
-   * For each affected collaborator who is now fully unauthorized (newRole === null) and has an
-   * observer record: best-effort removeObserver on all gatekeeper facets, then delete the record.
-   * All calls are best-effort -- an orphaned observer entry only causes superfluous future checks,
-   * never a data leak: a registration is what admits an open, and every open re-runs addObserver,
-   * so a stale one grants nothing on its own. See observers-implementation-plan.md §5 Step 6.
+   * Tear down observer records for collaborators who lost access as a result of a sharing
+   * change (see ObserverGatekeepers.tearDownLostObservers).
    */
   async tearDownLostObservers(affected: AffectedCollaborator[]): Promise<void> {
-    let gatekeeperIds = [...this.storage.gatekeepers.list()].map(gk => gk.id);
-    for (let entry of affected) {
-      if (entry.newRole !== null) continue;  // downgraded but still has access -> keep record
-      let observer = this.storage.observers.get(entry.profile.id);
-      if (!observer) continue;
-      this.storage.observers.delete(observer.profileId);
-      await this.removeObserverFromGatekeepers(observer.observerId, gatekeeperIds);
-    }
+    await this.observerGatekeepers.tearDownLostObservers(affected);
   }
 
   /**

@@ -1,12 +1,12 @@
 import { RpcStub } from "capnweb";
-import { WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, ChatCodeBase, AiChatMetadata, AiChatSubscriber, AiChatAuthorInfo, CapsuleSpecifier, CollaboratorRole, BlueprintOutput, AiChatStreamEvent, ChatAttachmentRef, PresenceParticipant, PresenceSubscriber, validateBindingName } from "@gadgets/workshop-shared/api";
+import { WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, ChatCodeBase, AiChatMetadata, AiChatSubscriber, AiChatAuthorInfo, CapsuleSpecifier, CollaboratorRole, BlueprintOutput, AiChatStreamEvent, ChatAttachmentRef, PresenceSubscriber, validateBindingName } from "@gadgets/workshop-shared/api";
 import type { FileContent, CodeContent, CodeChange } from "@gadgets/workshop-shared/code-change";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { chatKeyPrefix, makeOverseerStorage } from "./storage-schema/overseer-storage";
 import type { BindingRecord, ChatChangeRecord, ExternalMessageRecord, GadgetRecord, OverseerStorage, WorkpieceRecord, WorktreeRecord, WorkspaceOwnerSubject } from "./storage-schema/overseer-storage";
 import { GitStore } from "./git-store";
 import { WorkspaceGitCache } from "./git-cache";
-import type { WorktreeTurnAccess } from "./agent";
+import type { WorktreeTurnAccess } from "./agent-hooks";
 import { scanWorkpieceForGrep } from "./grep";
 import type { GrepScan } from "./grep";
 import { isTurnPrompt } from "./agent-compaction";
@@ -18,8 +18,10 @@ import { createWorkshopLogger, type WorkshopLogger } from "./observability";
 import type { LiveChatContext, SessionKind } from "./overseer-support";
 import { LiveChatState } from "./live-chat-state";
 import { AGENT_KEEPALIVE_ALARM_MS, AGENT_RESPONSE_DELIVERED_RETENTION_MS, CHAT_CHANGE_RETIRED_TTL_MS } from "./overseer-support";
+import { PresenceRegistry } from "./presence-registry";
 import { ChatCacheWarmer } from "./chat-cache-warming";
 import { CHAT_ATTACHMENT_EXTENSION_BY_MIME } from "./overseer-chat-attachments";
+import { seedEditBases, applyPrefetchedEditBases } from "./code-content";
 import type { OverseerImpl } from "./overseer-impl";
 
 const logger = createWorkshopLogger("workshop.overseer");
@@ -181,75 +183,15 @@ export abstract class OverseerCore {
   }
 
   /**
-   * Active viewers, keyed by profileId. Multiple sessions from the same user collapse into one
-   * participant.
+   * The workspace's presence roster and its subscribers (see PresenceRegistry). Kept as a
+   * collaborator so roster state lives in exactly one place; joinPresence() and
+   * addPresenceSubscriber() delegate to it.
    */
-  protected presence = new Map<string, {
-    key: string;
-    user: AiChatAuthorInfo;
-    sessions: Map<object, CollaboratorRole>;
-  }>();
-
-  /** Subscribers to roster changes, registered via subscribeToPresence(). */
-  protected presenceSubscribers = new Map<object, RpcStub<PresenceSubscriber>>();
-
-  #presenceKeyCounter = 0;
-
-  #effectivePresenceRole(sessions: Map<object, CollaboratorRole>): CollaboratorRole {
-    for (let role of sessions.values()) {
-      if (role === "build") return "build";
-    }
-    return "use";
-  }
-
-  #toParticipant(profileId: string): PresenceParticipant {
-    let entry = this.presence.get(profileId)!;
-    return { key: entry.key, user: entry.user, role: this.#effectivePresenceRole(entry.sessions) };
-  }
-
-  #broadcastPresenceAdd(participant: PresenceParticipant) {
-    for (let [token, sub] of this.presenceSubscribers) {
-      sub.add(participant).catch(() => this.#removePresenceSubscriber(token));
-    }
-  }
-
-  #broadcastPresenceRemove(key: string) {
-    for (let [token, sub] of this.presenceSubscribers) {
-      sub.remove(key).catch(() => this.#removePresenceSubscriber(token));
-    }
-  }
+  protected presence = new PresenceRegistry();
 
   /** Mark a session as present. Returns a function that removes it. */
   joinPresence(profileId: string, user: AiChatAuthorInfo, role: CollaboratorRole): () => void {
-    let token = {};
-    let entry = this.presence.get(profileId);
-    if (entry) {
-      let before = this.#effectivePresenceRole(entry.sessions);
-      entry.sessions.set(token, role);
-      if (this.#effectivePresenceRole(entry.sessions) !== before) {
-        this.#broadcastPresenceAdd(this.#toParticipant(profileId));
-      }
-    } else {
-      this.presence.set(profileId,
-          { key: `p${++this.#presenceKeyCounter}`, user, sessions: new Map([[token, role]]) });
-      this.#broadcastPresenceAdd(this.#toParticipant(profileId));
-    }
-
-    let removed = false;
-    return () => {
-      if (removed) return;
-      removed = true;
-      let e = this.presence.get(profileId);
-      if (!e) return;
-      let before = this.#effectivePresenceRole(e.sessions);
-      e.sessions.delete(token);
-      if (e.sessions.size === 0) {
-        this.presence.delete(profileId);
-        this.#broadcastPresenceRemove(e.key);
-      } else if (this.#effectivePresenceRole(e.sessions) !== before) {
-        this.#broadcastPresenceAdd(this.#toParticipant(profileId));
-      }
-    };
+    return this.presence.join(profileId, user, role);
   }
 
   // Live counts of everything a collaborator holds (or is about to hold) a role's access through,
@@ -291,23 +233,7 @@ export abstract class OverseerCore {
 
   /** Subscribe to roster changes. The current roster is delivered immediately via init(). */
   addPresenceSubscriber(subscriber: RpcStub<PresenceSubscriber>): RpcStub<{}> {
-    subscriber = subscriber.dup();
-    let token = {};
-    this.presenceSubscribers.set(token, subscriber);
-    let snapshot = [...this.presence.keys()].map(id => this.#toParticipant(id));
-    subscriber.init(snapshot).catch(() => this.#removePresenceSubscriber(token));
-    subscriber.onRpcBroken(() => this.#removePresenceSubscriber(token));
-    // @ts-expect-error Bugs in native RPC types make this not work currently.
-    return new NativeRpcStub<{}>({
-      [Symbol.dispose]: () => this.#removePresenceSubscriber(token),
-    });
-  }
-
-  #removePresenceSubscriber(token: object) {
-    let sub = this.presenceSubscribers.get(token);
-    if (!sub) return;
-    this.presenceSubscribers.delete(token);
-    sub[Symbol.dispose]();
+    return this.presence.subscribe(subscriber);
   }
 
   protected getLiveChat(chatId: number): LiveChatContext {
@@ -920,36 +846,16 @@ export abstract class OverseerCore {
   }
 
   /**
-   * The lazy half of worktree chat content: for each `edit` in `change` that targets a worktree
-   * path the content map does not yet hold, reads the file at the worktree's pinned base commit
-   * and seeds it into (a copy of) the content, so the edit applies and validates exactly as if
-   * the whole base tree had been materialized. Only edits need bases (a `set` is valid against
-   * any state and a `remove` of an absent path is a no-op), so untouched files are never read. A
-   * path absent from the base stays absent -- "edit of absent file" is then the change's own
-   * validation error -- while unreadable content (oversized/binary/symlink) throws its
-   * descriptive error, which ingestion surfaces to the submitter. (One deliberate quirk falls
-   * out for hand-rolled clients only: a row that edits a path an earlier row removed re-seeds
-   * the base text rather than failing -- every fold applies the same rule in the same order, so
-   * all replicas agree; the shipped producers never emit that sequence.)
+   * Seeds a change's worktree edit bases into (a copy of) the content before it applies: every
+   * edit of a path the content map does not yet hold is read at the worktree's pinned base
+   * commit. See seedEditBases in code-content.ts for the rule and its quirks; this is the
+   * ingestion-side fold.
    */
   async seedWorktreeEditBases(content: CodeContent, change: CodeChange,
                               worktreeBases: Map<WorkpieceId, string>): Promise<CodeContent> {
-    let result = content;
-    for (let [key, entries] of Object.entries(change)) {
-      let worktreeId = Number(key);
-      let base = worktreeBases.get(worktreeId);
-      if (base === undefined) continue;
-      for (let [path, fileChange] of entries) {
-        if (!("edit" in fileChange) || result.get(worktreeId)?.has(path)) continue;
-        let text = await this.gitCache.walker.readFileAtCommitIfExists(base, path);
-        if (text === undefined) continue;
-        if (result === content) result = new Map(content);
-        let files = new Map(result.get(worktreeId));
-        files.set(path, text);
-        result.set(worktreeId, files);
-      }
-    }
-    return result;
+    return await seedEditBases(content, change,
+        id => worktreeBases.get(id) !== undefined,
+        (id, path) => this.gitCache.walker.readFileAtCommitIfExists(worktreeBases.get(id)!, path));
   }
 
   /**
@@ -978,61 +884,36 @@ export abstract class OverseerCore {
                                       count: number}>();
 
   /**
-   * The async half of getCurrentChatContent's live-row worktree seeding: like
-   * seedWorktreeEditBases, but additionally records every looked-up base into `seeds`
-   * (`${worktreeId}:${path}` -> text, or null for a path absent from the base), so the
-   * synchronous tail can re-seed without awaiting.
+   * The async half of getCurrentChatContent's live-row worktree seeding: seedEditBases with a
+   * memoizing reader that records every looked-up base into `seeds` (`${worktreeId}:${path}` ->
+   * text, or null for a path absent from the base), so the synchronous tail can re-seed without
+   * awaiting.
    */
   protected async prefetchWorktreeSeeds(content: CodeContent, change: CodeChange,
                                worktreeBases: Map<WorkpieceId, string>,
                                seeds: Map<string, FileContent | null>): Promise<CodeContent> {
-    let result = content;
-    for (let [key, entries] of Object.entries(change)) {
-      let worktreeId = Number(key);
-      let base = worktreeBases.get(worktreeId);
-      if (base === undefined) continue;
-      for (let [path, fileChange] of entries) {
-        if (!("edit" in fileChange) || result.get(worktreeId)?.has(path)) continue;
-        let key = `${worktreeId}:${path}`;
-        let text = seeds.get(key);
-        if (text === undefined) {
-          text = await this.gitCache.walker.readFileAtCommitIfExists(base, path) ?? null;
-          seeds.set(key, text);
-        }
-        if (text === null) continue;
-        if (result === content) result = new Map(content);
-        let files = new Map(result.get(worktreeId));
-        files.set(path, text);
-        result.set(worktreeId, files);
-      }
-    }
-    return result;
+    return await seedEditBases(content, change,
+        id => worktreeBases.get(id) !== undefined,
+        async (id, path) => {
+          let key = `${id}:${path}`;
+          let text = seeds.get(key);
+          if (text === undefined) {
+            text = await this.gitCache.walker.readFileAtCommitIfExists(worktreeBases.get(id)!, path) ?? null;
+            seeds.set(key, text);
+          }
+          return text;
+        });
   }
 
   /**
-   * The synchronous half: seeds a change's worktree edit bases from the prefetched map, or
-   * returns null when a needed base wasn't prefetched (the row landed mid-prefetch; the caller
-   * retries the whole read).
+   * The synchronous half: applyPrefetchedEditBases seeds from the prefetched map, or returns
+   * null when a needed base wasn't prefetched (the row landed mid-prefetch; the caller retries
+   * the whole read).
    */
   protected applyPrefetchedWorktreeSeeds(content: CodeContent, change: CodeChange,
                                 worktreeBases: Map<WorkpieceId, string>,
                                 seeds: Map<string, FileContent | null>): CodeContent | null {
-    let result = content;
-    for (let [key, entries] of Object.entries(change)) {
-      let worktreeId = Number(key);
-      if (!worktreeBases.has(worktreeId)) continue;
-      for (let [path, fileChange] of entries) {
-        if (!("edit" in fileChange) || result.get(worktreeId)?.has(path)) continue;
-        let text = seeds.get(`${worktreeId}:${path}`);
-        if (text === undefined) return null;
-        if (text === null) continue;  // absent from the base: the edit's own validation reports
-        if (result === content) result = new Map(content);
-        let files = new Map(result.get(worktreeId));
-        files.set(path, text);
-        result.set(worktreeId, files);
-      }
-    }
-    return result;
+    return applyPrefetchedEditBases(content, change, worktreeBases, seeds);
   }
 
   /** Broadcast one accepted row to chat subscribers (see AiChatSubscriber.changeApplied). */
