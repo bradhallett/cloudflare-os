@@ -725,7 +725,9 @@ export class ActionJournal<A> {
 
   /**
    * Bumps the namespace's storage version, invalidating every journal instance's cached
-   * projections of it. Writes through the raw storage, outside the guarded facade.
+   * projections of it. Writes through the raw storage, outside the guarded facade. The
+   * read-modify-write leans on a Durable Object running one activation at a time; a kit that
+   * ever documents concurrent use must make this bump atomic first.
    */
   #bumpVersion(): void {
     this.#rawKv.put(this.#versionKey, (this.#rawKv.get<number>(this.#versionKey) ?? 0) + 1);
