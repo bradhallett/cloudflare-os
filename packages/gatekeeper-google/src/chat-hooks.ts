@@ -156,7 +156,10 @@ export class ChatHookDriver extends DurableObject<Env> {
       .find(([, subscription]) => subscription.name === subscriptionName)?.[0].slice("sub:".length);
     if (authority === undefined) return;
     const now = Date.now();
-    for (const [regKey, registration] of this.#registrations()) {
+    // Listed up front: enqueue lists the delivery queue against its pending cap, which would
+    // invalidate a live iterator mid-loop.
+    const registrations = [...this.#registrations()];
+    for (const [regKey, registration] of registrations) {
       if (registration.authority !== authority) continue;
       for (const message of messages) {
         // Never echo the account's own posts back to it, and omit app-private messages as every
