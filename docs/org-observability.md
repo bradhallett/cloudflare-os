@@ -15,10 +15,11 @@ picture — never on user-only surfaces:
   `logger.with({orgId})`, derived once from the org's own record, so every `org.*` event
   (`org.created`, `org.member.invited`, ...) names its org without each call saying so. Before a
   DO's org is initialized there is no id yet, and events carry none.
-- **Org-owned workspaces** (the Overseer of a workspace whose owner subject is an org): the
-  workspace's logger folds the owning org in the same way, from the moment of `transferToOrg`
-  (one-way), and the workspace's product activity events record the org (below). A user-owned
-  workspace records no org anywhere.
+- **Org-owned workspaces** (the Overseer of a workspace whose owner subject is an org — a
+  subject only the since-removed org-transfer flow ever wrote, so only historic org-owned
+  workspaces have one): while that flow lived, the workspace's logger folded the owning org in
+  the same way and its product activity events recorded the org (below). Nothing folds or
+  stamps an org anymore; a user-owned workspace records no org anywhere.
 
 ## The org dimension on activity events
 
@@ -33,9 +34,10 @@ truth; the read side resolves names from it, never a raw `blobN`):
   owner and workspace copies. Counting events there never double-counts: each event has exactly
   one org point.
 
-The write path is `OverseerCore.recordGadgetAnalytics`, which stamps the org on every gadget
-event an org-owned workspace records. `transferToOrg` adopts the org first, so even the transfer
-completing is logged with it.
+The write path is `OverseerCore.recordGadgetAnalytics`. The org stamp was adopted on the wake
+path of the since-removed org-transfer flow, so nothing stamps it anymore: the org dimension
+above is populated only by historic events from org-owned workspaces recorded while the flow
+lived.
 
 ## Per-org rollup queries
 

@@ -637,10 +637,11 @@ it.concurrent("a gadget switches to a blueprint built on an earlier release of t
   expect(await bobWs.listChangedPaths(bobsMainline, bobsMerge)).toEqual(["bob.js"]);
 
   // He publishes the result as a blueprint of his own. Its first release merges Alice's into a
-  // root that is the blueprint's own, and names nothing else: the merge his chat made is his.
+  // root that is the blueprint's own: the delta from Alice's release names his root's README.md
+  // and the change his chat made, which the release takes as its own head.
   const bobs = await publish(bobPublic, bobWs, bobGadget, "Bob's");
   const b1 = bobs.release;
-  expect(await bobWs.listChangedPaths(a2, b1)).toEqual(["bob.js"]);
+  expect(await bobWs.listChangedPaths(a2, b1)).toEqual(["README.md", "bob.js"]);
 
   // Carol's gadget is from Alice's third release, and has a change of its own.
   const a3 = await republish(alicePublic, aliceWs, alices, A3);
@@ -704,7 +705,7 @@ it.concurrent("a gadget with no lineage takes a blueprint only over a base the c
   using gadget = await ws.getGadget(gadgetId);
   const first = await gadgetNow(ws, gadgetId);
   expect(first.upstream).toEqual({});
-  const own = await commitCode(ws, gadgetId, { "client.js": "mine\n", ...NOTES });
+  await commitCode(ws, gadgetId, { "client.js": "mine\n", ...NOTES });
 
   const chats = await ws.listChats();
   expect(await gadget.applyBlueprint(blueprintId, { modelId: null }))
