@@ -99,7 +99,7 @@ vi.mock('./features/blueprint-updates/useBlueprintUpdateAvailable', () => ({
 
 // The two children whose reports decide when the editor's layout is ready. The chat mock counts
 // mounts: it must climb to 2 when navigation remounts the workspace body.
-vi.mock('./ChatInterface', () => ({
+vi.mock('./features/chat/ChatInterface', () => ({
   default: ({ onChatCountChange }: { onChatCountChange: (count: number, hasChatZero: boolean) => void }) => {
     useEffect(() => {
       mocks.mounts.push('chat')
