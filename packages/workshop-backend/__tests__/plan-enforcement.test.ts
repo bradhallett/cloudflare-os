@@ -42,6 +42,7 @@ type UserInternals = UserDurableObject & {
       list(): Array<{ id: number; vendorId: string }>;
       put(record: unknown): void;
     };
+    created: { get(): boolean; put(value: boolean): void };
     nextAccountId: { get(): number; put(next: number): void };
   };
   accounts: { uiAccountRecord(accountId: number): Promise<unknown> };
@@ -781,5 +782,61 @@ describe("admin-disabled and dormant accounts", () => {
         .toEqual({
           error: 'The "fakekee" gatekeeper is disabled on this deployment by an administrator.',
         });
+  });
+  // A recording stand-in for the browser's account-list subscription stub: dup() keeps the
+  // stub alive past the RPC return, exactly the shape the store calls.
+  function recordingSubscriber() {
+    const added: Array<{ id: number; vendorId: string }> = [];
+    const stub = {
+      dup: () => stub,
+      add: async (id: number, _description: unknown, _vendorDescription: unknown,
+                  _resources: unknown, _credentialsValid: boolean, vendorId: string) => {
+        added.push({ id, vendorId });
+      },
+      remove: (_id: number) => {},
+      ready: async () => {},
+      [Symbol.dispose]: () => {},
+    };
+    return { added, stub: stub as unknown as Parameters<
+        UserDurableObject["subscribeConnectedAccounts"]>[0] };
+  }
+
+  it("listAddable hides an admin-disabled ambient vendor the user hasn't added", async () => {
+    // Control: the optional ambient vendor is offered for opt-in...
+    const offered = planUser(null, {}, state => ({ GATEKEEPER_AMBIENTKEE: ambientVendor(state) }));
+    expect((await offered.inDo(user => user.listAddableGatekeepers())).map(rec => rec.id))
+        .toEqual(["ambientkee"]);
+    // ...but an administrator's disable hides it from the same listing.
+    const hidden = planUser(
+        null, { disabledGatekeepers: ["ambientkee"] },
+        state => ({ GATEKEEPER_AMBIENTKEE: ambientVendor(state) }));
+    expect(await hidden.inDo(user => user.listAddableGatekeepers())).toEqual([]);
+  });
+
+  it("a subscription pushes an on-plan account but not the same account off-plan", async () => {
+    const { knobs, inDo } = dormantUser({}, ON_PLAN);
+    await inDo((user, state) => seedConnectedAccount(user, state));
+    const onPlan = recordingSubscriber();
+    await inDo(user => user.subscribeConnectedAccounts(onPlan.stub));
+    expect(onPlan.added.map(rec => rec.vendorId)).toEqual(["ambientkee"]);
+
+    knobs.plan = DOWNGRADED;
+    const offPlan = recordingSubscriber();
+    await inDo(user => user.subscribeConnectedAccounts(offPlan.stub));
+    expect(offPlan.added).toEqual([]);  // the Connectors list can't show what the picker omits
+  });
+
+  it("an off-plan vendor offers no selectable gatekeeper users", async () => {
+    const { knobs, inDo } = dormantUser({}, ON_PLAN);
+    await inDo((user, state) => {
+      seedConnectedAccount(user, state);
+      (user as UserInternals).storage.created.put(true);  // a created user, past first login
+    });
+    expect(await inDo(user => user.selectableGatekeeperUsers("ambientkee")))
+        .toHaveLength(1);  // control: the account is selectable while on-plan
+
+    knobs.plan = DOWNGRADED;
+    expect(await inDo(user => user.selectableGatekeeperUsers("ambientkee")))
+        .toEqual([]);
   });
 });
