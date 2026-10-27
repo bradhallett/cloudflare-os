@@ -3,16 +3,47 @@
 // bookkeeping, and the content reads that make tool writes safe. Extracted from the agent loop
 // (agent.ts) so the loop file carries the model conversation and this one carries turn state.
 
+import type { AiToolCall } from "@gadgets/workshop-shared/api";
 import type { AssistantMessage, Message, TextContent, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
-import type { AgentHooks, SeedBindingInfo } from "./agent-hooks";
+import type { AgentHooks, SeedBindingInfo, WorktreeTurnAccess, AgentStepChange } from "./agent-hooks";
+import type { StoredAssistantMessage, StoredToolCall } from "./storage-schema/overseer-storage";
+
+export type AgentProgress = {
+  executionId: string;
+  barrierSequence: number;
+};
+
+
+
+
+
+/**
+ * Snapshots a completed step's AssistantMessage for persistence. See StoredAssistantMessage for
+ * why this copies everything and subtracts rather than picking fields. (Exported for tests.)
+ */
+export function makeStoredAssistantMessage(message: AssistantMessage): StoredAssistantMessage {
+  return {
+    ...message,
+    content: message.content.map(block => {
+      if (block.type !== "toolCall") return block;
+      let stored: StoredToolCall & {arguments?: Record<string, unknown>} = {...block};
+      delete stored.arguments;
+      return stored;
+    }),
+  };
+}
 import { zeroUsage } from "./ai-invoke";
+import { createWorkshopLogger, obsContext } from "./observability";
+import { createTracer } from "@gadgets/observability/tracing";
+import { CodePreviewManager, ExecuteCodeStreamManager } from "./code-preview";
+import { codeChangeSerializedSize, MAX_CODE_CHANGE_SIZE, validateCodeChangeSchema } from "@gadgets/workshop-shared/code-change";
 import { chatChangeStatuses } from "./agent-compaction";
 import { ChatBindingScope } from "./project-chat-log";
 import { blobOid } from "./git-store";
 import { createTwoFilesPatch, FILE_HEADERS_ONLY } from "diff";
 import { seedEditBases } from "./code-content";
 import type { ModelHandle } from "./ai-models";
-import { AlwaysAvailableResource, BlueprintMerge, ChatGadgetPin, WorkpieceId } from "@gadgets/workshop-shared/api";
+import { AlwaysAvailableResource, AiChatStreamEvent, BlueprintMerge, ChatGadgetPin, WorkpieceId } from "@gadgets/workshop-shared/api";
 import { applyCodeChange, type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
 import type { CompactionProjectionMessage } from "./agent-compaction";
 import { dedupCatalogsForBot } from "./bot-config";
@@ -99,6 +130,9 @@ export function applyPendingEditToText(content: string | null, edit: ReplayPendi
 export function makeReplayAssistantMessage(
     content: (TextContent | ToolCall)[], model: ModelHandle["model"],
     timestamp: number): AssistantMessage {
+
+
+
   return {
     role: "assistant",
     content,
@@ -157,6 +191,22 @@ export function formatUnifiedDiff(
 }
 
 
+/** Content-free counters for rejected transforms; diagnostics must contain no paths or text. */
+export function agentCodeChangeShape(change: CodeChange) {
+  const shape = {changeWorkpieceCount: Object.keys(change).length, changeFileCount: 0, changeEmptyPathCount: 0};
+  for (const entries of Object.values(change)) if (Array.isArray(entries)) {
+    for (const entry of entries) if (Array.isArray(entry)) {
+      ++shape.changeFileCount;
+      if (entry[0] === "") ++shape.changeEmptyPathCount;
+    }
+  }
+  return shape;
+}
+
+const logger = createWorkshopLogger("workshop.agent");
+
+const traced = createTracer(obsContext.get);
+
 /**
  * Builds the mutable state one runAgentPass turn works on: gadget/workspace snapshots, worktree
  * pin bases and bases-fault handling, replay application, and the file-read ledger. Everything
@@ -178,8 +228,10 @@ export async function createTurnSession(deps: {
   chatId: number;
   checkpoint: ChatHistory["checkpoint"];
   chatMessages: ChatHistory["chatMessages"];
+  progress: AgentProgress;
+  progressLogger: ReturnType<typeof createWorkshopLogger>;
 }) {
-  const {hooks, handle, chatId, checkpoint, chatMessages} = deps;
+  const {hooks, handle, chatId, checkpoint, chatMessages, progress, progressLogger} = deps;
   // The workspace's gadget registry, snapshotted at the start of the turn (gadgets provisional
   // to other chats are excluded -- they belong to those chats' proposed changes). This is the
   // enumeration source of truth for which Y.Doc roots hold gadget files (roots of gadgets
@@ -769,7 +821,169 @@ export async function createTurnSession(deps: {
     modelMessages.push(...makeReplayObservation(sequence, text, handle.model, timestamp));
   };
 
+  // The step buffer: the current step's tool edits, applied to the session content as they
+  // buffer but durable (and broadcast) only at the step's persistence barrier
+  // (AgentHooks.commitAgentStep), so a crash loses the whole step -- transcript and effects
+  // together -- and the resumed model re-runs it cleanly. Turn-owned and passed explicitly
+  // where needed (the barrier now; executeCodeMode once worktree writes join it). `bytes` is
+  // the buffered changes' summed codeChangeSerializedSize, checked against MAX_CODE_CHANGE_SIZE
+  // at each write call (see appendAgentEdit).
+  let stepBuffer = {changes: [] as AgentStepChange[], bytes: 0};
+
+  // (A crashed predecessor leaves no stranded state to recover here: each step's rows, pins,
+  // creation/binding stamps and messages are committed in one barrier transaction, so replay of
+  // the surviving log accounts for everything durable, and a mid-step crash durably kept
+  // nothing but unstamped registry records -- reaped by reconcilePendingGadgets before this
+  // turn started.)
+
+  let toolCallNotes = new Map<string, Partial<AiToolCall>>();
+
+  // Error-path notes for tool calls, merged into the persisted tool-call log at the turn_end
+  // barrier. A tool that fails throws (so the model sees an error result), but pi's conversion
+  // of a thrown error discards the tool's `details`, so the catch blocks record what the log
+  // needs (the error text, plus e.g. observedCodeVersion) here before rethrowing.
+  // Success-path notes ride the tool result's `details` instead.
+
+
+  let connectionRequested = false;
+
+  // Set to true once the agent has successfully created a connection request this turn. Used by
+  // finishTurn to end the turn (the agent must wait for the user to accept/deny). A
+  // *rejected* requestConnection call leaves this false so the agent can fix the request and retry
+  // without the turn ending (which would strand it, since there'd be no card to accept/deny and
+  // thus no resume).
+
+  // Latched by finishTurn when this step submitted an awaitDecision action. The awaited turn_end
+  // barrier persists the action before the loop ends and waits for approval to resume it.
+  let awaitingActionDecision = false;
+
+  // JavaScript clocks can be frozen through synchronous SQL/apply work in production. Let the
+  // runtime span own timing; the logs identify phase/order, not a duration or a disk-flush ACK.
+  let persistStep = <T>(operation: () => Promise<T>): Promise<T> => traced("agent.step.persist", async span => {
+    const sequence = ++progress.barrierSequence;
+    span.setAttribute("chatId", chatId);
+    span.setAttribute("executionId", progress.executionId);
+    span.setAttribute("sequence", sequence);
+    progressLogger.debug("agent persistence started", {event: "agent.step.persist.started", sequence});
+    try {
+      const result = await operation();
+      progressLogger.debug("agent persistence completed", {event: "agent.step.persist.completed", sequence});
+      return result;
+    } catch (error) {
+      progressLogger.debug("agent persistence failed", {event: "agent.step.persist.failed", sequence});
+      throw error;
+    }
+  });
+
+  // Buffer one file edit into the step and apply it to the session content; it becomes durable
+  // (row + broadcast) only at the step's persistence barrier. The first write to an unpinned
+  // gadget with committed code pins it at the given head -- always the current head, never the
+  // head an earlier read of this turn observed: a pin at an older head would silently drop
+  // whatever another chat accepted since (editFile's gate is what stops an edit anchored to
+  // such a read; a whole-file write needs no such check). The
+  // pin is validated and mirrored into the chat's code base when the barrier appends the row;
+  // within the step, later tools read the edit through the session content. The first write to
+  // an unpinned worktree pins it too, at its accepted commit, with nothing to declare (see
+  // pinWorktreeInSession).
+  let appendAgentEdit = (
+      workpieceId: WorkpieceId, change: CodeChange,
+      pin?: {baseCommit: string, baseFiles: Map<string, string>}) => {
+    try { validateCodeChangeSchema(change); }
+    catch (error) {
+      logger.warn("invalid agent transform rejected before buffering", {
+        event: "agent.step.change.invalid", chatId, changeStage: "buffer", ...agentCodeChangeShape(change),
+      });
+      throw error;
+    }
+    // Bound the step's total: the barrier writes the buffer as exactly one "changes" message,
+    // which must fit in one storage record, or the step's edits would be lost. Composition never
+    // exceeds the sum of its inputs' sizes, so the summed size bounds the message's change.
+    // The failed call buffers nothing -- everything buffered before it persists normally at the
+    // barrier -- and the error tells the model how to adapt: a single file write that is too
+    // large alone fails the same way every step, so its error says how to write the file
+    // instead. (This also bounds createGadget's blueprint copy, which buffers as one change.)
+    let size = codeChangeSerializedSize(change);
+    if (stepBuffer.bytes + size > MAX_CODE_CHANGE_SIZE) {
+      let oneFile = Object.values(change).flat().length === 1;
+      throw new Error(stepBuffer.changes.length === 0 && oneFile
+          ? "This write is too large to make in one step. Write the file in smaller parts, " +
+            "for example by splitting it into several files, or by writing part of it and then " +
+            "adding the rest with edits."
+          : "Too many code changes in one step. End this response; the changes made so far " +
+            "are being saved, and you can continue the work in your next step.");
+    }
+    // Apply first: an inapplicable change must throw before anything buffers.
+    let newContent = sessionContent;
+    if (pin !== undefined) {
+      newContent = new Map(newContent);
+      newContent.set(workpieceId, pin.baseFiles);
+    }
+    newContent = applyCodeChange(newContent, change);
+    stepBuffer.changes.push({
+      change,
+      ...(pin !== undefined ? {pin: {gadgetId: workpieceId, baseCommit: pin.baseCommit}} : {}),
+    });
+    stepBuffer.bytes += size;
+    if (pin !== undefined) pinnedGadgets.add(workpieceId);
+    sessionContent = newContent;
+    pinWorktreeInSession(workpieceId);
+    noteWorktreeRemovals(change);
+  };
+
+  // commit() head advancements buffered this step (see WorktreeTurnAccess.appendCommit),
+  // drained into the barrier's `worktreeCommits` alongside the change buffer: an advancement is
+  // durable iff the executeCode call that made it is, and an aborted or crashed step simply
+  // drops it (the commit objects it named stay -- dangling and harmless).
+  let pendingWorktreeCommits:
+      {worktreeId: WorkpieceId, commit: string, previousHead: string}[] = [];
+
+  // The Worktree binding's view of this turn (see the interface doc): closures over the same
+  // session state the file tools use, so binding operations and tool operations see one
+  // consistent worktree. Passed to executeCodeMode, which serves it to the chat's worktree env
+  // bindings for the duration of each execution.
+  let worktreeTurnAccess: WorktreeTurnAccess = {
+    getBaseCommit: worktreeBase,
+    getBufferedHead: id =>
+        pendingWorktreeCommits.findLast(entry => entry.worktreeId === id)?.commit,
+    getOverlayFiles: id => sessionContent.get(id) ?? new Map(),
+    getRemovedPaths: id => worktreeRemovedPaths.get(id) ?? new Set(),
+    readFile: async (id, path) =>
+        await readSessionText(id, path) ?? await readWorktreeBase(id, path),
+    appendChange: (id, path, change) => {
+      appendAgentEdit(id, {[id]: [[path, change]]});
+      // A write leaves the caller knowing the file's exact content, so it counts as a read for
+      // editFile's gate, exactly as the writeFile tool records its own writes.
+      if (!("remove" in change)) markFileRead(id, path);
+    },
+    appendCommit: (id, commit, previousHead) => {
+      pendingWorktreeCommits.push({worktreeId: id, commit, previousHead});
+      pinWorktreeInSession(id);
+    },
+  };
+
+  let emitStreamEvent = (event: AiChatStreamEvent) => {
+    hooks.emitChatStreamEvent(chatId, event);
+  };
+  let codePreviewManager = new CodePreviewManager(
+      emitStreamEvent,
+      workpiece => hooks.resolveWorkpieceRoot(resolveToolWorkpieceId(workpiece), true, chatId));
+  let executeCodeStreamManager = new ExecuteCodeStreamManager(emitStreamEvent);
+  let toolErrorText = (error: unknown) =>
+      error instanceof Error ? error.message : String(error);
+  let toolResult = (text: string, notes: Partial<AiToolCall> = {}) => ({
+    content: [{type: "text" as const, text}],
+    details: notes,
+  });
   return {
+    stepBuffer, toolCallNotes, toolErrorText, toolResult,
+    get connectionRequested() { return connectionRequested; },
+    set connectionRequested(v) { connectionRequested = v; },
+    get awaitingActionDecision() { return awaitingActionDecision; },
+    set awaitingActionDecision(v) { awaitingActionDecision = v; },
+    persistStep, appendAgentEdit,
+    get pendingWorktreeCommits() { return pendingWorktreeCommits; },
+    set pendingWorktreeCommits(v) { pendingWorktreeCommits = v; },
+    worktreeTurnAccess, emitStreamEvent, codePreviewManager, executeCodeStreamManager,
     get gadgetInfos() { return gadgetInfos; },
     set gadgetInfos(v) { gadgetInfos = v; },
     get sessionContent() { return sessionContent; },

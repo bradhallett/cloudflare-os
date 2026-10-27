@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 import type { AiToolCall } from "@gadgets/workshop-shared/api";
-import { makeStoredAssistantMessage, rehydrateStoredAssistantMessage } from "../src/agent.js";
+import { makeStoredAssistantMessage } from "../src/agent-session.js";
+import { rehydrateStoredAssistantMessage } from "../src/agent.js";
 
 // A representative completed step: signed thinking, redacted thinking, signed text, and two tool
 // calls (one with a Google-style thought signature). Extra fields unknown to the Workshop stand in

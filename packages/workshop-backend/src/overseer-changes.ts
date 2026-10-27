@@ -5,7 +5,7 @@ import { chatChangeClientKey, chatKeyPrefix } from "./storage-schema/overseer-st
 import type { ChatChangeBoundaryRecord, ChatChangeRecord, WorktreeRecord } from "./storage-schema/overseer-storage";
 import type { Usage } from "@earendil-works/pi-ai";
 import type { AiGatewayLogRoute } from "./ai-gateway";
-import { agentCodeChangeShape } from "./agent";
+import { agentCodeChangeShape } from "./agent-session";
 import type { AgentStepChange, AiChatMessageBodyWithModelData } from "./agent-hooks";
 import { OverseerPublishing } from "./overseer-publishing";
 import { AGENT_RUNNING_ERROR_MESSAGE, CHAT_CHANGE_AUTHOR_SPLIT_MS, CHAT_CHANGE_CLIENT_ID_PATTERN, chatStreamGoneError, submissionDigest, validateOid } from "./overseer-support";
