@@ -17,6 +17,8 @@
 // `Adapter` type is the root interface implemented by the service binding.
 
 import type { WorkerEntrypoint, DurableObject, RpcTarget, RpcStub } from "cloudflare:workers";
+import { codedErrorFamily } from "./errors.js";
+import type { OrgRole } from "./orgs.js";
 
 /**
  * A pagination cursor.
@@ -144,10 +146,12 @@ export type RedeemedGatekeeperUserSelection = {
 /**
  * One of a Workshop user's organization roles, as the Workshop reports it to a
  * gatekeeper. Opaque to the gatekeeper beyond ordering for governance: "owner"
- * and "admin" may govern org-level grants, "member" may only use them. Mirrors
- * `OrgRole` in api.ts without coupling gatekeepers to that API surface.
+ * and "admin" may govern org-level grants, "member" may only use them. Is
+ * `OrgRole` (orgs.ts) under its gatekeeper-facing name: orgs.ts is a
+ * zero-import leaf, so this type-only import couples gatekeepers to the org
+ * grammar alone, not to the API surface.
  */
-export type GatekeeperOrgRole = "owner" | "admin" | "member";
+export type GatekeeperOrgRole = OrgRole;
 
 /**
  * One organization a Workshop user belongs to, identified by the Workshop's org
@@ -1348,13 +1352,15 @@ export interface ObservationAuthorizer extends RpcTarget {
  */
 export const OBSERVATION_REFUSED_CODE = "ObservationRefusedError";
 
+const observationRefusedErrors = codedErrorFamily({OBSERVATION_REFUSED: OBSERVATION_REFUSED_CODE}, {
+  [OBSERVATION_REFUSED_CODE]:
+      "This observation was blocked because it contains data that a current collaborator " +
+      "is not permitted to see.",
+});
+
 /** Creates the refusal `authorizeObservation` throws when policy blocks an observation. */
 export function createObservationRefusedError(): Error & {code: typeof OBSERVATION_REFUSED_CODE} {
-  return Object.assign(
-      new Error(
-          "This observation was blocked because it contains data that a current collaborator " +
-          "is not permitted to see."),
-      {code: OBSERVATION_REFUSED_CODE} as const);
+  return observationRefusedErrors.create(OBSERVATION_REFUSED_CODE);
 }
 
 /**
@@ -1363,7 +1369,7 @@ export function createObservationRefusedError(): Error & {code: typeof OBSERVATI
  * @returns Whether the overseer refused the observation before recording it.
  */
 export function isObservationRefused(error: unknown): boolean {
-  return error instanceof Error && "code" in error && error.code === OBSERVATION_REFUSED_CODE;
+  return observationRefusedErrors.getCode(error) !== undefined;
 }
 
 /**

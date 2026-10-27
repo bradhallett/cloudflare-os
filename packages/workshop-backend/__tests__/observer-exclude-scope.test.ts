@@ -110,6 +110,12 @@ describe("excludeObservers against the observer's verification scope", () => {
         new Error(refusal.message), {code: refusal.code}))).toBe(true);
     expect(isObservationRefused(new Error(refusal.message))).toBe(false);
 
+    // The codedErrorFamily read-back (errors.ts) matches on the code over any object shape, not
+    // just Error instances: a transport that rebuilds the refusal as a bare record still
+    // classifies, and a foreign code never does.
+    expect(isObservationRefused({code: OBSERVATION_REFUSED_CODE})).toBe(true);
+    expect(isObservationRefused({code: "NotTheCode"})).toBe(false);
+
     // A blocked observation leaves no teardown behind it.
     expect(removals).toEqual([]);
     expect(impl.storage.observers.get(CAROL)).toBeDefined();
