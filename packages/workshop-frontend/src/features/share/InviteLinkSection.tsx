@@ -10,6 +10,7 @@ import { copyToClipboard } from '../../clipboard'
 import { useReportRpcFailure } from '../../useReportRpcFailure'
 import { isImeComposing } from '../../keyboardEvent'
 import { DependentKeepList, InlineConfirm, RoleBadge, RoleMenu } from './ShareDialogControls'
+import { formatRelativeTime } from '../../utils/formatRelativeTime'
 
 // The revoke flow's in-place confirmation state: which link, the preview of who else loses
 // access, and which of them the user chose to keep.
@@ -21,20 +22,6 @@ type RevokeTarget = {
   keepSet: Set<string>
 }
 
-function formatRelativeTime(date: Date): string {
-  const now = new Date()
-  const diffMs = now.getTime() - date.getTime()
-  const diffSeconds = Math.floor(diffMs / 1000)
-  const diffMinutes = Math.floor(diffSeconds / 60)
-  const diffHours = Math.floor(diffMinutes / 60)
-  const diffDays = Math.floor(diffHours / 24)
-
-  if (diffSeconds < 60) return 'just now'
-  if (diffMinutes < 60) return `${diffMinutes}m ago`
-  if (diffHours < 24) return `${diffHours}h ago`
-  if (diffDays < 7) return `${diffDays}d ago`
-  return date.toLocaleDateString()
-}
 
 /**
  * The share-link composer: the "Create a share link" affordance, the name/role form, and the
@@ -406,7 +393,7 @@ export function ShareLinksSection({
                   ) : (
                     <p className="truncate text-[13px] leading-[17px] font-medium tracking-[-0.25px] text-kumo-default">{sk.note || 'Untitled link'}</p>
                   )}
-                  <p className="truncate text-[12px] leading-[15px] tracking-[-0.15px] text-kumo-subtle">Created by {sk.createdBy.name} · {formatRelativeTime(sk.created)}</p>
+                  <p className="truncate text-[12px] leading-[15px] tracking-[-0.15px] text-kumo-subtle">Created by {sk.createdBy.name} · {formatRelativeTime(sk.created, { precision: 'second', beyondCutoffDate: true })}</p>
                 </div>
                 {isRenaming ? (
                   <InlineConfirm
