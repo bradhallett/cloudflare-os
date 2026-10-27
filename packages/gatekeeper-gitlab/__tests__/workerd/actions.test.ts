@@ -161,6 +161,13 @@ describe("issue creation", () => {
     await expect(unwrap(await hooks().applyAction(name, props, comment.approvalId))).rejects.toThrow(DISCARDED);
     await expect(unwrap(await hooks().rejectAction(name, props, comment.approvalId))).resolves.toBeUndefined();
     await expect(unwrap(await hooks().rejectAction(name, props, create.approvalId))).resolves.toBeUndefined();
+    // The kit never prunes a discarded action's record -- only its rejection releases the slot
+    // it holds against the capacity bound -- so those discards removed the records, and a third
+    // discard reports the action unknown rather than no-op against a permanent squatter.
+    await expect(unwrap(await hooks().rejectAction(name, props, comment.approvalId)))
+      .rejects.toThrow(`No queued GitLab action exists with id ${comment.approvalId}.`);
+    await expect(unwrap(await hooks().rejectAction(name, props, create.approvalId)))
+      .rejects.toThrow(`No queued GitLab action exists with id ${create.approvalId}.`);
   });
 
   it("rejecting a create also cascades to actions whose text names the provisional (#~N), which could never apply", async () => {
@@ -231,13 +238,40 @@ describe("issue mutations", () => {
     expect(action).toMatchObject({ type: "setTitle", previousTitle: "Old" });
     expect((await unwrap(await hooks().openIssue(name, props, "1"))).title).toBe("New");  // simulated
     expect(state.issue.title).toBe("Old");  // not yet on GitLab
-
     await unwrap(await hooks().applyAction(name, props, action.approvalId));
     expect(state.issue.title).toBe("New");
     expect(gitlab.requests.filter(r => r.method === "PUT").map(r => JSON.parse(r.body!))).toEqual([{ title: "New" }]);
 
     await unwrap(await hooks().revertAction(name, props, action.approvalId));
     expect(state.issue.title).toBe("Old");
+  });
+
+  it("retains only the newest applied actions for revert, retiring older ones from apply", async () => {
+    // The retained tier would grow without bound otherwise, exactly as the hand-kept
+    // `retiredAction:` rows did. Every apply sweeps: applied actions beyond the retention
+    // limit retire, and a revert of a retired id reports the action unknown.
+    const { gitlab, props, name } = await setup("retention");
+    const state = { issue: issue({ title: "Start" }) };
+    withIssue(gitlab, state);
+    gitlab.install();
+
+    let firstId = 0;
+    let lastId = 0;
+    const applies = 205;  // five past the retention limit
+    for (let n = 1; n <= applies; n++) {
+      const action = await unwrap(await hooks().queueAction(name, props, "prepareSetTitle",
+        ["issue", "1", `Title ${n}`], DESC));
+      if (n === 1) firstId = action.approvalId;
+      lastId = action.approvalId;
+      await unwrap(await hooks().applyAction(name, props, action.approvalId));
+    }
+    expect(state.issue.title).toBe(`Title ${applies}`);
+
+    // The newest stays revertible; the oldest was retired by the sweep.
+    await unwrap(await hooks().revertAction(name, props, lastId));
+    expect(state.issue.title).toBe(`Title ${applies - 1}`);
+    await expect(unwrap(await hooks().revertAction(name, props, firstId)))
+      .rejects.toThrow(`No queued GitLab action exists with id ${firstId}.`);
   });
 
   it("labels: add and remove use add_labels/remove_labels, match titles exactly as GitLab does, and invert on revert", async () => {

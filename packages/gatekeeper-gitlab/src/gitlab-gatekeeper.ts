@@ -189,6 +189,9 @@ const DIFF_REFS_RETRY_DELAY_MS = 1500;
 const MAX_PENDING_CHAIN_COMMITS = 250;
 /** Bound on following a chain of not-yet-applied replies back to a real thread. */
 const MAX_REPLY_TARGET_HOPS = 50;
+// Applied actions stay revertible while they are among the newest this many; older ones are
+// retired by the retention sweep (`#housekeepRetained`).
+const RETAINED_ACTION_LIMIT = 200;
 /** The connected account: its user id, which tells its approvals and notes from others', and its actor. */
 type StoredViewer = { id: number; actor: GitLabActor };
 
@@ -1660,17 +1663,19 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
 
   /**
    * One-time port of the records this gatekeeper kept by hand onto the journal. Idempotent by
-   * construction: every step consumes the storage it reads, so a crash mid-port leaves the rest
-   * for the next attempt, and the marker rules out a rerun once complete.
+   * construction: an in-place adopt overwrites the legacy row atomically, a retired row's adopt
+   * lands before its delete so a crash between them leaves both for the rerun to finish, and the
+   * marker rules out a rerun once complete.
    * @param journal The freshly constructed journal adopting the records.
    */
   #adoptActionRecords(journal: ActionJournal<GitLabAction>): void {
-    if (this.ctx.storage.kv.get("actionRecordsV2") !== undefined) return;
+    const kv = this.ctx.storage.kv;
+    if (kv.get("actionRecordsV2") !== undefined) return;
     // The old counter held the last issued id; the journal's holds the next unused one.
-    const lastIssued = this.ctx.storage.kv.get<number>("counter:action");
+    const lastIssued = kv.get<number>("counter:action");
     if (lastIssued !== undefined) {
-      this.ctx.storage.kv.put("nextActionId", lastIssued + 1);
-      this.ctx.storage.kv.delete("counter:action");
+      kv.put("nextActionId", lastIssued + 1);
+      kv.delete("counter:action");
     }
     // A review's partial progress and a revert's note target ride on the action itself now;
     // the wrapper record is gone.
@@ -1679,14 +1684,21 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
       ...(record.progress ? { progress: record.progress } : {}),
       ...(record.revertInfo ? { createdNoteId: record.revertInfo.noteId } : {}),
     });
-    for (const [key, record] of this.ctx.storage.kv.list<StoredActionRecord>({ prefix: "action:" })) {
+    for (const [key, record] of kv.list<StoredActionRecord>({ prefix: "action:" })) {
       const id = Number(key.slice("action:".length));
-      this.ctx.storage.kv.delete(key);
+      // A journal-written row here is this port's own earlier work on a rerun, or a retired
+      // row it moved onto the key; only legacy rows are ours to convert.
+      if (journal.hasRecord(id)) continue;
       journal.adopt(id, { state: record.state === "staged" ? "staged" : "pending", action: asAction(record) });
     }
-    for (const [key, record] of this.ctx.storage.kv.list<StoredActionRecord>({ prefix: "retiredAction:" })) {
+    for (const [key, record] of kv.list<StoredActionRecord>({ prefix: "retiredAction:" })) {
       const id = Number(key.slice("retiredAction:".length));
-      this.ctx.storage.kv.delete(key);
+      // The journal's record for this id lands on a different key: if it is already there, an
+      // earlier attempt adopted this row and only the delete is left to finish.
+      if (journal.hasRecord(id)) {
+        kv.delete(key);
+        continue;
+      }
       if (record.state === "approved") {
         journal.adopt(id, { state: "applied", action: asAction(record) });
       } else {
@@ -1697,8 +1709,10 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
           undispatched: true,
         });
       }
+      // After the adopt: a crash leaves both rows, and the rerun finishes this delete.
+      kv.delete(key);
     }
-    this.ctx.storage.kv.put("actionRecordsV2", true);
+    kv.put("actionRecordsV2", true);
   }
 
   #requireActionRecord(approvalId: number): JournalRecord<GitLabAction> {
@@ -2104,6 +2118,33 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
       // the provider itself refuses and the refusal path settles: the action stays appliable.
       this.#actions.restorePending(actionId);
       throw error;
+    }
+    this.#housekeepRetained();
+  }
+
+  /**
+   * Retires applied actions beyond the retention limit, so the retained tier stays bounded and
+   * `applied:action:` id memory keeps its promise (a revert of a retired id reports the action
+   * unknown, same as any long-gone id). Runs from every apply, inside the resolution lane the
+   * apply already holds; the sweep holds the tier near the limit, so the walk stays a page or
+   * three of storage.
+   */
+  #housekeepRetained(): void {
+    const ids: number[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = this.#actions.listRetained({
+        limit: 100,
+        ...(cursor === undefined ? {} : { cursor }),
+      });
+      ids.push(...page.entries.map(({ id }) => id));
+      cursor = page.nextCursor;
+    } while (cursor !== undefined);
+    // Storage lists keys lexicographically, so page order is not id order: sort numerically, then
+    // retire all but the newest limit. Ids rise over time, so the newest are the latest applies.
+    ids.sort((a, b) => a - b);
+    for (const id of ids.slice(0, Math.max(ids.length - RETAINED_ACTION_LIMIT, 0))) {
+      this.#actions.retire(id);
     }
   }
 
@@ -2620,8 +2661,12 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
     const record = this.#requireActionRecord(actionId);
     const action = record.action;
     // Discarded already: a cascade (see `#retireProvisional`) retires actions the Workshop still
-    // shows as pending, and the user's discard of one must then succeed, not strand it.
-    if (record.state === "failed") return;
+    // shows as pending, and the user's discard of one must then succeed, not strand it. The
+    // record held a slot the kit never prunes -- only this rejection releases it -- so remove it.
+    if (record.state === "failed") {
+      this.#actions.remove(actionId);
+      return;
+    }
     if (record.state !== "pending" && record.state !== "staged") {
       throw new Error(`GitLab action ${actionId} is no longer pending.`);
     }
