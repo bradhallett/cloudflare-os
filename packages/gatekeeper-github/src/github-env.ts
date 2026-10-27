@@ -39,3 +39,15 @@ export function webhookOrigin(env: Env): string | undefined {
   }
   return origin.origin;
 }
+
+/** The resource kinds a GitHub binding can hold; `issue` and `pull` are the mutable entities. */
+export type ResourceKind = "repo" | "issue" | "pull";
+
+/** The props every GitHubGatekeeperImpl is created with: its account and bound resource. */
+export type GitHubGatekeeperImplProps = {
+  userObjectId: string;
+  resourceKind: ResourceKind;
+  owner: string;
+  repo: string;
+  issueNumber?: number;
+};
