@@ -85,7 +85,7 @@ const CREATED_FILE_KEY = "createdFile";
  * reply and the receipt write, or a creation rejected after a lost success (the facet's storage,
  * and so the receipt, is deleted). Each created file is logged so an orphan can be found.
  *
- * Callers serialize calls with a Mutex.
+ * Callers serialize calls with a SerialTaskQueue.
  */
 export async function createFileOnce(
   ctx: DurableObjectState<object>,
