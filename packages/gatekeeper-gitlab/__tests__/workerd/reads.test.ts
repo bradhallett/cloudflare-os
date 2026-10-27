@@ -3,9 +3,11 @@
 // the `diff_refs` inversion, a diff over GitLab's limits refused, the merge request commit order,
 // discussion filtering, diff threads, paging, caching, and the Access service-token passthrough.
 
+import { RpcStub } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as fx from "../fixtures/gitlab-docs.js";
 import { ACCESS, API, FakeGitLab, hooks, json, projectProps, seedAccount, unwrap } from "./fake-gitlab.js";
+import { RecordingQueue } from "./worker.js";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -151,6 +153,70 @@ describe("issues", () => {
     const discussion = await unwrap(await hooks().discussionAll("paging", props, "issue", "1", 50));
     expect(discussion.map(entry => entry.id)).toEqual(["1126", "1128", "1129"]);
     expect(fake.count("GET", /issues\/1\/discussions/)).toBe(2);
+  });
+
+  it("serves [] for a fetch window the overlay emptied, then walks on", async () => {
+    // The fake ignores the labels query, so the whole listing arrives unfiltered and the
+    // gatekeeper's local filter drops it: ten full pages retain nothing, the first call's window
+    // empties before it fills a page, and `[]` asks again rather than ending the walk.
+    const fake = fakeProject();
+    const pages = Array.from({ length: 11 }, (_, n) =>
+      Array.from({ length: 10 }, (_, i) => ({ ...fx.issueResponse.data, id: n * 10 + i + 1, iid: n * 10 + i + 1 })));
+    pages[10] = [{ ...fx.issueResponse.data, id: 111, iid: 111, labels: ["wanted"] }];
+    fake.on("GET", new RegExp(`^/api/v4/projects/${P}/issues\\?`), request => {
+      const n = Number(request.url.searchParams.get("page"));
+      return json(pages[n - 1] ?? [], { headers: { "x-next-page": n < 11 ? String(n + 1) : "" } });
+    });
+    fake.install();
+    const id = await seedAccount();
+    const props = projectProps(id, PROJECT);
+
+    const served = await unwrap(
+      await hooks().listingPages("drop-all-walk", props, 100, 3, { labels: ["wanted"] }));
+
+    expect(served[0]).toEqual([]);
+    expect(Array.isArray(served[1]) ? served[1]?.map(i => i.id) : served[1]).toEqual(["111"]);
+    expect(served[2]).toBeNull();
+    expect(fake.count("GET", new RegExp(`^/api/v4/projects/${P}/issues\\?`))).toBe(11);
+  });
+
+  it("lists a queued create once, at its sort position, before the remote rows", async () => {
+    const fake = fakeProject();
+    fake.on("GET", new RegExp(`^/api/v4/projects/${P}/issues\\?`), () => json([fx.issueResponse.data]));
+    fake.install();
+    const id = await seedAccount();
+    const props = projectProps(id, PROJECT);
+    await unwrap(await hooks().queueCreateIssue(
+      "queued-create", props, new RpcStub(new RecordingQueue()) as never, { title: "Fresh" }));
+
+    const issues = await unwrap(await hooks().listIssuesAll("queued-create", props, 20));
+
+    // Newest first (the listing's default order), and exactly once.
+    expect(issues.map(i => i.id)).toEqual(["~1", "1"]);
+  });
+
+  it("serializes concurrent next() calls instead of duplicating a page", async () => {
+    const fake = fakeProject();
+    const issue2 = { ...fx.issueResponse.data, id: 101, iid: 101, created_at: "2016-01-05T15:31:51.081Z" };
+    // A full first page, so the first `next()` serves exactly it and the second must fetch; the
+    // second row's id is fresh (a row page 1 already served would drop as a duplicate).
+    const page1 = Array.from({ length: 100 }, (_, i) => ({ ...fx.issueResponse.data, id: i + 1, iid: i + 1 }));
+    fake.on("GET", new RegExp(`^/api/v4/projects/${P}/issues\\?`), request =>
+      request.url.searchParams.get("page") === "1"
+        ? json(page1, { headers: { "x-next-page": "2" } })
+        : json([issue2], { headers: { "x-next-page": "" } }));
+    fake.holdNextRequest();
+    fake.install();
+    const id = await seedAccount();
+    const props = projectProps(id, PROJECT);
+
+    const pages = await unwrap(await hooks().concurrentListingPages("concurrent-walk", props, 100, 2));
+
+    expect(pages.map(page => (page ?? []).map(i => i.id))).toEqual([
+      Array.from({ length: 100 }, (_, i) => String(i + 1)), ["101"],
+    ]);
+    // One fetch per page: a second caller re-entered the walk, not the fetch.
+    expect(fake.count("GET", new RegExp(`^/api/v4/projects/${P}/issues\\?`))).toBe(2);
   });
 
   it("lists issues, passing the documented query params", async () => {

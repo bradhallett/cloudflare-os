@@ -252,6 +252,54 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
   }
 
   /**
+   * One issue listing cursor's `next()` results, for up to `calls` calls or through its `null`. A
+   * call that throws is recorded as its message and retried on the same cursor; a second throw in
+   * a row ends the drain with it.
+   */
+  async listingPages(facetName: string, props: GatekeeperProps, pageSize: number, calls = Infinity,
+                     filter?: GitLabIssueFilter):
+      Promise<Outcome<(GitLabIssueSummary[] | null | string)[]>> {
+    return await outcome(async () => {
+      const cursor = await this.#gatekeeper(facetName, props).listIssues(filter, pageSize);
+      const pages: (GitLabIssueSummary[] | null | string)[] = [];
+      while (pages.length < calls && pages.at(-1) !== null) {
+        try {
+          pages.push(await cursor.next());
+        } catch (error) {
+          if (typeof pages.at(-1) === "string") throw error;
+          pages.push(String(error));
+        }
+      }
+      return pages;
+    });
+  }
+
+  /**
+   * Several concurrent `next()` calls on one issue listing cursor, their pages in call order:
+   * interleaved callers must neither duplicate nor skip pages, whatever the fetches' timing.
+   */
+  async concurrentListingPages(facetName: string, props: GatekeeperProps, pageSize: number, calls: number):
+      Promise<Outcome<(GitLabIssueSummary[] | null)[]>> {
+    return await outcome(async () => {
+      const cursor = await this.#gatekeeper(facetName, props).listIssues(undefined, pageSize);
+      return await Promise.all(Array.from({ length: calls }, () => cursor.next()));
+    });
+  }
+
+  /** Queues a create-issue action for approval, as the session's createIssue would. */
+  async queueCreateIssue(facetName: string, props: GatekeeperProps, queue: unknown, options: GitLabCreateIssueOptions):
+      Promise<Outcome<number>> {
+    return await outcome(async () => {
+      const gatekeeper = this.#gatekeeper(facetName, props);
+      const action = await gatekeeper.prepareCreateIssue(options);
+      await gatekeeper.submitActionForApproval(queue, action, {
+        title: `Create issue "${options.title}"`, implementsRevert: true,
+      });
+      return action.approvalId;
+    });
+  }
+
+  /**
    * Open an issue listing, serve `pagesBefore` of its pages, apply or reject `actionId`, then drain
    * the rest: what a cursor serves when an action is decided while it is being read. One call, so
    * the cursor never has to outlive the event it was received in.
