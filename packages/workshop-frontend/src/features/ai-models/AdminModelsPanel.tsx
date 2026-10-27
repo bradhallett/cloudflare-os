@@ -4,7 +4,7 @@
 // server reported rather than what was just chosen.
 
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
-import { Select, useKumoToastManager } from '@cloudflare/kumo'
+import { Select } from '@cloudflare/kumo'
 import { PendingSwitch } from '@gadgets/ui'
 import '@gadgets/ui/pending-switch.css'
 import { GATEWAY_MODEL_MODES, REASONING_LEVELS } from '@gadgets/workshop-shared/api'
@@ -23,7 +23,7 @@ import DeleteConfirmationDialog from '../../components/DeleteConfirmationDialog'
 import { AddGatewayModelForm } from './AddGatewayModelForm'
 import { GatewayModelRow, MODES } from './GatewayModelRow'
 import { GatewayProviders } from './GatewayProviders'
-import { rpcFailureDescription } from '../../rpcErrors'
+import { useReportRpcFailure } from '../../useReportRpcFailure'
 import { PROVIDER_LABELS, REASONING_LEVEL_LABELS } from './modelForm'
 import { fetchModelsDev, suggestModels } from './modelsDev'
 import { useGatewayTests } from './useGatewayTests'
@@ -141,7 +141,7 @@ export const AdminModelsPanel = ({ admin, gatewayModels, onChanged }: {
   /** Re-read the settings after a write, so that the panel shows what the server holds. */
   onChanged: () => Promise<void>
 }) => {
-  const toasts = useKumoToastManager()
+  const reportFailure = useReportRpcFailure()
   const [busy, setBusy] = useState(false)
   const [pendingRemoval, setPendingRemoval] = useState<AdminModel | null>(null)
   const [pendingDisable, setPendingDisable] = useState<AdminModel | null>(null)
@@ -175,11 +175,6 @@ export const AdminModelsPanel = ({ admin, gatewayModels, onChanged }: {
         </p>
       </div>
     )
-  }
-
-  const reportFailure = (title: string, err: unknown) => {
-    console.error(`${title}:`, err)
-    toasts.add({ title, description: rpcFailureDescription(err), variant: 'error' })
   }
 
   // Every write funnels through here, so writes can't overlap and each is followed by a re-read.

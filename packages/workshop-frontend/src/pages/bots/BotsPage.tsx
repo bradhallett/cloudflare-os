@@ -12,7 +12,8 @@ import { useDocumentTitle } from '../../useDocumentTitle'
 import DeleteConfirmationDialog from '../../components/DeleteConfirmationDialog'
 import { BotEditorDialog } from '../../features/bots/BotEditorDialog'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER } from '../../components/menuStyles'
-import { rpcFailureDescription } from '../../rpcErrors'
+import { useReportRpcFailure } from '../../useReportRpcFailure'
+import { PRIMARY_BTN } from '../../components/controlStyles'
 
 const CARD = 'rounded-xl border border-kumo-line bg-kumo-elevated p-6'
 
@@ -92,6 +93,7 @@ export function BotsPage() {
 
   const { authenticatedApi } = useAuthenticatedApi()
   const toasts = useKumoToastManager()
+  const reportFailure = useReportRpcFailure()
   const [bots, setBots] = useState<BotInfo[]>([])
   const [models, setModels] = useState<AiChatAuthorInfo[]>([])
   const [skills, setSkills] = useState<BotSkillChoice[]>([])
@@ -145,11 +147,6 @@ export function BotsPage() {
         setEditor(null)
       })
   }, [editor, authenticatedApi, toasts])
-
-  const reportFailure = (title: string, err: unknown) => {
-    console.error(`${title}:`, err)
-    toasts.add({ title, description: rpcFailureDescription(err), variant: 'error' })
-  }
 
   const saveEditor = async (def: BotDefinition) => {
     if (!editor) return
@@ -220,7 +217,7 @@ export function BotsPage() {
         <button
           type="button"
           onClick={() => setEditor({ mode: 'add' })}
-          className="press inline-flex h-9 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-lg bg-kumo-brand px-3.5 text-[13px] font-medium tracking-[-0.25px] text-white transition-colors hover:bg-kumo-brand-hover"
+          className={PRIMARY_BTN}
         >
           <Plus size={14} weight="bold" />
           New bot

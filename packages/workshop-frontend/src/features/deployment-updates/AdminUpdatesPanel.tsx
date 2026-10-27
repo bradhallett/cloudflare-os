@@ -4,7 +4,7 @@ import { ArrowSquareOut, ArrowsClockwise, Warning } from '@phosphor-icons/react'
 import type { RpcStub } from 'capnweb'
 import { MAX_UPDATE_CHECK_INTERVAL_MINUTES, MAX_UPDATE_HOURS } from '@gadgets/workshop-shared/api'
 import type { AdminApi, DeploymentUpdateStatus } from '@gadgets/workshop-shared/api'
-import { rpcFailureDescription } from '../../rpcErrors'
+import { useReportRpcFailure } from '../../useReportRpcFailure'
 import { formatFullTimestamp } from '../../utils/formatTimestamp'
 import { DurationSetting } from './DurationSetting'
 import { probeRouterTag } from './probeRouterTag'
@@ -55,6 +55,7 @@ const checkOutcome = (status: DeploymentUpdateStatus): string =>
 /** The admin Updates tab: which release this deployment runs, the newest one, and a way to update. */
 export const AdminUpdatesPanel = ({ admin, status, onChanged }: AdminUpdatesPanelProps) => {
   const toasts = useKumoToastManager()
+  const reportFailure = useReportRpcFailure()
   const [savingChecks, setSavingChecks] = useState(false)
   // A switch value the server took, shown while `status` is the one it was written over: after a
   // write whose re-read failed, `status` is stale. Any later status replaces it.
@@ -79,10 +80,6 @@ export const AdminUpdatesPanel = ({ admin, status, onChanged }: AdminUpdatesPane
     focusBeforeCall.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
   }
 
-  const reportFailure = (title: string, err: unknown) => {
-    console.error(`${title}:`, err)
-    toasts.add({ title, description: rpcFailureDescription(err), variant: 'error' })
-  }
 
   // Resolves whether `op` went through and the status was re-read after it. A failed re-read is
   // reported on its own, since the change before it did go through.
