@@ -666,27 +666,45 @@ export abstract class OverseerBlueprints extends OverseerBindings {
     // clients how to hand off (see ChatCodeBase.prior). The reset lands on the freshly-read
     // meta so concurrent changes to other fields (e.g. a title rename during the awaits)
     // survive.
-    this.retireChatChanges(this.listLiveChatChanges(chatId, generationToken));
-    this.pruneRetiredChatChanges(chatId);
-    this.storage.chatChangeBoundaries.put(
-        {chatId, generation: generationToken, finalRevision: revisionToken, boundaries});
-    this.chatContentCache.delete(chatId);
-    freshMeta.codeBase = {
-      pins: [],
-      generation: generationToken + 1,
-      revision: 0,
-      epoch: mergeSequence,
-      prior: {generation: generationToken, finalRevision: revisionToken, discontinuousGadgets},
-    };
-    freshMeta.lastActive = timestamp;
-    this.storage.chatMeta.put(freshMeta);
-    for (let [worktreeId, newPinBase] of worktreeAccepts) {
-      let record = this.storage.gadgets.get(worktreeId);
-      if (record?.type === "worktree" && record.pinBase !== newPinBase) {
-        record.pinBase = newPinBase;
-        this.storage.gadgets.put(record);
-      }
+    //
+    // One transaction for the whole epoch close (KL-6's crash-window class, the same barrier
+    // discipline #124 landed for materializeChatChanges): the row retirements, the boundary
+    // record, the meta's generation reset, and the worktree re-pins commit or roll back
+    // together. A crash between them must never leave retired rows with no boundary record
+    // (their changes would silently vanish from the straggler bridge) nor a reset code base
+    // over live rows (the reopened epoch would re-merge them). An outer mergeChanges caller's
+    // transaction nests this as a savepoint, so the merge stays one unit too.
+    try {
+      this.storage.transaction(() => {
+        this.retireChatChanges(this.listLiveChatChanges(chatId, generationToken));
+        this.pruneRetiredChatChanges(chatId);
+        this.storage.chatChangeBoundaries.put(
+            {chatId, generation: generationToken, finalRevision: revisionToken, boundaries});
+        freshMeta.codeBase = {
+          pins: [],
+          generation: generationToken + 1,
+          revision: 0,
+          epoch: mergeSequence,
+          prior: {generation: generationToken, finalRevision: revisionToken, discontinuousGadgets},
+        };
+        freshMeta.lastActive = timestamp;
+        this.storage.chatMeta.put(freshMeta);
+        for (let [worktreeId, newPinBase] of worktreeAccepts) {
+          let record = this.storage.gadgets.get(worktreeId);
+          if (record?.type === "worktree" && record.pinBase !== newPinBase) {
+            record.pinBase = newPinBase;
+            this.storage.gadgets.put(record);
+          }
+        }
+      });
+    } catch (err) {
+      // The retirement and reset advance the in-memory caches even when the transaction rolls
+      // back (the same recovery materializeChatChanges' catch does); drop them so later reads
+      // rebuild from storage.
+      this.chatContentCache.delete(chatId);
+      throw err;
     }
+    this.chatContentCache.delete(chatId);
 
     // Maybe generate gadget title if this was the first accepted code. (A merge covering only
     // binding additions to existing gadgets doesn't count: it creates no commits, so the first
