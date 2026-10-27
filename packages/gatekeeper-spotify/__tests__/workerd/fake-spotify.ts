@@ -32,11 +32,15 @@ export class FakeSpotify {
   readonly tokens = new Map<string, FakeUser>();
   /** Which user each authorization code authorizes. */
   readonly codes = new Map<string, FakeUser>();
+  /** Which user each refresh token belongs to. */
+  readonly refreshTokens = new Map<string, FakeUser>();
   /** Library saves, one entry per write with the URIs it carried. */
   readonly saves: string[][] = [];
   #nextGrant = 0;
   #writeHold: { promise: Promise<number>; resolve: (status: number) => void } | null = null;
   #writeArrived: { promise: Promise<void>; resolve: () => void } | null = null;
+  #refreshHold: { promise: Promise<void>; resolve: () => void } | null = null;
+  #failNextRefresh: number | null = null;
 
   install(): this {
     vi.stubGlobal("fetch", (input: string | URL | Request, init?: RequestInit) => this.#handle(input, init));
@@ -53,11 +57,26 @@ export class FakeSpotify {
     this.#writeHold = null;
   }
 
+  /** Holds every token-endpoint refresh until `releaseRefreshes` lets it through. */
+  holdRefreshes(): void {
+    this.#refreshHold = Promise.withResolvers<void>();
+  }
+
+  releaseRefreshes(): void {
+    this.#refreshHold?.resolve();
+    this.#refreshHold = null;
+  }
+
   /** Resolves once a library write has arrived while one was being waited for. */
   writeArrived(): Promise<void> {
     this.#writeArrived ??= Promise.withResolvers<void>();
     return this.#writeArrived.promise;
   }
+  /** Makes the next token-endpoint refresh answer `status` once, then serves normally again. */
+  failNextRefresh(status: number): void {
+    this.#failNextRefresh = status;
+  }
+
 
   async #handle(input: string | URL | Request, init?: RequestInit): Promise<Response> {
     const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
@@ -68,16 +87,39 @@ export class FakeSpotify {
 
     if (url.origin === ACCOUNTS && url.pathname === "/api/token" && method === "POST") {
       const form = new URLSearchParams(body ?? "");
-      const user = form.get("grant_type") === "authorization_code"
-        ? this.codes.get(form.get("code") ?? "")
-        : undefined;
+      if (form.get("grant_type") === "refresh_token") {
+        const user = this.refreshTokens.get(form.get("refresh_token") ?? "");
+        if (!user) {
+          return json({ error: "invalid_grant", error_description: "Unknown refresh token." }, { status: 400 });
+        }
+        if (this.#failNextRefresh !== null) {
+          const status = this.#failNextRefresh;
+          this.#failNextRefresh = null;
+          return json({ error: "server_error", error_description: "Transiently unavailable." }, { status });
+        }
+        if (this.#refreshHold) await this.#refreshHold.promise;
+        const n = this.#nextGrant++;
+        const accessToken = `access-${user.id}-${n}`;
+        const refreshToken = `refresh-${user.id}-${n}`;
+        this.tokens.set(accessToken, user);
+        this.refreshTokens.set(refreshToken, user);
+        return json({
+          access_token: accessToken,
+          refresh_token: refreshToken,
+          expires_in: 3600,
+          scope: "user-read-private user-library-modify",
+        });
+      }
+      const user = this.codes.get(form.get("code") ?? "");
       if (!user) return json({ error: "invalid_grant", error_description: "Unknown authorization code." }, { status: 400 });
       const n = this.#nextGrant++;
       const accessToken = `access-${user.id}-${n}`;
+      const refreshToken = `refresh-${user.id}-${n}`;
       this.tokens.set(accessToken, user);
+      this.refreshTokens.set(refreshToken, user);
       return json({
         access_token: accessToken,
-        refresh_token: `refresh-${user.id}-${n}`,
+        refresh_token: refreshToken,
         expires_in: 3600,
         scope: "user-read-private user-library-modify",
       });
@@ -163,15 +205,38 @@ export async function seedAccount(
 ): Promise<string> {
   const accountId = env.USER_ACCOUNT.newUniqueId();
   const accessToken = `seed-access-${user.id}`;
+  const refreshToken = `seed-refresh-${user.id}`;
   x.tokens.set(accessToken, user);
+  x.refreshTokens.set(refreshToken, user);
+  await runInDurableObject(env.USER_ACCOUNT.get(accountId), (_instance, state) => {
+    state.storage.kv.put("credentials", {
+      refreshToken,
+      accessToken,
+      accessTokenExpiresAt: Date.now() + 60 * 60 * 1000,
+      scopes: ["user-read-private"],
+    });
+    if (options.subject !== false) {
+      state.storage.kv.put("connectionSubject", { id: user.id, displayName: user.displayName });
+    }
+  });
+  return accountId.toString();
+}
+
+/**
+ * Seeds a connected account the way the pre-kit UserAccount left one: one kv key per credential
+ * field. Only the migration test wants this shape; everything else seeds the canonical record.
+ */
+export async function seedLegacyAccount(x: FakeSpotify, user: FakeUser = ALICE): Promise<string> {
+  const accountId = env.USER_ACCOUNT.newUniqueId();
+  const accessToken = `seed-access-${user.id}`;
+  x.tokens.set(accessToken, user);
+  x.refreshTokens.set(`seed-refresh-${user.id}`, user);
   await runInDurableObject(env.USER_ACCOUNT.get(accountId), (_instance, state) => {
     state.storage.kv.put("refreshToken", `seed-refresh-${user.id}`);
     state.storage.kv.put("accessToken", accessToken);
     state.storage.kv.put("accessTokenExpiresAt", Date.now() + 60 * 60 * 1000);
     state.storage.kv.put("scopes", ["user-read-private"]);
-    if (options.subject !== false) {
-      state.storage.kv.put("connectionSubject", { id: user.id, displayName: user.displayName });
-    }
+    state.storage.kv.put("connectionSubject", { id: user.id, displayName: user.displayName });
   });
   return accountId.toString();
 }
