@@ -60,10 +60,14 @@ export type StoredAction = { id: number; status: ActionStatus; failure?: string 
 );
 
 /**
- * Distributive Omit so the union's variant-specific fields survive; enqueue assigns id + status.
+ * Distributive Omit so the union's variant-specific fields survive; the journal assigns id and
+ * lifecycle state. The approver-facing presentation travels inside the action now (the engine's
+ * submit renders it), and `failure` was never a draft field — the journal records it.
  */
 export type StoredActionDraft = StoredAction extends infer T
-  ? T extends { id: number } ? Omit<T, "id" | "status"> : never
+  ? T extends { id: number } ? Omit<T, "id" | "status" | "failure"> & {
+      presentation: ActionDescriptionDraft;
+    } : never
   : never;
 
 /**
