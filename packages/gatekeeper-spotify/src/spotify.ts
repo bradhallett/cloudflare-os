@@ -1,5 +1,4 @@
 import {
-  DurableObject,
   RpcStub,
   WorkerEntrypoint,
 } from "cloudflare:workers";
@@ -10,7 +9,6 @@ import {
 import {
   workerVersionTag,
   type AccountDescription,
-  type ConnectHandoff,
   type Gatekeeper,
   type GatekeeperConnectCallback,
   type GatekeeperConnectOptions,
@@ -27,20 +25,18 @@ import {
   htmlResponse,
 } from "@gadgets/gatekeeper-kit/connect-pages";
 import {
-  commitReconnectOrThrow,
-  pinForConnect,
-  stageReconnect,
-} from "@gadgets/gatekeeper-kit/credential-stage";
-import {
-  type CallbackResult,
   fetchSubject,
   type PinnedSubject,
   pinRefusal,
 } from "./connect-subject";
 import {
-  clearCredentialExpiryLatch,
-  notifyCredentialsExpiredOnce,
-} from "@gadgets/gatekeeper-kit/credential-expiry";
+  OAuthAccountDO,
+  type OAuthAttempt,
+} from "@gadgets/gatekeeper-kit/oauth-account";
+import {
+  type CredentialCoordinatorOptions,
+  CredentialsExpiredError,
+} from "@gadgets/gatekeeper-kit/credentials";
 import {
   SpotifyApi,
   SpotifyApiError,
@@ -59,18 +55,6 @@ import { SpotifyAccountConfiguratorUI, SpotifyPlaylistConfiguratorUI } from "./s
 // Re-exported so the worker's main module still exposes every Durable Object class wrangler binds.
 export { SpotifyGatekeeperImpl } from "./spotify-gatekeeper";
 
-type StoredNonce = {
-  value: string;
-  expiresAt: number;
-  stage: "initiation" | "oauth";
-  /**
-   * Set when this flow reconnects an existing account, so its grant is staged rather than made
-   * live. The mode travels with the flow instead of living on the account: committing one
-   * reconnect while another is in flight must not change how that other flow lands.
-   */
-  reconnect?: true;
-};
-
 /**
  * The live credential keys a grant is written to, held as one unit while a reconnect awaits
  * confirmation (see UserAccount.commitReconnect).
@@ -83,10 +67,7 @@ type StoredCredentials = {
 };
 
 const NONCE_BYTES = 32;
-const INITIATION_NONCE_LIFETIME_MS = 10 * 60 * 1000;
-const OAUTH_NONCE_LIFETIME_MS = 10 * 60 * 1000;
 const ACCESS_TOKEN_SAFETY_MS = 60 * 1000;
-const CONNECT_TIMEOUT_MS = 60 * 60 * 1000;
 
 // Scopes requested during connect — broad enough to cover both resource granularities.
 const OAUTH_SCOPES = [
@@ -159,16 +140,6 @@ function hexEncode(bytes: Uint8Array): string {
 
 function generateNonce(): string {
   return hexEncode(crypto.getRandomValues(new Uint8Array(NONCE_BYTES)));
-}
-
-function constantTimeEqual(a: string, b: string): boolean {
-  const encoder = new TextEncoder();
-  const bufA = encoder.encode(a);
-  const bufB = encoder.encode(b);
-  // The early length-mismatch return isn't a timing leak here: both values are fixed-length random
-  // hex nonces, so length carries no secret. timingSafeEqual also requires equal-length inputs.
-  if (bufA.byteLength !== bufB.byteLength) return false;
-  return crypto.subtle.timingSafeEqual(bufA, bufB);
 }
 
 // ---------------------------------------------------------------------------
@@ -291,174 +262,108 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
 // ---------------------------------------------------------------------------
 // UserAccount DO — stores OAuth credentials and refreshes access tokens.
 
-export class UserAccount extends DurableObject<Env> {
-  async setCallback(callback: Fetcher<GatekeeperConnectCallback>, initiationNonce: string): Promise<void> {
-    if (!this.ctx.storage.kv.get<string>("refreshToken")) {
-      await this.ctx.storage.setAlarm(Date.now() + CONNECT_TIMEOUT_MS);
-    }
-    this.ctx.storage.kv.put("callback", callback);
-    this.ctx.storage.kv.put<StoredNonce>("nonce", {
-      value: initiationNonce,
-      expiresAt: Date.now() + INITIATION_NONCE_LIFETIME_MS,
-      stage: "initiation",
-    });
+export class UserAccount extends OAuthAccountDO<Env, StoredCredentials, PinnedSubject> {
+  protected vendorId(): string {
+    return "spotify";
   }
 
-  async prepareReconnect(initiationNonce: string): Promise<void> {
-    clearCredentialExpiryLatch(this.ctx.storage.kv);
-    this.ctx.storage.kv.put<StoredNonce>("nonce", {
-      value: initiationNonce,
-      expiresAt: Date.now() + INITIATION_NONCE_LIFETIME_MS,
-      stage: "initiation",
-      reconnect: true,
-    });
+  protected requestedScopes(): string[] {
+    return OAUTH_SCOPES;
   }
 
-  async beginOAuthFlow(initiationNonce: string): Promise<{ oauthNonce: string; scopes: string[] } | null> {
-    const stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
-    if (!stored || stored.stage !== "initiation" || Date.now() >= stored.expiresAt ||
-        !constantTimeEqual(stored.value, initiationNonce)) {
-      return null;
-    }
-    const oauthNonce = generateNonce();
-    this.ctx.storage.kv.put<StoredNonce>("nonce", {
-      value: oauthNonce,
-      expiresAt: Date.now() + OAUTH_NONCE_LIFETIME_MS,
-      stage: "oauth",
-      reconnect: stored.reconnect,
-    });
-    return { oauthNonce, scopes: OAUTH_SCOPES };
+  protected userFacet(): Fetcher<GatekeeperUser> {
+    const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
+    return this.ctx.exports.GatekeeperUserImpl({ props });
   }
 
-  /**
-   * Finishes the OAuth code exchange and returns the handoff for the page the browser lands on,
-   * null when the callback's nonce doesn't match, or a refusal when the grant came back as a
-   * different Spotify account than the connection is pinned to.
-   */
-  async acceptAuthCode(code: string, oauthNonce: string): Promise<CallbackResult | null> {
-    const stored = this.ctx.storage.kv.get<StoredNonce>("nonce");
-    if (!stored || stored.stage !== "oauth" || Date.now() >= stored.expiresAt ||
-        !constantTimeEqual(stored.value, oauthNonce)) {
-      return null;
-    }
-    this.ctx.storage.kv.delete("nonce");
+  protected redirectUri(): string {
+    return `${getBaseUrl(this.env)}/oauth`;
+  }
 
+  protected async exchange(code: string, attempt: OAuthAttempt): Promise<StoredCredentials> {
     ensureConfigured(this.env);
-    const callback = this.ctx.storage.kv.get<Fetcher<GatekeeperConnectCallback>>("callback");
-    if (!callback) {
-      throw new Error("Took too long to complete authorization. Please try again.");
-    }
-
-    const grant = await exchangeAuthCode(code, this.env.CLIENT_ID, this.env.CLIENT_SECRET, `${getBaseUrl(this.env)}/oauth`);
+    const grant = await exchangeAuthCode(
+      code, this.env.CLIENT_ID, this.env.CLIENT_SECRET, attempt.redirectUri ?? this.redirectUri());
     if (!grant.refreshToken) {
       throw new Error("Spotify did not return a refresh token.");
     }
-
-    const credentials: StoredCredentials = {
+    return {
       refreshToken: grant.refreshToken,
       accessToken: grant.accessToken,
       accessTokenExpiresAt: Date.now() + grant.expiresIn * 1000,
       scopes: grant.scopes,
     };
-
-    let subject: PinnedSubject;
-    try {
-      subject = await fetchSubject(credentials.accessToken);
-    } catch (error) {
-      throw new Error("Could not read which Spotify account authorized this connection. Please try again.",
-        { cause: error });
-    }
-
-    let handoff: ConnectHandoff;
-    if (stored.reconnect) {
-      // The connection is pinned to the Spotify user it was made as: a reconnect that comes back
-      // as anyone else is refused (Spotify has no token-revocation endpoint, so the refused grant
-      // is simply dropped) rather than silently swapping the account every binding reads.
-      const staged = stageReconnect(this.ctx.storage.kv, credentials, subject, Date.now(), pinRefusal);
-      if ("refused" in staged) return { refused: staged.refused };
-      // The reconnect URL is a bearer capability, so the new grant is only staged until the Workshop
-      // has confirmed the browser that finished the flow is the owner's (see commitReconnect). Bound
-      // gadgets keep reading the current token meanwhile.
-      handoff = await callback.reconnectComplete(staged.stageId);
-    } else {
-      this.#storeCredentials(credentials);
-      const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
-      // The pin brackets the handoff: a connect that fails unpins and drops the credentials
-      // stored ahead of it.
-      handoff = await pinForConnect(this.ctx.storage.kv, subject,
-        () => callback.complete(this.ctx.exports.GatekeeperUserImpl({ props })),
-        () => {
-          this.ctx.storage.kv.delete("refreshToken");
-          this.ctx.storage.kv.delete("accessToken");
-        });
-    }
-
-    await this.ctx.storage.deleteAlarm();
-    return { handoff };
   }
 
-  /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. The kit
-   * re-pins the staged subject, adopting a connection made before the pin existed. */
-  async commitReconnect(stageId: string): Promise<void> {
-    const credentials = commitReconnectOrThrow<StoredCredentials>(
-      this.ctx.storage.kv, Date.now(), stageId);
-    this.#storeCredentials(credentials);
+  protected subjectOf(creds: StoredCredentials): Promise<PinnedSubject | undefined> {
+    return fetchSubject(creds.accessToken);
   }
 
-  #storeCredentials(credentials: StoredCredentials): void {
-    this.ctx.storage.kv.put("refreshToken", credentials.refreshToken);
-    this.ctx.storage.kv.put("accessToken", credentials.accessToken);
-    this.ctx.storage.kv.put("accessTokenExpiresAt", credentials.accessTokenExpiresAt);
-    this.ctx.storage.kv.put("scopes", credentials.scopes);
-    clearCredentialExpiryLatch(this.ctx.storage.kv);
-  }
-
-  async getAccessToken(): Promise<string> {
-    const token = this.ctx.storage.kv.get<string>("accessToken");
-    const expiresAt = this.ctx.storage.kv.get<number>("accessTokenExpiresAt") ?? 0;
-    if (token && Date.now() < expiresAt - ACCESS_TOKEN_SAFETY_MS) {
-      return token;
-    }
-
-    const refreshToken = this.ctx.storage.kv.get<string>("refreshToken");
-    if (!refreshToken) {
-      throw new Error("Spotify credentials have not been configured for this account.");
-    }
+  protected async refreshCredentials(current: StoredCredentials): Promise<StoredCredentials> {
     ensureConfigured(this.env);
-
     let grant;
     try {
-      grant = await refreshAccessToken(refreshToken, this.env.CLIENT_ID, this.env.CLIENT_SECRET);
-    } catch (err) {
-      if (err instanceof SpotifyApiError && (err.isAuthError || err.status === 400)) {
-        await this.noteCredentialsExpired();
+      grant = await refreshAccessToken(current.refreshToken, this.env.CLIENT_ID, this.env.CLIENT_SECRET);
+    } catch (error) {
+      // A 400 from the token endpoint is how Spotify reports a dead grant (invalid_grant), and an
+      // auth-flagged error says the same; only those are a proven death, so only they expire the
+      // connection. Anything else is transient and the caller retries.
+      if (error instanceof SpotifyApiError && (error.isAuthError || error.status === 400)) {
+        throw new CredentialsExpiredError("The Spotify grant is dead.", { cause: error });
       }
-      throw err;
+      throw error;
     }
-
-    this.ctx.storage.kv.put("accessToken", grant.accessToken);
-    this.ctx.storage.kv.put("accessTokenExpiresAt", Date.now() + grant.expiresIn * 1000);
-    if (grant.refreshToken) this.ctx.storage.kv.put("refreshToken", grant.refreshToken);
-    if (grant.scopes.length > 0) this.ctx.storage.kv.put("scopes", grant.scopes);
-    return grant.accessToken;
+    return {
+      refreshToken: grant.refreshToken ?? current.refreshToken,
+      accessToken: grant.accessToken,
+      accessTokenExpiresAt: Date.now() + grant.expiresIn * 1000,
+      scopes: grant.scopes.length > 0 ? grant.scopes : current.scopes,
+    };
   }
 
-  async noteCredentialsExpired(): Promise<void> {
-    await notifyCredentialsExpiredOnce(this.ctx.storage.kv,
-      this.ctx.storage.kv.get<Fetcher<GatekeeperConnectCallback>>("callback"), "spotify");
+  protected reconnectRefusal(pinned: PinnedSubject, granted: PinnedSubject): { title: string; detail: string } {
+    return pinRefusal(pinned, granted);
   }
 
-  async alarm(): Promise<void> {
-    if (!this.ctx.storage.kv.get<string>("refreshToken")) {
-      await this.ctx.storage.deleteAll();
-    }
+  protected expiresAt(creds: StoredCredentials): number | undefined {
+    return creds.accessTokenExpiresAt;
   }
 
-  async revoke(): Promise<void> {
-    // Spotify exposes no token-revocation endpoint; drop the local credentials. The user can
-    // revoke the app's access from their Spotify account settings.
-    await this.ctx.storage.deleteAlarm();
-    await this.ctx.storage.deleteAll();
+  protected refreshSkewMs(): number | undefined {
+    return ACCESS_TOKEN_SAFETY_MS;
+  }
+
+  protected credentialsExpiredMessage(): string {
+    return "Spotify credentials have expired or been revoked. Please reconnect the account.";
+  }
+
+  protected credentialOptions(): CredentialCoordinatorOptions<StoredCredentials> {
+    return {
+      ...super.credentialOptions(),
+      // Accounts connected before the kit base stored one key per field; the coordinator migrates
+      // such an account on first read and reaps the old keys once the canonical record lands.
+      legacyKeys: ["refreshToken", "accessToken", "accessTokenExpiresAt", "scopes"],
+      upgrade: kv => {
+        const refreshToken = kv.get<string>("refreshToken");
+        if (refreshToken === undefined) return undefined;
+        return {
+          refreshToken,
+          accessToken: kv.get<string>("accessToken") ?? "",
+          accessTokenExpiresAt: kv.get<number>("accessTokenExpiresAt") ?? 0,
+          scopes: kv.get<string[]>("scopes") ?? [],
+        };
+      },
+    };
+  }
+
+  /**
+   * @returns The current access token, refreshed when it is within the safety window of expiry.
+   * @throws `CredentialsExpiredError` when the account is disconnected or its grant is dead, after
+   * notifying the Workshop of a death.
+   */
+  async getAccessToken(): Promise<string> {
+    const { creds } = await this.getCredentials();
+    return creds.accessToken;
   }
 }
 
@@ -482,7 +387,7 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
       return await fn(api);
     } catch (error) {
       if (error instanceof SpotifyApiError && error.isAuthError) {
-        await account.noteCredentialsExpired();
+        await account.notifyCredentialsExpired();
         throw new Error("Spotify credentials have expired or been revoked. Please reconnect the account.", { cause: error });
       }
       throw error;

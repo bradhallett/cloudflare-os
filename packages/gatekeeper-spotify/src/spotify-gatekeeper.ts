@@ -117,7 +117,7 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
       return await fn(api);
     } catch (error) {
       if (error instanceof SpotifyApiError && error.isAuthError) {
-        await account.noteCredentialsExpired();
+        await account.notifyCredentialsExpired();
         throw new Error("Spotify credentials have expired or been revoked. Please reconnect the account.", { cause: error });
       }
       throw error;
