@@ -543,7 +543,14 @@ export function useChatSubscription({
   const [chatListReady, setChatListReady] = useState(false);
   const [chatListVersion, setChatListVersion] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
-  const [updateCounter, setUpdateCounter] = useState(0); // Force re-render when cache updates
+  // Two invalidation channels, split so high-frequency stream events cannot churn the memos
+  // derived from the durable caches:
+  //  - `messagesVersion` bumps on every durable-cache mutation (messages, metadata, deletes,
+  //    history pages, the initial list). Memos over the caches key on it.
+  //  - `provisionalTick` is the rAF-coalesced tick for provisional streaming state (stream
+  //    deltas, live change rows), whose objects are mutated in place with stable identity.
+  const [messagesVersion, setMessagesVersion] = useState(0);
+  const [provisionalTick, setProvisionalTick] = useState(0);
   const [proposedChangesVersion, setProposedChangesVersion] = useState(0); // Incremented only for change-affecting messages
   // Rows live in refs (chatChangeRowsRef); this state only forces re-renders of their readers (the
   // draft banner) as rows arrive or get pruned. Subscribed consumers are fed synchronously and
@@ -646,20 +653,22 @@ export function useChatSubscription({
 
   // Subscription stub (wrapped in object for useState)
   const subscriptionRef = useRef<RpcStub<{}> | null>(null);
+  // The overseer stub whose onRpcBroken handler is already registered (see the subscribe effect).
+  const rpcBrokenOverseerRef = useRef<RpcStub<Overseer> | null>(null);
 
-  // Force a re-render when cache is updated
-  const forceUpdate = () => setUpdateCounter((prev) => prev + 1);
+  // Force a re-render when a durable cache (messages, chats, compacted) is mutated.
+  const forceUpdate = () => setMessagesVersion((prev) => prev + 1);
   const bumpChatListVersion = () => setChatListVersion((prev) => prev + 1);
 
-  // Batched version of forceUpdate for high frequency stream events.
-  // Coalesces multiple updates within a single animation frame.
+  // rAF-coalesced tick for high-frequency stream events, which only mutate provisional state.
+  // Coalesces multiple deltas within a single animation frame.
   const pendingUpdateRef = useRef(false);
   const scheduleUpdate = () => {
     if (!pendingUpdateRef.current) {
       pendingUpdateRef.current = true;
       requestAnimationFrame(() => {
         pendingUpdateRef.current = false;
-        forceUpdate();
+        setProvisionalTick((prev) => prev + 1);
       });
     }
   };
@@ -974,12 +983,18 @@ export function useChatSubscription({
 
     subscribe();
 
-    // Set up reconnection handling
-    overseer.onRpcBroken?.((error) => {
-      console.warn("RPC connection broken:", error);
-      setIsSubscribed(false);
-      // Cache persists, component will get new overseer prop and resubscribe
-    });
+    // capnweb's onRpcBroken has no unregister: each call attaches another rejection handler
+    // to the stub's session promise, so registering on every effect run (reconnects, StrictMode
+    // double-invoke) would stack handlers for the life of the session. Guard so each overseer
+    // stub gets at most one; the handler only flips local state, so a later stub needs its own.
+    if (rpcBrokenOverseerRef.current !== overseer) {
+      rpcBrokenOverseerRef.current = overseer;
+      overseer.onRpcBroken?.((error) => {
+        console.warn("RPC connection broken:", error);
+        setIsSubscribed(false);
+        // Cache persists, component will get new overseer prop and resubscribe
+      });
+    }
 
     return () => {
       isMounted = false;
@@ -990,9 +1005,10 @@ export function useChatSubscription({
     };
   }, [overseer]);
 
-  // Patch cached chat messages on action upserts.
+  // Patch cached chat messages on action upserts. This mutates the durable message cache, so it
+  // rides `forceUpdate` (messagesVersion), not the provisional tick.
   useActionEntries(overseer, (record) => {
-    if (applyActionLogUpdateToCachedMessages(record)) scheduleUpdate();
+    if (applyActionLogUpdateToCachedMessages(record)) forceUpdate();
   });
   // On a resumed reconnect the subscription replays the gap, so the entries above cover cached
   // cards. Otherwise (cold open, or the prior session never settled) re-fetch cached action
@@ -1017,7 +1033,7 @@ export function useChatSubscription({
         const current = getCachedActionMessage(location)?.msg;
         if (fetched.actionLog.state === "pending" &&
             current?.actionLog && current.actionLog.state !== "pending") return;
-        if (applyActionLogUpdateToCachedMessages(fetched.actionLog)) scheduleUpdate();
+        if (applyActionLogUpdateToCachedMessages(fetched.actionLog)) forceUpdate();
       } catch (err) {
         console.error("Failed to refresh action card:", err);
       }
@@ -1097,7 +1113,8 @@ export function useChatSubscription({
     chatListVersion,
     chatListReady,
     isLoading,
-    updateCounter,
+    messagesVersion,
+    provisionalTick,
     availableModels,
     selectedModel,
     setSelectedModel,

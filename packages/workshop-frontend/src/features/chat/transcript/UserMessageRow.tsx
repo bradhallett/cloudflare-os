@@ -1,5 +1,5 @@
 import type { AiChatMessage, ChatAttachmentRef } from "@gadgets/workshop-shared/api";
-import styles from "../../../ChatInterface.module.css";
+import styles from "../ChatInterface.module.css";
 import { ChatAttachmentGrid } from "../attachments/ChatAttachmentGrid";
 import { MarkdownMessage } from "../markdown/MarkdownMessage";
 import { SlashCommandMention } from "./SlashCommandMention";

@@ -39,7 +39,7 @@ vi.mock('@cloudflare/kumo', async (importOriginal) => {
   }
 })
 
-vi.mock('./AuthContext', () => {
+vi.mock('../../../AuthContext', () => {
   const context = {
     authenticatedApi: {
       listGatekeeperVendors: async () => [],
@@ -58,7 +58,7 @@ vi.mock('./AuthContext', () => {
 // The upgrade prompt navigates on its primary action; ChatInterface itself has no router use.
 vi.mock('@tanstack/react-router', () => ({ useNavigate: () => vi.fn<() => void>() }))
 
-import { makeTestRoot } from './action-test-harness'
+import { makeTestRoot } from '../../../action-test-harness'
 
 const testRoot = makeTestRoot()
 
@@ -95,7 +95,7 @@ async function renderChat() {
   // Re-imported per test so the VITE_SAAS stub is baked into the commerce gate.
   vi.stubEnv('VITE_SAAS', 'true')
   vi.resetModules()
-  const { default: ChatInterface } = await import('./ChatInterface')
+  const { default: ChatInterface } = await import('../ChatInterface')
 
   const overseer = {
     subscribeToActions: () => Promise.resolve({ [Symbol.dispose]: () => {} }),

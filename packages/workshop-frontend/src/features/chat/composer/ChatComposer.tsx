@@ -24,14 +24,9 @@ import type {
   SlashCommandChoice,
   SlashCommandRequest,
 } from "@gadgets/workshop-shared/api";
-import { isTransientRpcError } from "../../../rpcErrors";
-import { slashCommandTokenKey } from "./slash-commands/slashCommandInput";
 import {
   ComposerMirror, composerTextareaClass, type ComposerMirrorHandle, type MirrorToken,
 } from "./inline-items/ComposerMirror";
-import {
-  snapCaretOutOfRanges, type ComposerRange,
-} from "../../../components/chat/composer-tokens";
 import CapsuleOverlay from "../../../CapsuleOverlay";
 import type { SelectableItem } from "../../../ResourcePicker";
 import GatekeeperModal from "../../../GatekeeperModal";
@@ -53,16 +48,15 @@ import { CapturedConsoleLogsPrompt } from "./CapturedConsoleLogsPrompt";
 import ComposerAddMenu from "./ComposerAddMenu";
 import { ComposerModelSelector, type SelectedModel } from "./ComposerModelSelector";
 import { useComposerDraft } from "./draft/useComposerDraft";
-import { buildComposerSubmission } from "./composerSubmission";
 import {
   applyComposerTextEdit,
   insertComposerFormat,
-  removeComposerDocumentToken,
   resolveComposerSlashCommand,
-  type ComposerDocument,
 } from "./composerDocument";
 import { useComposerResources } from "./useComposerResources";
 import { useComposerEditorLayout } from "./useComposerEditorLayout";
+import { useComposerTokens } from "./useComposerTokens";
+import { useComposerSend } from "./useComposerSend";
 import styles from "./ChatComposer.module.css";
 
 // A capsule's text begins with an em space, which reserves the box the mirror paints the vendor
@@ -189,8 +183,6 @@ export const ChatComposer = ({
   queuedSteers?: readonly string[];
   showThinkingTraces?: boolean;
   onToggleThinkingTraces?: () => void;
-  /** Show the "Pre-approve actions" menu item (only when there are uncovered candidates). */
-  /** Open the pre-approval dialog (owned by the parent). */
   /** Called after a gatekeeper is connected via the attach flow, so the parent can refresh the
    * pre-approval catalog and proactively offer to pre-approve its actions. */
 }) => {
@@ -231,27 +223,10 @@ export const ChatComposer = ({
       text: applyStateAction(previous.text, action),
     }));
   };
-  const [isSending, setIsSending] = useState(false);
-  // Set by Stop until the agent goes idle: a steer sent meanwhile would be refused.
-  const [isStopping, setIsStopping] = useState(false);
-  if (isStopping && !isAgentActive) setIsStopping(false);
   const [catalogVersion, setCatalogVersion] = useState(0);
-  // The chat the "may not have been sent" hint belongs to; the render condition scopes it, and
-  // leaving the chat dismisses it.
-  const [sendHiccup, setSendHiccup] = useState<{ chatKey?: number | null } | null>(null);
-  useEffect(() => setSendHiccup(null), [chatKey]);
-  // The caret the slash command picker parses at. Deliberately updated only when it moves to a
-  // different command token (see `syncPickerCaret`): the mirror owns the caret the user sees,
-  // so ordinary caret movement doesn't have to re-render the composer.
-  const [cursorPosition, setCursorPosition] = useState(0);
-  const pickerCaretRef = useRef<{key: string | null; text: string}>({key: null, text: ""});
   const { authenticatedApi } = useAuthenticatedApi();
   const vendorBranding = useVendorBranding(authenticatedApi);
-  const selectedSlashCommandRef = useRef(selectedSlashCommand);
-  selectedSlashCommandRef.current = selectedSlashCommand;
-  const sendInFlightRef = useRef(false);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
-  const mountedRef = useRef(true);
   // Configure… toasts never time out, and their action needs this composer, so it closes them,
   // each with the close of the manager that added it (useKumoToastManager is new every render).
   const configureToastsRef = useRef(new Map<string, () => void>());
@@ -277,9 +252,6 @@ export const ChatComposer = ({
   const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
   const connectionCreatedRef = useRef<() => void>(() => {});
 
-  // Keep inputValue in a ref so handleCursorChange can read it without re-binding.
-  const inputValueRef = useRef(inputValue);
-  inputValueRef.current = inputValue;
   const {
     activeUrl,
     attachCreated,
@@ -354,11 +326,60 @@ export const ChatComposer = ({
     maxAttachments: MAX_COMPOSER_ATTACHMENTS,
     onFilesDropped: (files) => void addFiles(files),
   });
+  const {
+    cursorPosition,
+    currentTokenRanges,
+    currentComposerDocument,
+    currentText,
+    syncPickerCaret,
+    moveCaret,
+    removeTokenAt,
+    tokenAtPoint,
+    snapCaretOutOfTokens,
+  } = useComposerTokens({
+    document: composerDocument,
+    recordDraftEdit,
+    replaceDocument: replaceComposerDocument,
+    textareaRef: composerTextareaRef,
+    mirrorRef,
+  });
 
+  const isBlocked = !!blockedReason;
+
+  const {
+    isSending,
+    canSend,
+    canSteer,
+    submitMessage,
+    handleStop,
+    isStopping,
+    sendHiccup,
+  } = useComposerSend({
+    chatKey,
+    onSend,
+    onBotChange,
+    newChat,
+    isAgentActive,
+    isBlocked,
+    onStop,
+    queuedSteers,
+    selectedModelId: selectedModel?.id,
+    selectedBot,
+    document: composerDocument,
+    attachments: pendingAttachments,
+    clearSentAttachments,
+    isCreatingResource,
+    beginSend: beginDraftSend,
+    completeSend: completeDraftSend,
+    replaceDocument: replaceComposerDocument,
+    recordDraftEdit,
+    setInputValue,
+    toasts,
+  });
   useEffect(() => {
     if (!draftPresentationRequest) return;
     const frame = requestAnimationFrame(() => {
-      if (inputValueRef.current !== draftPresentationRequest.text) return;
+      if (currentText() !== draftPresentationRequest.text) return;
       const textarea = composerTextareaRef.current;
       if (!textarea) return;
       if (autoFocus) textarea.focus();
@@ -385,10 +406,9 @@ export const ChatComposer = ({
       ta.setSelectionRange(text.length, text.length);
       resizeTextarea(ta);
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- reseeds only when seedNonce changes
   }, [seedNonce]);
-  const capsulesRef = useRef(capsules);
-  capsulesRef.current = capsules;
+
   // Reset overlay selection when the overlay appears or changes URL, preferring a connected account
   // so Tab never reaches for "Connect new account" first.
   useEffect(() => {
@@ -396,7 +416,6 @@ export const ChatComposer = ({
     overlayNavigatedRef.current = false;
   }, [activeUrl]);
 
-  const isBlocked = !!blockedReason;
 
   // A disabled textarea stops firing mouse events, so drop the hover state the token hit-testing
   // below leaves behind; otherwise the cursor outlives `disabled:cursor-not-allowed`.
@@ -405,14 +424,6 @@ export const ChatComposer = ({
     mirrorRef.current?.setHoveredToken(null);
     if (composerTextareaRef.current) composerTextareaRef.current.style.cursor = "";
   }, [isBlocked]);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
-  }, []);
-
   useEffect(() => {
     const configureToasts = configureToastsRef.current;
     return () => {
@@ -421,64 +432,6 @@ export const ChatComposer = ({
     };
   }, []);
 
-  // Ranges the caret addresses as single units: resource capsules and the resolved command. Read
-  // from refs so callbacks scheduled off a render (rAF, awaited RPC) see current positions.
-  const currentTokenRanges = (): ComposerRange[] => {
-    const command = selectedSlashCommandRef.current;
-    return [
-      ...capsulesRef.current.map(({start, length}) => ({start, length})),
-      ...(command ? [{start: command.start, length: command.length}] : []),
-      ...formatTokensRef.current.map(({start, length}) => ({start, length})),
-    ];
-  };
-
-  // The picker parses at the caret, but only its token matters, so refresh its copy of the caret
-  // when that changes rather than on every movement. Plain caret movement then re-renders nothing.
-  const syncPickerCaret = (position: number) => {
-    const text = inputValueRef.current;
-    const key = slashCommandTokenKey(text, position);
-    if (key !== pickerCaretRef.current.key || text !== pickerCaretRef.current.text) {
-      pickerCaretRef.current = {key, text};
-      setCursorPosition(position);
-    }
-  };
-
-  const moveCaret = (position: number) => {
-    const textarea = composerTextareaRef.current;
-    if (!textarea) return;
-    textarea.setSelectionRange(position, position);
-    syncPickerCaret(position);
-  };
-
-  const currentComposerDocument = (): ComposerDocument => ({
-    text: inputValueRef.current,
-    capsules: capsulesRef.current,
-    formats: formatTokensRef.current,
-    command: selectedSlashCommandRef.current,
-  });
-
-  const commitComposerDocument = (document: ComposerDocument) => {
-    replaceComposerDocument(document);
-  };
-
-  const removeTokenAt = (range: ComposerRange) => {
-    recordDraftEdit();
-    const transition = removeComposerDocumentToken(currentComposerDocument(), range);
-    commitComposerDocument(transition.document);
-    requestAnimationFrame(() => moveCaret(transition.caret));
-  };
-
-  // Hit-tests the pointer against the mirror's token spans, which lay out identically to the
-  // textarea's text.
-  const tokenAtPoint = (clientX: number, clientY: number):
-      {start: number; edge: number} | null => {
-    // Hit-testing forces layout, so avoid it in the common case with no tokens.
-    if (capsulesRef.current.length === 0 && !selectedSlashCommandRef.current
-        && formatTokensRef.current.length === 0) {
-      return null;
-    }
-    return mirrorRef.current?.tokenAtPoint(clientX, clientY) ?? null;
-  };
 
   // Completing a command leaves the `/name` text in place (only its color changes) and parks the
   // caret past it so the next keystroke doesn't grow the token.
@@ -489,12 +442,12 @@ export const ChatComposer = ({
     const transition = resolveComposerSlashCommand(
       currentComposerDocument(), choice, tokenStart, tokenEnd, commandText,
     );
-    commitComposerDocument(transition.document);
+    replaceComposerDocument(transition.document);
     requestAnimationFrame(() => {
       composerTextareaRef.current?.focus();
       moveCaret(transition.caret);
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- closes over stable composer fns
   }, []);
 
   // Keeps the resolved command anchored to its text when text is inserted or removed before it.
@@ -514,109 +467,6 @@ export const ChatComposer = ({
     setCatalogVersion((current) => current + 1);
   };
 
-  const handleSend = async () => {
-    if (sendInFlightRef.current || isSending || isBlocked) return;
-    setSendHiccup(null);
-    const attachmentsSnapshot = pendingAttachments;
-    const readyAttachments = attachmentsSnapshot
-      .filter((attachment) => attachment.uploadState === "ready" && attachment.ref)
-      .map((attachment) => attachment.ref!);
-    const hasUploadingAttachment = attachmentsSnapshot.some((attachment) => attachment.uploadState === "uploading");
-    const hasFailedAttachment = attachmentsSnapshot.some((attachment) => attachment.uploadState === "error");
-
-    if (!inputValue.trim() && !selectedSlashCommand && readyAttachments.length === 0) return;
-    if (hasUploadingAttachment) {
-      toasts.add({ title: "Please wait for attachment uploads to finish", variant: "error" });
-      return;
-    }
-    if (hasFailedAttachment) {
-      toasts.add({ title: "Remove failed attachment uploads before sending", variant: "error" });
-      return;
-    }
-    if (isCreatingResource) {
-      toasts.add({ title: "Please wait for the resource connection to finish", variant: "error" });
-      return;
-    }
-
-    sendInFlightRef.current = true;
-    setIsSending(true);
-    const draftSend = beginDraftSend();
-    try {
-      const submissionResult = buildComposerSubmission({
-        document: composerDocument,
-        hasAttachments: readyAttachments.length > 0,
-      });
-      if (!submissionResult.ok) {
-        toasts.add({ title: "Slash commands cannot include resources or attachments", variant: "error" });
-        return;
-      }
-      const { message, capsules: capsuleSpecifiers, formats: formatRefs } =
-        submissionResult.submission;
-
-      // The picker's single choice of who answers. Intake names the bot for the chat being
-      // created; in-chat, an idle chat gets the explicit pick ("none" clears the bot) while a
-      // running turn keeps its agent — steers pass no bot.
-      const sendBot = onBotChange == null
-        ? undefined
-        : newChat
-          ? selectedBot ?? undefined
-          : isAgentActive
-            ? undefined
-            : selectedBot ?? "none";
-
-      try {
-        await onSend(message, selectedModel?.id ?? null,
-            capsuleSpecifiers,
-            readyAttachments.length ? readyAttachments : undefined,
-            formatRefs,
-            sendBot);
-      } catch (err) {
-        // A definitive failure in a chat with a transcript hands the message to the transcript's
-        // failed-send bubble, so the draft clears exactly as a success would; a transient failure
-        // (outcome unknown) and the new-chat composer (no transcript to hold it) keep the draft.
-        if (!isTransientRpcError(err) && chatKey != null) {
-          clearSentAttachments(attachmentsSnapshot);
-          if (completeDraftSend(draftSend)) {
-            replaceComposerDocument({ text: "", capsules: [], formats: [], command: null });
-          }
-        }
-        throw err;
-      }
-      clearSentAttachments(attachmentsSnapshot);
-      if (!completeDraftSend(draftSend)) return;
-      replaceComposerDocument({ text: "", capsules: [], formats: [], command: null });
-    } finally {
-      sendInFlightRef.current = false;
-      if (mountedRef.current) setIsSending(false);
-    }
-  };
-
-  const submitMessage = () => {
-    const submittedChatKey = chatKey;
-    void handleSend().catch((err) => {
-      if (isTransientRpcError(err)) {
-        setSendHiccup({ chatKey: submittedChatKey });
-      } else {
-        // The onSend handlers log the RPC failures they see; this is the only report for
-        // anything handleSend itself throws before reaching them.
-        console.error("Failed to send chat message:", err);
-      }
-    });
-  };
-
-  const handleStop = () => {
-    if (!onStop) return;
-    setIsStopping(true);
-    if (queuedSteers?.length) {
-      recordDraftEdit();
-      setInputValue([inputValue.trimEnd(), ...queuedSteers].filter(Boolean).join("\n\n"));
-    }
-    // A failed Stop may still have dropped the steers on the server, so the draft keeps them, and
-    // Stop can be pressed again.
-    onStop().catch(() => {
-      if (mountedRef.current) setIsStopping(false);
-    });
-  };
 
   const handleAttachLogs = () => {
     const formatted = onConsumeConsoleLogs();
@@ -625,19 +475,19 @@ export const ChatComposer = ({
   };
 
   const handleAttachOpen = () => {
-    const position = composerTextareaRef.current?.selectionStart ?? inputValueRef.current.length;
-    openAttachModal(snapCaretOutOfRanges(position, currentTokenRanges(), "nearest"));
+    const position = composerTextareaRef.current?.selectionStart ?? currentText().length;
+    openAttachModal(snapCaretOutOfTokens(position, "nearest"));
   };
 
   const addMenuCaretRef = useRef(0);
   const rememberAddMenuCaret = () => {
-    const position = composerTextareaRef.current?.selectionStart ?? inputValueRef.current.length;
-    addMenuCaretRef.current = snapCaretOutOfRanges(position, currentTokenRanges(), "nearest");
+    const position = composerTextareaRef.current?.selectionStart ?? currentText().length;
+    addMenuCaretRef.current = snapCaretOutOfTokens(position, "nearest");
   };
 
   const selectSkillFromAddMenu = (choice: SlashCommandChoice) => {
-    if (selectedSlashCommandRef.current) return;
-    const position = Math.min(addMenuCaretRef.current, inputValueRef.current.length);
+    if (currentComposerDocument().command) return;
+    const position = Math.min(addMenuCaretRef.current, currentText().length);
     applySlashCommandSelection(choice, position, position);
   };
 
@@ -655,7 +505,7 @@ export const ChatComposer = ({
     }
 
     recordDraftEdit();
-    commitComposerDocument(transition.document);
+    replaceComposerDocument(transition.document);
     if (transition.caret !== undefined) {
       const caret = transition.caret;
       requestAnimationFrame(() => moveCaret(caret));
@@ -672,7 +522,7 @@ export const ChatComposer = ({
     // closer edge. Ranged selections are left alone.
     let cursorPos = textarea.selectionStart;
     if (cursorPos === textarea.selectionEnd) {
-      const snapped = snapCaretOutOfRanges(cursorPos, currentTokenRanges(), "nearest");
+      const snapped = snapCaretOutOfTokens(cursorPos, "nearest");
       if (snapped !== cursorPos) {
         cursorPos = snapped;
         textarea.setSelectionRange(snapped, snapped);
@@ -686,8 +536,6 @@ export const ChatComposer = ({
   // Formats named in the message are inline tokens like capsules, addressed by the caret as one
   // unit. There can be several, and where each sits says which part of the request it belongs to,
   // so they stay in the text rather than becoming a separate field.
-  const formatTokensRef = useRef(formatTokens);
-  formatTokensRef.current = formatTokens;
 
   // A format is only context on the message, so it coexists with everything else the composer can
   // carry, including a slash command ("/writing-review turn this into a Doc").
@@ -696,11 +544,11 @@ export const ChatComposer = ({
   // Inserted at the caret, like a capsule, so the noun lands in the sentence that needs it.
   const chooseFormat = async (format: OutputFormatOffer) => {
     const logo = await formatIconDataUrl(format.output.icon);
-    const value = inputValueRef.current;
+    const value = currentText();
     // The menu takes focus, but the textarea keeps its last selection; falling back to the end is
     // right for the case where it was never focused at all.
     const caret = Math.min(composerTextareaRef.current?.selectionStart ?? value.length, value.length);
-    const at = snapCaretOutOfRanges(caret, currentTokenRanges(), "nearest");
+    const at = snapCaretOutOfTokens(caret, "nearest");
     const transition = insertComposerFormat(
       currentComposerDocument(),
       at,
@@ -709,7 +557,7 @@ export const ChatComposer = ({
     );
     if (!transition) return;
     recordDraftEdit();
-    commitComposerDocument(transition.document);
+    replaceComposerDocument(transition.document);
     requestAnimationFrame(() => {
       composerTextareaRef.current?.focus();
       moveCaret(transition.caret);
@@ -745,19 +593,6 @@ export const ChatComposer = ({
     })),
   ], [capsules, formatTokens, inputValue, selectedSlashCommand, vendorBranding]);
 
-  const hasReadyAttachment = pendingAttachments.some(
-    (attachment) => attachment.uploadState === "ready" && attachment.ref,
-  );
-  const hasUnreadyAttachment = pendingAttachments.some(
-    (attachment) => attachment.uploadState !== "ready",
-  );
-  const canSend = !isSending && !isAgentActive && !isBlocked &&
-    (inputValue.trim().length > 0 || selectedSlashCommand !== null || hasReadyAttachment) &&
-    !hasUnreadyAttachment && !isCreatingResource;
-  // While the agent works, a plain message steers it (see ChatInterface's handleSend).
-  const canSteer = isAgentActive && !isSending && !isStopping && !isBlocked &&
-    inputValue.trim().length > 0 && selectedSlashCommand === null && capsules.length === 0 &&
-    formatTokens.length === 0 && pendingAttachments.length === 0 && !isCreatingResource;
   return (
     // isolation: isolate contains z-indexes used inside the composer (the
     // captured-log floating chip with z-10, the textarea/mirror with z-[1])
@@ -966,8 +801,7 @@ export const ChatComposer = ({
                     e.currentTarget.selectionStart === e.currentTarget.selectionEnd) {
                   const direction = e.key === "ArrowRight" ? 1 : -1;
                   const target = e.currentTarget.selectionStart + direction;
-                  const snapped = snapCaretOutOfRanges(
-                      target, currentTokenRanges(), direction > 0 ? "right" : "left");
+                  const snapped = snapCaretOutOfTokens(target, direction > 0 ? "right" : "left");
                   if (snapped !== target) {
                     e.preventDefault();
                     moveCaret(snapped);

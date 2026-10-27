@@ -12,7 +12,7 @@ import {
 import { AlwaysApproveButton, ResolveButton, type ResolveClickResult } from "../../../components/ResolveButton";
 import { RestrictedApprovalNotice } from "../../../components/RestrictedApprovalNotice";
 import { safeExternalUrl } from "../../../utils/safeExternalUrl";
-import styles from "../../../ChatInterface.module.css";
+import styles from "../ChatInterface.module.css";
 import { MarkdownMessage } from "../markdown/MarkdownMessage";
 import type { ActionChatMessage } from "./messageTypes";
 import { WorkIcon } from "./WorkIcon";

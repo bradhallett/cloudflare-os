@@ -14,7 +14,7 @@ import {
   getStoredSelectedBot,
   getStoredSelectedModel,
   sameBotSelection,
-} from "./modelSelection";
+} from "../../modelSelection";
 import {
   Overseer,
   AiChatAuthorInfo,
@@ -28,64 +28,46 @@ import {
   WorkpieceId,
   BlueprintOutput,
 } from "@gadgets/workshop-shared/api";
-import { logRpcFailure } from "./rpcErrors";
-import { ChatListPanel, type ChatListScope } from "./features/chat/ChatListPanel";
-import { ChatTranscript } from "./features/chat/ChatTranscript";
-import { ChatDialogs } from "./features/chat/ChatDialogs";
-import { ChatHeaderBar } from "./features/chat/ChatHeaderBar";
-import { ChatComposerBar } from "./features/chat/ChatComposerBar";
-import { useChatActions } from "./features/chat/useChatActions";
-import { useChatListActions } from "./features/chat/useChatListActions";
-import { useChatChanges } from "./features/chat/useChatChanges";
-import { useConnectionRequests } from "./features/chat/useConnectionRequests";
-import type { ChatContentReader } from "./features/code/otClient";
-import { triggerBlobDownload } from "./fileTransfers";
-import { useAlwaysApproveTag } from "./useAlwaysApproveTag";
-import { useResolveAction } from "./useResolveAction";
-import { useAuthenticatedApi } from "./AuthContext";
+import { logRpcFailure } from "../../rpcErrors";
+import { ChatListPanel, type ChatListScope } from "./ChatListPanel";
+import { ChatTranscript } from "./ChatTranscript";
+import { ChatDialogs } from "./ChatDialogs";
+import { ChatHeaderBar } from "./ChatHeaderBar";
+import { ChatComposerBar } from "./ChatComposerBar";
+import { useChatActions } from "./useChatActions";
+import { useChatListActions } from "./useChatListActions";
+import { useChatChanges } from "./useChatChanges";
+import { useConnectionRequests } from "./useConnectionRequests";
+import type { ChatContentReader } from "../code/otClient";
+import { triggerBlobDownload } from "../../fileTransfers";
+import { useAlwaysApproveTag } from "../../useAlwaysApproveTag";
+import { useResolveAction } from "../../useResolveAction";
+import { useAuthenticatedApi } from "../../AuthContext";
 import {
   type ActiveFileTarget,
   type ChatCodeChanges,
   type ChatLiveChangeRows,
   type ChatLiveEditPreviews,
-} from "./features/chat/liveCodeStreams";
+} from "./liveCodeStreams";
 import {
   getStoredShowThinkingTraces,
   persistShowThinkingTraces,
-} from "./features/chat/thinkingTracesPreference";
-import { resolveToolCallOutput } from "./features/chat/transcript/toolCalls";
+} from "./thinkingTracesPreference";
+import { resolveToolCallOutput } from "./transcript/toolCalls";
 import {
   buildChatDisplayEntries,
   computeMessageStates,
   EARLIER_PAGE_PREFETCH_PX,
   inferChatAgentFromMessages,
   rhythmTopClass,
-} from "./features/chat/transcript/chatDisplayEntries";
-import { usePendingTurnChanges } from "./features/chat/transcript/usePendingTurnChanges";
-import { useMessageScroller } from "./features/chat/transcript/useMessageScroller";
-import { JumpToLatestPill } from "./features/chat/transcript/JumpToLatestPill";
-import { MissedMessagesStatus } from "./features/chat/transcript/MissedMessagesStatus";
-import { type AutoApproveTarget } from "./features/chat/transcript/ActionCard";
-import { useChatSubscription } from "./features/chat/useChatSubscription";
-
-// Re-exported so the module's former importers (GadgetEditor, WorkpieceCodeInterface, and the
-// ChatInterface unit tests) keep their `./ChatInterface` import surface.
-export type {
-  ActiveFileTarget,
-  ChatCodeChanges,
-  ChatLiveChangeRows,
-  ChatLiveEditPreviews,
-  EditPreviewEvent,
-  StreamingEditPreview,
-} from "./features/chat/liveCodeStreams";
-export type { CompactionBoundary } from "./features/chat/transcript/chatDisplayEntries";
-export {
-  buildChatDisplayEntries,
-  computeChatEpochChanges,
-  computeMessageStates,
-} from "./features/chat/transcript/chatDisplayEntries";
-export { resolveToolCallOutput } from "./features/chat/transcript/toolCalls";
-export { MarkdownMessage } from "./features/chat/markdown/MarkdownMessage";
+} from "./transcript/chatDisplayEntries";
+import { usePendingTurnChanges } from "./transcript/usePendingTurnChanges";
+import { useExpansionSet } from "./transcript/useExpansionSet";
+import { useMessageScroller } from "./transcript/useMessageScroller";
+import { JumpToLatestPill } from "./transcript/JumpToLatestPill";
+import { MissedMessagesStatus } from "./transcript/MissedMessagesStatus";
+import { type AutoApproveTarget } from "./transcript/ActionCard";
+import { useChatSubscription } from "./useChatSubscription";
 
 function fallbackToStoredModelSelection(
   modelId: string | null,
@@ -207,7 +189,8 @@ function ChatInterface({
     chatListVersion,
     chatListReady,
     isLoading,
-    updateCounter,
+    messagesVersion,
+    provisionalTick,
     availableModels,
     selectedModel,
     setSelectedModel,
@@ -241,17 +224,13 @@ function ChatInterface({
   const [isLoadingEarlier, setIsLoadingEarlier] = useState(false);
   // List, changes, and connection-request flow state lives in its hooks below
   // (useChatListActions, useChatChanges, useConnectionRequests).
-  const [expandedToolCalls, setExpandedToolCalls] = useState<Set<string>>(
-    new Set(),
-  );
+  const toolCallExpansion = useExpansionSet<string>();
   const [showThinkingTraces, setShowThinkingTraces] = useState(
     () => getStoredShowThinkingTraces(),
   );
-  const [expandedActions, setExpandedActions] = useState<Set<number>>(
-    new Set(),
-  );
-  const [expandedErrors, setExpandedErrors] = useState<Set<string>>(new Set());
-  const [expandedCompactions, setExpandedCompactions] = useState<Set<number>>(new Set());
+  const actionExpansion = useExpansionSet<number>();
+  const errorExpansion = useExpansionSet<string>();
+  const compactionExpansion = useExpansionSet<number>();
   const [sidebarActiveTab, setSidebarActiveTab] = useState<
     "chat" | "connections"
   >("chat");
@@ -356,17 +335,19 @@ function ChatInterface({
   }, [sidebarMode, selectedChatId, chatListReady, chatList]);
 
   // Get messages for selected chat (filter out any undefined slots in sparse array)
-  // Memoized to prevent creating new array on every render
+  // Memoized on `messagesVersion` alone: stream ticks (provisionalTick) never touch the
+  // durable caches, so streaming must not churn these memos or anything derived from them
+  // (message states, display entries).
   const currentMessages = useMemo(() => {
     if (selectedChatId === null) return [];
     return (cacheRef.current.messages.get(selectedChatId) || []).filter(
       (msg) => msg !== undefined,
     );
-  }, [selectedChatId, updateCounter]);
+  }, [selectedChatId, messagesVersion]);
   const currentCompactions = useMemo(() => {
     if (selectedChatId === null) return [];
     return cacheRef.current.compacted.get(selectedChatId) ?? [];
-  }, [selectedChatId, updateCounter]);
+  }, [selectedChatId, messagesVersion]);
   const messageStates = useMemo(() => computeMessageStates(currentMessages), [currentMessages]);
   // Declared bots for the composer's agent picker, plus its pick (a chat's own bot wins while
   // that chat is open; Home's stored pick covers the no-chat case).
@@ -672,12 +653,15 @@ function ChatInterface({
   });
 
   // Auto-scroll to the live edge when messages change, but only while the reader still follows it.
+  // `provisionalTick` rides along so growing stream text keeps following too: the durable deps
+  // (currentMessages, hasVisibleProvisionalContent) hold steady while a turn streams.
   useLayoutEffect(() => {
     scroller.followContent();
   }, [
     currentMessages,
     hasVisibleProvisionalContent,
     isAgentActive,
+    provisionalTick,
     queuedSteers?.length,
     scroller.followContent,
   ]);
@@ -733,15 +717,23 @@ function ChatInterface({
     };
   }, [authenticatedApi]);
 
-  // Reset per-chat UI state when selectedChatId changes
+  // Reset per-chat UI state when selectedChatId changes. Compaction summaries keep their
+  // expansion: their keys are boundary sequences, which are stable across views. The reset
+  // functions are stable (see useExpansionSet), so this runs on chat switches only — not on
+  // every expansion toggle.
   useEffect(() => {
-    setExpandedToolCalls(new Set());
-    setExpandedActions(new Set());
-    setExpandedErrors(new Set());
+    toolCallExpansion.reset();
+    actionExpansion.reset();
+    errorExpansion.reset();
     setIsLoadingEarlier(false);
     setIsEditingTitle(false);
     setSidebarActiveTab("chat");
-  }, [selectedChatId]);
+  }, [
+    selectedChatId,
+    toolCallExpansion.reset,
+    actionExpansion.reset,
+    errorExpansion.reset,
+  ]);
 
   // While the chat is shown, the workspace keeps the model provider's cache of it warm. Disposing
   // the call's promise disposes the lease it resolves to, even if it hasn't resolved yet.
@@ -796,18 +788,6 @@ function ChatInterface({
     });
 
 
-  const toggleToolCallExpansion = useCallback((expansionKey: string) => {
-    setExpandedToolCalls((prev) => {
-      const next = new Set(prev);
-      if (next.has(expansionKey)) {
-        next.delete(expansionKey);
-      } else {
-        next.add(expansionKey);
-      }
-      return next;
-    });
-  }, []);
-
   const toggleShowThinkingTraces = useCallback(() => {
     setShowThinkingTraces((prev) => {
       const next = !prev;
@@ -815,42 +795,6 @@ function ChatInterface({
       return next;
     });
   }, []);
-
-  // Toggle action description expansion
-  const toggleActionExpansion = (actionId: number) => {
-    setExpandedActions((prev) => {
-      const next = new Set(prev);
-      if (next.has(actionId)) {
-        next.delete(actionId);
-      } else {
-        next.add(actionId);
-      }
-      return next;
-    });
-  };
-
-  // Compaction summaries are collapsed by default: the marker answers where the cut fell, and the
-  // summary is there for anyone who wants to see what the model was left with.
-  const toggleCompactionSummary = (to: number) => {
-    setExpandedCompactions((prev) => {
-      const next = new Set(prev);
-      if (next.has(to)) next.delete(to); else next.add(to);
-      return next;
-    });
-  };
-
-  // Toggle error message expansion
-  const toggleErrorExpansion = (messageKey: string) => {
-    setExpandedErrors((prev) => {
-      const next = new Set(prev);
-      if (next.has(messageKey)) {
-        next.delete(messageKey);
-      } else {
-        next.add(messageKey);
-      }
-      return next;
-    });
-  };
 
 
   // The current epoch's opening sequence (see ChatCodeBase.epoch), zero when the epoch spans the
@@ -1012,47 +956,59 @@ function ChatInterface({
                     useConstrainedChatWidth={useConstrainedChatWidth}
                     displayEntries={displayEntries}
                     entryTopClasses={entryTopClasses}
-                    expandedCompactions={expandedCompactions}
-                    toggleCompactionSummary={toggleCompactionSummary}
                     currentUser={currentUser}
                     chatEpoch={chatEpoch}
                     onRetryFailedSend={retryFailedSend}
                     onDismissFailedSend={dismissFailedSend}
                     isAgentActive={isAgentActive}
                     activeAgent={activeAgent}
-                    lastDurablePendingChange={lastDurablePendingChange}
-                    pendingChangeByTurnItemSeq={pendingChangeByTurnItemSeq}
-                    createdWorkpiecesByTurnItemSeq={createdWorkpiecesByTurnItemSeq}
-                    completedAgentTurnMessageSeqs={completedAgentTurnMessageSeqs}
-                    latestCompletedAgentTurnMessageSeq={latestCompletedAgentTurnMessageSeq}
-                    resolveToolOutput={resolveToolOutput}
-                    expandedToolCalls={expandedToolCalls}
-                    toggleToolCallExpansion={toggleToolCallExpansion}
-                    onOpenGadget={onOpenGadget}
-                    getOverseer={getOverseer}
                     hideOwnUserName={hideOwnUserName}
-                    downloadChatAttachment={downloadChatAttachment}
                     showThinkingTraces={showThinkingTraces}
-                    handleCopyMessage={handleCopyMessage}
-                    handleRevertChanges={handleRevertChanges}
-                    messageStates={messageStates}
                     restricted={restricted}
-                    expandedActions={expandedActions}
-                    processingActions={processingActions}
-                    toggleActionExpansion={toggleActionExpansion}
-                    resolveAction={resolveAction}
-                    setAutoApproveConfirm={setAutoApproveConfirm}
-                    isTagAutoApproved={isTagAutoApproved}
-                    handleToggleHook={handleToggleHook}
-                    processingConnections={processingConnections}
-                    handleAcceptConnection={handleAcceptConnection}
-                    handleDenyConnection={handleDenyConnection}
-                    expandedErrors={expandedErrors}
-                    toggleErrorExpansion={toggleErrorExpansion}
-                    setUsageModalOpen={setUsageModalOpen}
-                    handleRetry={handleRetry}
-                    retryModelId={retryModelId}
                     lastMessageSequence={lastMessageSequence}
+                    currentMessages={currentMessages}
+                    queuedSteers={queuedSteers}
+                    turnChanges={{
+                      lastDurablePendingChange,
+                      pendingChangeByTurnItemSeq,
+                      createdWorkpiecesByTurnItemSeq,
+                      completedAgentTurnMessageSeqs,
+                      latestCompletedAgentTurnMessageSeq,
+                      handleRevertChanges,
+                    }}
+                    expansion={{
+                      toolCalls: toolCallExpansion,
+                      actions: actionExpansion,
+                      errors: errorExpansion,
+                      compactions: compactionExpansion,
+                    }}
+                    tools={{
+                      resolveToolOutput,
+                      onOpenGadget,
+                      getOverseer,
+                    }}
+                    actionCards={{
+                      processingActions,
+                      resolveAction,
+                      setAutoApproveConfirm,
+                      isTagAutoApproved,
+                      handleToggleHook,
+                    }}
+                    connections={{
+                      processingConnections,
+                      handleAcceptConnection,
+                      handleDenyConnection,
+                    }}
+                    errorHandling={{
+                      setUsageModalOpen,
+                      handleRetry,
+                      retryModelId,
+                    }}
+                    messages={{
+                      messageStates,
+                      handleCopyMessage,
+                      downloadChatAttachment,
+                    }}
                     currentRowBuffer={currentRowBuffer}
                     currentHasUserDraftRows={currentHasUserDraftRows}
                     handleDiscardDraftChanges={handleDiscardDraftChanges}
@@ -1060,8 +1016,7 @@ function ChatInterface({
                     currentProvisionalState={currentProvisionalState}
                     provisionalToolCalls={provisionalToolCalls}
                     isCompacting={isCompacting}
-                    currentMessages={currentMessages}
-                    queuedSteers={queuedSteers}
+                    provisionalTick={provisionalTick}
                   />
                 </div>
                 <MissedMessagesStatus

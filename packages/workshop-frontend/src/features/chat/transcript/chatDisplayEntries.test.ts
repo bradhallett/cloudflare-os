@@ -11,6 +11,7 @@ import {
   isUserMessageEntry,
   latestUserMessageEntry,
   rhythmTopClass,
+  rhythmTopClassForLiveRow,
   type ChatDisplayEntry,
 } from "./chatDisplayEntries";
 
@@ -141,6 +142,19 @@ describe("buildChatDisplayEntries with failed sends", () => {
     const entries = buildChatDisplayEntries([message(1, { type: "message", message: "hi" })], new Map());
     expect(entries.map((e) => e.type)).toEqual(["message"]);
   });
+
+  it("inserts an older failed send before a later durable message", () => {
+    const older = {...failedSend("a"), timestamp: new Date(1500)};
+    const entries = buildChatDisplayEntries(
+      [message(1, { type: "message", message: "first" }),
+        message(2, { type: "message", message: "second" })],
+      new Map(),
+      [],
+      undefined,
+      [older],
+    );
+    expect(entries.map((e) => e.type)).toEqual(["message", "failedSend", "message"]);
+  });
 });
 
 describe("failed-send spacing", () => {
@@ -161,5 +175,17 @@ describe("failed-send spacing", () => {
     const agent = { type: "message", key: "m1", message: message(1, { type: "message", message: "answer" }) } as const;
     const send = { type: "failedSend", key: "failed-a", send: failedSend("a") } as const;
     expect(rhythmTopClass(agent as never, send as never)).toBe("mt-5");
+  });
+});
+
+describe("rhythmTopClassForLiveRow", () => {
+  it("matches rhythmTopClass's prev-side decisions for a live row", () => {
+    expect(rhythmTopClassForLiveRow(null)).toBe("");
+    const modelChange = { type: "modelChange", key: "mc", author: AGENT, sequence: 3 } as const;
+    expect(rhythmTopClassForLiveRow(modelChange as never)).toBe("mt-2");
+    const user = { type: "message", key: "m1", message: durableUserMessage(1, "hi") } as const;
+    expect(rhythmTopClassForLiveRow(user as never)).toBe("mt-5");
+    const agent = { type: "message", key: "m2", message: message(1, { type: "message", message: "answer" }) } as const;
+    expect(rhythmTopClassForLiveRow(agent as never)).toBe("mt-4");
   });
 });

@@ -559,4 +559,85 @@ describe("useMessageScroller", () => {
 
     harness.unmount();
   });
+
+  // A nested scrollable inside a row (a capped description, a code block): wheel and touch
+  // over it pan it, not the transcript.
+  function nestedScrollableIn(row: HTMLElement): HTMLElement {
+    const nested = document.createElement("div");
+    nested.style.overflowY = "auto";
+    Object.defineProperty(nested, "scrollHeight", { get: () => 300, configurable: true });
+    Object.defineProperty(nested, "clientHeight", { get: () => 100, configurable: true });
+    row.appendChild(nested);
+    return nested;
+  }
+
+  it("keeps following through zoom wheels, nested wheels, and downward wheels", async () => {
+    const harness = await renderHarness([agentMessage(1)], false, {
+      scrollHeight: 1000,
+      clientHeight: 400,
+      scrollTop: 600,
+    });
+    const nested = nestedScrollableIn(
+      harness.transcript.querySelector<HTMLElement>("[data-entry-key]")!,
+    );
+
+    // ctrl+wheel is browser zoom, not a scroll intent: following survives it.
+    scrollToCalls.length = 0;
+    await act(async () => {
+      harness.transcript.dispatchEvent(
+        new WheelEvent("wheel", { bubbles: true, ctrlKey: true, deltaY: -100 }),
+      );
+      scroller().followContent();
+    });
+    expect(scrollToCalls.at(-1)?.top).toBe(1000);
+
+    // A wheel over the nested scrollable pans it, not the transcript.
+    await act(async () => {
+      nested.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -100 }));
+      scroller().followContent();
+    });
+    expect(scrollToCalls.at(-1)?.top).toBe(1000);
+
+    // A downward wheel while riding the live edge cannot leave it (trackpad momentum).
+    await act(async () => {
+      harness.transcript.dispatchEvent(
+        new WheelEvent("wheel", { bubbles: true, deltaY: 120 }),
+      );
+      scroller().followContent();
+    });
+    expect(scrollToCalls.at(-1)?.top).toBe(1000);
+    expect(scroller().atBottom).toBe(true);
+
+    // An upward wheel on the container itself still hands control to the reader.
+    scrollToCalls.length = 0;
+    await act(async () => {
+      harness.transcript.dispatchEvent(
+        new WheelEvent("wheel", { bubbles: true, deltaY: -120 }),
+      );
+      scroller().followContent();
+    });
+    expect(scrollToCalls).toHaveLength(0);
+
+    harness.unmount();
+  });
+
+  it("keeps following a touch drag that pans a nested scrollable", async () => {
+    const harness = await renderHarness([agentMessage(1)], false, {
+      scrollHeight: 1000,
+      clientHeight: 400,
+      scrollTop: 600,
+    });
+    const nested = nestedScrollableIn(
+      harness.transcript.querySelector<HTMLElement>("[data-entry-key]")!,
+    );
+
+    scrollToCalls.length = 0;
+    await act(async () => {
+      nested.dispatchEvent(new Event("touchmove", { bubbles: true }));
+      scroller().followContent();
+    });
+    expect(scrollToCalls.at(-1)?.top).toBe(1000);
+
+    harness.unmount();
+  });
 });

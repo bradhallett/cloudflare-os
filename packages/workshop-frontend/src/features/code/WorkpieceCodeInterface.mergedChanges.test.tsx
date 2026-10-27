@@ -5,7 +5,7 @@ import { act, type ComponentProps } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { FileAtCommit, GadgetSummary, TreeNode } from '@gadgets/workshop-shared/api'
-import type { ChatCodeChanges } from '../../ChatInterface'
+import type { ChatCodeChanges } from '../chat/liveCodeStreams'
 import type { ChangedFile } from './workpieceTree'
 
 // Covers the Changes list of a chat pinned at a merge commit (see ChatGadgetPinState): a file

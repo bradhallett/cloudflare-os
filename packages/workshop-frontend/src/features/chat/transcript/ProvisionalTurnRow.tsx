@@ -1,8 +1,9 @@
-import styles from "../../../ChatInterface.module.css";
+import { memo } from "react";
+import styles from "../ChatInterface.module.css";
 import type { AiChatMessage } from "@gadgets/workshop-shared/api";
 import { MarkdownMessage } from "../markdown/MarkdownMessage";
 import type { ProvisionalChatState, ProvisionalToolCallState } from "../provisionalChatState";
-import { isUserMessageEntry, type ChatDisplayEntry } from "./chatDisplayEntries";
+import { rhythmTopClassForLiveRow, type ChatDisplayEntry } from "./chatDisplayEntries";
 import { ProvisionalToolGroupRow } from "./ProvisionalToolGroupRow";
 import { ThinkingTraceRow } from "./ThinkingTraceRow";
 
@@ -11,7 +12,7 @@ import { ThinkingTraceRow } from "./ThinkingTraceRow";
  * thinking notices, reasoning, partial text, in-flight tool calls — shown only while the
  * agent is active; once real output appears, that speaks for itself.
  */
-export function ProvisionalTurnRow({
+export const ProvisionalTurnRow = memo(function ProvisionalTurnRow({
   provisionalState,
   toolCalls,
   isCompacting,
@@ -24,6 +25,13 @@ export function ProvisionalTurnRow({
   provisionalState: ProvisionalChatState | null;
   toolCalls: ProvisionalToolCallState[];
   isCompacting: boolean;
+  /**
+   * The rAF-coalesced stream tick. The provisional state and tool calls are mutated in place
+   * with stable identity, so this counter is the only prop that changes while a response
+   * streams -- exactly what the memo wrapper needs to repaint the row per tick while the
+   * durable transcript around it holds still.
+   */
+  provisionalTick: number;
   showThinkingTraces: boolean;
   /** The chat's messages, read for whether the agent has answered anything yet. */
   currentMessages: AiChatMessage[];
@@ -48,15 +56,9 @@ export function ProvisionalTurnRow({
     !hasShownReasoning &&
     toolCalls.length === 0;
 
-  // Match the spacing this response gets once finalized (see rhythmTopClass) so it doesn't
-  // shift when streaming completes.
-  const provisionalTopClass = !previousEntry
-    ? ""
-    : previousEntry.type === "modelChange"
-      ? "mt-2"
-      : isUserMessageEntry(previousEntry)
-        ? "mt-5"
-        : "mt-4";
+  // The shared live-row rhythm keeps this placeholder at the spacing the finalized response
+  // gets (see rhythmTopClassForLiveRow), so nothing shifts when streaming completes.
+  const provisionalTopClass = rhythmTopClassForLiveRow(previousEntry);
 
   return (
     <div className={`group/agent min-w-0 w-full max-w-[860px] space-y-2 ${provisionalTopClass}`}>
@@ -91,4 +93,4 @@ export function ProvisionalTurnRow({
       )}
     </div>
   );
-}
+});

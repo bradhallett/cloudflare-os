@@ -5,6 +5,8 @@ import {
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
+  type TouchEvent as ReactTouchEvent,
+  type WheelEvent as ReactWheelEvent,
   type RefObject,
 } from "react";
 
@@ -75,6 +77,31 @@ function rowTopInContainer(container: HTMLElement, row: HTMLElement): number {
   );
 }
 
+/**
+ * The nearest scrollable element at or above `target`: itself when it scrolls, else the first
+ * ancestor that does, up to (and including) `container`. Null when the walk escapes the
+ * container — the target is not inside the transcript's scroll context.
+ */
+function nearestScrollableAncestor(
+  target: EventTarget | null,
+  container: HTMLElement | null,
+): HTMLElement | null {
+  let node = target instanceof Element ? target : null;
+  while (node !== null && node !== container) {
+    if (node instanceof HTMLElement) {
+      const overflowY = getComputedStyle(node).overflowY;
+      if (
+        (overflowY === "auto" || overflowY === "scroll") &&
+        node.scrollHeight > node.clientHeight
+      ) {
+        return node;
+      }
+    }
+    node = node.parentElement;
+  }
+  return node === container ? container : null;
+}
+
 /** Options for {@link useMessageScroller}. */
 export interface UseMessageScrollerOptions {
   /** The transcript's scroll container. */
@@ -97,8 +124,8 @@ export interface MessageScroller {
   handleScroll: () => void;
   /** Spread on the container: explicit reader input — wheel, touch drag, scroll keys, scrollbar drag — opts out of following. */
   intentEvents: {
-    onWheel: () => void;
-    onTouchMove: () => void;
+    onWheel: (event: ReactWheelEvent<HTMLDivElement>) => void;
+    onTouchMove: (event: ReactTouchEvent<HTMLDivElement>) => void;
     onKeyDown: (event: ReactKeyboardEvent<HTMLDivElement>) => void;
     onPointerDown: (event: ReactPointerEvent<HTMLDivElement>) => void;
   };
@@ -299,6 +326,34 @@ export function useMessageScroller({
     lastSeenSequenceRef.current = latestSequenceRef.current;
   }, [containerRef]);
 
+  const handleWheel = useCallback(
+    (event: ReactWheelEvent<HTMLDivElement>) => {
+      const el = containerRef.current;
+      // Browser zoom (ctrl/⌘ + wheel) is not a scroll intent.
+      if (event.ctrlKey || event.metaKey) return;
+      // Scrolling a nested scrollable (a code block, a capped card description) navigates
+      // content, not the transcript's live edge.
+      if (nearestScrollableAncestor(event.target, el) !== el) return;
+      // A downward (or zero) wheel while riding the live edge cannot leave it — counting it
+      // would drop the follow to a no-op trackpad momentum flick. Read the live geometry, not
+      // the follow state: the edge may have been left without a scroll event landing yet.
+      if (el && event.deltaY >= 0 && isAtBottom(el)) return;
+      interrupt();
+    },
+    [containerRef, interrupt],
+  );
+
+  const handleTouchMove = useCallback(
+    (event: ReactTouchEvent<HTMLDivElement>) => {
+      // A touch drag inside a nested scrollable (a code block) pans that, not the transcript.
+      if (nearestScrollableAncestor(event.target, containerRef.current) !== containerRef.current) {
+        return;
+      }
+      interrupt();
+    },
+    [containerRef, interrupt],
+  );
+
   const jumpToLatest = useCallback(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -326,8 +381,8 @@ export function useMessageScroller({
     missedCount,
     handleScroll,
     intentEvents: {
-      onWheel: interrupt,
-      onTouchMove: interrupt,
+      onWheel: handleWheel,
+      onTouchMove: handleTouchMove,
       onKeyDown: handleKeyDown,
       onPointerDown: handlePointerDown,
     },

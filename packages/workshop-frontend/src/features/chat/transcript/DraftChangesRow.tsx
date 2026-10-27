@@ -23,6 +23,10 @@ export function DraftChangesRow({
   onFinalizeDraftChanges: () => Promise<void>;
 }) {
   const lastEditedAt = rowBuffer.lastUserEditAt;
+  // Live-row rhythm in the vocabulary of rhythmTopClassForLiveRow, with two intentional
+  // deltas: below a user message the banner hangs one step farther back than the mt-5 a
+  // reply gets (it's a status line, not the conversation's answer), and it hugs a work row
+  // like rhythmTopClass's work-to-work mt-2.
   const draftTopClass = !previousEntry
     ? ""
     : isUserMessageEntry(previousEntry)

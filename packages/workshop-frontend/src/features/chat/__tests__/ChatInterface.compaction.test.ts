@@ -5,7 +5,7 @@ import type { AiChatMessage, AiChatMessageBody, ChatCodeBase } from "@gadgets/wo
 import type { CodeChange } from "@gadgets/workshop-shared/code-change";
 import {
   buildChatDisplayEntries, computeChatEpochChanges, type CompactionBoundary,
-} from "./ChatInterface";
+} from "../transcript/chatDisplayEntries";
 
 const AUTHOR = { type: "agent", id: "test-model", name: "Test" } as const;
 
