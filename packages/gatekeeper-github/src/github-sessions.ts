@@ -12,7 +12,7 @@ import { commitIdsOfSummary, isCommitOid } from "@gadgets/gatekeeper-kit/git-obj
 import { SessionGitCache, requestedPageSize } from "@gadgets/gatekeeper-kit/cursors";
 import { commitIdsOfPullSummary } from "./git-commits";
 import { validateBranchName } from "@gadgets/gatekeeper-kit/git-transport";
-import type { GitHubGatekeeperImpl } from "./github";
+import type { GitHubGatekeeperImpl } from "./github-gatekeeper";
 import type { EntityKind } from "./github-action-types";
 import type {
   GitHubEventHookTarget,
