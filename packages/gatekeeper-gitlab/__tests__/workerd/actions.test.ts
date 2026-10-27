@@ -247,11 +247,13 @@ describe("issue mutations", () => {
   });
 
   // 205 queue+apply round-trips run ~0.8s serially, but a cold gate running every suite at once
-  // starved this past vitest's 5s default (CI 40438611289). The roomier timeout is half the fix:
-  // a timed-out test's body keeps running in this isolate, and its late provider calls land in
-  // whichever sibling test owns the fetch stub by then -- observed on a loaded runner as +1 on
-  // request-count assertions tests later in this file. The per-iteration abort check is the other
-  // half: an abandoned run stops issuing applies instead of zombifying into its siblings.
+  // starved this past vitest's 5s default -- CI 40438611289 failed the gatekeeper-github twin
+  // this way, and a loaded 16-task local gate timed this test out too. The roomier timeout is
+  // half the fix: a timed-out test's body keeps running in this isolate, and its late provider
+  // calls land in whichever sibling test owns the fetch stub by then -- that same loaded gate
+  // showed it as +1 on request-count assertions tests later in this file. The per-iteration
+  // abort check is the other half: an abandoned run stops issuing applies instead of
+  // zombifying into its siblings.
   it("retains only the newest applied actions for revert, retiring older ones from apply",
     async ({ signal }) => {
     // The retained tier would grow without bound otherwise, exactly as the hand-kept
