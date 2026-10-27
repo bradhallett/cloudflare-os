@@ -1,19 +1,14 @@
 import { AiChatAuthorInfo, AiToolCall, type AiModelConfig } from "@gadgets/workshop-shared/api";
 
 import { createWorkshopLogger } from "./observability";
-import {
-  Type,
-  getSystemMessageText,
-  isRetryableAssistantError,
-  toToolDeclaration,
-} from "@earendil-works/pi-ai";
+import { getSystemMessageText, isRetryableAssistantError, toToolDeclaration } from "@earendil-works/pi-ai";
 import type{ AssistantMessage, Message, SystemMessage } from "@earendil-works/pi-ai";
 import { runAgentLoopContinue, type AgentContext, type AgentEvent } from "@earendil-works/pi-agent-core";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { seenAlwaysAvailableResources } from "./agent-catalog";
 import { traceRejectedToolCall, traceTool } from "./agent-tracing";
 import { AgentTurnError, completeText, httpStatusFromError } from "./ai-invoke";
-import { buildTools, defineTool } from "./agent-tools";
+import { buildTools, buildBotTools } from "./agent-tools";
 
 import type{ AgentProgress } from "./agent-session";
 import { SPAWNED_AGENT_TOOLS, buildSystemPrompt } from "./agent-prompt";
@@ -158,104 +153,12 @@ async function runAgentPass(
   // turn_end persister to merge into the chat log. Success data rides details; error-path notes
   // go through session.toolCallNotes instead, because pi drops `details` for thrown errors.
 
-  // The bot list is tool-advertising, not turn-critical: a user-DO or KV hiccup must not fail
-  // the pass, so it degrades to an empty list (the tools are simply omitted this turn).
-  let delegatableBots = session.agentContext.spawnerConfig ? []
-      : await hooks.listDelegatableBots(chatId).catch(() => []);
-  let delegatableBotsList = delegatableBots.length === 0 ? ""
-      : delegatableBots.map(bot =>
-            `- ${bot.name} (${bot.key})${bot.description ? `: ${bot.description}` : ""}`)
-          .join("\n");
   // The built-in tools, closures over the turn session (see agent-tools.ts).
   let tools = buildTools({session, hooks, chatId, author, initiator});
 
-  if (session.agentContext.botConfig) {
-    tools.activateSkill = defineTool({
-      name: "activateSkill",
-      label: "Activate skill",
-      description:
-          "Activate one of this bot's skills on demand (see the Skills section of the system " +
-          "prompt). Pass the skill's command id, or its title when unambiguous. Returns the " +
-          "skill's agent-visible result text.",
-      parameters: Type.Object({
-        skill: Type.String({
-          description: 'The skill to activate: its command id (e.g. "search") or its title.',
-        }),
-      }),
-      execute: async (toolCallId, input) => {
-        try {
-          let output = await hooks.invokeBotSkill(chatId, input.skill);
-          return session.toolResult(output, {output});
-        } catch (error) {
-          session.toolCallNotes.set(toolCallId, {error: session.toolErrorText(error)});
-          throw error;
-        }
-      }
-    });
-  }
-
-  if (delegatableBots.length > 0) {
-    tools.delegateToBot = defineTool({
-      name: "delegateToBot",
-      label: "Delegate to bot",
-      description:
-          "Run another bot as a subagent of this chat: it starts (or continues) its own " +
-          "visible thread, works on the task, and this chat waits for its reply. Pass " +
-          "threadId from a earlier call to send the same bot a follow-up on its thread. " +
-          "Bots available to the initiator of this chat:\n" + delegatableBotsList,
-      parameters: Type.Object({
-        bot: Type.String({
-          description: 'The bot to run, by key (e.g. "u:3" or "d:slug").',
-        }),
-        message: Type.String({
-          description: "The task for the bot, stated completely: it sees no other context " +
-              "from this chat.",
-        }),
-        threadId: Type.Optional(Type.Number({
-          description: "threadId returned by an earlier delegateToBot call, to continue that " +
-              "thread instead of starting a new one.",
-        })),
-      }),
-      execute: async (toolCallId, input) => {
-        try {
-          let result = await hooks.runBotSubagent(
-              chatId, input.bot, input.message, input.threadId, toolCallId, abortSignal);
-          let output = JSON.stringify(result);
-          return session.toolResult(output, {output});
-        } catch (error) {
-          session.toolCallNotes.set(toolCallId, {error: session.toolErrorText(error)});
-          throw error;
-        }
-      }
-    });
-
-    tools.messageBot = defineTool({
-      name: "messageBot",
-      label: "Message bot",
-      description:
-          'Send a direct message to another bot (or to "orchestrator", the chat that ' +
-          'delegated to this one) without waiting for a reply: an idle bot starts a turn and ' +
-          'answers in its own thread; a mid-turn bot receives it as a steer. Use ' +
-          'delegateToBot for blocking Q&A; use this to hand off, notify, or coordinate ' +
-          'asynchronously. Targets are bot keys (e.g. "u:3", "d:slug"), bot names, or ' +
-          '"orchestrator".',
-      parameters: Type.Object({
-        to: Type.String({
-          description: 'The recipient: a bot key, a bot name, or "orchestrator".',
-        }),
-        text: Type.String({description: "The message body."}),
-      }),
-      execute: async (toolCallId, input) => {
-        try {
-          let output = await hooks.deliverBotMessage(chatId, input.to, input.text);
-          return session.toolResult(output, {output});
-        } catch (error) {
-          session.toolCallNotes.set(toolCallId, {error: session.toolErrorText(error)});
-          throw error;
-        }
-      }
-    });
-  }
+  // The bot-only tools (activateSkill for a chat running as a bot; delegateToBot and
+  // messageBot when the initiator has delegatable bots).
+  Object.assign(tools, await buildBotTools({session, hooks, chatId, abortSignal}));
 
   if (session.agentContext.spawnerConfig) {
     // Restrict sub-agents to a narrower set of tools. No user is present to approve changes, so
