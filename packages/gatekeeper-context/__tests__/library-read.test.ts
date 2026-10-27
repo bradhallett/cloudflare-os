@@ -7,6 +7,7 @@ import { CONTEXT_OBSERVER_DENIED, contextObserverStrategy } from "../src/context
 import type { ContextCollectionDurableObject } from "../src/context-collection.js";
 import { LibraryReadSession } from "../src/library-read.js";
 import type { UserLibraryDurableObject } from "../src/user-library.js";
+import type { CollectionAccess } from "../src/collection-access.js";
 import { domainName } from "../src/domain.js";
 
 const DOMAIN = "workshop.example";
@@ -38,8 +39,20 @@ const DOCUMENT = {
   body: "Ship it.",
 };
 
+// The owner's standing on the collections the library index covers: the public one, and a private
+// one the owner's library lists. Tests inject any other collection's access via `resolvedAccess`.
+const PUBLIC_ACCESS: CollectionAccess = {
+  exists: true, visibility: "public", role: null, manager: false,
+  everyoneCanView: false, hasOwner: false, shared: false,
+};
+const OWNER_ACCESS: CollectionAccess = {
+  exists: true, visibility: "private", role: "owner", manager: false,
+  everyoneCanView: false, hasOwner: true, shared: false,
+};
+
 // The owner's library: one public collection and one private collection.
-function makeSession({ publicDiscoveryFails = false, publicAccessFails = false } = {}) {
+function makeSession({ publicDiscoveryFails = false, publicAccessFails = false,
+  resolvedAccess = {} as Record<string, CollectionAccess> } = {}) {
   let kv = makeKv();
   let strategy = contextObserverStrategy(kv, DOMAIN);
   let authorized: ObservationDescription[] = [];
@@ -58,8 +71,15 @@ function makeSession({ publicDiscoveryFails = false, publicAccessFails = false }
         }
         return { exists: true, visibility: "public" };
       },
+      async getResolvedAccess() {
+        let id = name.split("\u0000").at(-1)!;
+        if (publicAccessFails && id === "unavailable") {
+          throw new Error("Public collection is unavailable.");
+        }
+        return resolvedAccess[id] ?? (id === "public" ? PUBLIC_ACCESS : OWNER_ACCESS);
+      },
       async getMetadata() {
-        let id = name.split(":").at(-1);
+        let id = name.split("\u0000").at(-1)!;
         return { title: `${id} title`, description: `${id} description`, documentCount: 1 };
       },
       async listContextDocuments() { return [DOCUMENT]; },
@@ -146,5 +166,40 @@ describe("LibraryReadSession sharing", () => {
       .toMatchObject([{ path: "plan.md", type: "document" }]);
     expect(await session.search("plan", { collectionId: "private" }))
       .toMatchObject([{ docId: "private/plan.md", collectionId: "private" }]);
+  });
+});
+
+describe("LibraryReadSession everyone-viewable", () => {
+  // A stranger on an everyone-viewable collection: no grant, no library index entry, not public.
+  const EVERYONE_CAN_VIEW: CollectionAccess = {
+    exists: true, visibility: "private", role: null, manager: false,
+    everyoneCanView: true, hasOwner: true, shared: true,
+  };
+
+  it("reads and searches an everyone-viewable collection by id, but never lists it", async () => {
+    let { session } = makeSession({ resolvedAccess: { everyone: EVERYONE_CAN_VIEW } });
+
+    // Id-addressed reads answer from the access authority, not the library index.
+    expect(await session.read("everyone/plan.md")).toMatchObject({
+      docId: "everyone/plan.md", content: "Ship it.",
+    });
+    expect(await session.search("plan", { collectionId: "everyone" }))
+      .toMatchObject([{ docId: "everyone/plan.md", collectionId: "everyone" }]);
+
+    // Discovery stays index-driven: the collection never lists, on its own or among results.
+    expect((await session.list()).entries.map(entry => entry.type === "collection" && entry.id))
+      .toEqual(["private", "public"]);
+    expect((await session.list({ collectionId: "everyone" })).entries).toEqual([]);
+    expect((await session.search("plan")).map(result => result.collectionId))
+      .toEqual(["private", "public"]);
+  });
+
+  it("takes everyone-viewable read back away once the flag is off", async () => {
+    let { session } = makeSession({
+      resolvedAccess: { everyone: { ...EVERYONE_CAN_VIEW, everyoneCanView: false } },
+    });
+
+    expect(await session.read("everyone/plan.md")).toBeNull();
+    expect(await session.search("plan", { collectionId: "everyone" })).toEqual([]);
   });
 });

@@ -9,6 +9,7 @@ import {
   decodeDocId, encodeDocId, isTextContentType, VENDOR_ID,
   type ContextLibrary,
 } from "./context-types.js";
+import { canReadCollection } from "./collection-access.js";
 import type { ContextCollectionDurableObject } from "./context-collection.js";
 import type { UserLibraryDurableObject } from "./user-library.js";
 import { listPublicCollectionsFromKv } from "./collection-kv.js";
@@ -91,6 +92,14 @@ export class LibraryReadSession extends RpcTarget implements ContextLibrary {
       || ((await this.#discoveredPublicIds()).includes(collectionId) && await this.#isLivePublic(collectionId));
   }
 
+  // Id-addressed reads answer from the access authority (canReadCollection over resolved access),
+  // the same policy management and observer verification use — so a stranger on an
+  // everyone-can-view collection reads by document id even though no index lists it. Listing stays
+  // index-driven (#inLibrary) per the sharing design: the flag grants read, not discovery.
+  async #canRead(collectionId: string): Promise<boolean> {
+    return canReadCollection(await this.#collection(collectionId).getResolvedAccess(this.accountId));
+  }
+
   // A read revealing no collection contents is authorized against the admission baseline, so it
   // does not constrain who may observe the workspace.
   #authorize(collectionIds: string[], description: ObservationInput): Promise<void> {
@@ -107,7 +116,7 @@ export class LibraryReadSession extends RpcTarget implements ContextLibrary {
 
     let targetIds: string[];
     if (opts?.collectionId) {
-      if (!await this.#inLibrary(opts.collectionId)) return [];
+      if (!await this.#canRead(opts.collectionId)) return [];
       targetIds = [opts.collectionId];
     } else {
       targetIds = await this.#libraryIds();
@@ -177,7 +186,7 @@ export class LibraryReadSession extends RpcTarget implements ContextLibrary {
     if (!decoded) return null;
     let { collectionId, path } = decoded;
 
-    if (!await this.#inLibrary(collectionId)) return null;
+    if (!await this.#canRead(collectionId)) return null;
 
     let doc = await this.#collection(collectionId).getContextDocument(path);
     // No document found (missing or inaccessible) → nothing was observed, so don't record one.

@@ -1484,7 +1484,9 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
   }
 
   async getAutoApprovableActions() {
-    return [];
+    // Derived from the set, so a kind newly marked auto-approvable is offered here without a
+    // second list to keep in sync.
+    return this.#actions.autoApprovableKinds();
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<SpotifyAccountSession | SpotifyPlaylist> {

@@ -55,6 +55,37 @@ describe("ActionJournal", () => {
     expect(journal.listPending().map(({ id }) => id)).toEqual([2, 10]);
   });
 
+  it("serves repeated pending projections from one scan per view, dropping the cache on mutation", () => {
+    const kv = makeKv();
+    const scans = vi.spyOn(kv, "list");
+    const journal = new ActionJournal<Sql>(kv, { namespace: "pending" });
+    const staged = journal.allocate({ sql: "staged" });
+    const submitted = journal.allocate({ sql: "waiting" });
+    journal.markSubmitted(submitted);
+    scans.mockClear();
+
+    // Three projections between mutations walk storage once per view, not once per call.
+    expect(journal.listPending().map(({ id }) => id)).toEqual([submitted]);
+    expect(journal.listPending().map(({ id }) => id)).toEqual([submitted]);
+    expect(journal.listUndecided().map(({ id }) => id)).toEqual([submitted]);
+    expect(scans).toHaveBeenCalledTimes(2);
+
+    // Each call still returns a fresh array, so a caller cannot poison the cache.
+    const page = journal.listPending();
+    page.push({ id: 99, action: { sql: "forged" } });
+    expect(journal.listPending().map(({ id }) => id)).toEqual([submitted]);
+
+    // Every mutation drops the cache, so the next projection sees storage again.
+    journal.markClaimed(submitted);
+    expect(journal.listPending().map(({ id }) => id)).toEqual([submitted]);
+    expect(scans).toHaveBeenCalledTimes(3);
+    journal.allocate({ sql: "later" });
+    journal.markSubmitted(staged);
+    expect(journal.listPending().map(({ id }) => id)).toEqual([staged, submitted]);
+    journal.remove(submitted);
+    expect(journal.listPending().map(({ id }) => id)).toEqual([staged]);
+  });
+
   it("refuses to stage over a live id, which a port of a last-issued counter would reissue", () => {
     const kv = makeKv();
     const journal = new ActionJournal<Sql>(kv, { namespace: "pending" });
