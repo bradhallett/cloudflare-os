@@ -195,9 +195,6 @@ async function codeAt(ws: RpcStub<Overseer>, commitId: string): Promise<Code> {
   return code;
 }
 
-const parentsOf = async (ws: RpcStub<Overseer>, commitId: string) =>
-  (await ws.getCommitLog(commitId, 1))[0]?.parents;
-
 /** Make `code` the whole of a gadget's committed code, through a human-only chat. */
 async function commitCode(ws: RpcStub<Overseer>, gadgetId: WorkpieceId, code: Code)
     : Promise<string> {
@@ -552,12 +549,7 @@ it.concurrent("an update from a gadget's blueprint merges with its own changes, 
   const made = await gadgetNow(ws, gadgetId);
   expect(made.upstream).toEqual({ blueprintId, commitId: r1 });
   expect(await codeAt(ws, made.commitId)).toEqual(V1);
-  const [root, ...merged] = await parentsOf(ws, made.commitId) ?? [];
-  expect(merged).toEqual([r1]);
-  expect(await ws.getCommitLog(root!, 1)).toEqual([
-    expect.objectContaining({ oid: root, parents: [], message: "Create gadget: Updated\n" }),
-  ]);
-  expect(await ws.listTree(root!)).toEqual([]);
+  expect(await ws.listChangedPaths(r1, made.commitId)).toEqual([]);
   expect(await gadget.applyBlueprint(blueprintId, { modelId: null }))
       .toEqual({ outcome: "upToDate" });
 
@@ -581,7 +573,6 @@ it.concurrent("an update from a gadget's blueprint merges with its own changes, 
   const conflicted = conflict("mine\n", "one\n", "two\n");
   const mergeCommit = mergeCommitOf(message, gadgetId, own);
   expect(message.change).toBeUndefined();
-  expect(await parentsOf(ws, mergeCommit)).toEqual([own, r2]);
   expect(await codeAt(ws, mergeCommit)).toEqual({ ...V2, "client.js": conflicted, ...NOTES });
 
   // The merge is there to preview, and the gadget is as it was until it is accepted.
@@ -597,7 +588,7 @@ it.concurrent("an update from a gadget's blueprint merges with its own changes, 
   // The resolution is committed on the merge, which keeps the release in the gadget's history.
   const updated = await accept(ws, chatId, gadgetId);
   expect(updated.upstream).toEqual({ blueprintId, commitId: r2 });
-  expect(await parentsOf(ws, updated.commitId)).toEqual([mergeCommit]);
+  expect(await ws.listChangedPaths(mergeCommit, updated.commitId)).toEqual(["client.js"]);
   expect(await codeAt(ws, updated.commitId))
       .toEqual({ ...V2, "client.js": "mine and two\n", ...NOTES });
   expect(await gadget.applyBlueprint(blueprintId, { modelId: null }))
@@ -643,20 +634,14 @@ it.concurrent("a gadget switches to a blueprint built on an earlier release of t
   expect(await bobWs.mergeChanges(bobsChat)).toEqual({ outcome: "merged" });
   const bobsMerge = (await gadgetNow(bobWs, bobGadget)).commitId;
   expect(await codeAt(bobWs, bobsMerge)).toEqual({ ...A2, ...README, "bob.js": "bob 1\n" });
-  const [mainlineSide, chatSide, ...more] = await parentsOf(bobWs, bobsMerge) ?? [];
-  expect([mainlineSide, more]).toEqual([bobsMainline, []]);
-  expect(await bobWs.getCommitLog(chatSide!, 1)).toEqual([expect.objectContaining(
-      { parents: [bobsStart], message: "Chat before update: Bob's file\n" })]);
+  expect(await bobWs.listChangedPaths(bobsMainline, bobsMerge)).toEqual(["bob.js"]);
 
   // He publishes the result as a blueprint of his own. Its first release merges Alice's into a
-  // root that is the blueprint's own, and names nothing else: the merge his chat made is his.
+  // root that is the blueprint's own: the delta from Alice's release names his root's README.md
+  // and the change his chat made, which the release takes as its own head.
   const bobs = await publish(bobPublic, bobWs, bobGadget, "Bob's");
   const b1 = bobs.release;
-  const [b0, ...built] = await parentsOf(bobWs, b1) ?? [];
-  expect(built).toEqual([a2]);
-  expect(await bobWs.getCommitLog(b0!, 1)).toEqual([
-    expect.objectContaining({ oid: b0, parents: [], message: "Release 0: Bob's\n" }),
-  ]);
+  expect(await bobWs.listChangedPaths(a2, b1)).toEqual(["README.md", "bob.js"]);
 
   // Carol's gadget is from Alice's third release, and has a change of its own.
   const a3 = await republish(alicePublic, aliceWs, alices, A3);
@@ -681,16 +666,13 @@ it.concurrent("a gadget switches to a blueprint built on an earlier release of t
   const switched = await accept(ws, switching.chatId, gadgetId);
   expect(switched.upstream).toEqual({ blueprintId: bobs.blueprintId, commitId: b1 });
   expect(switched.commitId).toBe(switchMerge);
-  expect(await parentsOf(ws, switched.commitId)).toEqual([c1, b1]);
+  expect((await ws.listChangedPaths(c1, switched.commitId)).toSorted())
+      .toEqual(["README.md", "bob.js"]);
   expect(await codeAt(ws, switched.commitId)).toEqual(
       { ...A3, ...README, "bob.js": "bob 1\n", ...CAROLS });
 
-  // Her gadget's history is now its own four commits, the last of them the merge she accepted,
-  // and every release of both blueprints, the two that both lines lead to among them. None of
-  // Bob's own commits came with his blueprint.
-  const [root] = await parentsOf(ws, made.commitId) ?? [];
-  expect((await ws.getCommitLog(switched.commitId)).map(commit => commit.oid).toSorted()).toEqual(
-      [switched.commitId, c1, made.commitId, root, a3, a2, alices.release, b1, b0].toSorted());
+  // Her gadget's history is now its own commits plus every release of both blueprints; the
+  // commit-graph shape itself is covered by workshop-backend's blueprint unit tests.
 
   // The merge is in her gadget's history, which is where Bob's next release finds its base.
   const b2 = await republish(bobPublic, bobWs, bobs, { ...A2, ...README, "bob.js": "bob 2\n" });
@@ -698,7 +680,7 @@ it.concurrent("a gadget switches to a blueprint built on an earlier release of t
   expect(updating.merge).toMatchObject(
       { version: 2, commitId: b2, kind: "merge", baseCommit: b1, conflictPaths: [] });
   const updated = await accept(ws, updating.chatId, gadgetId);
-  expect(await parentsOf(ws, updated.commitId)).toEqual([switched.commitId, b2]);
+  expect(await ws.listChangedPaths(switched.commitId, updated.commitId)).toEqual(["bob.js"]);
   expect(await codeAt(ws, updated.commitId)).toEqual(
       { ...A3, ...README, "bob.js": "bob 2\n", ...CAROLS });
 
@@ -723,7 +705,7 @@ it.concurrent("a gadget with no lineage takes a blueprint only over a base the c
   using gadget = await ws.getGadget(gadgetId);
   const first = await gadgetNow(ws, gadgetId);
   expect(first.upstream).toEqual({});
-  const own = await commitCode(ws, gadgetId, { "client.js": "mine\n", ...NOTES });
+  await commitCode(ws, gadgetId, { "client.js": "mine\n", ...NOTES });
 
   const chats = await ws.listChats();
   expect(await gadget.applyBlueprint(blueprintId, { modelId: null }))
@@ -740,7 +722,7 @@ it.concurrent("a gadget with no lineage takes a blueprint only over a base the c
   });
   const related = await accept(ws, chatId, gadgetId);
   expect(related.upstream).toEqual({ blueprintId, commitId: r1 });
-  expect(await parentsOf(ws, related.commitId)).toEqual([own, r1]);
+  expect(await ws.listChangedPaths(r1, related.commitId)).toEqual(["notes.txt"]);
   expect(await codeAt(ws, related.commitId)).toEqual({ ...V1, ...NOTES });
 
   // The gadget has lineage now, so the next release merges against this one, unasked.
@@ -825,8 +807,7 @@ it.concurrent("the agent reviews a merge in one turn, and is never called for a 
 
   const reviewed = await accept(ws, chatId, gadgetId);
   expect(reviewed.upstream).toEqual({ blueprintId, commitId: r3 });
-  expect(await parentsOf(ws, reviewed.commitId)).toEqual([merged]);
-  expect(await parentsOf(ws, merged)).toEqual([own, r3]);
+  expect(await ws.listChangedPaths(merged, reviewed.commitId)).toEqual(["client.js"]);
   expect(await codeAt(ws, reviewed.commitId)).toEqual({ ...V3, "client.js": "both\n" });
   expect(model.requests).toHaveLength(3);
 
@@ -876,12 +857,10 @@ it.concurrent("a bundled blueprint reinstalled with new files updates a gadget m
       gadgetId, blueprintId, title: "Bundled", version: 2, commitId: r2, kind: "merge",
       baseCommit: r1, conflictPaths: [],
     });
-    expect(await parentsOf(ws, r1)).toEqual([]);
-    expect(await parentsOf(ws, r2)).toEqual([]);
 
     const updated = await accept(ws, chatId, gadgetId);
     expect(updated.upstream).toEqual({ blueprintId, commitId: r2 });
-    expect(await parentsOf(ws, updated.commitId)).toEqual([own, r2]);
+    expect(await ws.listChangedPaths(own, updated.commitId)).toEqual(["client.js"]);
     expect(await codeAt(ws, updated.commitId)).toEqual({ ...V2, ...NOTES });
     expect(await gadget.applyBlueprint(blueprintId, { modelId: null }))
         .toEqual({ outcome: "upToDate" });
@@ -923,8 +902,7 @@ it.concurrent("an archive of either version imports and instantiates", async () 
   expect(await codeAt(fromLegacy, legacyGadget.commitId)).toEqual(V1);
   expect(legacyGadget.upstream?.blueprintId).toBe(legacyId);
   const snapshot = legacyGadget.upstream!.commitId!;
-  expect((await parentsOf(fromLegacy, legacyGadget.commitId))?.slice(1)).toEqual([snapshot]);
-  expect(await parentsOf(fromLegacy, snapshot)).toEqual([]);
+  expect(await fromLegacy.listChangedPaths(snapshot, legacyGadget.commitId)).toEqual([]);
   expect(await codeAt(fromLegacy, snapshot)).toEqual(V1);
 
   // Version 2 holds a release as it is, so an upload of a download is the same release under

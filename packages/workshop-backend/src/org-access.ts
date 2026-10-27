@@ -89,15 +89,6 @@ export function wouldLoseLastOwner(access: OrgAccess, targetRole: OrgRole): bool
 }
 
 /**
- * Whether the user may move resources into (and so also manage resources of) the org: its
- * workspace transfers and org-owned-workspace deletions. Owners and admins; a plain member,
- * pending invitee, or non-member may not.
- */
-export function canManageOrgAssets(access: OrgAccess): boolean {
-  return isActingMember(access) && ROLE_RANK[access.role!] >= ROLE_RANK["admin"];
-}
-
-/**
  * The baseline role an org role grants on a workspace the org owns: owners and admins manage it
  * (build), members use it. The single mapping from org authority to sharing-graph access -- the
  * sharing module seeds its graph with it, and the org compares it to decide when a role change

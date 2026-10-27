@@ -37,12 +37,11 @@ export type OrgInvitationRecord = {
 };
 
 /**
- * A workspace the org owns (see `Overseer.transferToOrg`), keyed by the Overseer DO's id. The
- * org's only record of it: membership changes fan out to these workspaces so a removed or
- * demoted member's live session is severed, while each workspace's own sharing graph stays the
- * authority on access (it re-checks membership live at every open). Written only by
- * addOwnedGadget (idempotently -- a retried transfer rewrites it); removed when a workspace is
- * deleted.
+ * A workspace the org owns, keyed by the Overseer DO's id. The org's only record of it:
+ * membership changes fan out to these workspaces so a removed or demoted member's live session
+ * is severed, while each workspace's own sharing graph stays the authority on access (it
+ * re-checks membership live at every open). Entries survive only from the removed org-transfer
+ * flow; removed when a workspace is deleted.
  */
 export type OrgOwnedGadgetRecord = {
   gadgetId: string;
@@ -62,8 +61,8 @@ export function makeOrgStorage(storage: DurableObjectStorage) {
       invitations: collection<OrgInvitationRecord>()({
         primaryKey: "inviteeId",
       }),
-      // The workspaces transferred into the org, keyed by their Overseer DO id. Written only by
-      // addOwnedGadget; removed when a workspace is deleted.
+      // The org's owned workspaces, keyed by their Overseer DO id. Only historic entries remain
+      // (the transfer flow is gone); removed when a workspace is deleted.
       ownedGadgets: collection<OrgOwnedGadgetRecord>()({
         primaryKey: "gadgetId",
       }),

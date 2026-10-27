@@ -15,9 +15,7 @@ import type { Entitlements } from "@gadgets/workshop-shared/entitlements";
 import { DecisionModelGatekeeper, LanguageModelGatekeeper } from "../src/ai-models.js";
 import { getPlanRefusalCode, type AiChatAuthorInfo } from "@gadgets/workshop-shared/api";
 import { serializeAdminConfig } from "../src/admin-config.js";
-import { OrgDurableObject } from "../src/org.js";
 import type { OverseerDurableObject } from "../src/overseer.js";
-import { makeOrgStorage } from "../src/storage-schema/org-storage.js";
 import {
   DEFAULT_ADMIN_CONFIG, type AdminConfig,
 } from "../src/storage-schema/admin-settings-storage.js";
@@ -27,7 +25,6 @@ import { UserDurableObject } from "../src/user.js";
 declare module "cloudflare:workers" {
   interface ProvidedEnv {
     TEST_USER: DurableObjectNamespace<UserDurableObject>;
-    TEST_ORG: DurableObjectNamespace<OrgDurableObject>;
     TEST_OVERSEER: DurableObjectNamespace<OverseerDurableObject>;
   }
 }
@@ -596,74 +593,6 @@ describe("plan-enforced external messages", () => {
     expect(h.registered).toEqual([]);  // never re-registered through the capped path
     expect(h.ensured).toEqual([h.doId]);
     expect(h.pending).toBe(false);
-  });
-});
-
-describe("plan-enforced org workspace caps", () => {
-  const OWNER = "org-owner@example.com";
-
-  // A real OrgDurableObject whose environment carries the entitlements port, seeded with an
-  // active owner and the given workspaces already in the org's index.
-  async function orgWithPlan(entitlements: Entitlements | Error | null, owned: string[]) {
-    const stub = env.TEST_ORG.getByName(`plan-enforcement-org-${++counter}`);
-    await runInDurableObject(stub, (_host: OrgDurableObject, state: DurableObjectState) => {
-      const storage = makeOrgStorage(state.storage);
-      storage.org.put({ id: "org", name: "Acme", createdAt: new Date(0) });
-      storage.members.put({
-        userId: OWNER, role: "owner", status: "active", invitedBy: null,
-        invitedAt: new Date(0), joinedAt: new Date(0),
-      });
-      for (const gadgetId of owned) storage.ownedGadgets.put({ gadgetId });
-    });
-    const port = entitlementsPort(entitlements ?? plan());
-    // As in planUser: no binding at all while unbound, which is what makes a deployment OSS.
-    const withPort = (env: Record<string, unknown>) =>
-        (entitlements === null ? env : { ...env, SAAS_ENTITLEMENTS: port.port });
-    const inDo = <T>(f: (org: OrgDurableObject) => T | Promise<T>): Promise<T> =>
-        runInDurableObject(stub, (_host: OrgDurableObject, state: DurableObjectState) => f(
-            new OrgDurableObject(state, withPort({}) as unknown as Cloudflare.Env)));
-    return { inDo };
-  }
-
-  const transfer = (org: OrgDurableObject, gadgetId: string, transferring = "member-1") =>
-      attempt(() => org.addOwnedGadget(OWNER, gadgetId, transferring));
-
-  it("a transfer is refused at the org's plan cap; below it, recorded", async () => {
-    const capped = await orgWithPlan(plan({ maxWorkspaces: 2 }), ["g1", "g2"]);
-    expect(await capped.inDo(org => transfer(org, "g3")))
-        .toEqual({ error: "This organization has reached its plan's limit of 2 workspaces." });
-    const room = await orgWithPlan(plan({ maxWorkspaces: 3 }), ["g1", "g2"]);
-    expect(await room.inDo(org => transfer(org, "g3"))).toBeUndefined();
-  });
-
-  it("the cap refusal carries the WORKSPACE_CAP_REACHED code a plan upgrade reads", async () => {
-    const capped = await orgWithPlan(plan({ maxWorkspaces: 1 }), ["g1"]);
-    // The code is read inside the Durable Object: runInDurableObject serializes a thrown
-    // error to its message, which is what `attempt` above asserts.
-    const code = await capped.inDo(async org => {
-      try {
-        await org.addOwnedGadget(OWNER, "g2", "member-1");
-      } catch (err) {
-        return getPlanRefusalCode(err);
-      }
-    });
-    expect(code).toBe("WORKSPACE_CAP_REACHED");
-  });
-
-  it("a transfer its own crashed attempt left behind is not re-refused", async () => {
-    // Counted, g3's own row reaches the cap of 3 — but that row is the crashed attempt's own,
-    // so the retry refreshes it rather than being refused by it.
-    const retried = await orgWithPlan(plan({ maxWorkspaces: 3 }), ["g1", "g2", "g3"]);
-    expect(await retried.inDo(org => transfer(org, "g3"))).toBeUndefined();
-  });
-
-  it("unbound: transfers are unlimited; a failing port refuses them", async () => {
-    const unbound = await orgWithPlan(null, ["g1", "g2", "g3"]);
-    expect(await unbound.inDo(org => transfer(org, "g4"))).toBeUndefined();
-    const down = await orgWithPlan(new Error("entitlements down"), []);
-    expect(await down.inDo(org => transfer(org, "g1"))).toEqual({
-      error: "Your plan couldn't be verified, so the workspace wasn't transferred. Please try again.",
-    });
   });
 });
 

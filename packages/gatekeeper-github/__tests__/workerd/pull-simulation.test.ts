@@ -16,8 +16,8 @@ import type {
   GitHubCommitFilter, GitHubCreatePullRequestOptions, GitHubPullRequestMergeOptions,
 } from "../../src/types";
 import type {
-  CreatePullRequestActionData, GatekeeperProps, MergePullRequestActionData, Outcome,
-  PushActionData,
+  CreatePullRequestActionData, GatekeeperProps, GitHubActionData, MergePullRequestActionData,
+  Outcome, PushActionData,
 } from "./worker";
 
 const OWNER = "acme";
@@ -430,6 +430,10 @@ async function repoGatekeeper() {
       unwrap(hooks.submitMerge(scenario, props, stubOf(queue), action, {
         title: "merge", description: "test merge", implementsRevert: false,
       })),
+    /** Submits a hand-built action record (creates and comments the helpers don't cover). */
+    submitHandBuilt: (action: GitHubActionData) =>
+      unwrap(hooks.submitAction(scenario, props, stubOf(new TestApprovalQueue()), action as never,
+        { title: "test", description: "test", implementsRevert: false })),
     applyAction: (actionId: number, cache: TestGitCache) =>
       unwrap(hooks.applyAction(scenario, props, actionId, stubOf(cache))),
     rejectAction: (actionId: number) => unwrap(hooks.rejectAction(scenario, props, actionId)),
@@ -569,6 +573,49 @@ describe("provisional pull request over a queued branch-creation push", () => {
     expect(diff.revision).toEqual({ baseSha: BASE, headSha: HEAD2, mergeBaseSha: BASE });
     expect(diff.files.map(file => [file.path, file.status]))
       .toEqual([["extra.txt", "added"], ["hello.txt", "modified"], ["new.txt", "added"]]);
+  });
+
+  it("picks the merge base of the queued head's whole ancestry, not just the anchor", async () => {
+    // A local merge whose side branch descends from main's newest commit: the first-parent walk
+    // anchors at BASE, but the side branch reaches M1, so the merge base GitHub will compute
+    // once the push lands is M1 -- the pairwise (main, anchor) answer BASE would fold M1's
+    // changes into the pull request's diff.
+    const github = scenarioGitHub();
+    const M1 = "e".repeat(40), S1 = "f".repeat(40), F1 = "cd".repeat(20), MERGE = "ab".repeat(20);
+    github.branches.set("main", M1);
+    github.restCommits.set(M1, { sha: M1, message: "on main", parents: [BASE], tree: TREE_BASE });
+    github.restCommits.set(S1, { sha: S1, message: "side", parents: [M1], tree: TREE_BASE });
+    github.compares.set(`main...${BASE}`, {
+      base_commit: { sha: M1 }, merge_base_commit: { sha: BASE },
+      commits: [{ sha: M1, message: "on main", parents: [BASE] }], total_commits: 1, files: [],
+    });
+    // The pairwise merge base against the side branch's frontier commit, then the two
+    // depth contests: BASE is one commit behind main's head, M1 none.
+    github.compares.set(`${M1}...${S1}`, {
+      base_commit: { sha: M1 }, merge_base_commit: { sha: M1 },
+      commits: [], total_commits: 0, files: [],
+    });
+    github.compares.set(`${BASE}...main`, {
+      base_commit: { sha: BASE }, merge_base_commit: { sha: BASE },
+      commits: [{ sha: M1, message: "on main", parents: [BASE] }], total_commits: 1, files: [],
+    });
+    github.compares.set(`${M1}...main`, {
+      base_commit: { sha: M1 }, merge_base_commit: { sha: M1 },
+      commits: [], total_commits: 0, files: [],
+    });
+    const gk = await repoGatekeeper();
+    const cache = scenarioCache()
+      .withObject(F1, "commit", commitPayload(TREE_1, [BASE], "feat: first parent"))
+      .withObject(MERGE, "commit", commitPayload(TREE_1, [F1, S1], "merge: fold in the side branch"));
+    const push = await queuePush(gk, cache, "feature", MERGE);
+    expect(push.expectedOldSha).toBe("0".repeat(40));
+    const pr = await queuePullRequest(gk, { title: "Fold in the side branch", head: "feature", base: "main" });
+
+    const diff = await gk.pullDiffAll(pr.provisionalId, cache);
+    expect(diff.revision).toEqual({ baseSha: M1, headSha: MERGE, mergeBaseSha: M1 });
+
+    const details = await gk.openPullRequest(pr.provisionalId, cache);
+    expect(details.commits).toBe(3);  // M1 plus the pending merge and its first parent
   });
 
   it("falls back to GitHub's compare once the push has been applied", async () => {
@@ -742,6 +789,77 @@ describe("push rejection cascade", () => {
     // Still pending: applying it now creates the pull request (both branches exist).
     await gk.applyAction(pr.approvalId, cache);
     expect((await gk.openPullRequest(pr.provisionalId, cache)).id).toBe("7");
+  });
+
+  it("retires the pushes and merges stacked on the rejected push's head", async () => {
+    const github = scenarioGitHub();
+    github.pulls.set(7, pullResponse(7, { ref: "main", sha: BASE }, { ref: "main", sha: BASE }));
+    const gk = await repoGatekeeper();
+    const cache = scenarioCache()
+      .withObject(HEAD2, "commit", commitPayload(TREE_1, [HEAD1], "second"))
+      .withAncestry(HEAD1, HEAD2);
+    const atBase = await queueMerge(gk, "7");   // main's head, as GitHub has it
+    const push = await queuePush(gk, cache, "main", HEAD1);
+    const atHead1 = await queueMerge(gk, "7");  // bound behind the push
+    const stacked = await queuePush(gk, cache, "main", HEAD2);
+    expect(atHead1.action).toMatchObject({ expectedHeadSha: HEAD1, headBranch: "main" });
+    expect(stacked.expectedOldSha).toBe(HEAD1);
+
+    // The stacked push's compare-and-swap could only fail -- blaming the branch for moving --
+    // and the merge bound to the head that will never exist could only be refused, so the
+    // rejection retires both; the merge bound to the head main already has is untouched.
+    expect(await gk.rejectAction(push.approvalId)).toEqual({ restart: true });
+    for (const { approvalId } of [stacked, atHead1.action]) {
+      await expect(gk.applyAction(approvalId, cache))
+        .rejects.toThrow(/was discarded, or something it depended on was/);
+    }
+    await gk.applyAction(atBase.action.approvalId, cache);
+    expect(github.merges.at(-1)).toBe(BASE);
+  });
+  it("spares what is stacked on a head the branch already has", async () => {
+    const github = scenarioGitHub();
+    const gk = await repoGatekeeper();
+    const cache = scenarioCache()
+      .withObject(HEAD2, "commit", commitPayload(TREE_1, [HEAD1], "second"))
+      .withAncestry(HEAD1, HEAD2);
+    const push = await queuePush(gk, cache, "main", HEAD1);
+    const stacked = await queuePush(gk, cache, "main", HEAD2);
+
+    // HEAD1 reached main by other means while the push that would leave it was queued: rejecting
+    // that push strands nothing, and the push stacked on HEAD1 still applies.
+    github.branches.set("main", HEAD1);
+    expect(await gk.rejectAction(push.approvalId)).toBeUndefined();
+    github.respondToPush("unpack ok", "ok refs/heads/main");
+    await gk.applyAction(stacked.approvalId, cache);
+  });
+
+  it("retires a create whose text cites a doomed provisional, recursively", async () => {
+    scenarioGitHub();
+    const gk = await repoGatekeeper();
+    const cache = scenarioCache();
+    const push = await queuePush(gk, cache, "feature", HEAD1);
+    const pr = await queuePullRequest(gk, { title: "Add new.txt", head: "feature", base: "main" });
+    const issue = {
+      approvalId: 901, submittedAt: 0, owner: OWNER, repo: REPO, type: "createIssue" as const,
+      provisionalId: "~97",
+      options: { title: "Tracking", bodyMarkdown: `Implements #${pr.provisionalId}` },
+    };
+    const comment = {
+      approvalId: 902, submittedAt: 0, owner: OWNER, repo: REPO, type: "postComment" as const,
+      targetKind: "issue" as const, targetId: "~97", bodyMarkdown: "Noted",
+      provisionalCommentId: "~comment97",
+    };
+    await gk.submitHandBuilt(issue);
+    await gk.submitHandBuilt(comment);
+
+    // Rejecting the push dooms the pull request's create (its head branch is gone); the issue's
+    // create dies with it because its body cites the doomed provisional, and the comment queued
+    // on that issue dies with the issue.
+    expect(await gk.rejectAction(push.approvalId)).toEqual({ restart: true });
+    for (const { approvalId } of [pr, issue, comment]) {
+      await expect(gk.applyAction(approvalId, cache))
+        .rejects.toThrow(/was discarded, or something it depended on was/);
+    }
   });
 });
 
