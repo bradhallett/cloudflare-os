@@ -86,6 +86,22 @@ describe("ActionJournal", () => {
     expect(journal.listPending().map(({ id }) => id)).toEqual([staged]);
   });
 
+  it("drops the cache when a second journal over the same storage mutates the namespace", () => {
+    const kv = makeKv();
+    const scans = vi.spyOn(kv, "list");
+    const live = new ActionJournal<Sql>(kv, { namespace: "pending" });
+    const id = live.allocate({ sql: "sending" });
+    live.markSubmitted(id);
+    expect(live.listUndecided().map(({ id }) => id)).toEqual([id]);
+    scans.mockClear();
+
+    // A claim an activation that died mid-apply left is written by a journal the live one never
+    // sees write, so the version key -- not this instance's own mutations -- must guard the cache.
+    new ActionJournal<Sql>(kv, { namespace: "pending" }).markClaimed(id);
+    expect(live.listUndecided()).toEqual([]);
+    expect(scans).toHaveBeenCalledTimes(1);
+  });
+
   it("refuses to stage over a live id, which a port of a last-issued counter would reissue", () => {
     const kv = makeKv();
     const journal = new ActionJournal<Sql>(kv, { namespace: "pending" });
@@ -169,8 +185,10 @@ describe("ActionJournal", () => {
     expect(journal.listPending()).toEqual([]);
     // Load-bearing literals: the defaults are the keys the ported gatekeepers already wrote, so a
     // port that passes no key options keeps reading its live records. `keys()` is sorted, so this
-    // asserts the whole keyspace regardless of write order.
-    expect(kv.keys()).toEqual([`pending:action:${id}`, "pending:nextActionId"]);
+    // asserts the whole keyspace regardless of write order. The version key guards cached
+    // projections across journal instances over one storage.
+    expect(kv.keys()).toEqual(["journalVersion:pending:action:", `pending:action:${id}`,
+      "pending:nextActionId"]);
   });
 
   it("moves a retained record out of the pending scan while keeping it findable", () => {
@@ -622,9 +640,10 @@ describe("ActionJournal", () => {
     journal.markSubmitted(second);
 
     expect(() => journal.allocate({ sql: "three" })).toThrow(/Too many pending actions/);
-    // Nothing was written, so the refused allocation did not consume an id either.
-    expect(kv.keys()).toEqual([`pending:action:${first}`, `pending:action:${second}`,
-      "pending:nextActionId"]);
+    // Nothing new was written, so the refused allocation did not consume an id either; the
+    // version key predates it, from the allocations that succeeded.
+    expect(kv.keys()).toEqual(["journalVersion:pending:action:", `pending:action:${first}`,
+      `pending:action:${second}`, "pending:nextActionId"]);
 
     // A failed record does not count: rejecting it is how it is cleared, so counting it would
     // wedge the queue for a user with nothing left to approve.

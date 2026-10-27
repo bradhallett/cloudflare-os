@@ -142,6 +142,7 @@ export type ActionJournalOptions<A> = JournalKeys & {
  * ```
  */
 export class ActionJournal<A> {
+  readonly #rawKv: ActionJournalKv;
   readonly #kv: ActionJournalKv;
   readonly #nextIdKey: string;
   readonly #prefix: string;
@@ -150,10 +151,14 @@ export class ActionJournal<A> {
   readonly #upgradeRecord?: (raw: unknown) => A | undefined;
   readonly #maxPending: number;
   // Pending projections, cached per states-view (the module's PROJECTED/UNDECIDED/FAILED constants
-  // key it, so it holds at most three entries) until the next record mutation clears it: one
+  // key it, so it holds at most three entries) until the namespace next changes in storage: one
   // activation may project the same set several times, and every projection is otherwise a full
-  // storage walk.
-  readonly #pendingCache = new Map<readonly JournalState[], readonly JournalEntry<A>[]>();
+  // storage walk. The guard is the storage version key, not this instance's own writes -- a second
+  // journal over the same storage can change the namespace (a claim an activation that died
+  // mid-apply left, say), and that must invalidate this cache just the same.
+  readonly #pendingCache =
+    new Map<readonly JournalState[], { version: number; entries: readonly JournalEntry<A>[] }>();
+  readonly #versionKey: string;
 
   /**
    * Creates an action journal.
@@ -161,7 +166,25 @@ export class ActionJournal<A> {
    * @param options `namespace` (or a port's `legacyKeys`), migration, and capacity settings.
    */
   constructor(kv: ActionJournalKv, options: ActionJournalOptions<A>) {
-    this.#kv = kv;
+    this.#rawKv = kv;
+    // Mutations go through a guarded facade, not `kv` itself, so no write can bypass the version
+    // bump that keeps the projection cache below honest: `put` and `delete` bump first (a write
+    // that throws still invalidates), and only the version bump writes through `#rawKv`, so the
+    // guard cannot re-enter. A second journal over the same storage bumps the same key, so an
+    // outside mutation -- a claim an activation that died mid-apply left -- invalidates this
+    // journal's cache as surely as its own writes: coherence belongs to the namespace.
+    this.#kv = {
+      get: kv.get.bind(kv),
+      list: kv.list.bind(kv),
+      put: (key, value) => {
+        this.#bumpVersion();
+        kv.put(key, value);
+      },
+      delete: (key) => {
+        this.#bumpVersion();
+        kv.delete(key);
+      },
+    };
     const keys = options.legacyKeys ?? {
       nextIdKey: `${options.namespace}:nextActionId`,
       recordPrefix: `${options.namespace}:action:`,
@@ -170,8 +193,10 @@ export class ActionJournal<A> {
     this.#prefix = keys.recordPrefix;
     // Outside the pending prefix, not beneath it: a retained record must fall out of that scan.
     this.#retainedPrefix = `retained:${this.#prefix}`;
-    // One key, not a tier: the non-numeric suffix keeps it out of every id scan.
+    // One key, not a tier: the applied-id memory's non-numeric suffix keeps it out of every id scan.
     this.#appliedIdsKey = `applied:${this.#prefix}`;
+    // Same shape for the version key that guards cached projections across journal instances.
+    this.#versionKey = `journalVersion:${this.#prefix}`;
     this.#upgradeRecord = options.upgradeRecord;
     this.#maxPending = requirePositiveInt("maxPending", options.maxPending ?? DEFAULT_MAX_PENDING);
 
@@ -185,7 +210,7 @@ export class ActionJournal<A> {
     if (!this.#prefix) throw new Error("recordPrefix must not be empty.");
     if (this.#nextIdKey.startsWith(this.#prefix) || this.#prefix.startsWith(this.#nextIdKey)
       || this.#nextIdKey.startsWith(this.#retainedPrefix)
-      || this.#nextIdKey === this.#appliedIdsKey) {
+      || this.#nextIdKey === this.#appliedIdsKey || this.#nextIdKey === this.#versionKey) {
       throw new Error(`nextIdKey "${this.#nextIdKey}" overlaps a record prefix.`);
     }
     if (this.#retainedPrefix.startsWith(this.#prefix)) {
@@ -433,7 +458,6 @@ export class ActionJournal<A> {
    * @param id Action ID to remove.
    */
   remove(id: number): void {
-    this.#pendingCache.clear();
     this.#kv.delete(this.#pendingKey(id));
     this.#kv.delete(this.#retainedKey(id));
   }
@@ -563,8 +587,11 @@ export class ActionJournal<A> {
    * @returns Matching actions ordered by ID, as a fresh array.
    */
   #scan(states: readonly JournalState[]): JournalEntry<A>[] {
+    // Version first, read before the walk: an entry built under an older version is unreachable,
+    // never wrong -- whether the mutation came from this journal or another over the namespace.
+    const version = this.#kv.get<number>(this.#versionKey) ?? 0;
     const cached = this.#pendingCache.get(states);
-    if (cached !== undefined) return [...cached];
+    if (cached !== undefined && cached.version === version) return [...cached.entries];
     const found: JournalEntry<A>[] = [];
     const applied = this.#appliedSet();
     for (const [key, raw] of this.#kv.list<unknown>({ prefix: this.#prefix })) {
@@ -577,7 +604,7 @@ export class ActionJournal<A> {
       found.push({ id, action: record.action });
     }
     const sorted = found.toSorted((a, b) => a.id - b.id);
-    this.#pendingCache.set(states, sorted);
+    this.#pendingCache.set(states, { version, entries: sorted });
     return [...sorted];
   }
 
@@ -693,8 +720,17 @@ export class ActionJournal<A> {
    * @param record Record to store.
    */
   #write(key: string, record: JournalRecord<A>): void {
-    this.#pendingCache.clear();
     this.#kv.put<StoredJournalRecord<A>>(key, { ...record, v: JOURNAL_VERSION });
+  }
+
+  /**
+   * Bumps the namespace's storage version, invalidating every journal instance's cached
+   * projections of it. Writes through the raw storage, outside the guarded facade. The
+   * read-modify-write leans on a Durable Object running one activation at a time; a kit that
+   * ever documents concurrent use must make this bump atomic first.
+   */
+  #bumpVersion(): void {
+    this.#rawKv.put(this.#versionKey, (this.#rawKv.get<number>(this.#versionKey) ?? 0) + 1);
   }
 
   /**
