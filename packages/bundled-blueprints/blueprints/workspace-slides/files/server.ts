@@ -1,5 +1,5 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
-import { SubscriberRegistry } from "@gadgets/bundled-blueprints/libraries/sync/server";
+import { MutationQueue, SubscriberRegistry } from "@gadgets/bundled-blueprints/libraries/sync/server";
 import { MAX_TOTAL_TEXT_LENGTH, deckToPptx, measureText } from "@gadgets/bundled-blueprints/libraries/pptx/server";
 import type {
   Block,
@@ -46,12 +46,15 @@ import type {
  */
 
 const STORAGE_KEY = "deck";
-/** The schema marker a stored deck carries; a deck without it is reseeded (see getDeck). */
+/** The schema marker a stored deck carries; an older deck is converted in place (see #loadDeck). */
 const THEME_VERSION = "workspace.1";
+/** Where a pre-`slides` deck is kept when it cannot be interpreted (see #loadDeck). */
+const LEGACY_DECK_KEY = "deck:legacy-v0";
 const MAX_UNDO = 50;
 
 export class Gadget extends DurableObject<unknown> implements GadgetStub {
   state: DurableObjectState;
+  mutations: MutationQueue;
   subscribers: SubscriberRegistry<DeckCallbacks>;
   undoStack: Deck[];
   redoStack: Deck[];
@@ -60,6 +63,11 @@ export class Gadget extends DurableObject<unknown> implements GadgetStub {
     super(state, env);
     this.state = state;
     this.subscribers = new SubscriberRegistry();
+    // RPC handlers interleave at every await, and the agent and the browser both
+    // mutate this deck: chain every mutation through the sync library's queue so
+    // each observes and commits one authoritative deck, in a strict order (the
+    // docs and sheets skeleton -- see libraries/sync mutation-queue.ts).
+    this.mutations = new MutationQueue();
     // Undo/redo stacks live in memory only — they're transient and
     // shared across every connected client (one global history for the
     // whole deck). On DO restart history is lost, which we consider
@@ -76,7 +84,13 @@ export class Gadget extends DurableObject<unknown> implements GadgetStub {
     };
   }
 
-  async undo(): Promise<boolean> {
+  undo(): Promise<boolean> {
+    return this.mutations.run(() => this.#undoLocked());
+  }
+
+  // Undo and redo read-modify-write the stored deck like any mutator, so they join the same
+  // chain; they write storage directly so they don't push onto the stacks they manage.
+  async #undoLocked(): Promise<boolean> {
     if (this.undoStack.length === 0) return false;
     const prev = this.undoStack.pop()!;
     const current = await this.state.storage.get<Deck>(STORAGE_KEY);
@@ -86,7 +100,11 @@ export class Gadget extends DurableObject<unknown> implements GadgetStub {
     return true;
   }
 
-  async redo(): Promise<boolean> {
+  redo(): Promise<boolean> {
+    return this.mutations.run(() => this.#redoLocked());
+  }
+
+  async #redoLocked(): Promise<boolean> {
     if (this.redoStack.length === 0) return false;
     const next = this.redoStack.pop()!;
     const current = await this.state.storage.get<Deck>(STORAGE_KEY);
@@ -98,20 +116,16 @@ export class Gadget extends DurableObject<unknown> implements GadgetStub {
 
   // -------- read ----------------------------------------------------------
   async getDeck(): Promise<Deck> {
-    let d = await this.state.storage.get<Deck>(STORAGE_KEY);
-    // Defensive: if the storage was empty OR holds an older-schema document
-    // (the previous version of this Gadget stored field overrides under
-    // numeric keys rather than a `slides` array), wipe and seed.
-    if (!d || !Array.isArray(d.slides) || d.themeVersion !== THEME_VERSION) {
-      d = initialDeck();
-      await this.state.storage.put(STORAGE_KEY, d);
-    }
-    return d;
+    return await this.#loadDeck();
   }
 
   // -------- slide ops -----------------------------------------------------
-  async addSlide(atIndex?: number | null, slide?: SlideInput): Promise<string> {
-    const d = await this.getDeck();
+  addSlide(atIndex?: number | null, slide?: SlideInput): Promise<string> {
+    return this.mutations.run(() => this.#addSlideLocked(atIndex, slide));
+  }
+
+  async #addSlideLocked(atIndex: number | null | undefined, slide: SlideInput | undefined): Promise<string> {
+    const d = await this.#loadDeck();
     const s = slide || newBlankSlide();
     if (!s.id) s.id = genId();
     // Mint ids for any blocks that arrived without one. Caller-supplied
@@ -128,15 +142,23 @@ export class Gadget extends DurableObject<unknown> implements GadgetStub {
     return s.id;
   }
 
-  async removeSlide(slideId: string): Promise<void> {
-    const d = await this.getDeck();
+  removeSlide(slideId: string): Promise<void> {
+    return this.mutations.run(() => this.#removeSlideLocked(slideId));
+  }
+
+  async #removeSlideLocked(slideId: string): Promise<void> {
+    const d = await this.#loadDeck();
     d.slides = d.slides.filter(s => s.id !== slideId);
     if (d.slides.length === 0) d.slides.push(newBlankSlide());
     await this.#save(d);
   }
 
-  async duplicateSlide(slideId: string): Promise<string | null> {
-    const d = await this.getDeck();
+  duplicateSlide(slideId: string): Promise<string | null> {
+    return this.mutations.run(() => this.#duplicateSlideLocked(slideId));
+  }
+
+  async #duplicateSlideLocked(slideId: string): Promise<string | null> {
+    const d = await this.#loadDeck();
     const i = d.slides.findIndex(s => s.id === slideId);
     if (i < 0) return null;
     const copy: Slide = JSON.parse(JSON.stringify(d.slides[i]));
@@ -147,8 +169,12 @@ export class Gadget extends DurableObject<unknown> implements GadgetStub {
     return copy.id;
   }
 
-  async moveSlide(slideId: string, toIndex: number): Promise<void> {
-    const d = await this.getDeck();
+  moveSlide(slideId: string, toIndex: number): Promise<void> {
+    return this.mutations.run(() => this.#moveSlideLocked(slideId, toIndex));
+  }
+
+  async #moveSlideLocked(slideId: string, toIndex: number): Promise<void> {
+    const d = await this.#loadDeck();
     const i = d.slides.findIndex(s => s.id === slideId);
     if (i < 0) return;
     const [s] = d.slides.splice(i, 1);
@@ -157,8 +183,12 @@ export class Gadget extends DurableObject<unknown> implements GadgetStub {
     await this.#save(d);
   }
 
-  async updateSlide(slideId: string, patch: SlidePatch): Promise<void> {
-    const d = await this.getDeck();
+  updateSlide(slideId: string, patch: SlidePatch): Promise<void> {
+    return this.mutations.run(() => this.#updateSlideLocked(slideId, patch));
+  }
+
+  async #updateSlideLocked(slideId: string, patch: SlidePatch): Promise<void> {
+    const d = await this.#loadDeck();
     const s = d.slides.find(s => s.id === slideId);
     if (!s) return;
     if (patch.background) s.background = { ...s.background, ...patch.background };
@@ -168,8 +198,14 @@ export class Gadget extends DurableObject<unknown> implements GadgetStub {
   }
 
   // -------- block ops -----------------------------------------------------
-  async addBlock(slideId: string, block: BlockInput, atIndex?: number | null): Promise<string | null> {
-    const d = await this.getDeck();
+  addBlock(slideId: string, block: BlockInput, atIndex?: number | null): Promise<string | null> {
+    return this.mutations.run(() => this.#addBlockLocked(slideId, block, atIndex));
+  }
+
+  async #addBlockLocked(
+    slideId: string, block: BlockInput, atIndex: number | null | undefined,
+  ): Promise<string | null> {
+    const d = await this.#loadDeck();
     const s = d.slides.find(s => s.id === slideId);
     if (!s) return null;
     const b: Block = { id: genId(), ...block };
@@ -180,8 +216,12 @@ export class Gadget extends DurableObject<unknown> implements GadgetStub {
     return b.id;
   }
 
-  async updateBlock(slideId: string, blockId: string, patch: BlockPatch): Promise<void> {
-    const d = await this.getDeck();
+  updateBlock(slideId: string, blockId: string, patch: BlockPatch): Promise<void> {
+    return this.mutations.run(() => this.#updateBlockLocked(slideId, blockId, patch));
+  }
+
+  async #updateBlockLocked(slideId: string, blockId: string, patch: BlockPatch): Promise<void> {
+    const d = await this.#loadDeck();
     const s = d.slides.find(s => s.id === slideId);
     if (!s) return;
     const b = s.blocks.find(b => b.id === blockId);
@@ -194,16 +234,24 @@ export class Gadget extends DurableObject<unknown> implements GadgetStub {
     await this.#save(d);
   }
 
-  async removeBlock(slideId: string, blockId: string): Promise<void> {
-    const d = await this.getDeck();
+  removeBlock(slideId: string, blockId: string): Promise<void> {
+    return this.mutations.run(() => this.#removeBlockLocked(slideId, blockId));
+  }
+
+  async #removeBlockLocked(slideId: string, blockId: string): Promise<void> {
+    const d = await this.#loadDeck();
     const s = d.slides.find(s => s.id === slideId);
     if (!s) return;
     s.blocks = s.blocks.filter(b => b.id !== blockId);
     await this.#save(d);
   }
 
-  async reorderBlock(slideId: string, blockId: string, toIndex: number): Promise<void> {
-    const d = await this.getDeck();
+  reorderBlock(slideId: string, blockId: string, toIndex: number): Promise<void> {
+    return this.mutations.run(() => this.#reorderBlockLocked(slideId, blockId, toIndex));
+  }
+
+  async #reorderBlockLocked(slideId: string, blockId: string, toIndex: number): Promise<void> {
+    const d = await this.#loadDeck();
     const s = d.slides.find(s => s.id === slideId);
     if (!s) return;
     const i = s.blocks.findIndex(b => b.id === blockId);
@@ -215,13 +263,21 @@ export class Gadget extends DurableObject<unknown> implements GadgetStub {
   }
 
   // -------- bulk ----------------------------------------------------------
-  async setDeck(deck: Deck): Promise<void> {
+  setDeck(deck: Deck): Promise<void> {
+    return this.mutations.run(() => this.#setDeckLocked(deck));
+  }
+
+  async #setDeckLocked(deck: Deck): Promise<void> {
     // Stamped as current: getDeck() reseeds a deck without the marker, which a caller building a
     // whole deck from the public type would otherwise lose on the next read.
     await this.#save({ ...deck, themeVersion: THEME_VERSION });
   }
 
-  async resetAll(): Promise<Deck> {
+  resetAll(): Promise<Deck> {
+    return this.mutations.run(() => this.#resetAllLocked());
+  }
+
+  async #resetAllLocked(): Promise<Deck> {
     const d = initialDeck();
     await this.#save(d);
     return d;
@@ -230,6 +286,34 @@ export class Gadget extends DurableObject<unknown> implements GadgetStub {
   // -------- realtime ------------------------------------------------------
   async subscribe(cb: DeckCallbacks): Promise<void> {
     this.subscribers.add(cb);
+  }
+
+  /**
+   * The stored deck in the current schema. Old shapes convert in place: a THEME_VERSION bump must
+   * never wipe a stored deck, because the blueprint update review sees only file diffs — storage
+   * side effects are this object's alone to keep correct. The one legacy shape this source tree
+   * cannot interpret (field overrides under numeric keys, from before the `slides` schema) is
+   * preserved under a legacy key rather than destroyed, and a fresh deck seeded.
+   */
+  async #loadDeck(): Promise<Deck> {
+    let d = await this.state.storage.get<Deck>(STORAGE_KEY);
+    if (!d) {
+      const seeded = initialDeck();
+      await this.state.storage.put(STORAGE_KEY, seeded);
+      return seeded;
+    }
+    if (!Array.isArray(d.slides)) {
+      await this.state.storage.put(LEGACY_DECK_KEY, d);
+      const seeded = initialDeck();
+      await this.state.storage.put(STORAGE_KEY, seeded);
+      return seeded;
+    }
+    if (d.themeVersion !== THEME_VERSION) {
+      const converted = convertDeckTheme(d);
+      await this.state.storage.put(STORAGE_KEY, converted);
+      return converted;
+    }
+    return d;
   }
 
   async #save(deck: Deck): Promise<void> {
@@ -256,6 +340,17 @@ export class Gadget extends DurableObject<unknown> implements GadgetStub {
     };
     this.subscribers.broadcast(sub => sub.deckChanged(deck, meta));
   }
+}
+
+/**
+ * Converts a stored deck to the current theme version, keeping its content. Append one step per
+ * THEME_VERSION bump: the step converts the previous version's shapes forward, in place — a deck
+ * is never discarded for being old (see #loadDeck).
+ */
+function convertDeckTheme(deck: Deck): Deck {
+  // workspace.1 is the first version, so the only older deck is one that predates the marker
+  // itself: same `slides` shape, no stamp yet.
+  return { ...deck, themeVersion: THEME_VERSION };
 }
 
 function genId(): string {

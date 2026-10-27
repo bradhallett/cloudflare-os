@@ -143,6 +143,23 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
     return await outcome(() => this.#gatekeeper(facetName, props).rejectAction(actionId));
   }
 
+  /**
+   * The claim-ordering race ZC-1 pinned: an apply's claim must be recorded before its first await,
+   * so a rejection delivered while the apply awaits its read reservation finds the claim and
+   * defers instead of recording "rejected" over a dispatch in flight. Sends the apply, lets the
+   * rejection land mid-reservation, and settles both outcomes as data.
+   */
+  async rejectDuringApply(
+    facetName: string, props: GatekeeperProps, actionId: number,
+  ): Promise<Outcome<{ apply: Outcome<void>; rejection: Outcome<unknown> }>> {
+    return await outcome(async () => {
+      let gatekeeper = this.#gatekeeper(facetName, props);
+      let apply = outcome(() => gatekeeper.applyAction(actionId, new NullGitCache()));
+      let rejection = await outcome(() => gatekeeper.rejectAction(actionId));
+      return { apply: await apply, rejection };
+    });
+  }
+
   // -- account ----------------------------------------------------------------------------
 
   /** Gives the account a Workshop callback and an initiation nonce, as `connectAccount` does. */

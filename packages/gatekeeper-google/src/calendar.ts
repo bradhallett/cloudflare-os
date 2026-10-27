@@ -13,6 +13,7 @@ import type {
 import {
   ActionJournal, stageAction, ActionOutcomeUnknownError, APPLY_OUTCOME_UNKNOWN_MESSAGE,
 } from "@gadgets/gatekeeper-kit/actions";
+import { validateRpc } from "capnweb-validate";
 import { buildDescription, codeSpan } from "@gadgets/gatekeeper-kit/action-description";
 import {
   calendarEventOverlaps, calendarEventSortKey, eventPatchToGoogle, GoogleCalendarApi,
@@ -55,7 +56,7 @@ type GoogleCalendarUpdateAction = GoogleCalendarActionBase & {
   patch: CalendarEventPatch;
 }
 
-type GoogleCalendarAction = GoogleCalendarCreateAction | GoogleCalendarUpdateAction;
+export type GoogleCalendarAction = GoogleCalendarCreateAction | GoogleCalendarUpdateAction;
 
 /**
  * Recognizes a queued event write the private store wrote as a bare payload, for the journal's
@@ -437,7 +438,8 @@ export class GoogleCalendarGatekeeperImpl
   }
 }
 
-class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSession {
+@validateRpc()
+export class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSession {
   #api: GoogleCalendarApi;
   #calendarId: string;
   #availabilityMode: CalendarAvailabilityMode;

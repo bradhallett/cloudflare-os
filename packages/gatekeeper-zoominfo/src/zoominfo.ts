@@ -813,17 +813,25 @@ export class ZoomInfoGatekeeperImpl extends DurableObject<Env, ZoomInfoGatekeepe
       throw new Error(`Unknown pending ZoomInfo enrichment: ${action}`);
     }
     const account = this.#userAccount();
+    // The claim, taken before any await: Durable Objects keep processing events across an
+    // outbound RPC's await, so a rejection delivered once the apply starts awaiting must find
+    // the "unknown" record, never a pending one — it cannot record "rejected" over a dispatch
+    // in flight (the same claim-before-dispatch contract as the kit's `applyClaimedAction`).
+    store.removePending(action);
+    store.putResult(action, { status: "unknown", message: APPLY_OUTCOME_UNKNOWN_MESSAGE });
     try {
-      const result = await withinReadLimit(account, () => {
-        // The claim, taken before dispatch: an activation that dies past this point leaves the
-        // "unknown" record behind, so the enrichment cannot be replayed on a retry.
-        store.removePending(action);
-        store.putResult(action, { status: "unknown", message: APPLY_OUTCOME_UNKNOWN_MESSAGE });
-        return callZoomInfo(account, () => performEnrichment(this.#makeApi(account), pending));
-      });
+      const result = await withinReadLimit(account, () =>
+        callZoomInfo(account, () => performEnrichment(this.#makeApi(account), pending)));
       store.putResult(action, { status: "ready", result });
     } catch (error) {
-      if (error instanceof ReadLimitError) throw error;  // never dispatched: retryable, pending intact
+      if (error instanceof ReadLimitError) {
+        // The reservation was refused before any dispatch, so no credits were spent and the
+        // claim was false: restore the enrichment to pending and drop the claim, leaving the
+        // action retryable exactly as it was.
+        store.putPending(action, pending);
+        store.removeResult(action);
+        throw error;
+      }
       if (isOutcomeUnknown(error)) throw new ActionOutcomeUnknownError(APPLY_OUTCOME_UNKNOWN_MESSAGE);
       store.putResult(action, {
         status: "failed",
