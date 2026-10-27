@@ -80,8 +80,13 @@ import {
   ACTION_KINDS,
   BINDING_ACTIONS,
   autoApprovalOf,
+  actionTarget,
+  escapeQuickActions,
   isCasBound,
   isGitHubOutcomeUnknown,
+  PROVISIONAL_REFERENCE,
+  referenceBearingTexts,
+  textReferences,
   type AddLabelsAction,
   type Cached,
   type ChangeStateAction,
@@ -251,6 +256,9 @@ const MAX_REPLY_TARGET_HOPS = 50;
 // Cap on the queued-but-not-yet-pushed commits walked when simulating a branch's history
 // (mirrors GitHub's own 250-commit cap on compare listings).
 const MAX_PENDING_CHAIN_COMMITS = 250;
+/** Cap on the GitHub-known frontier a simulated merge-base fold will consider, mirroring
+ * GitLab's URL-length cap: past it the read fails and callers degrade to remote reads. */
+const MAX_FRONTIER_COMMITS = 25;
 // Applied actions stay revertible while they are among the newest this many; older ones are
 // retired by the retention sweep (`#housekeepRetained`).
 const RETAINED_ACTION_LIMIT = 200;
@@ -903,52 +911,71 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       { undispatched: true });
   }
 
+  /**
+   * Whether a queued action cannot apply once the provisional resource is gone: it targets it,
+   * or its text names it (`#~N`, which apply would fail to rewrite -- see
+   * `referenceBearingTexts`).
+   */
   #actionDependsOnResource(action: GitHubAction, kind: EntityKind, provisionalId: string): boolean {
+    if (referenceBearingTexts(action).some(text => textReferences(text, provisionalId))) return true;
     switch (action.type) {
       case "createIssue":
       case "createPullRequest":
         return action.provisionalId === provisionalId;
-      case "setTitle":
-      case "setBody":
-      case "addLabels":
-      case "removeLabels":
-      case "changeState":
-      case "postComment":
-        return action.targetKind === kind && action.targetId === provisionalId;
-      case "postReview":
-      case "replyToDiffComment":
-      case "mergePullRequest":
-        return kind === "pull" && action.pullId === provisionalId;
-      case "push":
-        return false;  // pushes target a branch, never an issue/PR
-    }
-  }
-
-  #rejectActionsForResource(kind: EntityKind, provisionalId: string): void {
-    for (const pending of this.#listPendingActions()) {
-      if (this.#actionDependsOnResource(pending, kind, provisionalId)) {
-        this.#markActionRejected(pending);
+      default: {
+        const target = actionTarget(action);
+        return target?.kind === kind && target.id === provisionalId;
       }
     }
   }
 
   /**
-   * Discards a push along with every queued `createPullRequest` whose head or base is the push's
-   * branch, if that branch no longer exists without it -- on the remote or as the outcome of the
-   * remaining queued pushes -- and everything queued against the doomed pull request. A push no
-   * create depends on is discarded without reading GitHub, so a dead connection cannot block it.
-   * Otherwise the branch is read before anything is marked, so a failed read leaves the push
-   * pending and a retried discard still cascades; everything after the read runs without
-   * yielding, so a pull request queued during it is cascaded too, and a push applied during it
-   * is refused rather than overwritten as discarded. Returns whether anything was cascaded.
+   * A provisional resource will never exist: retire every pending action that depends on it
+   * (`#actionDependsOnResource`) and forget the provisional itself. A retired action may be a
+   * *create* -- an issue whose body cites the doomed pull request -- whose own provisional then
+   * never exists either, so the cascade recurses through it; otherwise a comment queued on that
+   * issue would stay pending and fail every apply.
+   */
+  #retireProvisional(kind: EntityKind, provisionalId: string): void {
+    this.ctx.storage.kv.delete(`provisional:${provisionalId}`);
+    for (const pending of this.#listPendingActions()) {
+      if (!this.#actionDependsOnResource(pending, kind, provisionalId)) continue;
+      // A nested cascade may have retired this one already (it depended on both).
+      if (this.#actions.get(pending.approvalId)?.state !== "pending") continue;
+      this.#markActionRejected(pending);
+      if (pending.type === "createIssue" || pending.type === "createPullRequest") {
+        this.#retireProvisional(pending.type === "createIssue" ? "issue" : "pull", pending.provisionalId);
+      }
+    }
+  }
+
+  /**
+   * Discards a push along with the queued actions stranded on heads that will now never be
+   * reached (`#rejectActionsStrandedByPush`) and the pull requests the missing-branch sweep
+   * dooms. The branch is read before anything is marked when anything queued touches it, so a
+   * failed read leaves the push pending and a retried discard still cascades; everything after
+   * the read runs without yielding, so a pull request queued during it is cascaded too, and a
+   * push applied during it is refused rather than overwritten as discarded. A push nothing
+   * touches is discarded without reading GitHub, so a dead connection cannot block it. Returns
+   * whether anything was cascaded.
    */
   async #rejectPush(push: PushAction): Promise<boolean> {
-    const dependsOnBranch = (action: GitHubAction): action is CreatePullRequestAction =>
-      action.type === "createPullRequest" &&
-      (action.options.head === push.branch || action.options.base === push.branch);
-    // `undefined`: not read, since nothing depended on the branch (and without an await, nothing
-    // can be queued before the mark); `null`: the branch does not exist on GitHub.
-    const realHead = this.#listPendingActions().some(dependsOnBranch)
+    const touchesBranch = (action: GitHubAction): boolean => {
+      switch (action.type) {
+        case "createPullRequest":
+          return action.options.head === push.branch || action.options.base === push.branch;
+        case "push":
+          return action.branch === push.branch;
+        case "mergePullRequest":
+          return action.headBranch === push.branch;
+        default:
+          return false;
+      }
+    };
+    // `undefined`: not read, since nothing queued touches the branch (and without an await,
+    // nothing can be queued before the mark); `null`: the branch does not exist on GitHub.
+    const realHead = this.#listPendingActions().some(
+      action => action.approvalId !== push.approvalId && touchesBranch(action))
       ? await this.#withApi(api => api.getBranchHead(this.ctx.props.owner, this.ctx.props.repo, push.branch))
       : undefined;
     // The read yields, so a concurrent apply or discard may have settled the push meanwhile.
@@ -959,13 +986,70 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     if (state === "failed") return false;
     // Marked before simulating, which takes the push out of the queued pushes it overlays.
     this.#markActionRejected(push);
-    if (realHead === undefined || this.#simulateBranchHead(push.branch, realHead) !== null) return false;
-    const creates = this.#listPendingActions().filter(dependsOnBranch);
-    for (const create of creates) {
-      this.#rejectActionsForResource("pull", create.provisionalId);  // the create included
-      this.ctx.storage.kv.delete(`provisional:${create.provisionalId}`);
+    return await this.#rejectActionsStrandedByPush(push, realHead ?? null);
+  }
+
+  /**
+   * Cascade for a rejected push: retire the queued actions stranded on a head that will now
+   * never be reached, then those the missing-branch check dooms
+   * (`#rejectPullRequestsForMissingBranches`). A head is stranded when the push that would
+   * leave it is retired, no other queued push to the branch would leave it too, and the branch
+   * is not there already (pushed by other means, the head needs no push, and what is bound to
+   * it can still apply; a branch that cannot be read counts as elsewhere). A push bound to a
+   * stranded head (`expectedOldSha`) could only fail its compare-and-swap -- with an error
+   * blaming the branch for moving -- and strands its own new head in turn; a merge bound to one
+   * (`expectedHeadSha`) could only be refused. Only a rejection strands a head: a branch moved
+   * by anyone else is the compare-and-swap's to report at apply. Returns whether anything
+   * cascaded.
+   */
+  async #rejectActionsStrandedByPush(rejected: PushAction, liveHead: string | null): Promise<boolean> {
+    const { branch } = rejected;
+    let cascaded = false;
+    const stranded = [rejected.newSha];
+    for (let head = stranded.pop(); head !== undefined; head = stranded.pop()) {
+      const pending = this.#listPendingActions();
+      if (head === liveHead || pending.some(
+        action => action.type === "push" && action.branch === branch && action.newSha === head)) continue;
+      for (const action of pending) {
+        if (action.type === "push" && action.branch === branch && action.expectedOldSha === head) {
+          this.#markActionRejected(action);
+          stranded.push(action.newSha);
+          cascaded = true;
+        } else if (action.type === "mergePullRequest" && action.headBranch === branch &&
+          action.expectedHeadSha === head) {
+          this.#markActionRejected(action);
+          cascaded = true;
+        }
+      }
     }
-    return creates.length > 0;
+    return await this.#rejectPullRequestsForMissingBranches() || cascaded;
+  }
+
+  /**
+   * Cascade for a rejected push: reject every queued `createPullRequest` whose head or base
+   * branch no longer exists on the remote or as the outcome of the remaining queued pushes,
+   * along with everything queued against the doomed pull request. Returns whether anything
+   * cascaded.
+   */
+  async #rejectPullRequestsForMissingBranches(): Promise<boolean> {
+    const creates = this.#listPendingActions()
+      .filter((action): action is CreatePullRequestAction => action.type === "createPullRequest");
+    const branches = [...new Set(creates.flatMap(action => [action.options.head, action.options.base]))];
+    const heads = new Map(await Promise.all(branches.map(async branch =>
+      [branch, await this.#withApi(
+        api => api.getBranchHead(this.ctx.props.owner, this.ctx.props.repo, branch))] as const)));
+    let cascaded = false;
+    for (const pending of creates) {
+      for (const branch of [pending.options.head, pending.options.base]) {
+        if (this.#simulateBranchHead(branch, heads.get(branch)!) === null) {
+          this.#markActionRejected(pending);
+          this.#retireProvisional("pull", pending.provisionalId);
+          cascaded = true;
+          break;
+        }
+      }
+    }
+    return cascaded;
   }
 
   #rejectReplyDependencyChain(rootCommentIds: string[]): void {
@@ -1006,26 +1090,27 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     return provisional?.realId;
   }
 
+  #realIdOf(targetId: string): string | undefined {
+    return targetId.startsWith("~") ? this.#resolveProvisionalId(targetId) : targetId;
+  }
+
+  #requireRealId(targetId: string, what = "Target"): string {
+    const realId = this.#realIdOf(targetId);
+    if (!realId) throw new Error(`${what} ${targetId} has not been created on GitHub yet.`);
+    return realId;
+  }
+
   #entityIdMatches(targetId: string, logicalId: string): boolean {
     if (targetId === logicalId) return true;
-    const targetResolved = targetId.startsWith("~") ? this.#resolveProvisionalId(targetId) : targetId;
-    const logicalResolved = logicalId.startsWith("~") ? this.#resolveProvisionalId(logicalId) : logicalId;
+    const targetResolved = this.#realIdOf(targetId);
+    const logicalResolved = this.#realIdOf(logicalId);
     return !!targetResolved && !!logicalResolved && targetResolved === logicalResolved;
   }
 
   #pendingActionsForEntity(kind: EntityKind, logicalId: string): GitHubAction[] {
     return this.#listPendingActions().filter(action => {
-      if (action.type === "createIssue" || action.type === "createPullRequest" ||
-          action.type === "push") {
-        return false;
-      }
-
-      if (action.type === "postReview" || action.type === "replyToDiffComment" || action.type === "mergePullRequest") {
-        if (kind !== "pull") return false;
-        return this.#entityIdMatches(action.pullId, logicalId);
-      }
-
-      return action.targetKind === kind && this.#entityIdMatches(action.targetId, logicalId);
+      const target = actionTarget(action);
+      return target?.kind === kind && this.#entityIdMatches(target.id, logicalId);
     });
   }
 
@@ -1041,8 +1126,12 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }) as CreateIssueAction | CreatePullRequestAction | undefined;
   }
 
-  #rewriteKnownReferences(text: string, requireAll: boolean): string {
-    return text.replace(/#(~\d+)/g, (_, provisionalId: string) => {
+  // The text apply posts: `#~N` provisional references rewritten to the GitHub numbers of the
+  // issues or pull requests they name, and slash-command lines escaped so GitHub does not run
+  // them (see escapeQuickActions). `requireAll` demands every reference resolve -- a dispatching
+  // action must never post a stale provisional reference -- while a read may show one as written.
+  #postedText(text: string, requireAll: boolean): string {
+    const rewritten = text.replace(PROVISIONAL_REFERENCE, (match, provisionalId: string) => {
       const realId = this.#resolveProvisionalId(provisionalId);
       if (!realId && requireAll) {
         throw new Error(
@@ -1050,8 +1139,9 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         );
       }
 
-      return realId ? `#${realId}` : `#${provisionalId}`;
+      return realId ? `#${realId}` : match;
     });
+    return escapeQuickActions(rewritten);
   }
 
   async #getViewerActor(): Promise<GitHubActor> {
@@ -1085,34 +1175,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   #pendingExistingEntityIds(kind: EntityKind): Set<string> {
     const ids = new Set<string>();
     for (const action of this.#listPendingActions()) {
-      let targetId: string | undefined;
-      switch (action.type) {
-        case "setTitle":
-        case "setBody":
-        case "addLabels":
-        case "removeLabels":
-        case "changeState":
-        case "postComment":
-          if (action.targetKind === kind) {
-            targetId = action.targetId;
-          }
-          break;
-        case "postReview":
-        case "replyToDiffComment":
-        case "mergePullRequest":
-          if (kind === "pull") {
-            targetId = action.pullId;
-          }
-          break;
-        default:
-          break;
-      }
-
-      if (!targetId) continue;
-      const realId = targetId.startsWith("~") ? this.#resolveProvisionalId(targetId) : targetId;
-      if (realId) {
-        ids.add(realId);
-      }
+      const target = actionTarget(action);
+      if (target?.kind !== kind) continue;
+      const realId = this.#realIdOf(target.id);
+      if (realId) ids.add(realId);
     }
     return ids;
   }
@@ -1180,11 +1246,9 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       };
     }
 
-    const realId = targetId.startsWith("~") ? this.#resolveProvisionalId(targetId) : targetId;
+    const realId = this.#realIdOf(targetId);
     if (!realId) {
-      const details = targetKind === "issue"
-        ? await this.#getIssueDetails(targetId)
-        : await this.#getPullRequestDetails(targetId);
+      const details = await this.#detailsOf(targetKind, targetId);
       return {
         state: details.state,
         reason: undefined,
@@ -1247,6 +1311,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     return await this.#overlaySimulatedPullHead(
       this.#overlayIssueLike(await this.#getRemotePullRequestDetails(logicalId), "pull", logicalId),
       gitCache);
+  }
+
+  #detailsOf(targetKind: EntityKind, targetId: string): Promise<GitHubIssueDetails | GitHubPullRequestDetails> {
+    return targetKind === "issue" ? this.#getIssueDetails(targetId) : this.#getPullRequestDetails(targetId);
   }
 
   /**
@@ -1473,7 +1541,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           break;
         case "setBody":
           if ("bodyMarkdown" in result) {
-            result.bodyMarkdown = this.#rewriteKnownReferences(action.bodyMarkdown, false);
+            result.bodyMarkdown = this.#postedText(action.bodyMarkdown, false);
             result.updatedAt = new Date(action.submittedAt);
           }
           break;
@@ -1850,7 +1918,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           kind: "comment",
           id: action.provisionalCommentId,
           author: viewer,
-          bodyMarkdown: this.#rewriteKnownReferences(action.bodyMarkdown, false),
+          bodyMarkdown: this.#postedText(action.bodyMarkdown, false),
           createdAt: new Date(action.submittedAt),
           url: `${kind === "issue" ? issueUrl(this.ctx.props.owner, this.ctx.props.repo, logicalId) : pullUrl(this.ctx.props.owner, this.ctx.props.repo, logicalId)}#comment-${action.provisionalCommentId}`,
         });
@@ -1859,7 +1927,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           kind: "review",
           id: action.provisionalReviewId,
           author: viewer,
-          bodyMarkdown: this.#rewriteKnownReferences(action.review.bodyMarkdown ?? "", false),
+          bodyMarkdown: this.#postedText(action.review.bodyMarkdown ?? "", false),
           createdAt: new Date(action.submittedAt),
           url: `${pullUrl(this.ctx.props.owner, this.ctx.props.repo, logicalId)}#review-${action.provisionalReviewId}`,
           decision: action.review.decision,
@@ -1868,7 +1936,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
             threadId: comment.provisionalCommentId,
             target: comment.target,
             author: viewer,
-            bodyMarkdown: this.#rewriteKnownReferences(comment.bodyMarkdown, false),
+            bodyMarkdown: this.#postedText(comment.bodyMarkdown, false),
             createdAt: new Date(action.submittedAt),
             url: `${pullUrl(this.ctx.props.owner, this.ctx.props.repo, logicalId)}#discussion-${comment.provisionalCommentId}`,
           })),
@@ -2089,7 +2157,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
               id: comment.provisionalCommentId,
               reviewId: action.provisionalReviewId,
               author: viewer,
-              bodyMarkdown: this.#rewriteKnownReferences(comment.bodyMarkdown, false),
+              bodyMarkdown: this.#postedText(comment.bodyMarkdown, false),
               createdAt: new Date(action.submittedAt),
               url: `${pullUrl(this.ctx.props.owner, this.ctx.props.repo, logicalId)}#discussion-${comment.provisionalCommentId}`,
             }],
@@ -2103,7 +2171,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           thread.comments.push({
             id: action.provisionalCommentId,
             author: viewer,
-            bodyMarkdown: this.#rewriteKnownReferences(action.bodyMarkdown, false),
+            bodyMarkdown: this.#postedText(action.bodyMarkdown, false),
             createdAt: new Date(action.submittedAt),
             url: `${pullUrl(this.ctx.props.owner, this.ctx.props.repo, logicalId)}#discussion-${action.provisionalCommentId}`,
           });
@@ -2576,7 +2644,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       case "createIssue": {
         const response = await this.#withApi(api => api.createIssue(action.owner, action.repo, {
           title: action.options.title,
-          body: action.options.bodyMarkdown ? this.#rewriteKnownReferences(action.options.bodyMarkdown, true) : undefined,
+          body: action.options.bodyMarkdown ? this.#postedText(action.options.bodyMarkdown, true) : undefined,
           labels: action.options.labels,
           assignees: action.options.assignees,
         }));
@@ -2588,7 +2656,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         try {
           response = await this.#withApi(api => api.createPullRequest(action.owner, action.repo, {
             title: action.options.title,
-            body: action.options.bodyMarkdown ? this.#rewriteKnownReferences(action.options.bodyMarkdown, true) : undefined,
+            body: action.options.bodyMarkdown ? this.#postedText(action.options.bodyMarkdown, true) : undefined,
             head: action.options.head,
             base: action.options.base,
             draft: action.options.draft,
@@ -2611,35 +2679,30 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         return action;
       }
       case "setTitle": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
-        if (!realId) throw new Error(`Target ${action.targetId} has not been created on GitHub yet.`);
+        const realId = this.#requireRealId(action.targetId);
         await this.#withApi(api => api.updateIssue(action.owner, action.repo, Number(realId), { title: action.title }));
         return action;
       }
       case "setBody": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
-        if (!realId) throw new Error(`Target ${action.targetId} has not been created on GitHub yet.`);
+        const realId = this.#requireRealId(action.targetId);
         await this.#withApi(api => api.updateIssue(action.owner, action.repo, Number(realId), {
-          body: this.#rewriteKnownReferences(action.bodyMarkdown, true),
+          body: this.#postedText(action.bodyMarkdown, true),
         }));
         return action;
       }
       case "addLabels": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
-        if (!realId) throw new Error(`Target ${action.targetId} has not been created on GitHub yet.`);
+        const realId = this.#requireRealId(action.targetId);
         await this.#withApi(api => api.addLabels(action.owner, action.repo, Number(realId), action.labels));
         return action;
       }
       case "removeLabels": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
-        if (!realId) throw new Error(`Target ${action.targetId} has not been created on GitHub yet.`);
+        const realId = this.#requireRealId(action.targetId);
         await this.#withApi(api =>
           api.setLabels(action.owner, action.repo, Number(realId), remainingLabels(action)));
         return action;
       }
       case "changeState": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
-        if (!realId) throw new Error(`Target ${action.targetId} has not been created on GitHub yet.`);
+        const realId = this.#requireRealId(action.targetId);
         await this.#withApi(api => api.updateIssue(action.owner, action.repo, Number(realId), {
           state: action.state,
           state_reason: denormalizeStateReason(action.reason),
@@ -2647,22 +2710,20 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         return action;
       }
       case "postComment": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
-        if (!realId) throw new Error(`Target ${action.targetId} has not been created on GitHub yet.`);
+        const realId = this.#requireRealId(action.targetId);
         const response = await this.#withApi(api => api.createIssueComment(
           action.owner,
           action.repo,
           Number(realId),
-          this.#rewriteKnownReferences(action.bodyMarkdown, true),
+          this.#postedText(action.bodyMarkdown, true),
         ));
         return { ...action, createdCommentId: response.id };
       }
       case "postReview": {
-        const realId = action.pullId.startsWith("~") ? this.#resolveProvisionalId(action.pullId) : action.pullId;
-        if (!realId) throw new Error(`Pull request ${action.pullId} has not been created on GitHub yet.`);
+        const realId = this.#requireRealId(action.pullId, "Pull request");
         await this.#withApi(api => api.createPullRequestReview(action.owner, action.repo, Number(realId), {
           commit_id: action.review.revision.headSha,
-          body: action.review.bodyMarkdown ? this.#rewriteKnownReferences(action.review.bodyMarkdown, true) : undefined,
+          body: action.review.bodyMarkdown ? this.#postedText(action.review.bodyMarkdown, true) : undefined,
           event: action.review.decision === "approve"
             ? "APPROVE"
             : action.review.decision === "requestChanges"
@@ -2670,7 +2731,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
               : "COMMENT",
           comments: action.review.diffComments?.map(comment => ({
             path: comment.target.path,
-            body: this.#rewriteKnownReferences(comment.bodyMarkdown, true),
+            body: this.#postedText(comment.bodyMarkdown, true),
             line: comment.target.subjectType === "file" ? undefined : comment.target.line,
             side: comment.target.subjectType === "file" ? undefined : comment.target.side === "old" ? "LEFT" : "RIGHT",
             start_line: comment.target.subjectType === "file" ? undefined : comment.target.startLine,
@@ -2683,22 +2744,20 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         return action;
       }
       case "replyToDiffComment": {
-        const pullId = action.pullId.startsWith("~") ? this.#resolveProvisionalId(action.pullId) : action.pullId;
-        if (!pullId) throw new Error(`Pull request ${action.pullId} has not been created on GitHub yet.`);
+        const pullId = this.#requireRealId(action.pullId, "Pull request");
         const replyTargetId = await this.#resolveReplyTarget(action.commentId);
         const response = await this.#withApi(api => api.replyToPullRequestReviewComment(
           action.owner,
           action.repo,
           Number(pullId),
           replyTargetId,
-          this.#rewriteKnownReferences(action.bodyMarkdown, true),
+          this.#postedText(action.bodyMarkdown, true),
         ));
         this.ctx.storage.kv.put(`diffAlias:${action.provisionalCommentId}`, String(response.id));
         return { ...action, createdCommentId: response.id };
       }
       case "mergePullRequest": {
-        const pullId = action.pullId.startsWith("~") ? this.#resolveProvisionalId(action.pullId) : action.pullId;
-        if (!pullId) throw new Error(`Pull request ${action.pullId} has not been created on GitHub yet.`);
+        const pullId = this.#requireRealId(action.pullId, "Pull request");
         await this.#mergePullRequest(Number(pullId), action);
         return action;
       }
@@ -2793,9 +2852,6 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     } else if (this.#listPendingActions().some(leavesExpected)) {
       reason = `The push cannot be applied yet: it builds on ${expected}, the head the queued ` +
         `push to "${branch}" will leave. Approve that push first, then this one.`;
-    } else if (this.#actions.listFailed().some(({ action }) => leavesExpected(action))) {
-      reason = `The push cannot be applied: it builds on ${expected}, the head of a discarded ` +
-        `push to "${branch}". Re-push your commits from the branch's current head.`;
     } else {
       reason = `The push cannot be applied: branch "${branch}" has moved from ${expected}, the ` +
         `head it was approved against. Re-observe the branch and queue a fresh push against ` +
@@ -2867,8 +2923,9 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
 
     if (action.type === "push") {
       // A queued pull request may depend on this push for its head (or base) branch to exist at
-      // all. With the push rejected, such a pull request can never be created -- cascade-reject
-      // it (and, transitively, everything queued against it), mirroring how rejecting a
+      // all, and pushes or merges may be stacked on the head it would leave -- with the push
+      // rejected, none of those can ever apply -- so cascade-reject them (and, transitively,
+      // everything queued against the doomed pull requests), mirroring how rejecting a
       // provisional create rejects its dependents. A pull request whose branches still exist --
       // really, or through the remaining queued pushes -- is left queued: a later push can still
       // deliver the branch content.
@@ -2879,8 +2936,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
 
     this.#markActionRejected(action);
     if (action.type === "createIssue" || action.type === "createPullRequest") {
-      this.#rejectActionsForResource(action.type === "createIssue" ? "issue" : "pull", action.provisionalId);
-      this.ctx.storage.kv.delete(`provisional:${action.provisionalId}`);
+      this.#retireProvisional(action.type === "createIssue" ? "issue" : "pull", action.provisionalId);
       this.#clearCaches();
       return { restart: true };
     }
@@ -2900,21 +2956,21 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const action = record.action;
     switch (action.type) {
       case "setTitle": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
+        const realId = this.#realIdOf(action.targetId);
         if (!realId) return { message: "The target resource no longer exists on GitHub.", canRetry: false };
         await this.#withApi(api => api.updateIssue(action.owner, action.repo, Number(realId), { title: action.previousTitle }));
         this.#clearCaches();
         return;
       }
       case "setBody": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
+        const realId = this.#realIdOf(action.targetId);
         if (!realId) return { message: "The target resource no longer exists on GitHub.", canRetry: false };
         await this.#withApi(api => api.updateIssue(action.owner, action.repo, Number(realId), { body: action.previousBodyMarkdown }));
         this.#clearCaches();
         return;
       }
       case "addLabels": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
+        const realId = this.#realIdOf(action.targetId);
         if (!realId) return { message: "The target resource no longer exists on GitHub.", canRetry: false };
         // Only the labels the action introduced: one that was already there stays.
         const introduced = action.labels.filter(label => !action.previousLabels.includes(label));
@@ -2925,7 +2981,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         return;
       }
       case "removeLabels": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
+        const realId = this.#realIdOf(action.targetId);
         if (!realId) return { message: "The target resource no longer exists on GitHub.", canRetry: false };
         // Only the labels the action removed: one that was never there is not added.
         const removed = action.labels.filter(label => action.previousLabels.includes(label));
@@ -2936,7 +2992,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         return;
       }
       case "changeState": {
-        const realId = action.targetId.startsWith("~") ? this.#resolveProvisionalId(action.targetId) : action.targetId;
+        const realId = this.#realIdOf(action.targetId);
         if (!realId) return { message: "The target resource no longer exists on GitHub.", canRetry: false };
         await this.#withApi(api => api.updateIssue(action.owner, action.repo, Number(realId), {
           state: action.previousState,
@@ -3202,43 +3258,56 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
    * Walk a simulated branch head down to its **anchor** -- the first commit GitHub already knows
    * -- reading the not-yet-pushed commits from the workspace git cache (which serves this
    * gatekeeper's queued-push closure, pulling objects through on demand). Returns the pending
-   * first-parent chain newest-first (what simulated listings show), its anchor, and `pending`:
-   * every commit reachable from `head` that GitHub lacks, a local merge's side branches included.
-   * A chain that leaves the cache or bottoms out with no GitHub-known ancestor throws, as does
-   * exceeding the cap, and callers degrade.
+   * first-parent chain newest-first (what simulated listings show), its anchor, the frontier of
+   * GitHub-known commits its whole ancestry ends at, and `pending`: every commit the walk found
+   * GitHub lacks, a local merge's side branches included. The walk, and so every listing built
+   * from it, follows first parents only, where GitHub's own history lists every parent: a local
+   * merge's side branch is missing from simulated listings until its push lands (a known gap --
+   * matching GitHub would mean date-merging the remote history behind each side parent). A chain
+   * that leaves the cache or bottoms out with no GitHub-known ancestor throws, as does exceeding
+   * the cap, and callers degrade.
    *
    * Every pending id is recorded in `#servedSimulatedCommitIds`, so sessions withhold it from
    * advertising: listed summaries name their parents, and a side parent advertised as
    * remote-known would be left out of the push's pack, which GitHub then rejects.
    *
-   * `realHead` is the branch's remote head, the one ancestor known without a probe. It is the
-   * only base the pushes `#simulateBranchHead` consumes start from: every other expectation in
-   * that chain is a pending newSha, and a push stranded by a rejection is never consumed, so its
-   * never-received expectation must not pass as GitHub's.
+   * `realHead` is the branch's remote head, the one ancestor known without a probe. Beyond it, a
+   * push's expectedOldSha is usually known to GitHub without a probe too: it was read from the
+   * remote at queue time. Stacked pushes bind each expectedOldSha to the previous queued push's
+   * newSha (a pending commit), so those are excluded from the known set and the walk continues to
+   * the real anchor. Rejecting a push retires the pushes stacked on it
+   * (`#rejectActionsStrandedByPush`), so no pending push is left bound to a head that will never
+   * exist, which this would take for GitHub's.
    */
   async #collectPendingChain(
     gitCache: RpcStub<GitCache>, head: GitOid, realHead: string | null,
   ): Promise<{
     commits: { summary: GitHubCommitSummary; tree: GitOid }[];
     anchor: GitOid;
+    /** The commits GitHub has where the pending commits' whole ancestry ends: the anchor first. */
+    frontier: GitOid[];
+    /** Every commit the walk found GitHub lacks, side branches' included: none may be advertised. */
     pending: GitOid[];
   }> {
+    const pendingNewShas = new Set(this.#pendingPushActions().map(action => action.newSha));
+    const knownShas = new Set(this.#pendingPushActions()
+      .map(action => action.expectedOldSha)
+      .filter(sha => sha !== ZERO_OID && !pendingNewShas.has(sha)));
+
+    const onGitHub = async (oid: GitOid) =>
+      oid === realHead || knownShas.has(oid) || await this.#isCommitOnGitHub(oid);
     const commits: { summary: GitHubCommitSummary; tree: GitOid }[] = [];
-    const pending: GitOid[] = [];
-    const seen = new Set<GitOid>();
-    let anchor: GitOid | undefined;
-    // Depth-first with first parents on top: the walk descends the first-parent chain until the
-    // anchor, then drains the side parents stacked along the way.
-    const stack = [head];
-    for (let current = stack.pop(); current !== undefined; current = stack.pop()) {
-      if (seen.has(current)) continue;
-      seen.add(current);
-      if (current === realHead || await this.#isCommitOnGitHub(current)) {
-        anchor ??= current;
-        continue;
-      }
-      if (pending.length === MAX_PENDING_CHAIN_COMMITS) {
-        throw new Error(`More than ${MAX_PENDING_CHAIN_COMMITS} commits are queued for push.`);
+    const sideParents: GitOid[] = [];
+    let current = head;
+    while (commits.length <= MAX_PENDING_CHAIN_COMMITS) {
+      if (await onGitHub(current)) {
+        const chainIds = commits.map(commit => commit.summary.id);
+        const side = await this.#recordPendingSideParents(
+          gitCache, sideParents, new Set([...chainIds, current]), onGitHub);
+        return {
+          commits, anchor: current, frontier: [current, ...side.frontier],
+          pending: [...chainIds, ...side.pending],
+        };
       }
       const object = await gitCache.get(current);
       if (object === null || object.type !== "commit") {
@@ -3246,20 +3315,55 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       }
       const parsed = parseGitCommitPayload(object.content, current);
       this.#servedSimulatedCommitIds.add(current);
-      pending.push(current);
-      if (anchor === undefined) {
-        if (parsed.parents.length === 0) {
-          throw new Error(`Commit ${current} has no ancestor known to GitHub.`);
-        }
-        commits.push({
-          summary: commitDetailsFromGitObject(
-            current, object.content, canonicalRepoUrl(this.ctx.props.owner, this.ctx.props.repo)),
-          tree: parsed.tree,
-        });
+      commits.push({
+        summary: commitDetailsFromGitObject(
+          current, object.content, canonicalRepoUrl(this.ctx.props.owner, this.ctx.props.repo)),
+        tree: parsed.tree,
+      });
+      if (parsed.parents.length === 0) {
+        throw new Error(`Commit ${current} has no ancestor known to GitHub.`);
       }
-      stack.push(...parsed.parents.toReversed());
+      sideParents.push(...parsed.parents.slice(1));
+      current = parsed.parents[0];
     }
-    return { commits, anchor: anchor!, pending };
+    throw new Error(`More than ${MAX_PENDING_CHAIN_COMMITS} commits are queued for push.`);
+  }
+
+  /**
+   * Mark every not-yet-pushed commit reachable through a local merge's side parents as served
+   * (see `#collectPendingChain`), walking each side branch down to commits GitHub has. Returns
+   * the commits it marked and the GitHub ones it stopped at. `walked` holds the commits already
+   * walked, and the side walk adds to it; the served set cannot stand in, since it outlives the
+   * walk that filled it. Bounded like the main chain, and past the bound it throws, so callers
+   * degrade: a partial walk could leave a side parent unmarked that a listed merge names, and the
+   * session would advertise it. A side branch that leaves the cache is left unmarked and
+   * unfollowed (the push itself would fail on the missing object, not silently advertise it).
+   */
+  async #recordPendingSideParents(
+    gitCache: RpcStub<GitCache>, roots: GitOid[], walked: Set<GitOid>,
+    onGitHub: (oid: GitOid) => Promise<boolean>,
+  ): Promise<{ pending: GitOid[]; frontier: GitOid[] }> {
+    const pending: GitOid[] = [];
+    const frontier: GitOid[] = [];
+    const stack = [...roots];
+    while (stack.length > 0) {
+      const oid = stack.pop()!;
+      if (walked.has(oid)) continue;
+      walked.add(oid);
+      if (await onGitHub(oid)) {
+        frontier.push(oid);
+        continue;
+      }
+      const object = await gitCache.get(oid);
+      if (object === null || object.type !== "commit") continue;
+      if (pending.length === MAX_PENDING_CHAIN_COMMITS) {
+        throw new Error(`More than ${MAX_PENDING_CHAIN_COMMITS} commits are queued for push.`);
+      }
+      pending.push(oid);
+      this.#servedSimulatedCommitIds.add(oid);
+      stack.push(...parseGitCommitPayload(object.content, oid).parents);
+    }
+    return { pending, frontier };
   }
 
   /** The tree oid of a commit, from cached bytes when available, else GitHub's commit API. */
@@ -3333,8 +3437,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const simulatedHead = this.#simulateBranchHead(headBranch, realHead);
     if (simulatedHead === null || simulatedHead === realHead) return null;
 
-    // "-v2": `pendingCommitIds` gained merges' side parents, which a hit withholds from advertising.
-    const cacheKey = this.#cacheKey("pull-simulated-v2", stableKey(baseRef), simulatedHead);
+    // "-v3": the merge base became the fold over the chain's frontier (right for multi-parent
+    // histories) -- "-v2" entries hold the pairwise (base, anchor) answer, and before them
+    // `pendingCommitIds` gained merges' side parents, which a hit withholds from advertising.
+    const cacheKey = this.#cacheKey("pull-simulated-v3", stableKey(baseRef), simulatedHead);
     const cached = this.#loadCached<SimulatedPullComparison>(cacheKey, ENTITY_CACHE_TTL_MS);
     if (cached !== undefined) {
       // The served-id set is in-memory; re-record the cached result's pending ids so this
@@ -3348,9 +3454,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const compare = await this.#withApi(api =>
       api.compareBranches(this.ctx.props.owner, this.ctx.props.repo, baseRef, chain.anchor));
     this.#recordCompareMergeBase(compare, chain.anchor);
-    // Malformed (merge-base-less) responses throw here, degrading via
-    // #simulatedPullComparisonOrWarn: the tree diff below would be wrong against any other base.
-    const mergeBase = mergeBaseOfCompare(compare);
+    // The merge base the pushed head's comparison will diff from is the greatest common ancestor
+    // of the base branch and the queued head's *whole* ancestry -- which ends at the frontier,
+    // not just at the anchor. Malformed (merge-base-less) compare responses throw inside the
+    const mergeBase = await this.#simulatedMergeBase(baseRef, compare.base_commit.sha, chain.frontier);
 
     const newTree = chain.commits.length > 0
       ? chain.commits[0].tree
@@ -3360,7 +3467,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
 
     const result: SimulatedPullComparison = {
       // The pending chain descends from the anchor without touching the base branch, so the
-      // diff's merge base is the compare's (base, anchor) one.
+      // diff's merge base is the fold over the frontier above.
       revision: { baseSha: compare.base_commit.sha, headSha: simulatedHead, mergeBaseSha: mergeBase },
       files,
       additions: files.reduce((sum, file) => sum + file.additions, 0),
@@ -3375,6 +3482,41 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     };
     this.#storeCached(cacheKey, result, generation);
     return result;
+  }
+
+  /**
+   * The merge base GitHub will compute for `baseRef` and a queued head whose ancestry ends at
+   * `frontier` on GitHub: the greatest commit common to the base branch and the queued head's
+   * *whole* ancestry -- the frontier, not just the anchor, since a local merge's side branch can
+   * reach deeper into the base branch than the first-parent chain does. GitHub's compare answers
+   * only a pair of commits (GitLab asks one `/merge_base` for all), so the candidates are the
+   * pairwise merge bases against each frontier commit -- every candidate is a common ancestor of
+   * the base branch and the queued head, and the greatest is among them, since a commit common
+   * to the base branch and every frontier commit is common to it and one frontier commit, hence
+   * at most that pair's answer -- and the winner is the candidate that is greatest, told by one
+   * metadata-only compare each: for commits under the base branch's head,
+   * `candidate...baseRef` counts the head's ancestors the candidate lacks, and the greatest
+   * lacks the fewest. Ties (criss-cross history) resolve to the first candidate, as git itself
+   * resolves them arbitrarily. With no local merges the frontier is the anchor alone, and the
+   * single pairwise answer is the (base, anchor) compare `#simulatedPullComparison` already
+   * made and recorded in the pair cache, costing no extra call. A frontier past the cap fails
+   * the read (like GitLab's URL-length cap), and callers degrade.
+   */
+  async #simulatedMergeBase(baseRef: string, baseSha: GitOid, frontier: GitOid[]): Promise<GitOid> {
+    if (frontier.length > MAX_FRONTIER_COMMITS) {
+      throw new Error(`The queued head's history reaches more than ${MAX_FRONTIER_COMMITS} GitHub commits.`);
+    }
+    const { owner, repo } = this.ctx.props;
+    let best: { base: GitOid, ahead: number } | undefined;
+    for (const commit of frontier) {
+      const candidate = await this.#getMergeBaseCached(baseSha, commit);
+      // The base branch's own head is the deepest candidate there can be.
+      if (candidate === baseSha || frontier.length === 1) return candidate;
+      const ahead = (await this.#withApi(api =>
+        api.compareBranches(owner, repo, candidate, baseRef, { perPage: 1, page: 2 }))).total_commits;
+      if (best === undefined || ahead < best.ahead) best = { base: candidate, ahead };
+    }
+    return best!.base;
   }
 
   /**
@@ -3902,12 +4044,18 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async prepareCreateIssue(options: GitHubCreateIssueOptions): Promise<CreateIssueAction> {
     return {
       type: "createIssue",
+      ...this.#base(),
+      provisionalId: this.#nextProvisionalResourceId(),
+      options,
+    };
+  }
+
+  #base() {
+    return {
       approvalId: this.#actions.reserveId(),
       submittedAt: Date.now(),
       owner: this.ctx.props.owner,
       repo: this.ctx.props.repo,
-      provisionalId: this.#nextProvisionalResourceId(),
-      options,
     };
   }
 
@@ -3929,23 +4077,17 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
     return {
       type: "createPullRequest",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       provisionalId: this.#nextProvisionalResourceId(),
       options,
     };
   }
 
   async prepareSetTitle(targetKind: EntityKind, targetId: string, title: string): Promise<SetTitleAction> {
-    const details = targetKind === "issue" ? await this.#getIssueDetails(targetId) : await this.#getPullRequestDetails(targetId);
+    const details = await this.#detailsOf(targetKind, targetId);
     return {
       type: "setTitle",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       targetKind,
       targetId,
       title,
@@ -3954,13 +4096,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   }
 
   async prepareSetBody(targetKind: EntityKind, targetId: string, bodyMarkdown: string): Promise<SetBodyAction> {
-    const details = targetKind === "issue" ? await this.#getIssueDetails(targetId) : await this.#getPullRequestDetails(targetId);
+    const details = await this.#detailsOf(targetKind, targetId);
     return {
       type: "setBody",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       targetKind,
       targetId,
       bodyMarkdown,
@@ -3969,13 +4108,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   }
 
   async prepareAddLabels(targetKind: EntityKind, targetId: string, labels: string[]): Promise<AddLabelsAction> {
-    const details = targetKind === "issue" ? await this.#getIssueDetails(targetId) : await this.#getPullRequestDetails(targetId);
+    const details = await this.#detailsOf(targetKind, targetId);
     return {
       type: "addLabels",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       targetKind,
       targetId,
       labels,
@@ -3984,13 +4120,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   }
 
   async prepareRemoveLabels(targetKind: EntityKind, targetId: string, labels: string[]): Promise<RemoveLabelsAction> {
-    const details = targetKind === "issue" ? await this.#getIssueDetails(targetId) : await this.#getPullRequestDetails(targetId);
+    const details = await this.#detailsOf(targetKind, targetId);
     return {
       type: "removeLabels",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       targetKind,
       targetId,
       labels,
@@ -4007,10 +4140,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     const current = await this.#getCurrentStateInfo(targetKind, targetId);
     return {
       type: "changeState",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       targetKind,
       targetId,
       state,
@@ -4023,10 +4153,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async preparePostComment(targetKind: EntityKind, targetId: string, bodyMarkdown: string): Promise<PostCommentAction> {
     return {
       type: "postComment",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       targetKind,
       targetId,
       bodyMarkdown,
@@ -4037,10 +4164,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async preparePostReview(pullId: string, review: GitHubPullRequestReviewDraft): Promise<PostReviewAction> {
     return {
       type: "postReview",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       pullId,
       provisionalReviewId: this.#nextProvisionalCommentId("review"),
       review: {
@@ -4056,10 +4180,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async prepareReplyToDiffComment(pullId: string, commentId: string, bodyMarkdown: string): Promise<ReplyToDiffCommentAction> {
     return {
       type: "replyToDiffComment",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       pullId,
       commentId,
       bodyMarkdown,
@@ -4076,7 +4197,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
    * provisional pull request's at its head branch's simulated head.
    */
   async prepareMergePullRequest(pullId: string, options?: GitHubPullRequestMergeOptions): Promise<MergePullRequestAction> {
-    const realId = pullId.startsWith("~") ? this.#resolveProvisionalId(pullId) : pullId;
+    const realId = this.#realIdOf(pullId);
     let headBranch: string | null;
     let headSha: string | null;
     if (realId === undefined) {
@@ -4102,10 +4223,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
     return {
       type: "mergePullRequest",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       pullId,
       options,
       expectedHeadSha: headSha,
@@ -4145,10 +4263,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
     return {
       type: "push",
-      approvalId: this.#actions.reserveId(),
-      submittedAt: Date.now(),
-      owner: this.ctx.props.owner,
-      repo: this.ctx.props.repo,
+      ...this.#base(),
       branch,
       expectedOldSha,
       newSha: commitId,

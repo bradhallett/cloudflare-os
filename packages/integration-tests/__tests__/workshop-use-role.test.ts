@@ -85,12 +85,10 @@ const DENIED_OVERSEER: Record<Exclude<keyof Overseer, keyof RpcTarget | UseSurfa
     (ws: RpcStub<Overseer>) => unknown> = {
   setTitle: ws => ws.setTitle("Title"),
   deleteSelf: ws => ws.deleteSelf(),
-  transferToOrg: ws => ws.transferToOrg("org"),
   createGadget: ws => ws.createGadget("App"),
   listTree: ws => ws.listTree(COMMIT),
   listChangedPaths: ws => ws.listChangedPaths(COMMIT, COMMIT),
   readFilesAtCommit: ws => ws.readFilesAtCommit(COMMIT, ["client.js"]),
-  getCommitLog: ws => ws.getCommitLog(COMMIT),
   submitCodeChange: ws => ws.submitCodeChange(1, {
     generation: 0, revision: 0, clientId: "use", seq: 1, change: diffFiles(new Map(), new Map()),
   }),

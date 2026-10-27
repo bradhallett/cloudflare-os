@@ -8,7 +8,7 @@ import { invokeSlashCommand } from "./slash-commands";
 import { retryOnDoReset } from "./do-retry";
 import { stringifyError } from "./overseer-support";
 import { SlashCommandAuthorizerImpl } from "./overseer-gatekeeper-client";
-import type { UserChatContext } from "./user";
+import type { UserChatContext } from "./user-models";
 import { OverseerGatekeepers } from "./overseer-gatekeepers";
 
 /** Fallback reply for a bot subagent whose turn ended without producing a reply. */

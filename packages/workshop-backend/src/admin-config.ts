@@ -9,12 +9,14 @@
 // changed by a compromised admin session. Everything here is enabled by default; the admin UI opts
 // things *out*.
 
-import { AiModelProvider, AmbientGatekeeperMode, BlueprintBinding, BlueprintMetadata, BlueprintOutput, BotDefinition, DEFAULT_BANNER_COLOR, GatewayModel, GatewayModelCapabilities, GatewayModelMode, GatewayModelSettings, MAX_UPDATE_CHECK_INTERVAL_MINUTES, MAX_UPDATE_HOURS, OutputFormatOffer, REASONING_LEVELS, SUGGESTED_MODELS, isAmbientGatekeeperMode, isBannerColor, isGatewayModelMode, isOutputIcon, isReasoningLevel } from "@gadgets/workshop-shared/api";
+import { AiModelProvider, AmbientGatekeeperMode, BlueprintBinding, BlueprintMetadata, BlueprintOutput, BotDefinition, createPlanRefusalError, DEFAULT_BANNER_COLOR, GatewayModel, GatewayModelCapabilities, GatewayModelMode, GatewayModelSettings, MAX_UPDATE_CHECK_INTERVAL_MINUTES, MAX_UPDATE_HOURS, OutputFormatOffer, REASONING_LEVELS, SUGGESTED_MODELS, isAmbientGatekeeperMode, isBannerColor, isGatewayModelMode, isOutputIcon, isReasoningLevel } from "@gadgets/workshop-shared/api";
 import { SupportedResource } from "@gadgets/workshop-shared/gatekeeper";
 import { normalizeBotDefinition } from "./bot-config.js";
 import { sanitizeBlueprintOutput } from "./blueprint-archive.js";
 import { DEFAULT_ADMIN_CONFIG, type AdminConfig, type FormatCuration, type VendorAdminPolicy } from "./storage-schema/admin-settings-storage.js";
 import { ADMIN_CONFIG_KEY, BlueprintKvEnv, readBlueprintKvRecord } from "./storage-schema/blueprints-kv.js";
+import { ambientGatekeeperMode } from "./provisioning-policy.js";
+import { allowedGatekeepers } from "./user-plan.js";
 
 /**
  * Longest `agentHint` a promoted format may carry. Every enabled format's hint goes into the
@@ -476,6 +478,131 @@ export function filterEnabledResources(
   return resources.filter(r => !disabled.includes(r.urlPattern));
 }
 
+// --- Gatekeeper access policy ---
+
+/**
+ * The deployment's gatekeeper-access policy for one user: the admin's vendor settings
+ * (disabledGatekeepers, ambientGatekeeperModes, disabledResources) joined with the user's plan
+ * (see allowedGatekeepers). One object answers "may this user use this vendor, account, or
+ * resource" — the capability mints (UserAccountStore.getSingletonGatekeeperClass,
+ * getGatekeeperClassFor, createResourceGatekeeper) enforce it as the primary gate, and the
+ * listings apply the same predicates as UX, so admin-disable and plan-withholding cannot drift
+ * apart at different call sites again (they had: a disabled vendor's singleton kept minting).
+ *
+ * Build one per request with gatekeeperAccessPolicy(). The admin config the policy was resolved
+ * against is exposed as `config`, so sites that also need its other fields (formats, deployment
+ * bots, vendor admin policy) read them there instead of fetching the config twice.
+ */
+export class GatekeeperAccessPolicy {
+  #disabled: ReadonlySet<string>;
+  #planAllowed: ReadonlySet<string> | null;
+
+  constructor(readonly config: AdminConfig, planAllowed: ReadonlySet<string> | null) {
+    this.#disabled = new Set(config.disabledGatekeepers);
+    this.#planAllowed = planAllowed;
+  }
+
+  /** Whether the admin disabled the vendor outright (AdminConfig.disabledGatekeepers). */
+  adminDisabled(vendorId: string): boolean {
+    return this.#disabled.has(vendorId.toLowerCase());
+  }
+
+  /**
+   * The ambient mode configured for the vendor ("optional" when unset): the auto-provisioning
+   * and dormancy knob for ambient gatekeepers (see provisioning-policy.ts).
+   */
+  ambientMode(vendorId: string): AmbientGatekeeperMode {
+    return ambientGatekeeperMode(this.config, vendorId);
+  }
+
+  /**
+   * Whether an ambient vendor is forced on every user ("enabled" mode): its account is
+   * auto-provisioned and not user-removable (disconnectAccount refuses).
+   */
+  forcedAmbient(vendorId: string): boolean {
+    return this.ambientMode(vendorId) === "enabled";
+  }
+
+  /**
+   * Whether the vendor is disabled at the deployment level: admin-disabled outright, or an
+   * ambient vendor the admin set to "disabled". The vendor-level gate the resource mints and
+   * the hook handout enforce; per-account dormancy is accountUsable, which does not hold an
+   * ambient mode against a non-ambient (OAuth) account.
+   */
+  vendorDisabled(vendorId: string): boolean {
+    return this.adminDisabled(vendorId) || this.ambientMode(vendorId) === "disabled";
+  }
+
+  /**
+   * Whether the user's plan offers the vendor. Every vendor while no entitlements service is
+   * bound (every OSS deployment); a bound service that fails yields the empty set, so an
+   * entitlements outage fails closed.
+   */
+  onPlan(vendorId: string): boolean {
+    return this.#planAllowed === null || this.#planAllowed.has(vendorId.toLowerCase());
+  }
+
+  /**
+   * THE dormancy invariant for a connected account: its vendor is neither admin-disabled nor
+   * off-plan, and an auto-provisioned account's ambient mode is not "disabled" (the storage
+   * field is optional; undefined counts as not auto-provisioned, i.e. an OAuth account). A
+   * dormant account's record stays (its data is preserved; re-enabling restores it) but nothing
+   * mints, lists, or offers it — the mints enforce this and the listings apply it as UX.
+   */
+  accountUsable(vendorId: string, autoProvisioned: boolean | undefined): boolean {
+    return !this.adminDisabled(vendorId) && this.onPlan(vendorId) &&
+        (!autoProvisioned || this.ambientMode(vendorId) !== "disabled");
+  }
+
+  /**
+   * Refuse to connect to or opt into a vendor: the admin's message first, then the plan's (the
+   * ordering assertResourceEnabled has always used, so an admin-disabled gatekeeper keeps its
+   * message when the plan also omits it). An ambient mode of "disabled" refuses the same way an
+   * admin-disable does — that mode IS the vendor's disable.
+   */
+  assertConnectable(vendorId: string): void {
+    if (this.vendorDisabled(vendorId)) {
+      throw new Error(`The "${vendorId}" gatekeeper is disabled on this deployment.`);
+    }
+    if (!this.onPlan(vendorId)) {
+      throw createPlanRefusalError("CONNECTOR_NOT_ON_PLAN",
+          `The "${vendorId}" connector isn't available on your plan.`);
+    }
+  }
+
+  /**
+   * Refuse a resource mint for a disabled vendor or resource, or an off-plan one: the
+   * core-side chokepoint every gatekeeper-class mint passes (getGatekeeperClassFor,
+   * createResourceGatekeeper). Admin settings are checked first, so an administrator's disable
+   * keeps its message when the plan also omits the vendor.
+   */
+  assertResourceEnabled(vendorId: string, resource: SupportedResource): void {
+    if (this.vendorDisabled(vendorId)) {
+      throw new Error(
+          `The "${vendorId}" gatekeeper is disabled on this deployment by an administrator.`);
+    }
+    if (isResourceDisabled(this.config, vendorId.toLowerCase(), resource.urlPattern)) {
+      throw new Error(
+          `The "${resource.title}" resource is disabled on this deployment by an administrator.`);
+    }
+    if (!this.onPlan(vendorId)) {
+      throw createPlanRefusalError("CONNECTOR_NOT_ON_PLAN",
+          `The "${vendorId}" connector isn't available on your plan.`);
+    }
+  }
+}
+
+/**
+ * Resolve the gatekeeper-access policy for `userId` against the current admin config: one KV
+ * read joined with the user's plan answer (see allowedGatekeepers). Sites that need only the
+ * admin config, not an access decision, call readAdminConfig directly.
+ */
+export async function gatekeeperAccessPolicy(
+    env: Cloudflare.Env, userId: string): Promise<GatekeeperAccessPolicy> {
+  let [config, planAllowed] = await Promise.all(
+      [readAdminConfig(env), allowedGatekeepers(env, userId)]);
+  return new GatekeeperAccessPolicy(config, planAllowed);
+}
 // --- Agent system-prompt instructions ---
 
 /**

@@ -89,8 +89,9 @@ The owner is the implicit root of the permission graph. The owner is never store
 
 ### Org-owned workspaces: the org as root
 
-The workspace's user owner can transfer it into an organization they administer
-(`transferToOrg`; one-way). From then on the permission graph roots at the org, not at any user:
+A workspace whose durable owner subject is an org has its permission graph rooted at the org,
+not at any user. Such subjects were written only by the since-removed org-transfer flow
+(`transferToOrg`), so only historic org-owned workspaces root this way:
 
 - **Baselines.** Each *active* org member is seeded at the role their org role grants
   (org-access.ts): owners/admins at `build`, members at `use`. Pending invitees get nothing.
@@ -113,14 +114,6 @@ The workspace's user owner can transfer it into an organization they administer
   client reconnects and re-authorizes), and the fan-out is best-effort: a membership change
   never fails because one workspace was unreachable, and a missed notification costs only a
   stale live session that the next `open()` still denies.
-- **Transfer flow.** `transferToOrg` registers the workspace with the org *first* — the org
-  refuses registration unless the caller is one of its owners/admins — and only then writes the
-  durable owner subject. A refusal therefore leaves the workspace exactly as it was, and an
-  eviction between the two writes can leave at worst a harmless org index entry for a workspace
-  that is still user-owned (which severs nothing, and which a retried transfer rewrites) —
-  never an org-owned workspace the org does not know about. After a successful transfer all
-  live sessions are severed, the transferring owner's included: everyone reopens and
-  re-authorizes through the org.
 - **Owner authority moves with the root.** An org owner/admin may delete the workspace (the
   deletion also drops it from the org's index) and holds the sharing-management authority the
   user owner had: adding and removing collaborators, and owner-style link management.

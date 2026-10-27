@@ -16,7 +16,8 @@
 // (unless `ownerInvitesOnly` is set, when only the owner's direct grants count).
 // (Records and revoked keys accumulate in storage; a future GC could reclaim long-dead entries.)
 //
-// ORG-OWNED WORKSPACES: a workspace transferred to an org (see `transferToOrg`) roots the same
+// ORG-OWNED WORKSPACES: a workspace transferred to an org (historic: the transfer flow is
+// removed, but such workspaces keep rooting the same graph at the org) roots the same
 // graph at the org instead of the user owner. Each active member starts at the role their org
 // role grants (owners/admins "build", members "use" -- org-access.ts baselines), and stored edges
 // still extend access transitively but only on top of those baselines, so removing someone from
