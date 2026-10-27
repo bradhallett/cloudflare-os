@@ -246,7 +246,14 @@ describe("issue mutations", () => {
     expect(state.issue.title).toBe("Old");
   });
 
-  it("retains only the newest applied actions for revert, retiring older ones from apply", async () => {
+  // 205 queue+apply round-trips run ~0.8s serially, but a cold gate running every suite at once
+  // starved this past vitest's 5s default (CI 40438611289). The roomier timeout is half the fix:
+  // a timed-out test's body keeps running in this isolate, and its late provider calls land in
+  // whichever sibling test owns the fetch stub by then -- observed on a loaded runner as +1 on
+  // request-count assertions tests later in this file. The per-iteration abort check is the other
+  // half: an abandoned run stops issuing applies instead of zombifying into its siblings.
+  it("retains only the newest applied actions for revert, retiring older ones from apply",
+    async ({ signal }) => {
     // The retained tier would grow without bound otherwise, exactly as the hand-kept
     // `retiredAction:` rows did. Every apply sweeps: applied actions beyond the retention
     // limit retire, and a revert of a retired id reports the action unknown.
@@ -259,6 +266,7 @@ describe("issue mutations", () => {
     let lastId = 0;
     const applies = 205;  // five past the retention limit
     for (let n = 1; n <= applies; n++) {
+      if (signal.aborted) return;  // the timeout already failed this run; stop feeding the fake
       const action = await unwrap(await hooks().queueAction(name, props, "prepareSetTitle",
         ["issue", "1", `Title ${n}`], DESC));
       if (n === 1) firstId = action.approvalId;
@@ -272,7 +280,7 @@ describe("issue mutations", () => {
     expect(state.issue.title).toBe(`Title ${applies - 1}`);
     await expect(unwrap(await hooks().revertAction(name, props, firstId)))
       .rejects.toThrow(`No queued GitLab action exists with id ${firstId}.`);
-  });
+  }, 60_000);
 
   it("labels: add and remove use add_labels/remove_labels, match titles exactly as GitLab does, and invert on revert", async () => {
     const { gitlab, props, name } = await setup("labels");

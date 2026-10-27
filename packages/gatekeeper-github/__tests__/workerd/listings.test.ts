@@ -283,31 +283,40 @@ describe("read cache", () => {
 });
 
 describe("applied-action retention", () => {
-  it("retires applied actions beyond the retention limit from apply, so revert covers the newest only", async () => {
-    // The retained tier would grow without bound otherwise, exactly as the hand-kept
-    // `retiredAction:` rows did. Every apply sweeps: applied actions beyond the retention
-    // limit retire, and a revert of a retired id reports the action unknown.
-    const github = new FakeGitHub();
-    github.issues.set(5, issue(5, { title: "Old" }));
-    const gk = await repoGatekeeper();
+  // 205 queue+apply round-trips run ~0.7s serially, but a cold gate running every suite at once
+  // starved this past vitest's 5s default (CI run 40438611289 failed the same-shaped twin in
+  // gatekeeper-gitlab). The roomier timeout is half the fix: a timed-out test's body keeps
+  // running in this isolate, and its late provider calls land in whichever sibling test owns the
+  // fetch stub by then -- the gitlab twin showed up as +1 on request-count assertions later in
+  // its file. The per-iteration abort check is the other half: an abandoned run stops issuing
+  // applies instead of zombifying into its siblings.
+  it("retires applied actions beyond the retention limit from apply, so revert covers the newest only",
+    async ({ signal }) => {
+      // The retained tier would grow without bound otherwise, exactly as the hand-kept
+      // `retiredAction:` rows did. Every apply sweeps: applied actions beyond the retention
+      // limit retire, and a revert of a retired id reports the action unknown.
+      const github = new FakeGitHub();
+      github.issues.set(5, issue(5, { title: "Old" }));
+      const gk = await repoGatekeeper();
 
-    let firstId = 0;
-    let lastId = 0;
-    const applies = 205;  // five past the retention limit
-    for (let n = 1; n <= applies; n++) {
-      const actionId = await gk.queueEdit("issue", "5", { title: `Title ${n}` });
-      if (n === 1) firstId = actionId;
-      lastId = actionId;
-      await gk.applyAction(actionId);
-    }
-    expect(github.issues.get(5)!.title).toBe(`Title ${applies}`);
+      let firstId = 0;
+      let lastId = 0;
+      const applies = 205;  // five past the retention limit
+      for (let n = 1; n <= applies; n++) {
+        if (signal.aborted) return;  // the timeout already failed this run; stop feeding the fake
+        const actionId = await gk.queueEdit("issue", "5", { title: `Title ${n}` });
+        if (n === 1) firstId = actionId;
+        lastId = actionId;
+        await gk.applyAction(actionId);
+      }
+      expect(github.issues.get(5)!.title).toBe(`Title ${applies}`);
 
-    // The newest stays revertible; the oldest was retired by the sweep.
-    await gk.revertAction(lastId);
-    expect(github.issues.get(5)!.title).toBe(`Title ${applies - 1}`);
-    await expect(gk.revertAction(firstId))
-      .rejects.toThrow(`No queued GitHub action exists with id ${firstId}.`);
-  });
+      // The newest stays revertible; the oldest was retired by the sweep.
+      await gk.revertAction(lastId);
+      expect(github.issues.get(5)!.title).toBe(`Title ${applies - 1}`);
+      await expect(gk.revertAction(firstId))
+        .rejects.toThrow(`No queued GitHub action exists with id ${firstId}.`);
+    }, 60_000);
 });
 
 describe("session page size", () => {
