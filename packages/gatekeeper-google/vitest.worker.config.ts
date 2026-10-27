@@ -31,7 +31,7 @@ export default defineConfig({
     }),
   ],
   test: {
-    testTimeout: 15_000,
+    testTimeout: 60_000,
     include: [
       "__tests__/workerd/chat-actions.test.ts",
       "__tests__/workerd/chat-hooks.test.ts",

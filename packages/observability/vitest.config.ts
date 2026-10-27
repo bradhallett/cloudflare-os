@@ -52,6 +52,7 @@ export default defineConfig({
     }),
   ],
   test: {
+    testTimeout: 60_000,
     include: ["__tests__/*.test.ts"],
     // Asserts the pool actually started; only two files here import `cloudflare:workers`, so the
     // rest would pass under a Node fallback without noticing.

@@ -21,8 +21,12 @@ Run them separately with `pnpm --filter @gadgets/workshop-frontend test:run:brow
 
 Shared test tasks use `scripts/with-timeout.ts`: 60 seconds without output and 600 seconds total.
 Import-heavy backend unit tests use a 120-second idle allowance. These process-level watchdogs are
-separate from Vitest's per-test limits and Linux Container execution deadlines. Google test
-projects allow 15 seconds per test.
+separate from Vitest's per-test limits and Linux Container execution deadlines. Every Vitest pool
+that runs its tests inside workerd (the `cloudflareTest` configs) sets a pool-level
+`testTimeout: 60_000`, the lesson of PR #120: cold gates run every suite at once, a starved test
+times out at the 5-second default, and its abandoned body keeps running in the isolate and
+corrupts sibling tests. New workerd pools carry the same line; keep per-test overrides only for
+known-marathon tests. Google's Node pool allows 15 seconds per test.
 
 For a slow container or CI runner, explicitly override both bounds rather than changing local
 defaults:

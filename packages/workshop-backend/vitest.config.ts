@@ -141,6 +141,7 @@ export default defineConfig({
     }),
   ],
   test: {
+    testTimeout: 60_000,
     include: ['__tests__/*.test.ts'],
     // Vitest 5 enables this by default, and every run after the first breaks under the Workers
     // pool: cached `.txt` modules come back with root-relative ids that `textModules` cannot
