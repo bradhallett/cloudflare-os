@@ -6,10 +6,11 @@ import type {
 } from '@gadgets/workshop-shared/api'
 import type { GatekeeperUiFrame } from '@gadgets/workshop-shared/gatekeeper'
 import { useAuthenticatedApi } from '../AuthContext'
-import { AccountsSubscriberAdapter, type AccountEvent } from '../accountsSubscriber'
+import { type AccountEvent } from '../accountsSubscriber'
 import { rpcFailureDescription } from '../rpcErrors'
 import { requestAccountResources } from '../requestAccountResources'
 import { useConnectAccountActions } from '../useConnectAccountActions'
+import { useConnectedAccounts } from '../useConnectedAccounts'
 import { AccountChooser } from '../gatekeeper-modal/AccountChooser'
 import ResourceConfiguratorHost from '../ResourceConfiguratorHost'
 import { disposeConfiguratorFrame } from '../disposeConfiguratorFrame'
@@ -35,8 +36,8 @@ export const CreationAccountModal = ({ overseer, gatekeeperId, onChoose, onCance
   const { authenticatedApi } = useAuthenticatedApi()
   const toasts = useKumoToastManager()
   const [target, setTarget] = useState<CreationTarget | null>(null)
-  const [accounts, setAccounts] = useState<AccountEvent[]>([])
-  const [ready, setReady] = useState(false)
+  const { accounts: accountEvents, ready, failed: accountsFailed } = useConnectedAccounts(authenticatedApi)
+  const accounts = Array.from(accountEvents.values())
   const [chosen, setChosen] = useState<number>()
   const [configurator, setConfigurator] = useState<Configurator | null>(null)
   const [configuratorReady, setConfiguratorReady] = useState<boolean | null>(null)
@@ -69,36 +70,9 @@ export const CreationAccountModal = ({ overseer, gatekeeperId, onChoose, onCance
     })
     return () => { cancelled = true }
   }, [overseer, gatekeeperId, authenticatedApi])
-
   useEffect(() => {
-    let cancelled = false
-    const subscription = authenticatedApi.subscribeConnectedAccounts(new AccountsSubscriberAdapter({
-      add(account) {
-        // An update keeps its place, so the default selection (the first usable account) does not
-        // move to another account and restart the configurator when a grant arrives.
-        if (!cancelled) {
-          setAccounts(prev => prev.some(a => a.id === account.id)
-            ? prev.map(a => a.id === account.id ? account : a)
-            : [...prev, account])
-        }
-      },
-      remove(id) {
-        if (!cancelled) setAccounts(prev => prev.filter(a => a.id !== id))
-      },
-      ready() {
-        if (!cancelled) setReady(true)
-      },
-    }))
-    subscription.catch(err => {
-      if (cancelled) return
-      console.error('Failed to subscribe to connected accounts:', err)
-      toasts.add({ title: 'Failed to load your connected accounts', variant: 'error' })
-    })
-    return () => {
-      cancelled = true
-      subscription[Symbol.dispose]()
-    }
-  }, [authenticatedApi])
+    if (accountsFailed) toasts.add({ title: 'Failed to load your connected accounts', variant: 'error' })
+  }, [accountsFailed, toasts])
 
   // Desktop redeems in the popup; native awaits in-app redemption. Both notify the subscription.
   const connectActions = useConnectAccountActions(authenticatedApi)

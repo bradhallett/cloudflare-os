@@ -1,7 +1,6 @@
 import { logRpcFailure } from '../rpcErrors'
 import { createFileRoute } from '@tanstack/react-router'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useKumoToastManager } from '@cloudflare/kumo'
 import {
   MagnifyingGlass,
   ArrowsClockwise,
@@ -24,7 +23,8 @@ import {
 import { GatekeeperVendorInfo } from '@gadgets/workshop-shared/api'
 import { useDocumentTitle } from '../useDocumentTitle'
 import { useSiteName } from '../ServerConfigContext'
-import { AccountsSubscriberAdapter } from '../accountsSubscriber'
+import { useConnectedAccounts } from '../useConnectedAccounts'
+import { useVendors } from '../useVendors'
 import { useConnectAccountActions } from '../useConnectAccountActions'
 import { useReportRpcFailure } from '../useReportRpcFailure'
 import { nativeApp } from '../features/native-app/nativeApp'
@@ -435,7 +435,6 @@ function ConnectorsPage() {
   const siteName = useSiteName()
 
   const { authenticatedApi } = useAuthenticatedApi()
-  const toasts = useKumoToastManager()
   const reportRpcFailure = useReportRpcFailure()
 
   const [search, setSearch] = useState('')
@@ -443,10 +442,26 @@ function ConnectorsPage() {
     if (typeof window === 'undefined') return 'grid'
     return localStorage.getItem('gatekeepers-view') === 'list' ? 'list' : 'grid'
   })
-  const [accounts, setAccounts] = useState<AccountEntry[]>([])
-  const [vendors, setVendors] = useState<VendorEntry[]>([])
-  const [accountsLoaded, setAccountsLoaded] = useState(false)
-  const [vendorsLoaded, setVendorsLoaded] = useState(false)
+  // The page's account list and vendor catalog come from the shared subscriptions; either one
+  // failing latches the page-level error state below.
+  const { accounts: subscribedAccounts, ready: accountsLoaded, failed: accountsFailed } =
+    useConnectedAccounts(authenticatedApi)
+  const { vendors: vendorCatalog, loading: vendorsLoading, failed: vendorsFailed } =
+    useVendors(authenticatedApi)
+  const vendorsLoaded = !vendorsLoading && !vendorsFailed
+  const accounts = Array.from(subscribedAccounts.values(), (event) => ({
+    id: event.id,
+    accountDescription: event.description,
+    vendorId: event.vendorId,
+    vendorDescription: event.vendor,
+    supportedResources: event.supportedResources,
+    credentialsValid: event.credentialsValid,
+  }))
+  const vendors: VendorEntry[] = vendorCatalog.map((v) => ({
+    id: v.id,
+    description: v.description,
+    supportedResources: v.supportedResources,
+  }))
   // Auto-provisioning ("ambient") gatekeepers set to "optional" that the user can opt into. They're
   // shown in the same "Available" section and opened through the same modal as OAuth vendors; the
   // only difference is that confirming adds the account directly (no OAuth redirect).
@@ -472,11 +487,6 @@ function ConnectorsPage() {
 
   useEffect(() => {
     let cancelled = false
-    const accountMap = new Map<number, AccountEntry>()
-
-    setAccountsLoaded(false)
-    setVendorsLoaded(false)
-
     authenticatedApi.listAddableGatekeepers()
       .then((list) => {
         if (!cancelled) setAddable(list)
@@ -484,67 +494,14 @@ function ConnectorsPage() {
       .catch((err) => {
         logRpcFailure('Failed to load addable gatekeepers:', err)
       })
-
-    authenticatedApi.listGatekeeperVendors()
-      .then((vendorList) => {
-        if (cancelled) return
-        const unavailable = vendorList.filter((v) => v.unavailable)
-        if (unavailable.length > 0) {
-          toasts.add({
-            title: `Some services are temporarily unavailable: ${unavailable.map((v) => v.id).join(', ')}`,
-            variant: 'warning',
-          })
-        }
-        setVendors(
-          vendorList
-            .filter((v) => !v.unavailable)
-            .map((v) => ({
-              id: v.id,
-              description: v.description,
-              supportedResources: v.supportedResources,
-            })),
-        )
-        setVendorsLoaded(true)
-      })
-      .catch((err) => {
-        logRpcFailure('Failed to load available services:', err)
-        if (!cancelled) setLoadError(true)
-      })
-
-    const subscriber = new AccountsSubscriberAdapter({
-      add({ id, description, vendor, supportedResources, credentialsValid, vendorId }) {
-        if (cancelled) return
-        accountMap.set(id, {
-          id,
-          accountDescription: description,
-          vendorId,
-          vendorDescription: vendor,
-          supportedResources,
-          credentialsValid,
-        })
-        setAccounts(Array.from(accountMap.values()))
-      },
-      remove(id) {
-        accountMap.delete(id)
-        if (!cancelled) setAccounts(Array.from(accountMap.values()))
-      },
-      ready() {
-        if (!cancelled) setAccountsLoaded(true)
-      },
-    })
-
-    const subscription = authenticatedApi.subscribeConnectedAccounts(subscriber)
-    subscription.catch((err) => {
-      if (cancelled) return
-      logRpcFailure('Failed to subscribe to connected accounts:', err)
-      setLoadError(true)
-    })
-
     return () => {
       cancelled = true
-      subscription[Symbol.dispose]()
     }
   }, [authenticatedApi])
+
+  useEffect(() => {
+    if (accountsFailed || vendorsFailed) setLoadError(true)
+  }, [accountsFailed, vendorsFailed])
 
   const handleOpenConnect = (vendorId: string) => {
     setModalTarget({ kind: 'connect', vendorId })
