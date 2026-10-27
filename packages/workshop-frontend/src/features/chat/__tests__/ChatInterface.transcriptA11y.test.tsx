@@ -55,6 +55,9 @@ import { makeOverseer, makeTestRoot } from '../../../action-test-harness'
 import ChatInterface from '../ChatInterface'
 
 const testRoot = makeTestRoot()
+// The chat store registry is module-global and keyed by workspace id, so each mount takes a
+// fresh id to keep tests' chats isolated from each other.
+let mountSeq = 0
 
 afterEach(() => {
   testRoot.cleanup()
@@ -107,7 +110,7 @@ async function openChat() {
   })
   await testRoot.render(
     <ChatInterface
-      workspaceId="workspace"
+      workspaceId={`ChatInterface-transcriptA11y-${++mountSeq}`}
       overseer={server.overseer as RpcStub<Overseer>}
       selectedChatId={CHAT_ID}
       onNavigateToChat={() => {}}

@@ -22,19 +22,16 @@ export const ProvisionalTurnRow = memo(function ProvisionalTurnRow({
   expandedToolCalls,
   toggleToolCallExpansion,
 }: {
+  /**
+   * The chat's committed provisional state: the store replaces its identity once per streamed
+   * frame, which is what repaints this memoized row while the durable transcript holds still.
+   */
   provisionalState: ProvisionalChatState | null;
   toolCalls: ProvisionalToolCallState[];
   isCompacting: boolean;
-  /**
-   * The rAF-coalesced stream tick. The provisional state and tool calls are mutated in place
-   * with stable identity, so this counter is the only prop that changes while a response
-   * streams -- exactly what the memo wrapper needs to repaint the row per tick while the
-   * durable transcript around it holds still.
-   */
-  provisionalTick: number;
   showThinkingTraces: boolean;
   /** The chat's messages, read for whether the agent has answered anything yet. */
-  currentMessages: AiChatMessage[];
+  currentMessages: readonly AiChatMessage[];
   /** The transcript row above the placeholder, which sets its spacing rhythm. */
   previousEntry: ChatDisplayEntry | null;
   expandedToolCalls: ReadonlySet<string>;

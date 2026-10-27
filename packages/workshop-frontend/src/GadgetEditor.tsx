@@ -38,11 +38,17 @@ import WorkpiecePicker, {
   WORKPIECE_RAIL_EXPANDED_WIDTH,
 } from './WorkpiecePicker'
 import {
-  type ActiveFileTarget,
-  type ChatCodeChanges,
-  type ChatLiveChangeRows,
-  type ChatLiveEditPreviews,
-} from './features/chat/liveCodeStreams'
+  getChatStore,
+  useAnyChatProposedWorkpieces,
+  useChatCodeChanges,
+  useChatList,
+  useChatListReady,
+  useChatMetadata,
+  useChatStreamingActiveFile,
+  useLiveEditPreviewsStream,
+  useLiveRowsStream,
+  useSelectedChatProposedWorkpieces,
+} from './features/chat/store/useChatStore'
 import { formatOf } from './components/format/formats'
 import ShareModal from './ShareModal'
 import BlueprintModal from './BlueprintModal'
@@ -508,37 +514,18 @@ function GadgetEditorWorkspace({ id }: { id: string | undefined }) {
   // ── code / chat state ────────────────────────────────────────────────────────
   const [uiReloadTrigger, setUiReloadTrigger] = useState(0)
   const [autoApproveReloadTrigger, setAutoApproveReloadTrigger] = useState(0)
-  // The selected chat's code-branch snapshot (see ChatCodeChanges in ChatInterface): its code
-  // base and the current epoch's recorded changes, plumbed from the chat subscription into the
-  // code view, which layers them over the per-pin commit-derived doc base.
-  const [chatChanges, setChatChanges] = useState<ChatCodeChanges | undefined>(undefined)
-  // The selected chat's live (unmaterialized) change row stream, stable per chat; the code view
-  // subscribes to it rather than reading rows through renders (see ChatLiveChangeRows).
-  const [liveRows, setLiveRows] = useState<ChatLiveChangeRows | undefined>(undefined)
-  // The selected chat's live edit-preview stream (the agent's in-progress writeFile/editFile
-  // content), likewise subscription-shaped (see ChatLiveEditPreviews).
-  const [liveEditPreviews, setLiveEditPreviews] =
-    useState<ChatLiveEditPreviews | undefined>(undefined)
+  // Chat state arrives through the workspace's chat store (see features/chat/store): ChatInterface
+  // owns the subscription; this component reads the slices it orchestrates with. The list-level
+  // facts gate the layout below; the selected chat's slices follow effectiveSelectedChatId.
+  const chatList = useChatList(id!)
+  const chatListReady = useChatListReady(id!)
+  const chatCount = chatListReady ? chatList.length : null
+  const hasChatZero = chatList.some(chat => chat.id === 0)
   // The selected chat's uncommitted content as the code view holds it, plumbed the other way:
   // the chat reads it to look for unresolved merge conflicts before accepting.
   const [chatContent, setChatContent] = useState<ChatContentReader | undefined>(undefined)
-  const [streamingActiveFileState, setStreamingActiveFileState] = useState<{
-    chatId: number
-    file: ActiveFileTarget | null | undefined
-  } | null>(null)
   const [hasCode, setHasCode] = useState<boolean | null>(null)
-  const [chatCount, setChatCount] = useState<number | null>(null)
-  const [hasChatZero, setHasChatZero] = useState(false)
-  const [isAgentActive, setIsAgentActive] = useState(false)
-  // The workpieces any chat proposes changes to (see AiChatMetadata.proposedChangeWorkpieces).
-  const [anyChatProposedWorkpieces, setAnyChatProposedWorkpieces] =
-    useState<readonly WorkpieceId[]>([])
-  // The workpieces the selected chat proposes changes to (see
-  // AiChatMetadata.proposedChangeWorkpieces): drives per-gadget draft previews below.
-  const [selectedChatProposedWorkpieces, setSelectedChatProposedWorkpieces] =
-    useState<readonly WorkpieceId[]>([])
   const selectedChatId = urlChatId
-  const chatListReady = chatCount !== null
   const singleInitialChat = chatCount === 1 && hasChatZero
   const [userNavigatedToList, setUserNavigatedToList] = useState(false)
 
@@ -571,6 +558,20 @@ function GadgetEditorWorkspace({ id }: { id: string | undefined }) {
   const pinInitialChatSelection =
     singleInitialChat && !hasCommittedCode && !userNavigatedToList
   const effectiveSelectedChatId = selectedChatId ?? (pinInitialChatSelection ? 0 : null)
+
+  // The selected chat's slices: its code-branch snapshot and live row/edit-preview streams (fed
+  // to the code view, which layers them over the per-pin commit-derived doc base), and the
+  // workpieces it proposes changes to (drives per-gadget draft previews below).
+  const currentChatMeta = useChatMetadata(id!, effectiveSelectedChatId)
+  const isAgentActive = currentChatMeta?.activeAgent !== undefined
+  const chatChanges = useChatCodeChanges(id!, effectiveSelectedChatId)
+  const liveRows = useLiveRowsStream(id!, effectiveSelectedChatId)
+  const liveEditPreviews = useLiveEditPreviewsStream(id!, effectiveSelectedChatId)
+  const anyChatProposedWorkpieces = useAnyChatProposedWorkpieces(id!)
+  // Holds the last value while a switched-to chat's metadata loads, so draft previews don't
+  // flash empty mid-navigation (see useSelectedChatProposedWorkpieces).
+  const selectedChatProposedWorkpieces =
+    useSelectedChatProposedWorkpieces(id!, effectiveSelectedChatId)
 
   // ── workpiece selection ──────────────────────────────────────────────────────
 
@@ -687,9 +688,7 @@ function GadgetEditorWorkspace({ id }: { id: string | undefined }) {
     gadget !== null && gadget.id === selectedGadgetId ? gadget.stub : null
   // Only the selected chat's streaming drives this editor. Everything downstream then narrows it
   // further to the selected workpiece.
-  const streamingActiveFile = streamingActiveFileState?.chatId === effectiveSelectedChatId
-    ? streamingActiveFileState.file
-    : undefined
+  const streamingActiveFile = useChatStreamingActiveFile(id!, effectiveSelectedChatId)
   // The file the agent is streaming edits into, when it is in the selected workpiece. (Edits
   // going to a different one instead auto-switch the picker; see the effect below.)
   const streamingActiveFileForSelected =
@@ -898,11 +897,7 @@ function GadgetEditorWorkspace({ id }: { id: string | undefined }) {
     return () => window.removeEventListener('resize', handleResize)
   }, [])
 
-  // ── chat count / auto-switch ─────────────────────────────────────────────────
-  const handleChatCountChange = useCallback((count: number, chatZeroExists: boolean) => {
-    setChatCount(count)
-    setHasChatZero(chatZeroExists)
-  }, [])
+  // ── turn choreography ───────────────────────────────────────────────────────
 
   // The tab auto-switch exists only to show a user building their first gadget what the agent is
   // doing: while the app tab shows the "No gadget UI yet" placeholder, the turn's edits are shown
@@ -934,28 +929,33 @@ function GadgetEditorWorkspace({ id }: { id: string | undefined }) {
     if (showsNoUi) showCodeIfNoUi()
   }, [showCodeIfNoUi])
 
-  const handleAgentActiveChange = useCallback((chatId: number, isActive: boolean) => {
-    if (chatId !== selectedChatIdRef.current) return
-    setIsAgentActive(isActive)
-    if (isActive) {
-      turnOutputRef.current = {
-        chatId,
-        wroteFile: false,
-        showedCode: false,
-        userSelectedTab: false,
-      }
+  // The agent-active edges drive the tab choreography: a turn starting begins tracking its
+  // output, and a turn ending returns to the app tab if the code tab was shown for it. Chat
+  // switches re-run this too, which starts tracking the newly selected chat's turn.
+  useEffect(() => {
+    if (!isAgentActive) {
+      const output = turnOutputRef.current
+      turnOutputRef.current = null
+      if (!output || output.chatId !== effectiveSelectedChatId || output.userSelectedTab) return
+      if (output.showedCode) setActiveTab('app')
       return
     }
+    if (effectiveSelectedChatId === null) return
+    turnOutputRef.current = {
+      chatId: effectiveSelectedChatId,
+      wroteFile: false,
+      showedCode: false,
+      userSelectedTab: false,
+    }
+  }, [isAgentActive, effectiveSelectedChatId])
 
-    let output = turnOutputRef.current
-    turnOutputRef.current = null
-    if (!output || output.chatId !== chatId || output.userSelectedTab) return
-    if (output.showedCode) setActiveTab('app')
-  }, [])
-
-  const handleStreamingActiveFileChange = useCallback(
-      (chatId: number, file: ActiveFileTarget | null | undefined) => {
-    if (file && chatId === selectedChatIdRef.current) {
+  // The store notifies file streaming synchronously (before the committed state re-renders), so
+  // the choreography can react while the agent's first edits are still arriving. The rendered
+  // target comes from the streaming-file selector above instead.
+  useEffect(() => {
+    const store = getChatStore(id!)
+    store.setOnStreamingActiveFile((chatId, file) => {
+      if (!file || chatId !== selectedChatIdRef.current) return
       let output = turnOutputRef.current
       if (!output || output.chatId !== chatId) {
         output = {chatId, wroteFile: false, showedCode: false, userSelectedTab: false}
@@ -963,9 +963,9 @@ function GadgetEditorWorkspace({ id }: { id: string | undefined }) {
       }
       output.wroteFile = true
       showCodeIfNoUi()
-    }
-    setStreamingActiveFileState({chatId, file})
-  }, [showCodeIfNoUi])
+    })
+    return () => store.setOnStreamingActiveFile(undefined)
+  }, [id, showCodeIfNoUi])
 
   const handleTabSelect = useCallback((tab: RightTab) => {
     let output = turnOutputRef.current
@@ -1458,16 +1458,12 @@ function GadgetEditorWorkspace({ id }: { id: string | undefined }) {
               <div className={layoutModeReady ? 'h-full' : 'h-full invisible'}>
                 <ChatInterface
                   key={id}
-                  workspaceId={id}
+                  workspaceId={id!}
                   overseer={overseer.stub}
                   restricted={metadata?.containsRestrictedData === true}
                   selectedChatId={effectiveSelectedChatId}
                   onNavigateToChat={navigateToChat}
-                  onChatChangesChange={setChatChanges}
-                  onLiveRowsChange={setLiveRows}
-                  onLiveEditPreviewsChange={setLiveEditPreviews}
                   chatContent={chatContent}
-                  onStreamingActiveFileChange={handleStreamingActiveFileChange}
                   pendingConsoleLogCount={consoleLogCount}
                   consoleLogPreview={
                     consoleLogCount > 0 ? formatConsoleLogs(consoleLogBufferRef.current) : ''
@@ -1482,11 +1478,7 @@ function GadgetEditorWorkspace({ id }: { id: string | undefined }) {
                   onConsumeConsoleLogs={consumeConsoleLogs}
                   onDiscardConsoleLogs={discardConsoleLogs}
                   constrainChatWidth
-                  onChatCountChange={handleChatCountChange}
-                  onAgentActiveChange={handleAgentActiveChange}
                   onAutoApproveChange={() => setAutoApproveReloadTrigger(t => t + 1)}
-                  onAnyChatProposedChangesChange={setAnyChatProposedWorkpieces}
-                  onSelectedChatProposedChangesChange={setSelectedChatProposedWorkpieces}
                   onOpenGadget={handleSelectWorkpiece}
                   outputOfWorkpiece={outputOfWorkpiece}
                 />

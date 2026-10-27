@@ -9,7 +9,7 @@ import {
   listConflictedFiles,
   type UnresolvedConflict,
 } from "./mergeConflicts";
-import type { Toasts } from "./useChatSubscription";
+import type { Toasts } from "./store/chatStore";
 import type { MessageState } from "./transcript/chatDisplayEntries";
 
 /** Props {@link useChatChanges} reads from its host component. */
@@ -20,7 +20,7 @@ export interface UseChatChangesArgs {
   selectedChatIdRef: { current: number | null };
   /** The selected chat's metadata, undefined while it has not loaded. */
   currentChatMetadata: AiChatMetadata | null | undefined;
-  currentMessages: AiChatMessage[];
+  currentMessages: readonly AiChatMessage[],
   messageStates: MessageState;
   /** The selected chat's uncommitted content, checked for unresolved conflicts on accept. */
   chatContent: ChatContentReader | undefined;

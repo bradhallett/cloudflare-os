@@ -20,7 +20,7 @@ import { hookToggleFailureToast } from "../../components/HookToggle";
 import { isTransientRpcError, logRpcFailure, rpcFailureDescription } from "../../rpcErrors";
 import { persistSelectedBot, persistSelectedModel, sameBotSelection } from "../../modelSelection";
 import { copyToClipboard } from "../../clipboard";
-import type { Toasts } from "./useChatSubscription";
+import type { ChatStore, Toasts } from "./store/chatStore";
 import type { FailedChatSend } from "./transcript/failedSends";
 import { failedSendFromRejection } from "./transcript/failedSends";
 
@@ -29,18 +29,16 @@ export interface UseChatActionsArgs {
   overseer: RpcStub<Overseer>;
   selectedChatId: number | null;
   selectedModel: string | null;
-  setSelectedModel: Dispatch<SetStateAction<string | null>>;
+  setSelectedModel: (model: string | null) => void;
   /** Declared bots offered in the composer's agent picker (see AuthenticatedApi.listBots). */
   bots: BotInfo[];
   /** The picker's bot selection, or null when a model or "No agent" answers the chat. */
   selectedBot: BotSelection | null;
   setSelectedBot: Dispatch<SetStateAction<BotSelection | null>>;
-  /** Latest onNavigateToChat, for callbacks built once that must call the current one. */
-  onNavigateToChatRef: {
-    current: (chatId: number | null, options?: { replace?: boolean }) => void;
-  };
-  forceUpdate: () => void;
-  applyOptimisticHookEnabled: (actionId: number, enabled: boolean) => boolean;
+  /** Navigates to a freshly created chat (see ChatInterface's onNavigateToChat). */
+  onNavigateToChat: (chatId: number | null, options?: { replace?: boolean }) => void;
+  /** Patches cached action cards when a hook toggle is optimistically applied or reverted. */
+  store: ChatStore;
   toasts: Toasts;
   /** The selected chat's metadata, undefined while it has not loaded. */
   currentChatMetadata: AiChatMetadata | null | undefined;
@@ -61,9 +59,8 @@ export function useChatActions({
   bots,
   selectedBot,
   setSelectedBot,
-  onNavigateToChatRef,
-  forceUpdate,
-  applyOptimisticHookEnabled,
+  onNavigateToChat,
+  store,
   toasts,
   currentChatMetadata,
 }: UseChatActionsArgs) {
@@ -90,7 +87,7 @@ export function useChatActions({
     const newChatId = await overseer.newChat(
         message, model, capsules, attachments, formats,
         bot === "none" ? undefined : bot);
-    onNavigateToChatRef.current(newChatId);
+    onNavigateToChat(newChatId);
   };
 
   // Handle sending a message (always called from ChatComposer with explicit messageText)
@@ -205,7 +202,7 @@ export function useChatActions({
   // Handle enabling/disabling a bound hook from the chat thread.
   const handleToggleHook = async (actionId: number, hookId: number, enabled: boolean) => {
     setProcessingActions((prev) => new Set(prev).add(actionId));
-    if (applyOptimisticHookEnabled(actionId, enabled)) forceUpdate();
+    store.applyOptimisticHookEnabled(actionId, enabled);
     try {
       if (enabled) {
         await overseer.enableHook(hookId);
@@ -216,7 +213,7 @@ export function useChatActions({
       console.error("Failed to toggle hook:", err);
       toasts.add(hookToggleFailureToast(enabled, err));
       // Revert the optimistic update.
-      if (applyOptimisticHookEnabled(actionId, !enabled)) forceUpdate();
+      store.applyOptimisticHookEnabled(actionId, !enabled);
     } finally {
       setProcessingActions((prev) => {
         const next = new Set(prev);

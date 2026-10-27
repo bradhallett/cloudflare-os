@@ -56,6 +56,7 @@ vi.mock('../../../AuthContext', () => {
 import { makeOverseer, makeTestRoot } from '../../../action-test-harness'
 import ChatInterface from '../ChatInterface'
 import type { ChatCodeChanges } from '../liveCodeStreams'
+import { getChatStore } from '../store/useChatStore'
 
 const testRoot = makeTestRoot()
 
@@ -98,15 +99,17 @@ const REFOLDED: AiChatHistoryPage = {
   compacted: { to: 10, summary: 'Earlier work' },
 }
 
-type OnChatChangesChange = (changes: ChatCodeChanges | undefined) => void
+// The workspace's chat store outlives individual mounts (as across a reconnect), so each test
+// takes a fresh id and both of its mounts — the dropped connection and the reconnect — share it.
+let mountSeq = 0
 
 // Renders the compacted chat over a fresh overseer, as a reconnect does when one is already
 // rendered. The server answers with `newest` for the newest page, and runs `refetch` for the
 // boundary's own page.
 async function openChat(
+  workspaceId: string,
   newest: AiChatHistoryPage,
   refetch: () => Promise<AiChatHistoryPage>,
-  onChatChangesChange: OnChatChangesChange,
 ) {
   const server = makeOverseer()
   let subscriber: AiChatSubscriber | undefined
@@ -128,11 +131,10 @@ async function openChat(
   })
   await testRoot.render(
     <ChatInterface
-      workspaceId="workspace"
+      workspaceId={workspaceId}
       overseer={server.overseer as RpcStub<Overseer>}
       selectedChatId={CHAT_ID}
       onNavigateToChat={() => {}}
-      onChatChangesChange={onChatChangesChange}
       pendingConsoleLogCount={0}
       consoleLogPreview=""
       consoleLogSeverity="info"
@@ -161,19 +163,17 @@ const filesOf = (changes: ChatCodeChanges | undefined) =>
 
 it('holds the code view until a refetch of the boundary succeeds, retrying on reconnect',
     async () => {
-  const views: (ChatCodeChanges | undefined)[] = []
-  const onChatChangesChange: OnChatChangesChange = changes => { views.push(changes) }
-  const first = await openChat(TAIL, async () => { throw new Error('connection lost') },
-                               onChatChangesChange)
-  expect(filesOf(views.at(-1))).toEqual(['loaded.txt', 'pre.txt'])
+  const workspaceId = `ChatInterface-compactionRevert-${++mountSeq}`
+  const first = await openChat(workspaceId, TAIL,
+      async () => { throw new Error('connection lost') })
+  const store = getChatStore(workspaceId)
+  expect(filesOf(store.getCodeChanges(CHAT_ID))).toEqual(['loaded.txt', 'pre.txt'])
 
-  const beforeRevert = views.length
   await first.revertFromStart()
   expect(first.getChatHistory).toHaveBeenCalledWith(CHAT_ID, 11)
-  expect(views.length).toBeGreaterThan(beforeRevert)
-  expect(views.slice(beforeRevert).every(view => view === undefined)).toBe(true)
+  expect(store.getCodeChanges(CHAT_ID)).toBeUndefined()
 
-  const second = await openChat(REFOLDED, async () => REFOLDED, onChatChangesChange)
+  const second = await openChat(workspaceId, REFOLDED, async () => REFOLDED)
   expect(second.getChatHistory).toHaveBeenCalledWith(CHAT_ID, 11)
-  expect(views.at(-1)).toMatchObject({ chatId: CHAT_ID, epochChange: undefined })
+  expect(store.getCodeChanges(CHAT_ID)).toMatchObject({ chatId: CHAT_ID, epochChange: undefined })
 })

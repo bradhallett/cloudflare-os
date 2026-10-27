@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { AiChatMetadata, Overseer } from "@gadgets/workshop-shared/api";
 import { RpcStub } from "capnweb";
-import type { ChatCache, Toasts } from "./useChatSubscription";
+import type { ChatStore, Toasts } from "./store/chatStore";
 
 /** Props {@link useChatListActions} reads from its host component. */
 export interface UseChatListActionsArgs {
@@ -9,9 +9,8 @@ export interface UseChatListActionsArgs {
   selectedChatId: number | null;
   /** The selected chat's metadata, undefined while it has not loaded. */
   currentChatMetadata: AiChatMetadata | null | undefined;
-  cacheRef: { current: ChatCache };
-  forceUpdate: () => void;
-  bumpChatListVersion: () => void;
+  /** Applies a local rename to the cached chat list (see ChatStore.renameChatLocally). */
+  store: ChatStore;
   toasts: Toasts;
 }
 
@@ -25,9 +24,7 @@ export function useChatListActions({
   overseer,
   selectedChatId,
   currentChatMetadata,
-  cacheRef,
-  forceUpdate,
-  bumpChatListVersion,
+  store,
   toasts,
 }: UseChatListActionsArgs) {
   const [titleInput, setTitleInput] = useState("");
@@ -51,15 +48,8 @@ export function useChatListActions({
     try {
       await overseer.setChatTitle(selectedChatId, titleInput.trim());
 
-      // Update the cache with the new title
-      const chat = cacheRef.current.chats.get(selectedChatId);
-      if (chat) {
-        cacheRef.current.chats.set(selectedChatId, {
-          ...chat,
-          title: titleInput.trim(),
-        });
-        forceUpdate();
-      }
+      // Apply the new title locally; the subscription redelivers it as metadata.
+      store.renameChatLocally(selectedChatId, titleInput.trim());
 
       setIsEditingTitle(false);
       toasts.add({ title: "Chat title updated successfully", variant: "success" });
@@ -117,20 +107,12 @@ export function useChatListActions({
     setRenamingChatId(null);
 
     const trimmed = renamingInput.trim();
-    const existing = cacheRef.current.chats.get(chatId);
     // Cancel on empty or no-op so commit-on-blur doesn't fire pointless RPCs.
-    if (!trimmed || trimmed === existing?.title) return;
+    if (!trimmed || trimmed === store.getChat(chatId)?.title) return;
 
     try {
       await overseer.setChatTitle(chatId, trimmed);
-      if (existing) {
-        cacheRef.current.chats.set(chatId, {
-          ...existing,
-          title: trimmed,
-        });
-        bumpChatListVersion();
-        forceUpdate();
-      }
+      store.renameChatLocally(chatId, trimmed);
       toasts.add({ title: "Chat title updated successfully", variant: "success" });
     } catch (err) {
       console.error("Failed to update chat title:", err);

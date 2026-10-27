@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { AiChatMessage, GatekeeperClient, Overseer } from "@gadgets/workshop-shared/api";
 import { RpcStub } from "capnweb";
-import type { Toasts } from "./useChatSubscription";
+import type { Toasts } from "./store/chatStore";
 
 /** The accept-flow GatekeeperModal's pre-seeded connection request (see AiChatMetadata). */
 export interface ConnectionAccept {

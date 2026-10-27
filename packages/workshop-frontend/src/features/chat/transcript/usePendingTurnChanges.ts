@@ -18,7 +18,7 @@ import { type CreatedWorkpieceCardInfo } from "./CreatedWorkpieceChatCard";
 
 /** Inputs {@link usePendingTurnChanges} derives the transcript's turn structure from. */
 export interface UsePendingTurnChangesArgs {
-  currentMessages: AiChatMessage[];
+  currentMessages: readonly AiChatMessage[];
   messageStates: MessageState;
   isAgentActive: boolean;
   /**

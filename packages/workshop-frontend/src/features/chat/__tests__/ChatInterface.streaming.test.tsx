@@ -48,6 +48,9 @@ import * as chatDisplayEntries from '../transcript/chatDisplayEntries'
 import ChatInterface from '../ChatInterface'
 
 const testRoot = makeTestRoot()
+// The chat store registry is module-global and keyed by workspace id, so each mount takes a
+// fresh id to keep tests' chats isolated from each other.
+let mountSeq = 0
 
 afterEach(() => {
   testRoot.cleanup()
@@ -85,7 +88,7 @@ async function openActiveChat() {
   })
   await testRoot.render(
     <ChatInterface
-      workspaceId="workspace"
+      workspaceId={`ChatInterface-streaming-${++mountSeq}`}
       overseer={server.overseer as RpcStub<Overseer>}
       selectedChatId={CHAT_ID}
       onNavigateToChat={() => {}}

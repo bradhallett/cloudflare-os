@@ -61,6 +61,9 @@ vi.mock('@tanstack/react-router', () => ({ useNavigate: () => vi.fn<() => void>(
 import { makeTestRoot } from '../../../action-test-harness'
 
 const testRoot = makeTestRoot()
+// The chat store registry is module-global and keyed by workspace id, so each mount takes a
+// fresh id to keep tests' chats isolated from each other.
+let mountSeq = 0
 
 afterEach(() => {
   testRoot.cleanup()
@@ -106,7 +109,7 @@ async function renderChat() {
 
   await testRoot.render(
     <ChatInterface
-      workspaceId="workspace"
+      workspaceId={`ChatInterface-refusalPrompt-${++mountSeq}`}
       overseer={overseer}
       restricted={false}
       selectedChatId={1}

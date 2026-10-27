@@ -31,6 +31,9 @@ const TITLE = 'Watch acme/widgets on GitHub'
 const refusal = "GitHub refused to add a webhook to acme/widgets: only the repository's admins can."
 const hookSwitch = () => page.getByRole('switch', { name: `Hook: ${TITLE}` })
 
+// The chat store registry is module-global and keyed by workspace id, so each mount takes a
+// fresh id to keep tests' chats isolated from each other.
+let mountSeq = 0
 let root: Root | undefined
 let container: HTMLElement | undefined
 
@@ -170,7 +173,7 @@ describe('in chat', () => {
       viewChat: () => ({ [Symbol.dispose]: () => {} }),
     })
     await render(
-      <ChatInterface workspaceId="workspace" overseer={server.overseer} selectedChatId={1}
+      <ChatInterface workspaceId={`hookToggles-${++mountSeq}`} overseer={server.overseer} selectedChatId={1}
         onNavigateToChat={() => {}} pendingConsoleLogCount={0} consoleLogPreview="" consoleLogSeverity="info"
         onConsumeConsoleLogs={() => ''} onDiscardConsoleLogs={() => {}} onOpenGadget={() => {}}
         outputOfWorkpiece={() => undefined} />,

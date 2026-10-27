@@ -93,7 +93,7 @@ function makeChatServer() {
     getChatMessage: async () => undefined,
     viewChat: () => ({ [Symbol.dispose]: () => {} }),
     onRpcBroken: (_handler: (error: unknown) => void) => {},
-    // Surfaces for useActionEntries, which useChatSubscription mounts internally.
+    // Surfaces for useActionEntries, which the store connection mounts internally.
     subscribeToActions: () => Promise.resolve({ [Symbol.dispose]: () => {} }),
     listActions: async () => ({ entries: [], nextBeforeId: undefined }),
   } as unknown as RpcStub<Overseer>;
@@ -143,7 +143,7 @@ function probeState(workspaceId: string, selectedChatId: number | null): Observe
   const rows = useChatRowBuffer(workspaceId, selectedChatId);
   const compactions = useChatCompactions(workspaceId, selectedChatId);
   return {
-    chats: [...list].sort((a, b) => a.id - b.id)
+    chats: [...list].toSorted((a, b) => a.id - b.id)
       .map((chat) => `${chat.id}:${chat.title}${chat.activeAgent ? "+active" : ""}`)
       .join(","),
     messages: messages.map((m) => `${m.sequence}:${m.type}`).join(","),
@@ -168,8 +168,8 @@ let workspaceCounter = 0;
 
 async function mountChat(server: ChatServer, options: MountOptions = {}) {
   const root = makeTestRoot();
-  const toasts = { add: vi.fn() } as unknown as UseChatStoreConnectionArgs["toasts"];
-  const onNavigateToChat = (options.onNavigateToChat ?? vi.fn()) as unknown as NavigateToChat & {
+  const toasts = { add: vi.fn<() => string>() } as unknown as UseChatStoreConnectionArgs["toasts"];
+  const onNavigateToChat = (options.onNavigateToChat ?? vi.fn<NavigateToChat>()) as unknown as NavigateToChat & {
     mock: ReturnType<typeof vi.fn<NavigateToChat>>["mock"];
   };
   let selectedChatId = options.selectedChatId ?? null;
@@ -225,7 +225,7 @@ afterEach(async () => {
 
 // ─── tests ────────────────────────────────────────────────────────────────────
 
-describe("useChatSubscription characterization", () => {
+describe("useChatStore characterization", () => {
   it("subscribes once on mount and disposes the subscription on unmount", async () => {
     const server = makeChatServer();
     const chat = await mountChat(server);
@@ -271,7 +271,7 @@ describe("useChatSubscription characterization", () => {
   it("navigates back to the list when the selected chat's history fails to load", async () => {
     const server = makeChatServer();
     server.responders.history = async () => { throw new Error("no such chat"); };
-    const onNavigateToChat = vi.fn();
+    const onNavigateToChat = vi.fn<NavigateToChat>();
     const chat = await mountChat(server, { selectedChatId: CHAT_ID, onNavigateToChat });
     mounted.push(chat);
 
@@ -426,7 +426,7 @@ describe("useChatSubscription characterization", () => {
   it("removes a deleted chat and leaves it when it was selected", async () => {
     const server = makeChatServer();
     server.responders.chats = async () => [metadata()];
-    const onNavigateToChat = vi.fn();
+    const onNavigateToChat = vi.fn<NavigateToChat>();
     const chat = await mountChat(server, {
       selectedChatId: CHAT_ID,
       onNavigateToChat,
