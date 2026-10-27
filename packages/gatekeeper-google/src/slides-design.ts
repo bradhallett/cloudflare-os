@@ -23,9 +23,10 @@ import type { SlideBounds } from "./slides-read-types";
 import type { Deck } from "./slides-simulation";
 import { editSlide, locate, textSlot, type Located, type TextSlot } from "./slides-target";
 import {
-  ChangeConflict, changeRange, fixedRange, isGraphemeBoundary, paragraphAt, paragraphRange,
-  projectedText, providerRange, restTextOf, richTextOf, spliceText, styledText, type RichText,
-} from "./slides-text";
+  ChangeConflict, changeRange, isGraphemeBoundary, paragraphAt, paragraphRange, projectedText,
+  providerRange, richTextOf, spliceText, type RichText,
+} from "./office-text";
+import { fixedRange, restTextOf, styledText } from "./slides-text";
 import type { SlideChange, SlideTextTarget } from "./slides-types";
 
 type Minted<C> = C extends { ref?: string } ? Omit<C, "ref"> & { id: string } : C;

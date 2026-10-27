@@ -6,7 +6,7 @@ import {
 } from "../src/slides-simulation";
 import type { ShapeElement } from "../src/slides-read-types";
 import { editSlide } from "../src/slides-target";
-import { ChangeConflict } from "../src/slides-text";
+import { ChangeConflict } from "../src/office-text";
 import { layout, master, presentation, shape, slide, text } from "./slides-fixture";
 
 /** A deck as `getPresentation()` would project it. */

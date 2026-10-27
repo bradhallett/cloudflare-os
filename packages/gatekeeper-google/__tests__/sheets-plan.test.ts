@@ -13,7 +13,7 @@ import {
   type QueuedChange, type SheetBatch, type SheetMeta,
 } from "../src/sheets-simulation";
 import type { SheetChange } from "../src/sheets-types";
-import { ChangeConflict } from "../src/slides-text";
+import { ChangeConflict } from "../src/office-text";
 import { NEW_SHEET_SIZE, TYPED_INPUT, WHITESPACE_DRIFT, grid, rect, sheet } from "./sheets-fixture";
 
 // Every export calls through to its own code; the spies only count how many lines are listed.

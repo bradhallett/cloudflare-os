@@ -5,9 +5,10 @@
 
 import type { RestPageElement, RestSlide, RestText, RestTextStyle } from "./slides-api";
 import {
-  ChangeConflict, changeRange, narrowChange, projectedText, providerRange, replaceRequests,
-  restTextOf, richTextOf, spliceText, type IndexRange, type TextLocation,
-} from "./slides-text";
+  ChangeConflict, changeRange, narrowChange, projectedText, providerRange, richTextOf, spliceText,
+  type IndexRange,
+} from "./office-text";
+import { replaceRequests, restTextOf, type TextLocation } from "./slides-text";
 import type { SlideTextEdit } from "./slides-types";
 
 /**

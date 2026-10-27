@@ -39,7 +39,7 @@ import type {
   SpreadsheetCellValue, SpreadsheetFormats, SpreadsheetRange, SpreadsheetValueMode,
 } from "./sheets-read-types";
 import { baseIndexOf, baseLines, basePieces, linesAt, type Lines } from "./sheets-structure";
-import { ChangeConflict } from "./slides-text";
+import { ChangeConflict } from "./office-text";
 import type { SheetCellInput, SheetFormatChange } from "./sheets-types";
 
 /** A sheet as the spreadsheet's metadata describes it. */

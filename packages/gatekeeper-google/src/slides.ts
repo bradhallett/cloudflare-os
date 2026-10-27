@@ -33,7 +33,7 @@ import {
   type SlidesActions, type ThemeLabel,
 } from "./slides-simulation";
 import { elementIdsOf } from "./slides-target";
-import { ChangeConflict } from "./slides-text";
+import { ChangeConflict } from "./office-text";
 import type { GooglePresentationReadSession } from "./slides-read-types";
 import type { GooglePresentationSession, SlideChange } from "./slides-types";
 import { SLIDES_TYPES_MODULE_PREFIX, stripTypeModulePrefix } from "./type-bundle";

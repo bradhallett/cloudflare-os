@@ -43,7 +43,7 @@ import { guardDigest, guardFits, guardOf, planSheet } from "./sheets-plan";
 import { gridOf, type PlannedChange, type SheetBatch, type SheetsActions } from "./sheets-simulation";
 import type { SheetBorder, SheetNumberFormat } from "./sheets-read-types";
 import type { SheetCellInput, SheetFormatChange } from "./sheets-types";
-import { ChangeConflict } from "./slides-text";
+import { ChangeConflict } from "./office-text";
 
 const logger = obsContext.createLogger({ component: "gatekeeper.google.sheets", vendorId: "google" });
 

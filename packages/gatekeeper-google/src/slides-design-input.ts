@@ -7,7 +7,7 @@ import { isSlideColor, THEME_COLOR_TYPES } from "./slides-format";
 import type { SlideBounds, ThemeColorName } from "./slides-read-types";
 import type { DesignChange } from "./slides-design";
 import { mintObjectId } from "./slides-simulation";
-import { STRIPPED_CHARACTERS } from "./slides-text";
+import { STRIPPED_CHARACTERS } from "./office-text";
 import type {
   ShapeOutline, SlideBackgroundChange, SlideChange, SlideTextEdit, SlideTextTarget,
   TextFormatChange,
