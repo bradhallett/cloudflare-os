@@ -16,6 +16,7 @@ import { GoogleApiError } from "./google-response";
 import { ApprovalQueueRpcTarget, RpcCursor } from "./shared-approval-queue";
 import { EmailContent, GmailAttachmentInput, GmailComposeOptions, GmailDraft, GmailDraftAttachment, GmailDraftAttachmentEntry, GmailDraftEntry, GmailDraftInfo, GmailDraftPatch } from "./types";
 import { sanitizeTitle } from "@gadgets/gatekeeper-kit/action-description";
+import {validateRpc} from "capnweb-validate";
 import { Cursor } from "@gadgets/workshop-shared/gatekeeper";
 
 export function applyingDraftCreates(store: GmailStore): Array<{
@@ -393,6 +394,7 @@ export function restrictedDraftCursor(ctx: GmailContext): Cursor<GmailDraftEntry
   }), ctx.approvalQueue);
 }
 
+@validateRpc()
 export class GmailDraftStub extends ApprovalQueueRpcTarget implements GmailDraft {
   #ctx: GmailContext;
   #logicalId: string;

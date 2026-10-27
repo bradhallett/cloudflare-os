@@ -8,6 +8,7 @@ import { parseSafeGmailDraft } from "./gmail-drafts";
 import { GmailContext } from "./gmail-list";
 
 
+import {validateRpc} from "capnweb-validate";
 import {DurableObject, RpcStub, restore} from "cloudflare:workers";
 import type {
   ActionKind, ApprovalQueue, Gatekeeper, GatekeeperUserVerifier,
@@ -47,6 +48,7 @@ export type GmailGatekeeperImplProps = {
   labelName?: string;
 };
 
+@validateRpc()
 export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplProps>
     implements Gatekeeper<GmailScopedSession | GmailSession> {
   #applying = new Set<number>();

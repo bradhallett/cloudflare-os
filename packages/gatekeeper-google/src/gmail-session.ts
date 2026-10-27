@@ -22,6 +22,7 @@ import { Cursor } from "@gadgets/workshop-shared/gatekeeper";
 import { validateRpc } from "capnweb-validate";
 import { RpcStub } from "cloudflare:workers";
 
+@validateRpc()
 export class GmailSessionImpl extends ApprovalQueueRpcTarget implements GmailSession {
   #ctx: GmailContext;
 

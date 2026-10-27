@@ -14,6 +14,7 @@ import { GoogleApiError } from "./google-response";
 import { GmailAttachmentInfo, GmailAttachmentInput, GmailComposeOptions, GmailDraftInfo, GmailDraftPatch } from "./types";
 import { ActionDescriptionBuilder, RenderedDescription, buildDescription } from "@gadgets/gatekeeper-kit/action-description";
 
+/** Keep draft inspection aligned with the maximum inline-forward message size. */
 export const MAX_GMAIL_DRAFT_MIME_BYTES = MAX_GMAIL_FORWARD_SOURCE_BYTES;
 
 export function requireCurrentSourceSnapshot(

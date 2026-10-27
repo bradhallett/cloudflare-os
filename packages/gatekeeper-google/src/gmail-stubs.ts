@@ -22,6 +22,7 @@ import { ApprovalQueue } from "@gadgets/workshop-shared/gatekeeper";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import { RpcStub, RpcTarget } from "cloudflare:workers";
 
+@validateRpc()
 export class GmailThreadStub extends ApprovalQueueRpcTarget implements GmailThread {
   #ctx: GmailContext;
   #threadId: string;
@@ -260,6 +261,7 @@ export class GmailThreadStub extends ApprovalQueueRpcTarget implements GmailThre
   }
 }
 
+@validateRpc()
 export class GmailMessageStub extends ApprovalQueueRpcTarget implements GmailMessage {
   #ctx: GmailContext;
   #messageId: string;
@@ -517,6 +519,7 @@ export class GmailMessageStub extends ApprovalQueueRpcTarget implements GmailMes
  * on a message that has no Gmail ID yet, and new mail has no thread until Gmail assigns one.
  */
 
+@validateRpc()
 export class GmailPendingMessageStub extends ApprovalQueueRpcTarget implements GmailMessage {
   #ctx: GmailContext;
   #rfcMessageId: string;
@@ -709,6 +712,7 @@ export class GmailPendingMessageStub extends ApprovalQueueRpcTarget implements G
   }
 }
 
+@validateRpc()
 export class GmailAttachmentStub extends ApprovalQueueRpcTarget implements GmailAttachment {
   #ctx: GmailContext;
   #info: GmailAttachmentInfo;
@@ -778,6 +782,7 @@ export class GmailDraftAttachmentStub extends GmailAttachmentStub implements Gma
  * mail the binding would list (in the hook's thread, for a thread hook).
  */
 
+@validateRpc()
 export class GmailHookDeliveryImpl extends RpcTarget implements GmailHookDelivery {
   constructor(
     private readonly params: GmailHookParams,
